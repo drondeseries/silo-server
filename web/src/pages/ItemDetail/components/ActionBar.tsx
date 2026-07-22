@@ -17,6 +17,7 @@ import {
   Search,
   RotateCcw,
   Tags,
+  Trash2,
 } from "lucide-react";
 import AddToCollectionDialog from "@/components/AddToCollectionDialog";
 import { Button } from "@/components/ui/button";
@@ -77,6 +78,8 @@ interface ActionBarProps {
   onEditMetadata?: () => void;
   onMatchItem?: () => void;
   onSplitItem?: () => void;
+  onDeleteItem?: () => void;
+  isDeletingItem?: boolean;
   onShowMediaInfo?: () => void;
   isAdmin?: boolean;
   canCurateMetadata?: boolean;
@@ -130,6 +133,8 @@ export default function ActionBar({
   onEditMetadata,
   onMatchItem,
   onSplitItem,
+  onDeleteItem,
+  isDeletingItem = false,
   onShowMediaInfo,
   isAdmin = false,
   canCurateMetadata = false,
@@ -456,6 +461,16 @@ export default function ActionBar({
                   <DropdownMenuItem onSelect={onSplitItem}>
                     <Scissors className="size-4" />
                     Split Versions
+                  </DropdownMenuItem>
+                )}
+                {isAdmin && onDeleteItem && (
+                  <DropdownMenuItem
+                    disabled={isDeletingItem}
+                    className="text-destructive focus:text-destructive"
+                    onSelect={onDeleteItem}
+                  >
+                    <Trash2 className="size-4" />
+                    Delete Item
                   </DropdownMenuItem>
                 )}
               </>

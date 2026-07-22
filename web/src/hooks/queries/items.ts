@@ -557,3 +557,21 @@ export function useMetadataTranslationJobs(contentId: string, enabled: boolean) 
     },
   });
 }
+
+export function useDeleteItem() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (contentId: string) =>
+      api<{ success: boolean; content_id: string; message: string }>(
+        `/admin/items/${itemPathID(contentId)}`,
+        { method: "DELETE" },
+      ),
+    onSuccess: () => {
+      toast.success("Item deleted from catalog");
+      void invalidateMediaSurfaceQueries(queryClient);
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Failed to delete item");
+    },
+  });
+}

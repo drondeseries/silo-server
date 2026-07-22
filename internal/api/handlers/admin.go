@@ -136,6 +136,12 @@ type AdminHandler struct {
 	OnServerSettingUpdated       func(ctx context.Context, key, value string)
 	RestartStatus                *ServerRestartStatusTracker
 	CatalogSearchStatus          catalog.CatalogSearchStatusProvider
+	ItemRepo                     *catalog.ItemRepository
+}
+
+func (h *AdminHandler) WithItemRepo(repo *catalog.ItemRepository) *AdminHandler {
+	h.ItemRepo = repo
+	return h
 }
 
 // NewAdminHandler creates a new AdminHandler backed by the given
@@ -3014,4 +3020,30 @@ func validateProspectiveDiagnosticsSettings(values map[string]string) error {
 		)
 	}
 	return nil
+}
+
+// HandleDeleteItem handles DELETE /api/admin/items/{id}.
+// Deletes a media item (movie or show) and its associated database entries.
+func (h *AdminHandler) HandleDeleteItem(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "Item id is required")
+		return
+	}
+	if h.ItemRepo == nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Item repository unavailable")
+		return
+	}
+
+	if err := h.ItemRepo.DeleteItem(r.Context(), id); err != nil {
+		slog.ErrorContext(r.Context(), "failed to delete media item", "component", "api", "content_id", id, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", fmt.Sprintf("Failed to delete item: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":    true,
+		"content_id": id,
+		"message":    "Item deleted successfully",
+	})
 }
