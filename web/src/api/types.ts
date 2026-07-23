@@ -1651,6 +1651,7 @@ export interface ImportTMDBCollectionRequest {
   time_window?: "day" | "week";
   media_type: "movie" | "tv" | "all";
   limit?: number;
+  virtual_playback?: boolean;
   featured?: boolean;
   poster_url?: string;
   poster_source_url?: string;
@@ -1678,6 +1679,7 @@ export interface ImportTraktCollectionRequest {
   profile_id?: string;
   list_url?: string;
   limit?: number;
+  virtual_playback?: boolean;
   featured?: boolean;
   poster_url?: string;
   poster_source_url?: string;

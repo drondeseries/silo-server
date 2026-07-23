@@ -50,6 +50,27 @@ type TMDBMediaType = "movie" | "tv" | "all";
 type TMDBTimeWindow = "day" | "week";
 type TraktSourceKind = "preset" | "list";
 type TraktPreset = "trending" | "popular" | "recommended";
+
+function VirtualPlaybackSwitch({
+  checked,
+  onChange,
+}: {
+  checked: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <div className="border-border flex items-center justify-between rounded-lg border px-4 py-3">
+      <div>
+        <p className="text-sm font-medium">Zero-storage virtual playback</p>
+        <p className="text-muted-foreground text-xs">
+          Create database-only entries for items not already in the selected libraries and resolve
+          them through Silo Virtual Library.
+        </p>
+      </div>
+      <Switch checked={checked} onCheckedChange={onChange} />
+    </div>
+  );
+}
 type TraktMediaType = "movie" | "tv";
 
 interface TMDBPresetSourceConfig {
@@ -687,6 +708,7 @@ export function TMDBPresetForm({
   const [mediaType, setMediaType] = useState<TMDBMediaType>("all");
   const [limit, setLimit] = useState("");
   const [featured, setFeatured] = useState(true);
+  const [virtualPlayback, setVirtualPlayback] = useState(false);
   const [posterFile, setPosterFile] = useState<File | null>(null);
   const [backdropFile, setBackdropFile] = useState<File | null>(null);
   const [posterSourceUrl, setPosterSourceUrl] = useState("");
@@ -716,6 +738,7 @@ export function TMDBPresetForm({
           time_window: tmdbPresetNeedsTimeWindow(preset) ? timeWindow : undefined,
           media_type: normalizedMediaType,
           limit: parsedLimit,
+          virtual_playback: virtualPlayback,
           featured,
           poster_source_url: posterSourceUrl.trim() || undefined,
           backdrop_source_url: backdropSourceUrl.trim() || undefined,
@@ -884,6 +907,8 @@ export function TMDBPresetForm({
 
         <SyncScheduleField value={tmdbSyncSchedule} onChange={setTmdbSyncSchedule} />
 
+        <VirtualPlaybackSwitch checked={virtualPlayback} onChange={setVirtualPlayback} />
+
         <div className="border-border flex items-center justify-between rounded-lg border px-4 py-3">
           <div>
             <p className="text-sm font-medium">Feature on library tab</p>
@@ -929,6 +954,7 @@ export function TraktPresetForm({
   const [profileId, setProfileId] = useState("");
   const [limit, setLimit] = useState("");
   const [featured, setFeatured] = useState(true);
+  const [virtualPlayback, setVirtualPlayback] = useState(false);
   const [posterFile, setPosterFile] = useState<File | null>(null);
   const [backdropFile, setBackdropFile] = useState<File | null>(null);
   const [posterSourceUrl, setPosterSourceUrl] = useState("");
@@ -965,6 +991,7 @@ export function TraktPresetForm({
                 profile_id: requiresProfile ? profileId : undefined,
               }),
           limit: parsedLimit,
+          virtual_playback: virtualPlayback,
           featured,
           poster_source_url: posterSourceUrl.trim() || undefined,
           backdrop_source_url: backdropSourceUrl.trim() || undefined,
@@ -1154,6 +1181,8 @@ export function TraktPresetForm({
         </div>
 
         <SyncScheduleField value={syncSchedule} onChange={setSyncSchedule} />
+
+        <VirtualPlaybackSwitch checked={virtualPlayback} onChange={setVirtualPlayback} />
 
         <div className="border-border flex items-center justify-between rounded-lg border px-4 py-3">
           <div>

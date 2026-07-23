@@ -621,6 +621,9 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 	if item == nil || item.ContentID == "" || strings.TrimSpace(item.ImdbID) == "" {
 		return fmt.Errorf("virtual playback item requires content and IMDb IDs")
 	}
+	if item.Type != "movie" && item.Type != "series" {
+		return fmt.Errorf("virtual playback item has unsupported type %q", item.Type)
+	}
 	if len(libraryIDs) == 0 {
 		return fmt.Errorf("virtual playback item requires at least one library")
 	}
@@ -639,16 +642,54 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 			return fmt.Errorf("linking virtual item to library: %w", err)
 		}
 	}
-	virtualPath := "aiostreams://movie/" + strings.TrimSpace(item.ImdbID)
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO media_files (content_id, media_folder_id, file_path, file_size)
-		SELECT $1, $2, $3, 0
-		WHERE NOT EXISTS (
-			SELECT 1 FROM media_files
-			WHERE content_id = $1 AND left(file_path, 13) <> $4
-		)
-		ON CONFLICT (file_path) DO NOTHING`, item.ContentID, libraryIDs[0], virtualPath, "aiostreams://"); err != nil {
-		return fmt.Errorf("creating virtual playback file: %w", err)
+	virtualPath := "aiostreams://" + item.Type + "/" + strings.TrimSpace(item.ImdbID)
+	if item.Type == "series" {
+		seasonID := fmt.Sprintf("%s-1", strings.Replace(item.ContentID, "series-", "season-", 1))
+		episodeID := fmt.Sprintf("%s-1-1", strings.Replace(item.ContentID, "series-", "episode-", 1))
+		epVirtualPath := fmt.Sprintf("aiostreams://series/%s/1/1", strings.TrimSpace(item.ImdbID))
+
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO seasons (content_id, series_id, season_number, title, metadata_source)
+			VALUES ($1, $2, 1, 'Season 1', 'provider')
+			ON CONFLICT (series_id, season_number) DO NOTHING`, seasonID, item.ContentID); err != nil {
+			return fmt.Errorf("creating virtual season: %w", err)
+		}
+
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO episodes (content_id, series_id, season_id, season_number, episode_number, title, metadata_source)
+			VALUES ($1, $2, $3, 1, 1, 'Episode 1', 'provider')
+			ON CONFLICT (series_id, season_number, episode_number) DO NOTHING`, episodeID, item.ContentID, seasonID); err != nil {
+			return fmt.Errorf("creating virtual episode: %w", err)
+		}
+
+		for _, libraryID := range libraryIDs {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO episode_libraries (episode_id, media_folder_id)
+				VALUES ($1, $2) ON CONFLICT DO NOTHING`, episodeID, libraryID); err != nil {
+				return fmt.Errorf("linking virtual episode library: %w", err)
+			}
+		}
+
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO media_files (content_id, episode_id, media_folder_id, file_path, file_size, container)
+			SELECT $1, $2, $3, $4, 0, 'virtual'
+			WHERE NOT EXISTS (
+				SELECT 1 FROM media_files WHERE episode_id = $2
+			)
+			ON CONFLICT (file_path) DO NOTHING`, item.ContentID, episodeID, libraryIDs[0], epVirtualPath); err != nil {
+			return fmt.Errorf("creating virtual episode file: %w", err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO media_files (content_id, media_folder_id, file_path, file_size, container)
+			SELECT $1, $2, $3, 0, 'virtual'
+			WHERE NOT EXISTS (
+				SELECT 1 FROM media_files
+				WHERE content_id = $1 AND left(file_path, 13) <> $4
+			)
+			ON CONFLICT (file_path) DO NOTHING`, item.ContentID, libraryIDs[0], virtualPath, "aiostreams://"); err != nil {
+			return fmt.Errorf("creating virtual playback file: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit virtual item transaction: %w", err)
