@@ -59,7 +59,7 @@ func NewVirtualMediaRegistrar(pool *pgxpool.Pool) *VirtualMediaRegistrar {
 	return &VirtualMediaRegistrar{pool: pool}
 }
 
-func (r *VirtualMediaRegistrar) Upsert(ctx context.Context, in VirtualMedia) (*VirtualMediaResult, error) {
+func (r *VirtualMediaRegistrar) Upsert(ctx context.Context, installationID int, in VirtualMedia) (*VirtualMediaResult, error) {
 	if r == nil || r.pool == nil {
 		return nil, errors.New("virtual catalog is unavailable")
 	}
