@@ -2910,6 +2910,7 @@ func (h *LibraryCollectionHandler) HandleImportMDBList(w http.ResponseWriter, r 
 			writeError(w, http.StatusBadRequest, "bad_request", validationErr.Error())
 			return
 		}
+		slog.ErrorContext(r.Context(), "failed to create MDBList collection", "title", req.Title, "url", req.URL, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to create collection")
 		return
 	}
@@ -2917,14 +2918,14 @@ func (h *LibraryCollectionHandler) HandleImportMDBList(w http.ResponseWriter, r 
 	// Process admin artwork before sync so maybeGenerateCollage sees the
 	// uploaded poster and skips collage generation.
 	if err := h.processArtworkInputs(r, collection.ID, req.PosterSourceURL, req.BackdropSourceURL); err != nil {
+		slog.ErrorContext(r.Context(), "failed to process MDBList collection artwork", "collection_id", collection.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to process uploaded images")
 		return
 	}
 
 	run, err := h.service.SyncCollection(r.Context(), collection.ID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to import MDBList collection")
-		return
+		slog.WarnContext(r.Context(), "MDBList collection sync failed during initial import", "collection_id", collection.ID, "error", err)
 	}
 
 	refreshed, err := h.repo.GetByID(r.Context(), collection.ID)
