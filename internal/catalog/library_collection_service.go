@@ -116,6 +116,11 @@ type LibraryCollectionService struct {
 	libraryItems *LibraryItemRepository
 	httpClient   *http.Client
 
+	// TMDBAPIKey is the configured TMDB API key used for release-date lookups
+	// in the virtual-playback availability gate. When empty, only the Cinemeta
+	// fallback is used.
+	TMDBAPIKey string
+
 	// TMDBCollections is nil when TMDB is not configured.
 	TMDBCollections TMDBCollectionFetcher
 
@@ -239,11 +244,19 @@ func (s *LibraryCollectionService) checkVirtualMediaAvailability(ctx context.Con
 	}
 
 	if itemType == "movie" {
-		// 1. Try TMDB digital/physical release dates if TMDB ID is available
-		if tmdbID != "" {
+		// 1. Try TMDB digital/physical release dates if TMDB ID and API key are available
+		if tmdbID != "" && s.TMDBAPIKey != "" {
 			endpoint := "https://api.themoviedb.org/3/movie/" + url.PathEscape(tmdbID) + "/release_dates"
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 			if err == nil {
+				// Attach auth — bearer token for v4 JWT keys (two dots), api_key for v3
+				if strings.Count(s.TMDBAPIKey, ".") == 2 {
+					req.Header.Set("Authorization", "Bearer "+s.TMDBAPIKey)
+				} else {
+					q := req.URL.Query()
+					q.Set("api_key", s.TMDBAPIKey)
+					req.URL.RawQuery = q.Encode()
+				}
 				resp, err := client.Do(req)
 				if err == nil {
 					defer resp.Body.Close()
@@ -308,7 +321,9 @@ func (s *LibraryCollectionService) checkVirtualMediaAvailability(ctx context.Con
 				}
 			}
 		}
-		return true, "Movie is available for home media"
+		// Both TMDB and Cinemeta failed to produce a verified home-release signal.
+		// Fail closed so theatrical-only films don't slip into the virtual catalog.
+		return false, "Release metadata unavailable; monitoring will retry"
 	}
 
 	if itemType == "series" {
