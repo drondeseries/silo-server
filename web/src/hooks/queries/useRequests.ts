@@ -211,8 +211,25 @@ export function useCreateMediaRequest() {
         method: "POST",
         body: JSON.stringify(body),
       }),
-    onSuccess: () => {
+    onSuccess: (newReq, variables) => {
       toast.success("Request submitted");
+      if (variables.media_type && variables.tmdb_id) {
+        queryClient.setQueryData(
+          requestKeys.detail(variables.media_type as RequestMediaType, variables.tmdb_id),
+          (old: RequestMediaDetail | undefined) => {
+            if (!old) return old;
+            return {
+              ...old,
+              request: {
+                status: newReq.status,
+                requestable: false,
+                reason: "already_requested",
+                request_id: newReq.id,
+              },
+            };
+          },
+        );
+      }
       invalidateRequestSurfaces(queryClient);
     },
     onError: (err) => {
