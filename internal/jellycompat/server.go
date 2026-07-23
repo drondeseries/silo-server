@@ -111,6 +111,8 @@ type Dependencies struct {
 	SubtitleRepo subtitles.Repository // optional; downloaded subtitle support
 	S3Client     subtitles.S3Client   // optional
 	S3Bucket     string               // optional
+
+	VirtualPlaybackResolver VirtualPlaybackResolver
 }
 
 // CurrentConfig returns the live config when hot reload is wired, falling

@@ -205,7 +205,8 @@ type PlaybackHandler struct {
 	// driven to refresh a stale token, so the node reconstructs from this
 	// server-authoritative store instead (see internal/noderecipe). Optional
 	// (nil disables it — integrated/no-node deployments need no handoff).
-	RecipeNodeStore recipeNodePutter
+	RecipeNodeStore         recipeNodePutter
+	VirtualPlaybackResolver VirtualPlaybackResolver
 }
 
 // recipeNodePutter persists and removes a remote transcode's reconstruction
