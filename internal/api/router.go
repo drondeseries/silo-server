@@ -673,8 +673,8 @@ func NewRouter(deps Dependencies) chi.Router {
 		catalogHandler.SetWorkSummaryProvider(literaryRepo)
 
 		tmdbAPIKey := ""
-		if deps.Config != nil {
-			tmdbAPIKey = deps.Config.TMDBAPIKey
+		if cfg := deps.CurrentConfig(); cfg != nil {
+			tmdbAPIKey = cfg.TMDBAPIKey
 		}
 		requestsRepo := mediarequests.NewRepository(deps.DB, deps.SecretCipher)
 		requestSvc := mediarequests.NewService(
