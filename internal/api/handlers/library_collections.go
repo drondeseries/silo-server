@@ -408,6 +408,7 @@ type importTMDBRequest struct {
 	TimeWindow         string `json:"time_window"`
 	MediaType          string `json:"media_type"`
 	Limit              *int   `json:"limit,omitempty"`
+	VirtualPlayback    bool   `json:"virtual_playback,omitempty"`
 	Featured           bool   `json:"featured"`
 	SortOrder          int    `json:"sort_order,omitempty"`
 	PosterURL          string `json:"poster_url"`
@@ -432,6 +433,7 @@ type importTMDBFranchiseRequest struct {
 	Description        string `json:"description"`
 	CollectionID       int    `json:"collection_id"`
 	Limit              *int   `json:"limit,omitempty"`
+	VirtualPlayback    bool   `json:"virtual_playback,omitempty"`
 	Featured           bool   `json:"featured"`
 	SortOrder          int    `json:"sort_order,omitempty"`
 	PosterURL          string `json:"poster_url"`
@@ -458,6 +460,7 @@ type importTMDBDiscoverRequest struct {
 	MediaType          string                     `json:"media_type"`
 	Spec               importTMDBDiscoverSpecBody `json:"spec"`
 	Limit              *int                       `json:"limit,omitempty"`
+	VirtualPlayback    bool                       `json:"virtual_playback,omitempty"`
 	Featured           bool                       `json:"featured"`
 	SortOrder          int                        `json:"sort_order,omitempty"`
 	PosterURL          string                     `json:"poster_url"`
@@ -499,6 +502,7 @@ type importTraktRequest struct {
 	// (https://trakt.tv/users/{user}/lists/{slug}) instead of a preset.
 	ListURL           string `json:"list_url,omitempty"`
 	Limit             *int   `json:"limit,omitempty"`
+	VirtualPlayback   bool   `json:"virtual_playback,omitempty"`
 	Featured          bool   `json:"featured"`
 	PosterURL         string `json:"poster_url"`
 	PosterSourceURL   string `json:"poster_source_url"`
@@ -2689,7 +2693,7 @@ func (h *LibraryCollectionHandler) createTMDBCollection(
 		syncSchedule = &s
 	}
 
-	sourceConfig, err := buildTMDBSourceConfig(preset, mediaType, timeWindow, req.Limit)
+	sourceConfig, err := buildTMDBSourceConfig(preset, mediaType, timeWindow, req.Limit, req.VirtualPlayback)
 	if err != nil {
 		return nil, fmt.Errorf("building TMDB source config: %w", err)
 	}
@@ -2758,7 +2762,7 @@ func (h *LibraryCollectionHandler) createTMDBFranchiseCollection(
 		syncSchedule = &s
 	}
 
-	sourceConfig, err := buildTMDBCollectionSourceConfig(req.CollectionID, req.Limit)
+	sourceConfig, err := buildTMDBCollectionSourceConfig(req.CollectionID, req.Limit, req.VirtualPlayback)
 	if err != nil {
 		return nil, fmt.Errorf("building TMDB franchise source config: %w", err)
 	}
@@ -2821,7 +2825,7 @@ func (h *LibraryCollectionHandler) createTMDBDiscoverCollection(
 		syncSchedule = &s
 	}
 
-	sourceConfig, err := buildTMDBDiscoverSourceConfig(req.MediaType, req.Spec, req.Limit)
+	sourceConfig, err := buildTMDBDiscoverSourceConfig(req.MediaType, req.Spec, req.Limit, req.VirtualPlayback)
 	if err != nil {
 		return nil, fmt.Errorf("building TMDB discover source config: %w", err)
 	}
@@ -3033,10 +3037,10 @@ func (h *LibraryCollectionHandler) HandleImportTraktCollection(w http.ResponseWr
 	var sourceURL string
 	var err error
 	if listURL != "" {
-		sourceConfig, err = buildTraktListSourceConfig(listURL, req.Limit)
+		sourceConfig, err = buildTraktListSourceConfig(listURL, req.Limit, req.VirtualPlayback)
 		sourceURL = listURL
 	} else {
-		sourceConfig, err = buildTraktSourceConfig(preset, mediaType, profileID, req.Limit)
+		sourceConfig, err = buildTraktSourceConfig(preset, mediaType, profileID, req.Limit, req.VirtualPlayback)
 		sourceURL = buildTraktSourceURL(preset, mediaType, profileID)
 	}
 	if err != nil {
@@ -3402,18 +3406,20 @@ func buildMDBListSourceConfig(url string, limit *int, virtualPlayback bool) (jso
 	return raw, nil
 }
 
-func buildTMDBSourceConfig(preset, mediaType, timeWindow string, limit *int) (json.RawMessage, error) {
+func buildTMDBSourceConfig(preset, mediaType, timeWindow string, limit *int, virtualPlayback bool) (json.RawMessage, error) {
 	payload := struct {
-		Mode       string `json:"mode"`
-		Preset     string `json:"preset"`
-		MediaType  string `json:"media_type"`
-		TimeWindow string `json:"time_window,omitempty"`
-		Limit      *int   `json:"limit,omitempty"`
+		Mode            string `json:"mode"`
+		Preset          string `json:"preset"`
+		MediaType       string `json:"media_type"`
+		TimeWindow      string `json:"time_window,omitempty"`
+		Limit           *int   `json:"limit,omitempty"`
+		VirtualPlayback bool   `json:"virtual_playback,omitempty"`
 	}{
-		Mode:      "tmdb_preset",
-		Preset:    preset,
-		MediaType: mediaType,
-		Limit:     limit,
+		Mode:            "tmdb_preset",
+		Preset:          preset,
+		MediaType:       mediaType,
+		Limit:           limit,
+		VirtualPlayback: virtualPlayback,
 	}
 	if preset == "trending" {
 		payload.TimeWindow = timeWindow
@@ -3430,15 +3436,17 @@ func buildTMDBSourceConfig(preset, mediaType, timeWindow string, limit *int) (js
 // franchise/saga collection. CollectionID == 0 is permitted and round-trips
 // through omitempty as no key at all — the catalog sync path uses that to
 // detect a placeholder template that an admin still needs to configure.
-func buildTMDBCollectionSourceConfig(collectionID int, limit *int) (json.RawMessage, error) {
+func buildTMDBCollectionSourceConfig(collectionID int, limit *int, virtualPlayback bool) (json.RawMessage, error) {
 	payload := struct {
-		Mode         string `json:"mode"`
-		CollectionID int    `json:"collection_id,omitempty"`
-		Limit        *int   `json:"limit,omitempty"`
+		Mode            string `json:"mode"`
+		CollectionID    int    `json:"collection_id,omitempty"`
+		Limit           *int   `json:"limit,omitempty"`
+		VirtualPlayback bool   `json:"virtual_playback,omitempty"`
 	}{
-		Mode:         collectionSourceModeTMDBCollection,
-		CollectionID: collectionID,
-		Limit:        limit,
+		Mode:            collectionSourceModeTMDBCollection,
+		CollectionID:    collectionID,
+		Limit:           limit,
+		VirtualPlayback: virtualPlayback,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -3481,16 +3489,18 @@ type tmdbDiscoverConfigBody struct {
 // The discover sub-object exists so additional discover-only fields don't
 // pollute the top-level libraryCollectionSourceConfig struct used for the
 // existing tmdb_preset / trakt_preset / mdblist_json modes.
-func buildTMDBDiscoverSourceConfig(mediaType string, spec importTMDBDiscoverSpecBody, limit *int) (json.RawMessage, error) {
+func buildTMDBDiscoverSourceConfig(mediaType string, spec importTMDBDiscoverSpecBody, limit *int, virtualPlayback bool) (json.RawMessage, error) {
 	payload := struct {
-		Mode      string                 `json:"mode"`
-		MediaType string                 `json:"media_type"`
-		Limit     *int                   `json:"limit,omitempty"`
-		Discover  tmdbDiscoverConfigBody `json:"discover"`
+		Mode            string                 `json:"mode"`
+		MediaType       string                 `json:"media_type"`
+		Limit           *int                   `json:"limit,omitempty"`
+		VirtualPlayback bool                   `json:"virtual_playback,omitempty"`
+		Discover        tmdbDiscoverConfigBody `json:"discover"`
 	}{
-		Mode:      collectionSourceModeTMDBDiscover,
-		MediaType: mediaType,
-		Limit:     limit,
+		Mode:            collectionSourceModeTMDBDiscover,
+		MediaType:       mediaType,
+		Limit:           limit,
+		VirtualPlayback: virtualPlayback,
 		Discover: tmdbDiscoverConfigBody{
 			WithGenres:       spec.WithGenres,
 			WithoutGenres:    spec.WithoutGenres,
@@ -3522,38 +3532,42 @@ func buildTMDBDiscoverSourceURL(mediaType, sortBy string) string {
 
 // buildTraktListSourceConfig builds the source config for a user-authored
 // Trakt list (mode trakt_list, issue #214).
-func buildTraktListSourceConfig(listURL string, limit *int) (json.RawMessage, error) {
+func buildTraktListSourceConfig(listURL string, limit *int, virtualPlayback bool) (json.RawMessage, error) {
 	payload := struct {
-		Mode     string `json:"mode"`
-		Provider string `json:"provider"`
-		URL      string `json:"url"`
-		ListURL  string `json:"list_url"`
-		Limit    *int   `json:"limit,omitempty"`
+		Mode            string `json:"mode"`
+		Provider        string `json:"provider"`
+		URL             string `json:"url"`
+		ListURL         string `json:"list_url"`
+		Limit           *int   `json:"limit,omitempty"`
+		VirtualPlayback bool   `json:"virtual_playback,omitempty"`
 	}{
-		Mode:     "trakt_list",
-		Provider: "trakt",
-		URL:      listURL,
-		ListURL:  listURL,
-		Limit:    limit,
+		Mode:            "trakt_list",
+		Provider:        "trakt",
+		URL:             listURL,
+		ListURL:         listURL,
+		Limit:           limit,
+		VirtualPlayback: virtualPlayback,
 	}
 	return json.Marshal(payload)
 }
 
-func buildTraktSourceConfig(preset, mediaType, profileID string, limit *int) (json.RawMessage, error) {
+func buildTraktSourceConfig(preset, mediaType, profileID string, limit *int, virtualPlayback bool) (json.RawMessage, error) {
 	payload := struct {
-		Mode      string `json:"mode"`
-		Provider  string `json:"provider"`
-		Preset    string `json:"preset"`
-		MediaType string `json:"media_type"`
-		ProfileID string `json:"profile_id,omitempty"`
-		Limit     *int   `json:"limit,omitempty"`
+		Mode            string `json:"mode"`
+		Provider        string `json:"provider"`
+		Preset          string `json:"preset"`
+		MediaType       string `json:"media_type"`
+		ProfileID       string `json:"profile_id,omitempty"`
+		Limit           *int   `json:"limit,omitempty"`
+		VirtualPlayback bool   `json:"virtual_playback,omitempty"`
 	}{
-		Mode:      "trakt_preset",
-		Provider:  "trakt",
-		Preset:    preset,
-		MediaType: mediaType,
-		ProfileID: profileID,
-		Limit:     limit,
+		Mode:            "trakt_preset",
+		Provider:        "trakt",
+		Preset:          preset,
+		MediaType:       mediaType,
+		ProfileID:       profileID,
+		Limit:           limit,
+		VirtualPlayback: virtualPlayback,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {

@@ -14,7 +14,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/collage"
 	"github.com/Silo-Server/silo-server/internal/collectionutil"
-	"github.com/Silo-Server/silo-server/internal/idgen"
+	"github.com/Silo-Server/silo-server/internal/contentid"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -102,6 +102,12 @@ type CollageGenerator interface {
 	GenerateCollectionPoster(ctx context.Context, collectionID string) error
 }
 
+// MetadataRefresher is implemented by the metadata service. Collection-created
+// virtual items use it for an immediate background enrichment pass.
+type MetadataRefresher interface {
+	RefreshItemForLibrary(context.Context, string, int) error
+}
+
 var ErrLibraryCollectionSyncUnsupported = errors.New("smart collections cannot be synchronized")
 
 type LibraryCollectionService struct {
@@ -128,7 +134,8 @@ type LibraryCollectionService struct {
 	TraktTokenResolver TraktAccessTokenResolver
 
 	// CollageGen is nil when S3/image processing is not configured.
-	CollageGen CollageGenerator
+	CollageGen        CollageGenerator
+	MetadataRefresher MetadataRefresher
 }
 
 func NewLibraryCollectionService(
@@ -215,6 +222,246 @@ func sourceEnablesVirtualPlayback(raw json.RawMessage) bool {
 		VirtualPlayback bool `json:"virtual_playback"`
 	}
 	return json.Unmarshal(raw, &cfg) == nil && cfg.VirtualPlayback
+}
+
+func (s *LibraryCollectionService) checkVirtualMediaAvailability(ctx context.Context, itemType, imdbID, tmdbID, tvdbID string) (bool, string) {
+	imdbID = strings.TrimSpace(imdbID)
+	tmdbID = strings.TrimSpace(tmdbID)
+	tvdbID = strings.TrimSpace(tvdbID)
+	if imdbID == "" && tmdbID == "" && tvdbID == "" {
+		return false, "IMDb, TMDB, or TVDB ID is required"
+	}
+	now := time.Now().UTC()
+
+	client := s.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+
+	if itemType == "movie" {
+		// 1. Try TMDB digital/physical release dates if TMDB ID is available
+		if tmdbID != "" {
+			endpoint := "https://api.themoviedb.org/3/movie/" + url.PathEscape(tmdbID) + "/release_dates"
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+			if err == nil {
+				resp, err := client.Do(req)
+				if err == nil {
+					defer resp.Body.Close()
+					if resp.StatusCode == http.StatusOK {
+						var data struct {
+							Results []struct {
+								Country string `json:"iso_3166_1"`
+								Dates   []struct {
+									Date time.Time `json:"release_date"`
+									Type int       `json:"type"`
+								} `json:"release_dates"`
+							} `json:"results"`
+						}
+						if json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&data) == nil {
+							var earliestHome time.Time
+							for _, typ := range []int{4, 5} { // 4=Digital, 5=Physical
+								for _, r := range data.Results {
+									for _, d := range r.Dates {
+										if d.Type == typ && !d.Date.IsZero() && (earliestHome.IsZero() || d.Date.Before(earliestHome)) {
+											earliestHome = d.Date
+										}
+									}
+								}
+							}
+							if !earliestHome.IsZero() {
+								if earliestHome.After(now) {
+									return false, "Movie is theatrical-only; waiting for digital/home release date (" + earliestHome.Format("2006-01-02") + ")"
+								}
+								return true, "Movie digital/home release verified"
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// 2. Cinemeta fallback (premiere date + 90 days conservative home window)
+		if imdbID != "" {
+			endpoint := "https://v3-cinemeta.strem.io/meta/movie/" + url.PathEscape(imdbID) + ".json"
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+			if err == nil {
+				resp, err := client.Do(req)
+				if err == nil {
+					defer resp.Body.Close()
+					if resp.StatusCode == http.StatusOK {
+						var payload struct {
+							Meta struct {
+								Released    time.Time `json:"released"`
+								ReleaseInfo string    `json:"releaseInfo"`
+								Year        string    `json:"year"`
+							} `json:"meta"`
+						}
+						if json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload) == nil {
+							if !payload.Meta.Released.IsZero() {
+								presumedHome := payload.Meta.Released.AddDate(0, 0, 90)
+								if presumedHome.After(now) {
+									return false, "Movie is theatrical-only; waiting for home-media release"
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		return true, "Movie is available for home media"
+	}
+
+	if itemType == "series" {
+		var airedEpisodes int
+		// 1. Try Cinemeta for series episode listing & air dates
+		if imdbID != "" {
+			endpoint := "https://v3-cinemeta.strem.io/meta/series/" + url.PathEscape(imdbID) + ".json"
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+			if err == nil {
+				resp, err := client.Do(req)
+				if err == nil {
+					defer resp.Body.Close()
+					if resp.StatusCode == http.StatusOK {
+						var payload struct {
+							Meta struct {
+								Videos []struct {
+									Season   int       `json:"season"`
+									Episode  int       `json:"episode"`
+									Released time.Time `json:"released"`
+								} `json:"videos"`
+							} `json:"meta"`
+						}
+						if json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload) == nil {
+							for _, v := range payload.Meta.Videos {
+								if v.Season > 0 && v.Episode > 0 && !v.Released.IsZero() && !v.Released.After(now) {
+									airedEpisodes++
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// 2. Fallback to TVMaze if Cinemeta returned 0 aired episodes
+		if airedEpisodes == 0 {
+			lookupURL, err := url.Parse("https://api.tvmaze.com/lookup/shows")
+			if err == nil {
+				q := lookupURL.Query()
+				if imdbID != "" {
+					q.Set("imdb", imdbID)
+				} else if tvdbID != "" {
+					q.Set("thetvdb", tvdbID)
+				}
+				lookupURL.RawQuery = q.Encode()
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, lookupURL.String(), nil)
+				if err == nil {
+					resp, err := client.Do(req)
+					if err == nil {
+						defer resp.Body.Close()
+						if resp.StatusCode == http.StatusOK {
+							var show struct {
+								ID int `json:"id"`
+							}
+							if json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&show) == nil && show.ID > 0 {
+								episodesURL := fmt.Sprintf("https://api.tvmaze.com/shows/%d/episodes", show.ID)
+								epReq, err := http.NewRequestWithContext(ctx, http.MethodGet, episodesURL, nil)
+								if err == nil {
+									epResp, err := client.Do(epReq)
+									if err == nil {
+										defer epResp.Body.Close()
+										if epResp.StatusCode == http.StatusOK {
+											var episodes []struct {
+												Season  int    `json:"season"`
+												Number  int    `json:"number"`
+												Airdate string `json:"airdate"`
+											}
+											if json.NewDecoder(io.LimitReader(epResp.Body, 4<<20)).Decode(&episodes) == nil {
+												for _, ep := range episodes {
+													if ep.Season > 0 && ep.Number > 0 && ep.Airdate != "" {
+														if t, pErr := time.Parse("2006-01-02", ep.Airdate); pErr == nil && !t.After(now) {
+															airedEpisodes++
+														}
+													}
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if airedEpisodes == 0 {
+			return false, "No episodes have aired yet"
+		}
+		return true, fmt.Sprintf("%d aired episodes verified", airedEpisodes)
+	}
+
+	return true, "Item available"
+}
+
+func (s *LibraryCollectionService) materializeVirtualCollectionEntry(ctx context.Context, libraryIDs []int, title, mediaType, imdbID string, tmdbID, tvdbID, year int) (*models.MediaItem, error) {
+	if strings.TrimSpace(imdbID) == "" {
+		return nil, nil
+	}
+	itemType := "movie"
+	if mediaType == "tv" || mediaType == "series" {
+		itemType = "series"
+	}
+
+	tmdbStr := ""
+	if tmdbID > 0 {
+		tmdbStr = fmt.Sprintf("%d", tmdbID)
+	}
+	tvdbStr := ""
+	if tvdbID > 0 {
+		tvdbStr = fmt.Sprintf("%d", tvdbID)
+	}
+
+	available, reason := s.checkVirtualMediaAvailability(ctx, itemType, imdbID, tmdbStr, tvdbStr)
+	if !available {
+		slog.InfoContext(ctx, "collection virtual playback item deferred", "title", title, "type", itemType, "imdb_id", imdbID, "reason", reason)
+		return nil, nil
+	}
+
+	ids := contentid.ProviderIDs{Imdb: strings.TrimSpace(imdbID), Tmdb: tmdbStr, Tvdb: tvdbStr}
+	var contentID string
+	var ok bool
+	if itemType == "series" {
+		contentID, ok = contentid.ForSeries(ids)
+	} else {
+		contentID, ok = contentid.ForMovie(ids)
+	}
+	if !ok {
+		return nil, fmt.Errorf("virtual playback item %q has no valid provider ID", title)
+	}
+	item := &models.MediaItem{ContentID: contentID, Type: itemType, Title: title, SortTitle: title, Year: year, ImdbID: strings.TrimSpace(imdbID), Status: "matched"}
+	if tmdbID > 0 {
+		item.TmdbID = fmt.Sprintf("%d", tmdbID)
+	}
+	if tvdbID > 0 {
+		item.TvdbID = tvdbStr
+	}
+	if err := s.items.MaterializeVirtualPlaybackItem(ctx, item, libraryIDs); err != nil {
+		return nil, fmt.Errorf("materializing virtual item %q: %w", title, err)
+	}
+	if s.MetadataRefresher != nil {
+		contentID := item.ContentID
+		for _, libraryID := range libraryIDs {
+			go func(folderID int) {
+				refreshCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				if err := s.MetadataRefresher.RefreshItemForLibrary(refreshCtx, contentID, folderID); err != nil {
+					slog.Warn("collection virtual item metadata refresh failed", "content_id", contentID, "folder_id", folderID, "error", err)
+				}
+			}(libraryID)
+		}
+	}
+	return item, nil
 }
 
 func (s *LibraryCollectionService) SyncCollection(ctx context.Context, collectionID string) (*models.LibraryCollectionSyncRun, error) {
@@ -311,32 +558,56 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 		return nil, err
 	}
 
+	unmaterializableWarnings := make(map[int]string)
+
 	if sourceEnablesVirtualPlayback(collection.SourceConfig) {
-		for _, entry := range entries {
-			if mdbListEntryItemType(entry) != "movie" || strings.TrimSpace(entry.IMDbID) == "" {
+		for i, entry := range entries {
+			itemType := mdbListEntryItemType(entry)
+			var lookup *ExternalIDLookup
+			if itemType == "movie" {
+				lookup = movieLookup
+			} else {
+				lookup = seriesLookup
+			}
+
+			if len(pickCandidatesByPriority(lookup, entry, itemType)) > 0 {
 				continue
 			}
-			if len(pickCandidatesByPriority(movieLookup, entry, "movie")) > 0 {
+
+			if strings.TrimSpace(entry.IMDbID) == "" {
+				slog.WarnContext(ctx, "MDBList sync: missing IMDb ID for virtual playback", "title", entry.Title)
+				unmaterializableWarnings[i] = fmt.Sprintf("Missing IMDb ID for virtual playback: %s", entry.Title)
 				continue
 			}
-			contentID, err := idgen.NextID()
-			if err != nil {
-				return nil, fmt.Errorf("generating virtual media id: %w", err)
+
+			tvdbID := 0
+			if entry.TVDBID != nil {
+				tvdbID = *entry.TVDBID
 			}
-			item := &models.MediaItem{
-				ContentID: contentID, Type: "movie", Title: entry.Title,
-				SortTitle: entry.Title, Year: entry.ReleaseYear, ImdbID: entry.IMDbID,
-				TmdbID: fmt.Sprintf("%d", entry.ID), Status: "matched",
+
+			item, matErr := s.materializeVirtualCollectionEntry(ctx, collection.LibraryIDs, entry.Title, itemType, entry.IMDbID, entry.ID, tvdbID, entry.ReleaseYear)
+			if matErr != nil {
+				slog.WarnContext(ctx, "MDBList sync: virtual playback materialization failed", "title", entry.Title, "error", matErr)
+				unmaterializableWarnings[i] = fmt.Sprintf("Virtual playback materialization failed for %s: %v", entry.Title, matErr)
+				continue
 			}
-			if entry.ID <= 0 {
-				item.TmdbID = ""
+			if item == nil {
+				continue
 			}
-			if err := s.items.MaterializeVirtualPlaybackItem(ctx, item, collection.LibraryIDs); err != nil {
-				return nil, fmt.Errorf("materializing virtual item %q: %w", entry.Title, err)
-			}
-			movieLookup.ByIMDb[entry.IMDbID] = contentID
-			if item.TmdbID != "" {
-				movieLookup.ByTMDB[item.TmdbID] = contentID
+
+			if itemType == "movie" {
+				movieLookup.ByIMDb[entry.IMDbID] = item.ContentID
+				if item.TmdbID != "" {
+					movieLookup.ByTMDB[item.TmdbID] = item.ContentID
+				}
+			} else {
+				seriesLookup.ByIMDb[entry.IMDbID] = item.ContentID
+				if item.TmdbID != "" {
+					seriesLookup.ByTMDB[item.TmdbID] = item.ContentID
+				}
+				if item.TvdbID != "" {
+					seriesLookup.ByTVDB[item.TvdbID] = item.ContentID
+				}
 			}
 		}
 	}
@@ -401,7 +672,11 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 		scannedEntries = index + 1
 		r, ok := resolvedByIndex[index]
 		if !ok {
-			warnings = append(warnings, fmt.Sprintf("No match in libraries %v for %s", collection.LibraryIDs, entry.Title))
+			if w, exists := unmaterializableWarnings[index]; exists {
+				warnings = append(warnings, w)
+			} else {
+				warnings = append(warnings, fmt.Sprintf("No match in libraries %v for %s", collection.LibraryIDs, entry.Title))
+			}
 			continue
 		}
 		var chosen string
@@ -412,7 +687,11 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 			}
 		}
 		if chosen == "" {
-			warnings = append(warnings, fmt.Sprintf("No match in libraries %v for %s", collection.LibraryIDs, entry.Title))
+			if w, exists := unmaterializableWarnings[index]; exists {
+				warnings = append(warnings, w)
+			} else {
+				warnings = append(warnings, fmt.Sprintf("No match in libraries %v for %s", collection.LibraryIDs, entry.Title))
+			}
 			continue
 		}
 		matchedItems = append(matchedItems, LibraryCollectionItemInput{
@@ -523,6 +802,12 @@ func (s *LibraryCollectionService) syncTMDBPresetCollection(ctx context.Context,
 		item, err := s.resolveTMDBEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
+		}
+		if item == nil && cfg.VirtualPlayback {
+			item, err = s.materializeVirtualCollectionEntry(ctx, collection.LibraryIDs, entry.Title, entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID, 0)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if item == nil {
 			slog.DebugContext(ctx, "TMDB preset sync: no match", "component", "catalog",
@@ -687,6 +972,12 @@ func (s *LibraryCollectionService) syncTMDBFranchiseCollection(ctx context.Conte
 		item, err := s.resolveTMDBEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
+		}
+		if item == nil && cfg.VirtualPlayback {
+			item, err = s.materializeVirtualCollectionEntry(ctx, collection.LibraryIDs, entry.Title, entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID, 0)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if item == nil {
 			slog.DebugContext(ctx, "TMDB franchise sync: no match", "component", "catalog",
@@ -863,6 +1154,12 @@ func (s *LibraryCollectionService) syncTMDBDiscoverCollection(ctx context.Contex
 		if err != nil {
 			return nil, err
 		}
+		if item == nil && cfg.VirtualPlayback {
+			item, err = s.materializeVirtualCollectionEntry(ctx, collection.LibraryIDs, entry.Title, entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID, 0)
+			if err != nil {
+				return nil, err
+			}
+		}
 		if item == nil {
 			slog.DebugContext(ctx, "TMDB discover sync: no match", "component", "catalog",
 				"rank", i+1,
@@ -1011,7 +1308,7 @@ func (s *LibraryCollectionService) syncTraktPresetCollection(ctx context.Context
 		"count", len(results),
 	)
 
-	return s.completeTraktEntrySync(ctx, collection, results, cfg.Limit, startedAt, opts)
+	return s.completeTraktEntrySync(ctx, collection, results, cfg.Limit, cfg.VirtualPlayback, startedAt, opts)
 }
 
 // syncTraktListCollection populates a collection from a user-authored Trakt
@@ -1049,7 +1346,7 @@ func (s *LibraryCollectionService) syncTraktListCollection(ctx context.Context, 
 		"count", len(results),
 	)
 
-	return s.completeTraktEntrySync(ctx, collection, results, cfg.Limit, startedAt, opts)
+	return s.completeTraktEntrySync(ctx, collection, results, cfg.Limit, cfg.VirtualPlayback, startedAt, opts)
 }
 
 // ParseTraktListURL extracts the user and list slug from a trakt.tv list URL
@@ -1099,7 +1396,7 @@ func ParseTraktListURL(raw string) (user, list string, err error) {
 // completeTraktEntrySync matches fetched Trakt entries against the
 // collection's libraries and records the sync run. Shared by the preset and
 // user-list sources.
-func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, collection *models.LibraryCollection, results []TraktCollectionEntry, limit *int, startedAt time.Time, opts SyncCollectionOptions) (*models.LibraryCollectionSyncRun, error) {
+func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, collection *models.LibraryCollection, results []TraktCollectionEntry, limit *int, virtualPlayback bool, startedAt time.Time, opts SyncCollectionOptions) (*models.LibraryCollectionSyncRun, error) {
 	matchedItems := make([]LibraryCollectionItemInput, 0, len(results))
 	seenContentIDs := make(map[string]int, len(results))
 	warnings := make([]string, 0)
@@ -1113,6 +1410,12 @@ func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, c
 		item, err := s.resolveTraktEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
+		}
+		if item == nil && virtualPlayback {
+			item, err = s.materializeVirtualCollectionEntry(ctx, collection.LibraryIDs, entry.Title, entry.MediaType, entry.IMDbID, entry.TMDBID, entry.TVDBID, entry.Year)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if item == nil {
 			unmatchedCount++
