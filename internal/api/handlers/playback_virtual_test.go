@@ -88,3 +88,32 @@ func TestHandleStartPlaybackVirtualV3ReturnsExternalPlan(t *testing.T) {
 		t.Fatalf("sessions = %d, want 1", len(manager.AllSessions()))
 	}
 }
+
+func TestHandleStartPlaybackVirtualV3ReturnsProxiedStreamURLForWebClient(t *testing.T) {
+	file := &models.MediaFile{ID: 42, ContentID: "movie-1", FilePath: "aiostreams://movie/tt0133093", Duration: 8160}
+	resolver := &recordingVirtualPlaybackResolver{streamURL: "https://stream.example/movie.mkv?token=secret"}
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"playback.protocol_v3_enabled": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.VirtualPlaybackResolver = resolver
+
+	start := v3HandlerStartRequest()
+	start.FileID = file.ID
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start)))
+	req.Header.Set("X-Silo-Client", "Silo Web")
+	req = req.WithContext(newAuthorizedPlaybackContext())
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var response playback.DecisionResponseV3
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.PlaybackPlan == nil || !strings.HasPrefix(response.PlaybackPlan.Stream.URL, "/stream/") {
+		t.Fatalf("expected proxied /stream/ URL for web client, got: %#v", response)
+	}
+}
