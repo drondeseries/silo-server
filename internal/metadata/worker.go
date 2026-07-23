@@ -1324,6 +1324,19 @@ func (w *MatchWorker) RetryUnmatchedItemsByFolderAndPathPrefix(ctx context.Conte
 		)
 	}
 
+	repaired, repairErr := w.service.repairAnchoredIdentityMismatchesByFolderAndPathPrefix(ctx, folderID, pathPrefix)
+	retried += repaired
+	if repairErr != nil {
+		return retried, stillUnmatched, repairErr
+	}
+	if repaired > 0 {
+		slog.InfoContext(ctx, "metadata: repaired provider-anchored roots in scope", "component", "metadata",
+			"folder_id", folderID,
+			"path_prefix", pathPrefix,
+			"repaired_roots", repaired,
+		)
+	}
+
 	return retried, stillUnmatched, nil
 }
 

@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/cache"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/mdblist"
 	"github.com/Silo-Server/silo-server/internal/recommendations/embeddings"
 	"github.com/Silo-Server/silo-server/internal/s3client"
 )
@@ -30,6 +33,9 @@ type connectionCheckResponse struct {
 
 type s3SettingsCheckClient interface {
 	HeadBucket(ctx context.Context, bucket string) error
+	PutObject(ctx context.Context, bucket, key string, data []byte) error
+	GetObject(ctx context.Context, bucket, key string) ([]byte, error)
+	DeleteObject(ctx context.Context, bucket, key string) error
 }
 
 type redisSettingsCheckClient interface {
@@ -39,6 +45,10 @@ type redisSettingsCheckClient interface {
 
 type embeddingsSettingsCheckClient interface {
 	Embed(ctx context.Context, texts []string) ([][]float32, error)
+}
+
+type mdblistSettingsCheckClient interface {
+	Check(ctx context.Context) error
 }
 
 type redisSettingsCheckAdapter struct {
@@ -72,6 +82,10 @@ var newAdminEmbeddingsSettingsCheckClient = func(
 	cfg embeddings.ClientConfig,
 ) embeddingsSettingsCheckClient {
 	return embeddings.NewClient(cfg)
+}
+
+var newAdminMDBListSettingsCheckClient = func(apiKey string) mdblistSettingsCheckClient {
+	return mdblist.NewClient(apiKey, nil)
 }
 
 func (h *AdminHandler) HandleCheckSettingsConnection(w http.ResponseWriter, r *http.Request) {
@@ -119,12 +133,26 @@ func (h *AdminHandler) HandleCheckSettingsConnection(w http.ResponseWriter, r *h
 		response = checkRecommendationsEmbeddingConnection(r.Context(), cfg)
 	case "meilisearch":
 		response = checkMeilisearchConnection(r.Context(), effectiveSettings)
+	case "mdblist":
+		response = checkMDBListConnection(r.Context(), cfg)
 	default:
 		writeError(w, http.StatusBadRequest, "bad_request", "Unsupported connection check kind")
 		return
 	}
 
 	writeJSON(w, http.StatusOK, response)
+}
+
+func checkMDBListConnection(ctx context.Context, cfg *config.Config) connectionCheckResponse {
+	if strings.TrimSpace(cfg.MDBListAPIKey) == "" {
+		return connectionCheckResponse{Success: false, Message: "MDBList API key is required."}
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := newAdminMDBListSettingsCheckClient(cfg.MDBListAPIKey).Check(checkCtx); err != nil {
+		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("MDBList connection check failed: %v", err)}
+	}
+	return connectionCheckResponse{Success: true, Message: "MDBList API key verified."}
 }
 
 func checkMeilisearchConnection(ctx context.Context, settings map[string]string) connectionCheckResponse {
@@ -230,10 +258,13 @@ func checkS3PublicConnection(ctx context.Context, cfg *config.Config) connection
 			Message: fmt.Sprintf("S3 connection check failed: %v", err),
 		}
 	}
+	if err := checkS3ObjectPermissions(checkCtx, client, cfg.S3.Public.Bucket); err != nil {
+		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("S3 object permission check failed: %v", err)}
+	}
 
 	return connectionCheckResponse{
 		Success: true,
-		Message: "S3 connection successful.",
+		Message: "S3 connection and object read/write/delete permissions verified.",
 	}
 }
 
@@ -263,11 +294,56 @@ func checkS3PrivateConnection(ctx context.Context, cfg *config.Config) connectio
 			Message: fmt.Sprintf("S3 connection check failed: %v", err),
 		}
 	}
+	if err := checkS3ObjectPermissions(checkCtx, client, cfg.S3.Private.Bucket); err != nil {
+		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("S3 object permission check failed: %v", err)}
+	}
 
 	return connectionCheckResponse{
 		Success: true,
-		Message: "S3 connection successful.",
+		Message: "S3 connection and object read/write/delete permissions verified.",
 	}
+}
+
+func checkS3ObjectPermissions(
+	ctx context.Context,
+	client s3SettingsCheckClient,
+	bucket string,
+) (resultErr error) {
+	key := fmt.Sprintf(".silo-admin-connection-check/%d", time.Now().UnixNano())
+	payload := []byte("silo-storage-check")
+	deleted := false
+	defer func() {
+		if deleted {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := client.DeleteObject(cleanupCtx, bucket, key); err != nil {
+			cleanupErr := fmt.Errorf("cleanup probe object: %w", err)
+			if resultErr == nil {
+				resultErr = cleanupErr
+			} else {
+				resultErr = errors.Join(resultErr, cleanupErr)
+			}
+		}
+	}()
+
+	if err := client.PutObject(ctx, bucket, key, payload); err != nil {
+		return fmt.Errorf("write probe object: %w", err)
+	}
+
+	read, err := client.GetObject(ctx, bucket, key)
+	if err != nil {
+		return fmt.Errorf("read probe object: %w", err)
+	}
+	if !bytes.Equal(read, payload) {
+		return fmt.Errorf("read probe object returned unexpected content")
+	}
+	if err := client.DeleteObject(ctx, bucket, key); err != nil {
+		return fmt.Errorf("delete probe object: %w", err)
+	}
+	deleted = true
+	return nil
 }
 
 func checkRedisConnection(ctx context.Context, cfg *config.Config) connectionCheckResponse {

@@ -3,12 +3,14 @@ import { toast } from "sonner";
 import {
   useAdminSensitiveStatus,
   useAdminServerSettings,
-  useUpdateServerSetting,
+  useUpdateServerSettings,
 } from "@/hooks/queries/admin/settings";
+import { AlertTriangle } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { QUOTA_PERIODS, QUOTA_PERIOD_WINDOW_LABELS } from "@/lib/quotaPeriods";
 import { CredentialStatus } from "./CredentialStatus";
+import { RestartServerButton } from "./RestartServerButton";
 import { SettingField } from "./SettingField";
 
 // Connection settings live under the ai.* keys; reads fall back to the legacy
@@ -79,7 +81,7 @@ const TRANSCRIPTION_PRESETS: {
 function AIConnectionCard() {
   const { data: settings } = useAdminServerSettings();
   const { data: sensitive } = useAdminSensitiveStatus();
-  const updateSetting = useUpdateServerSetting();
+  const updateSettings = useUpdateServerSettings();
 
   const configuredKeys = new Set(sensitive?.configured ?? []);
   const apiKeyConfigured =
@@ -93,6 +95,7 @@ function AIConnectionCard() {
   const [asrBaseUrl, setAsrBaseUrl] = useState("");
   const [asrApiKey, setAsrApiKey] = useState("");
   const [maxConcurrent, setMaxConcurrent] = useState("2");
+  const [restartRequired, setRestartRequired] = useState(false);
 
   useEffect(() => {
     if (!settings) return;
@@ -107,7 +110,7 @@ function AIConnectionCard() {
     );
   }, [settings]);
 
-  function save() {
+  async function save() {
     const trimmedBaseUrl = baseUrl.trim();
     const trimmedChatModel = chatModel.trim();
     const parsedMaxConcurrent = Number.parseInt(maxConcurrent, 10);
@@ -127,30 +130,42 @@ function AIConnectionCard() {
       return;
     }
 
-    const updates = [
-      updateSetting.mutateAsync({ key: "ai.base_url", value: trimmedBaseUrl }),
-      updateSetting.mutateAsync({ key: "ai.chat_model", value: trimmedChatModel }),
-      updateSetting.mutateAsync({ key: "ai.asr_model", value: asrModel.trim() }),
-      updateSetting.mutateAsync({ key: "ai.asr_base_url", value: asrBaseUrl.trim() }),
-      updateSetting.mutateAsync({
-        key: "ai.max_concurrent_jobs",
-        value: String(parsedMaxConcurrent),
-      }),
-    ];
+    const candidates: Record<string, string> = {
+      "ai.base_url": trimmedBaseUrl,
+      "ai.chat_model": trimmedChatModel,
+      "ai.asr_model": asrModel.trim(),
+      "ai.asr_base_url": asrBaseUrl.trim(),
+      "ai.max_concurrent_jobs": String(parsedMaxConcurrent),
+    };
+    const updates = Object.fromEntries(
+      Object.entries(candidates).filter(([key, value]) => settings?.[key] !== value),
+    );
     if (apiKey.trim() !== "") {
-      updates.push(updateSetting.mutateAsync({ key: "ai.api_key", value: apiKey }));
+      updates["ai.api_key"] = apiKey;
     }
     if (asrApiKey.trim() !== "") {
-      updates.push(updateSetting.mutateAsync({ key: "ai.asr_api_key", value: asrApiKey }));
+      updates["ai.asr_api_key"] = asrApiKey;
     }
-    void Promise.all(updates).then(() => {
+    if (Object.keys(updates).length === 0) {
+      toast.info("No endpoint settings changed.");
+      return;
+    }
+    try {
+      const result = await updateSettings.mutateAsync(updates);
       setApiKey("");
       setAsrApiKey("");
-    });
+      setRestartRequired((current) => current || result.restart_required);
+      toast.success("AI endpoint settings saved");
+    } catch {
+      // The mutation reports the API error.
+    }
   }
 
   return (
-    <div className="border-border bg-surface max-w-2xl rounded-lg border px-5 py-4">
+    <fieldset
+      disabled={updateSettings.isPending}
+      className="border-border bg-surface max-w-2xl rounded-lg border px-5 py-4"
+    >
       <div className="mb-2 flex items-center justify-between gap-3">
         <div>
           <h3 className="text-sm font-semibold">Endpoint</h3>
@@ -243,20 +258,30 @@ function AIConnectionCard() {
         hint="One shared cap across subtitle translation, transcription, and description translation."
       />
       <div className="pt-2">
-        <Button type="button" onClick={save} disabled={updateSetting.isPending}>
-          {updateSetting.isPending ? "Saving..." : "Save Endpoint Settings"}
+        <Button type="button" onClick={() => void save()} disabled={updateSettings.isPending}>
+          {updateSettings.isPending ? "Saving..." : "Save Endpoint Settings"}
         </Button>
         <p className="text-muted-foreground mt-2 text-xs">
-          Changes take effect after a server restart.
+          Endpoint, model, and credential changes apply live. Changing the concurrency cap requires
+          a restart.
         </p>
+        {restartRequired && (
+          <div className="border-warning/30 bg-warning/10 text-warning mt-3 flex items-center justify-between gap-3 rounded-xl border px-3 py-2 text-xs">
+            <span className="flex items-center gap-2">
+              <AlertTriangle className="h-3.5 w-3.5" />
+              Restart required to resize the AI job pool.
+            </span>
+            <RestartServerButton />
+          </div>
+        )}
       </div>
-    </div>
+    </fieldset>
   );
 }
 
 function AIFeaturesCard() {
   const { data: settings } = useAdminServerSettings();
-  const updateSetting = useUpdateServerSetting();
+  const updateSettings = useUpdateServerSettings();
 
   const [subtitleTranslate, setSubtitleTranslate] = useState("false");
   const [transcribe, setTranscribe] = useState("false");
@@ -281,7 +306,7 @@ function AIFeaturesCard() {
     setTranscribeQuotaPeriod(settings["subtitle_ai.transcribe_quota_period"] ?? "day");
   }, [settings]);
 
-  function save() {
+  async function save() {
     const parsedBatch = Number.parseInt(batchSize, 10);
     const parsedNeighbors = Number.parseInt(contextNeighbors, 10);
     if (!Number.isInteger(parsedBatch) || parsedBatch < 1) {
@@ -306,33 +331,37 @@ function AIFeaturesCard() {
       toast.error("Transcription limit must be zero (unlimited) or a positive whole number.");
       return;
     }
-    void Promise.all([
-      updateSetting.mutateAsync({ key: "subtitle_ai.enabled", value: subtitleTranslate }),
-      updateSetting.mutateAsync({ key: "subtitle_ai.transcribe_enabled", value: transcribe }),
-      updateSetting.mutateAsync({ key: "metadata_ai.enabled", value: metadataTranslate }),
-      updateSetting.mutateAsync({ key: "metadata_ai.on_view", value: onView }),
-      updateSetting.mutateAsync({ key: "subtitle_ai.batch_size", value: String(parsedBatch) }),
-      updateSetting.mutateAsync({
-        key: "subtitle_ai.context_neighbors",
-        value: String(parsedNeighbors),
-      }),
-      updateSetting.mutateAsync({
-        key: "subtitle_ai.asr_chunk_seconds",
-        value: String(parsedChunkSeconds),
-      }),
-      updateSetting.mutateAsync({
-        key: "subtitle_ai.transcribe_quota_jobs",
-        value: String(parsedQuotaJobs),
-      }),
-      updateSetting.mutateAsync({
-        key: "subtitle_ai.transcribe_quota_period",
-        value: transcribeQuotaPeriod,
-      }),
-    ]);
+    const candidates: Record<string, string> = {
+      "subtitle_ai.enabled": subtitleTranslate,
+      "subtitle_ai.transcribe_enabled": transcribe,
+      "metadata_ai.enabled": metadataTranslate,
+      "metadata_ai.on_view": onView,
+      "subtitle_ai.batch_size": String(parsedBatch),
+      "subtitle_ai.context_neighbors": String(parsedNeighbors),
+      "subtitle_ai.asr_chunk_seconds": String(parsedChunkSeconds),
+      "subtitle_ai.transcribe_quota_jobs": String(parsedQuotaJobs),
+      "subtitle_ai.transcribe_quota_period": transcribeQuotaPeriod,
+    };
+    const updates = Object.fromEntries(
+      Object.entries(candidates).filter(([key, value]) => settings?.[key] !== value),
+    );
+    if (Object.keys(updates).length === 0) {
+      toast.info("No feature settings changed.");
+      return;
+    }
+    try {
+      await updateSettings.mutateAsync(updates);
+      toast.success("AI feature settings saved");
+    } catch {
+      // The mutation reports the API error.
+    }
   }
 
   return (
-    <div className="border-border bg-surface max-w-2xl rounded-lg border px-5 py-4">
+    <fieldset
+      disabled={updateSettings.isPending}
+      className="border-border bg-surface max-w-2xl rounded-lg border px-5 py-4"
+    >
       <div className="mb-2">
         <h3 className="text-sm font-semibold">Features</h3>
         <p className="text-muted-foreground text-xs">
@@ -413,14 +442,12 @@ function AIFeaturesCard() {
         hint="Rolling window the transcription limit counts against."
       />
       <div className="pt-2">
-        <Button type="button" onClick={save} disabled={updateSetting.isPending}>
-          {updateSetting.isPending ? "Saving..." : "Save Feature Settings"}
+        <Button type="button" onClick={() => void save()} disabled={updateSettings.isPending}>
+          {updateSettings.isPending ? "Saving..." : "Save Feature Settings"}
         </Button>
-        <p className="text-muted-foreground mt-2 text-xs">
-          Changes take effect after a server restart.
-        </p>
+        <p className="text-muted-foreground mt-2 text-xs">Feature changes apply live.</p>
       </div>
-    </div>
+    </fieldset>
   );
 }
 

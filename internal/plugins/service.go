@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/protobuf/proto"
@@ -58,6 +59,13 @@ type serviceInstallationStore interface {
 type serviceConfigStore interface {
 	ListGlobalConfigs(ctx context.Context, installationID int) ([]*RuntimeConfig, error)
 	PutGlobalConfig(ctx context.Context, installationID int, key string, value map[string]any) error
+	CompareAndSwapGlobalConfig(
+		ctx context.Context,
+		installationID int,
+		key string,
+		value map[string]any,
+		expectedUpdatedAt *time.Time,
+	) (bool, error)
 }
 
 type Service struct {

@@ -707,29 +707,80 @@ func TestItemRepo_Search_ScoredCTEExposesItemColumnNames(t *testing.T) {
 	}
 }
 
-// TestItemRepo_Search_GroupByHasNoOutputAliases asserts the scored CTE's
-// GROUP BY uses raw column references: AS aliases are valid in a select list
-// but are a syntax error inside GROUP BY, so the CTE must not reuse the
-// aliased projection there.
-func TestItemRepo_Search_GroupByHasNoOutputAliases(t *testing.T) {
+// TestItemRepo_Search_ScoredCTEIsLean asserts that relevance ranking carries
+// only candidate identity/rank fields. Wide MediaItem columns are hydrated
+// from the page CTE after LIMIT/OFFSET, which keeps broad episode searches
+// from sorting metadata arrays and image fields for every candidate.
+func TestItemRepo_Search_ScoredCTEIsLean(t *testing.T) {
 	repo := &ItemRepository{}
-	dataSQL, countSQL, _ := repo.buildSearchSQL("avatar", []string{"movie"}, 20, 0, AccessFilter{})
+	for _, test := range []struct {
+		name      string
+		itemTypes []string
+	}{
+		{name: "movie", itemTypes: []string{"movie"}},
+		{name: "episode", itemTypes: []string{"episode"}},
+		{name: "mixed", itemTypes: nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dataSQL, countSQL, _ := repo.buildSearchSQL("avatar", test.itemTypes, 20, 0, AccessFilter{})
+			for _, sql := range []string{dataSQL, countSQL} {
+				end := strings.Index(sql, "), stats AS")
+				if end < 0 {
+					t.Fatalf("expected scored CTE boundary; got:\n%s", sql)
+				}
+				scored := sql[:end]
+				for _, wideColumn := range []string{"poster_path", "backdrop_path", "metadata_s3_path", "genres"} {
+					if strings.Contains(scored, wideColumn) {
+						t.Fatalf("scored CTE must not carry %s; got:\n%s", wideColumn, scored)
+					}
+				}
+			}
+		})
+	}
+}
 
-	for _, sql := range []string{dataSQL, countSQL} {
-		idx := strings.Index(sql, "GROUP BY")
-		if idx < 0 {
-			t.Fatalf("expected GROUP BY in scored CTE; got:\n%s", sql)
+func TestItemRepo_Search_UnscopedIncludesEpisodeCandidateBranch(t *testing.T) {
+	repo := &ItemRepository{}
+	sql, _, _ := repo.buildSearchSQL("Who Are You?", nil, 20, 0, AccessFilter{})
+	for _, want := range []string{
+		"FROM episodes e JOIN media_items si",
+		"si.type = 'series'",
+		"FROM episode_libraries available_el",
+		"UNION ALL",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("mixed search SQL missing %q:\n%s", want, sql)
 		}
-		clause := sql[idx:]
-		if end := strings.Index(clause, ")"); end >= 0 {
-			clause = clause[:end]
-		}
-		if strings.Contains(clause, " AS ") {
-			t.Fatalf("GROUP BY must not contain output aliases; got:\n%s", clause)
-		}
-		if strings.Contains(clause, "COALESCE") {
-			t.Fatalf("GROUP BY should group by raw columns, not COALESCE expressions; got:\n%s", clause)
-		}
+	}
+}
+
+func TestItemRepo_Search_EpisodeScopeOmitsMediaItemCandidateBranch(t *testing.T) {
+	repo := &ItemRepository{}
+	sql, _, _ := repo.buildSearchSQL("Who Are You?", []string{"episode"}, 20, 0, AccessFilter{})
+	scoredEnd := strings.Index(sql, "), stats AS")
+	if scoredEnd < 0 {
+		t.Fatalf("expected scored CTE boundary; got:\n%s", sql)
+	}
+	scored := sql[:scoredEnd]
+	if strings.Contains(scored, "FROM media_items mi") {
+		t.Fatalf("episode-only candidate set must not scan media_items directly:\n%s", scored)
+	}
+	if !strings.Contains(scored, "FROM episodes e JOIN media_items si") {
+		t.Fatalf("episode-only candidate set missing episode branch:\n%s", scored)
+	}
+}
+
+func TestItemRepo_Search_EpisodeAccessUsesIndependentMembershipPredicates(t *testing.T) {
+	repo := &ItemRepository{}
+	sql, _, _ := repo.buildSearchSQL("Who Are You?", []string{"episode"}, 20, 0, AccessFilter{
+		AllowedLibraryIDs:  []int{1},
+		DisabledLibraryIDs: []int{2},
+	})
+	if !strings.Contains(sql, "FROM episode_libraries allowed_el") {
+		t.Fatalf("episode search missing allowed-library EXISTS:\n%s", sql)
+	}
+	if !strings.Contains(sql, "NOT EXISTS (SELECT 1 FROM episode_libraries disabled_el") {
+		t.Fatalf("episode search missing independent disabled-library NOT EXISTS:\n%s", sql)
 	}
 }
 

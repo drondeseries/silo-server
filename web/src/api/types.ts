@@ -3426,6 +3426,8 @@ export interface PluginAsset {
 export interface PluginConfigValue {
   key: string;
   value: Record<string, unknown>;
+  /** Secret fields saved on the server but redacted from value. */
+  configured_secrets?: string[];
 }
 
 export interface PluginAuthBinding {
@@ -3556,6 +3558,8 @@ export interface UpdatePluginInstallationRequest {
 export interface SavePluginConfigRequest {
   key: string;
   value: Record<string, unknown>;
+  /** Explicitly clear these manifest-declared secret fields. */
+  clear_secrets?: string[];
 }
 
 export interface SavePluginAuthBindingRequest {
@@ -4101,6 +4105,23 @@ export interface AdminSettingUpdateResponse {
   restart_required?: boolean;
 }
 
+/** Response of the atomic PUT /admin/settings endpoint. */
+export interface AdminSettingsUpdateResponse {
+  /** Saved non-sensitive values. Secret values are intentionally omitted. */
+  values: Record<string, string>;
+  restart_required: boolean;
+  restart_required_keys?: string[];
+}
+
+export interface AdminServerStatus {
+  started_at: string;
+  restart_required: boolean;
+  restart_required_at?: string;
+  restart_required_reason?: string;
+  restart_requested: boolean;
+  restart_requested_at?: string;
+}
+
 // IP visibility
 export interface UserIPEntry {
   client_ip: string;
@@ -4241,6 +4262,7 @@ export interface SubtitleProviderUpdateRequest {
   api_key?: string;
   username?: string;
   password?: string;
+  clear_credentials?: boolean;
 }
 
 export interface SubtitleProviderTestRequest {

@@ -5,6 +5,19 @@ import (
 	"time"
 )
 
+const (
+	MaxBurst = 1<<31 - 1
+
+	// MaxRequestsPerWindow keeps the limiter's float-to-int conversions
+	// portable and bounded on both 32-bit and 64-bit platforms.
+	MaxRequestsPerWindow = float64(MaxBurst)
+
+	// The global per-second rate is also expanded into a per-minute window.
+	// Use integer division so multiplying by 60 stays below the window limit
+	// without a floating-point rounding edge.
+	MaxGlobalRequestsPerSecond = float64(MaxBurst / 60)
+)
+
 // Rate defines the rate limits for a key.
 type Rate struct {
 	RequestsPerSecond float64

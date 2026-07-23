@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -13,11 +16,15 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/diagnostics"
 	"github.com/Silo-Server/silo-server/internal/s3client"
 )
 
 type fakeServerSettingsStore struct {
-	values map[string]string
+	values       map[string]string
+	setCalls     int
+	setManyCalls int
+	atomicCalls  int
 }
 
 func (f *fakeServerSettingsStore) Get(_ context.Context, key string) (string, error) {
@@ -25,6 +32,7 @@ func (f *fakeServerSettingsStore) Get(_ context.Context, key string) (string, er
 }
 
 func (f *fakeServerSettingsStore) Set(_ context.Context, key, value string) error {
+	f.setCalls++
 	if f.values == nil {
 		f.values = map[string]string{}
 	}
@@ -33,6 +41,7 @@ func (f *fakeServerSettingsStore) Set(_ context.Context, key, value string) erro
 }
 
 func (f *fakeServerSettingsStore) SetMany(_ context.Context, values map[string]string) error {
+	f.setManyCalls++
 	if f.values == nil {
 		f.values = map[string]string{}
 	}
@@ -40,6 +49,679 @@ func (f *fakeServerSettingsStore) SetMany(_ context.Context, values map[string]s
 		f.values[key] = value
 	}
 	return nil
+}
+
+func (f *fakeServerSettingsStore) UpdateAtomic(
+	ctx context.Context,
+	update func(current map[string]string) (map[string]string, error),
+) error {
+	f.atomicCalls++
+	current, err := f.GetAll(ctx)
+	if err != nil {
+		return err
+	}
+	writes, err := update(current)
+	if err != nil || len(writes) == 0 {
+		return err
+	}
+	return f.SetMany(ctx, writes)
+}
+
+func TestAdminGetEffectiveSettingsReturnsRuntimeDefaultsAndRedactsSecrets(t *testing.T) {
+	settings := &fakeServerSettingsStore{values: map[string]string{
+		"server.log_level": "debug",
+		"tmdb.api_key":     "never-return-this",
+	}}
+	handler := &AdminHandler{SettingsRepo: settings}
+	rec := httptest.NewRecorder()
+
+	handler.HandleGetEffectiveSettings(rec, httptest.NewRequest(http.MethodGet, "/admin/settings/effective", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var values map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&values); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if values["server.log_level"] != "debug" {
+		t.Fatalf("server.log_level = %q, want debug", values["server.log_level"])
+	}
+	if values["database.max_connections"] != "20" {
+		t.Fatalf("database.max_connections = %q, want effective default 20", values["database.max_connections"])
+	}
+	if values["playback.transcode_enabled"] != "true" {
+		t.Fatalf("playback.transcode_enabled = %q, want effective default true", values["playback.transcode_enabled"])
+	}
+	if _, leaked := values["tmdb.api_key"]; leaked {
+		t.Fatal("effective settings response leaked tmdb.api_key")
+	}
+}
+
+func TestAdminGetEffectiveSettingsUsesEnvironmentManagedRuntimeValue(t *testing.T) {
+	settings := &fakeServerSettingsStore{values: map[string]string{
+		"clientip.trusted_proxies": "10.0.0.0/8",
+	}}
+	handler := &AdminHandler{
+		SettingsRepo: settings,
+		BootstrapSensitiveConfigured: map[string]bool{
+			"clientip.trusted_proxies": true,
+			"redis.url":                true,
+		},
+		BootstrapSensitiveValues: map[string]string{
+			"clientip.trusted_proxies": "192.0.2.0/24, 2001:db8::/32",
+			"redis.url":                "redis://private.example.invalid:6379",
+		},
+	}
+	rec := httptest.NewRecorder()
+
+	handler.HandleGetEffectiveSettings(rec, httptest.NewRequest(http.MethodGet, "/admin/settings/effective", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var values map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&values); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := values["clientip.trusted_proxies"]; got != "192.0.2.0/24, 2001:db8::/32" {
+		t.Fatalf("clientip.trusted_proxies = %q, want active environment value", got)
+	}
+	if _, leaked := values["redis.url"]; leaked {
+		t.Fatal("effective settings response leaked environment-managed redis.url")
+	}
+}
+
+func TestAdminSettingsValidationIncludesEnvironmentManagedValues(t *testing.T) {
+	newHandler := func() (*AdminHandler, *fakeServerSettingsStore) {
+		settings := &fakeServerSettingsStore{values: map[string]string{
+			"watchsync.trakt.client_id": "configured-client-id",
+		}}
+		return &AdminHandler{
+			SettingsRepo: settings,
+			BootstrapSensitiveConfigured: map[string]bool{
+				"watchsync.trakt.client_secret": true,
+			},
+			BootstrapSensitiveValues: map[string]string{
+				"watchsync.trakt.client_secret": "clawrouter-e2e-secret",
+			},
+		}, settings
+	}
+
+	t.Run("batch update", func(t *testing.T) {
+		handler, settings := newHandler()
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings",
+			strings.NewReader(`{"values":{"branding.server_name":"Casa"}}`),
+		)
+		rec := httptest.NewRecorder()
+
+		handler.HandleUpdateSettings(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if settings.values["branding.server_name"] != "Casa" {
+			t.Fatalf("branding.server_name = %q, want Casa", settings.values["branding.server_name"])
+		}
+	})
+
+	t.Run("single update", func(t *testing.T) {
+		handler, settings := newHandler()
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings/branding.server_name",
+			strings.NewReader(`{"value":"Casa"}`),
+		)
+		req = withChiParam(req, "key", "branding.server_name")
+		rec := httptest.NewRecorder()
+
+		handler.HandleUpdateSetting(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if settings.values["branding.server_name"] != "Casa" {
+			t.Fatalf("branding.server_name = %q, want Casa", settings.values["branding.server_name"])
+		}
+	})
+}
+
+func TestAdminSensitiveStatusReportsNonSecretEnvironmentManagedSettings(t *testing.T) {
+	handler := &AdminHandler{
+		SettingsRepo: &fakeServerSettingsStore{values: map[string]string{}},
+		BootstrapSensitiveConfigured: map[string]bool{
+			"clientip.trusted_proxies": true,
+		},
+	}
+	rec := httptest.NewRecorder()
+
+	handler.HandleGetSensitiveStatus(rec, httptest.NewRequest(http.MethodGet, "/admin/settings/sensitive-status", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var response sensitiveStatusResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.ManagedByEnv) != 1 || response.ManagedByEnv[0] != "clientip.trusted_proxies" {
+		t.Fatalf("managed_by_env = %#v", response.ManagedByEnv)
+	}
+}
+
+func TestAdminUpdateSettingsRejectsEnvironmentManagedSetting(t *testing.T) {
+	settings := &fakeServerSettingsStore{values: map[string]string{}}
+	handler := &AdminHandler{
+		SettingsRepo: settings,
+		BootstrapSensitiveConfigured: map[string]bool{
+			"clientip.trusted_proxies": true,
+		},
+	}
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/settings",
+		strings.NewReader(`{"values":{"clientip.trusted_proxies":"10.0.0.0/8"}}`),
+	)
+	rec := httptest.NewRecorder()
+
+	handler.HandleUpdateSettings(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if settings.setManyCalls != 0 {
+		t.Fatalf("SetMany calls = %d, want 0", settings.setManyCalls)
+	}
+}
+
+func TestAdminUpdateSettingsCommitsOneValidatedBatch(t *testing.T) {
+	settings := &fakeServerSettingsStore{values: map[string]string{}}
+	restartStatus := NewServerRestartStatusTracker()
+	handler := &AdminHandler{SettingsRepo: settings, RestartStatus: restartStatus}
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/settings",
+		strings.NewReader(`{"values":{"database.max_connections":" 40 ","branding.server_name":"Casa"}}`),
+	)
+	rec := httptest.NewRecorder()
+
+	handler.HandleUpdateSettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if settings.setManyCalls != 1 {
+		t.Fatalf("SetMany calls = %d, want 1", settings.setManyCalls)
+	}
+	if settings.values["database.max_connections"] != "40" ||
+		settings.values["branding.server_name"] != "Casa" {
+		t.Fatalf("stored values = %#v", settings.values)
+	}
+	var response updateSettingsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.RestartRequired ||
+		len(response.RestartRequiredKeys) != 1 ||
+		response.RestartRequiredKeys[0] != "database.max_connections" {
+		t.Fatalf("response = %#v", response)
+	}
+}
+
+func TestAdminUpdateSettingsRejectsWholeBatchBeforeWrite(t *testing.T) {
+	settings := &fakeServerSettingsStore{values: map[string]string{"branding.server_name": "Silo"}}
+	handler := &AdminHandler{SettingsRepo: settings}
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/settings",
+		strings.NewReader(`{"values":{"branding.server_name":"Casa","database.max_connections":"0"}}`),
+	)
+	rec := httptest.NewRecorder()
+
+	handler.HandleUpdateSettings(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if settings.setManyCalls != 0 {
+		t.Fatalf("SetMany calls = %d, want 0", settings.setManyCalls)
+	}
+	if settings.values["branding.server_name"] != "Silo" {
+		t.Fatalf("valid sibling value was partially persisted: %#v", settings.values)
+	}
+}
+
+func TestAdminUpdateSettingsValidatesProspectiveDiagnosticsLimits(t *testing.T) {
+	const (
+		mib = 1024 * 1024
+	)
+
+	t.Run("rejects invalid final relationship", func(t *testing.T) {
+		settings := &fakeServerSettingsStore{values: map[string]string{
+			diagnostics.KeyMaxBundleBytes:       strconv.Itoa(10 * mib),
+			diagnostics.KeyMaxUncompressedBytes: strconv.Itoa(64 * mib),
+			diagnostics.KeyMaxBytesPerUser:      strconv.Itoa(200 * mib),
+		}}
+		handler := &AdminHandler{SettingsRepo: settings}
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings",
+			strings.NewReader(fmt.Sprintf(
+				`{"values":{"%s":"%d","%s":"%d"}}`,
+				diagnostics.KeyMaxBundleBytes,
+				50*mib,
+				diagnostics.KeyMaxUncompressedBytes,
+				20*mib,
+			)),
+		)
+		rec := httptest.NewRecorder()
+
+		handler.HandleUpdateSettings(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+		if settings.setManyCalls != 0 {
+			t.Fatalf("invalid diagnostics batch wrote settings: SetMany=%d", settings.setManyCalls)
+		}
+	})
+
+	t.Run("accepts valid paired repair", func(t *testing.T) {
+		settings := &fakeServerSettingsStore{values: map[string]string{
+			diagnostics.KeyMaxBundleBytes:       strconv.Itoa(64 * mib),
+			diagnostics.KeyMaxUncompressedBytes: strconv.Itoa(128 * mib),
+			diagnostics.KeyMaxBytesPerUser:      strconv.Itoa(200 * mib),
+		}}
+		handler := &AdminHandler{SettingsRepo: settings}
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings",
+			strings.NewReader(fmt.Sprintf(
+				`{"values":{"%s":"%d","%s":"%d"}}`,
+				diagnostics.KeyMaxBundleBytes,
+				50*mib,
+				diagnostics.KeyMaxUncompressedBytes,
+				60*mib,
+			)),
+		)
+		rec := httptest.NewRecorder()
+
+		handler.HandleUpdateSettings(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if settings.setManyCalls != 1 {
+			t.Fatalf("valid diagnostics batch SetMany=%d, want 1", settings.setManyCalls)
+		}
+	})
+}
+
+func TestAdminGenericSettingsRoutesRejectUnsafeRateLimitValues(t *testing.T) {
+	t.Run("batch", func(t *testing.T) {
+		settings := &fakeServerSettingsStore{values: map[string]string{}}
+		handler := &AdminHandler{SettingsRepo: settings}
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings",
+			strings.NewReader(`{"values":{"ratelimit.global.requests_per_second":"1e308"}}`),
+		)
+		rec := httptest.NewRecorder()
+
+		handler.HandleUpdateSettings(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+		if settings.setManyCalls != 0 || settings.setCalls != 0 {
+			t.Fatalf("invalid rate wrote settings: SetMany=%d Set=%d", settings.setManyCalls, settings.setCalls)
+		}
+	})
+
+	t.Run("single", func(t *testing.T) {
+		settings := &fakeServerSettingsStore{values: map[string]string{}}
+		handler := &AdminHandler{SettingsRepo: settings}
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings/ratelimit.global.requests_per_second",
+			strings.NewReader(`{"value":"1e308"}`),
+		)
+		req = withChiParam(req, "key", "ratelimit.global.requests_per_second")
+		rec := httptest.NewRecorder()
+
+		handler.HandleUpdateSetting(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+		if settings.setManyCalls != 0 || settings.setCalls != 0 {
+			t.Fatalf("invalid rate wrote settings: SetMany=%d Set=%d", settings.setManyCalls, settings.setCalls)
+		}
+	})
+}
+
+func TestAdminSettingsRejectClearingOnlyRedisTransport(t *testing.T) {
+	newStore := func() *fakeServerSettingsStore {
+		return &fakeServerSettingsStore{values: map[string]string{
+			"ratelimit.backend": "redis",
+			"redis.url":         "redis://cache.example.invalid:6379",
+		}}
+	}
+
+	t.Run("batch", func(t *testing.T) {
+		settings := newStore()
+		handler := &AdminHandler{SettingsRepo: settings}
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings",
+			strings.NewReader(`{"values":{"redis.url":""}}`),
+		)
+		rec := httptest.NewRecorder()
+
+		handler.HandleUpdateSettings(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+		if settings.setManyCalls != 0 || settings.values["redis.url"] == "" {
+			t.Fatalf("invalid clear was persisted: calls=%d values=%#v", settings.setManyCalls, settings.values)
+		}
+	})
+
+	t.Run("single", func(t *testing.T) {
+		settings := newStore()
+		handler := &AdminHandler{SettingsRepo: settings}
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings/redis.url",
+			strings.NewReader(`{"value":""}`),
+		)
+		req = withChiParam(req, "key", "redis.url")
+		rec := httptest.NewRecorder()
+
+		handler.HandleUpdateSetting(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+		if settings.setCalls != 0 || settings.values["redis.url"] == "" {
+			t.Fatalf("invalid clear was persisted: calls=%d values=%#v", settings.setCalls, settings.values)
+		}
+	})
+
+	t.Run("bootstrap Sentinel", func(t *testing.T) {
+		settings := newStore()
+		handler := &AdminHandler{
+			SettingsRepo:            settings,
+			RedisBootstrapAvailable: true,
+		}
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings",
+			strings.NewReader(`{"values":{"redis.url":""}}`),
+		)
+		rec := httptest.NewRecorder()
+
+		handler.HandleUpdateSettings(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if settings.setManyCalls != 1 || settings.values["redis.url"] != "" {
+			t.Fatalf("clear with bootstrap transport was not persisted: calls=%d values=%#v", settings.setManyCalls, settings.values)
+		}
+	})
+}
+
+func TestAdminSettingsRejectMalformedRedisURL(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		target string
+		body   string
+		single bool
+	}{
+		{name: "batch", target: "/admin/settings", body: `{"values":{"redis.url":"not-a-url"}}`},
+		{name: "single", target: "/admin/settings/redis.url", body: `{"value":"not-a-url"}`, single: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			settings := &fakeServerSettingsStore{values: map[string]string{}}
+			handler := &AdminHandler{SettingsRepo: settings}
+			req := httptest.NewRequest(http.MethodPut, tc.target, strings.NewReader(tc.body))
+			if tc.single {
+				req = withChiParam(req, "key", "redis.url")
+			}
+			rec := httptest.NewRecorder()
+
+			if tc.single {
+				handler.HandleUpdateSetting(rec, req)
+			} else {
+				handler.HandleUpdateSettings(rec, req)
+			}
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+			if settings.setManyCalls != 0 || settings.setCalls != 0 {
+				t.Fatalf("malformed Redis URL was persisted: SetMany=%d Set=%d", settings.setManyCalls, settings.setCalls)
+			}
+		})
+	}
+}
+
+func TestAdminUpdateSettingsSkipsFunctionalNoOp(t *testing.T) {
+	settings := &fakeServerSettingsStore{values: map[string]string{}}
+	handler := &AdminHandler{SettingsRepo: settings, RestartStatus: NewServerRestartStatusTracker()}
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/settings",
+		strings.NewReader(`{"values":{"database.max_connections":"20"}}`),
+	)
+	rec := httptest.NewRecorder()
+
+	handler.HandleUpdateSettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if settings.setManyCalls != 0 {
+		t.Fatalf("SetMany calls = %d, want 0 for an effective-default no-op", settings.setManyCalls)
+	}
+	var response updateSettingsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.RestartRequired || len(response.RestartRequiredKeys) != 0 {
+		t.Fatalf("no-op response requested restart: %#v", response)
+	}
+}
+
+func TestAdminUpdateSettingsPersistsClearWhenOverrideEqualsDefault(t *testing.T) {
+	settings := &fakeServerSettingsStore{values: map[string]string{"branding.server_name": "Silo"}}
+	handler := &AdminHandler{SettingsRepo: settings, RestartStatus: NewServerRestartStatusTracker()}
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/settings",
+		strings.NewReader(`{"values":{"branding.server_name":""}}`),
+	)
+	rec := httptest.NewRecorder()
+
+	handler.HandleUpdateSettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if settings.setManyCalls != 1 {
+		t.Fatalf("SetMany calls = %d, want 1 for explicit clear", settings.setManyCalls)
+	}
+	if settings.values["branding.server_name"] != "" {
+		t.Fatalf("stored value = %q, want cleared override", settings.values["branding.server_name"])
+	}
+	var response updateSettingsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Values["branding.server_name"] != "Silo" || response.RestartRequired {
+		t.Fatalf("response = %#v, want unchanged effective default without restart", response)
+	}
+}
+
+func TestAdminUpdateSettingsReturnsEffectiveDefaultAfterClear(t *testing.T) {
+	settings := &fakeServerSettingsStore{values: map[string]string{"branding.server_name": "Casa"}}
+	var callbackValue string
+	handler := &AdminHandler{
+		SettingsRepo: settings,
+		OnServerSettingUpdated: func(_ context.Context, _ string, value string) {
+			callbackValue = value
+		},
+	}
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/settings",
+		strings.NewReader(`{"values":{"branding.server_name":""}}`),
+	)
+	rec := httptest.NewRecorder()
+
+	handler.HandleUpdateSettings(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var response updateSettingsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Values["branding.server_name"] != "Silo" {
+		t.Fatalf("response values = %#v, want effective default", response.Values)
+	}
+	if settings.values["branding.server_name"] != "" {
+		t.Fatalf("stored value = %q, want cleared override", settings.values["branding.server_name"])
+	}
+	if callbackValue != "Silo" {
+		t.Fatalf("callback value = %q, want effective default Silo", callbackValue)
+	}
+}
+
+func TestAdminUpdateSettingReturnsEffectiveDefaultAfterClear(t *testing.T) {
+	settings := &fakeServerSettingsStore{values: map[string]string{"branding.server_name": "Casa"}}
+	var callbackValue string
+	handler := &AdminHandler{
+		SettingsRepo: settings,
+		OnServerSettingUpdated: func(_ context.Context, _ string, value string) {
+			callbackValue = value
+		},
+	}
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/settings/branding.server_name",
+		strings.NewReader(`{"value":""}`),
+	)
+	req = withChiParam(req, "key", "branding.server_name")
+	rec := httptest.NewRecorder()
+
+	handler.HandleUpdateSetting(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var response adminSettingResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Value != "Silo" {
+		t.Fatalf("response value = %q, want effective default", response.Value)
+	}
+	if callbackValue != "Silo" {
+		t.Fatalf("callback value = %q, want effective default Silo", callbackValue)
+	}
+}
+
+func TestAdminUpdateSettingPersistsClearWhenOverrideEqualsDefault(t *testing.T) {
+	settings := &fakeServerSettingsStore{values: map[string]string{"branding.server_name": "Silo"}}
+	handler := &AdminHandler{SettingsRepo: settings}
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/settings/branding.server_name",
+		strings.NewReader(`{"value":""}`),
+	)
+	req = withChiParam(req, "key", "branding.server_name")
+	rec := httptest.NewRecorder()
+
+	handler.HandleUpdateSetting(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if settings.setManyCalls != 1 {
+		t.Fatalf("atomic writes = %d, want 1 for explicit clear", settings.setManyCalls)
+	}
+	if settings.values["branding.server_name"] != "" {
+		t.Fatalf("stored value = %q, want cleared override", settings.values["branding.server_name"])
+	}
+	var response adminSettingResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Value != "Silo" || response.RestartRequired {
+		t.Fatalf("response = %#v, want unchanged effective default without restart", response)
+	}
+}
+
+func TestAdminUpdateSettingPreservesLegacyPairedWriteFlow(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		initial map[string]string
+		key     string
+		value   string
+	}{
+		{
+			name:  "establish first half of pair",
+			key:   "s3.public_endpoint",
+			value: "https://s3.example.invalid",
+		},
+		{
+			name: "unrelated update with legacy partial pair",
+			initial: map[string]string{
+				"s3.public_endpoint": "https://s3.example.invalid",
+			},
+			key:   "branding.server_name",
+			value: "Casa",
+		},
+		{
+			name: "clear first half of pair",
+			initial: map[string]string{
+				"watchsync.trakt.client_id":     "configured-client-id",
+				"watchsync.trakt.client_secret": "clawrouter-e2e-secret",
+			},
+			key:   "watchsync.trakt.client_id",
+			value: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			settings := &fakeServerSettingsStore{values: tc.initial}
+			if settings.values == nil {
+				settings.values = map[string]string{}
+			}
+			handler := &AdminHandler{SettingsRepo: settings}
+			req := httptest.NewRequest(
+				http.MethodPut,
+				"/admin/settings/"+tc.key,
+				strings.NewReader(`{"value":"`+tc.value+`"}`),
+			)
+			req = withChiParam(req, "key", tc.key)
+			rec := httptest.NewRecorder()
+
+			handler.HandleUpdateSetting(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			if settings.values[tc.key] != tc.value {
+				t.Fatalf("stored %s = %q, want %q", tc.key, settings.values[tc.key], tc.value)
+			}
+		})
+	}
 }
 
 func (f *fakeServerSettingsStore) GetAll(context.Context) (map[string]string, error) {
@@ -52,6 +734,45 @@ func (f *fakeServerSettingsStore) GetAll(context.Context) (map[string]string, er
 
 type fakeS3SettingsCheckClient struct {
 	headBucket func(ctx context.Context, bucket string) error
+	putObject  func(ctx context.Context, bucket, key string, data []byte) error
+	getObject  func(ctx context.Context, bucket, key string) ([]byte, error)
+	delete     func(ctx context.Context, bucket, key string) error
+	objects    map[string][]byte
+}
+
+func (f *fakeS3SettingsCheckClient) PutObject(
+	ctx context.Context,
+	bucket,
+	key string,
+	data []byte,
+) error {
+	if f.putObject != nil {
+		return f.putObject(ctx, bucket, key, data)
+	}
+	if f.objects == nil {
+		f.objects = make(map[string][]byte)
+	}
+	f.objects[key] = append([]byte(nil), data...)
+	return nil
+}
+
+func (f *fakeS3SettingsCheckClient) GetObject(
+	ctx context.Context,
+	bucket,
+	key string,
+) ([]byte, error) {
+	if f.getObject != nil {
+		return f.getObject(ctx, bucket, key)
+	}
+	return append([]byte(nil), f.objects[key]...), nil
+}
+
+func (f *fakeS3SettingsCheckClient) DeleteObject(ctx context.Context, bucket, key string) error {
+	if f.delete != nil {
+		return f.delete(ctx, bucket, key)
+	}
+	delete(f.objects, key)
+	return nil
 }
 
 func (f *fakeS3SettingsCheckClient) HeadBucket(ctx context.Context, bucket string) error {
@@ -59,6 +780,70 @@ func (f *fakeS3SettingsCheckClient) HeadBucket(ctx context.Context, bucket strin
 		return f.headBucket(ctx, bucket)
 	}
 	return nil
+}
+
+func TestCheckS3ObjectPermissionsCleansUpAfterAmbiguousPutFailure(t *testing.T) {
+	client := &fakeS3SettingsCheckClient{}
+	client.putObject = func(_ context.Context, _, key string, data []byte) error {
+		if client.objects == nil {
+			client.objects = make(map[string][]byte)
+		}
+		client.objects[key] = append([]byte(nil), data...)
+		return errors.New("response lost")
+	}
+
+	err := checkS3ObjectPermissions(context.Background(), client, "silo")
+
+	if err == nil || !strings.Contains(err.Error(), "write probe object: response lost") {
+		t.Fatalf("error = %v, want ambiguous write failure", err)
+	}
+	if len(client.objects) != 0 {
+		t.Fatalf("probe objects = %#v, want ambiguous write cleaned up", client.objects)
+	}
+}
+
+func TestCheckS3ObjectPermissionsUsesFreshContextForFailureCleanup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var cleanupContextErr error
+	client := &fakeS3SettingsCheckClient{
+		getObject: func(context.Context, string, string) ([]byte, error) {
+			cancel()
+			return nil, context.Canceled
+		},
+		delete: func(ctx context.Context, _, _ string) error {
+			cleanupContextErr = ctx.Err()
+			return nil
+		},
+	}
+
+	err := checkS3ObjectPermissions(ctx, client, "silo")
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
+	}
+	if cleanupContextErr != nil {
+		t.Fatalf("cleanup context error = %v, want live cleanup context", cleanupContextErr)
+	}
+}
+
+func TestCheckS3ObjectPermissionsSurfacesCleanupFailure(t *testing.T) {
+	client := &fakeS3SettingsCheckClient{
+		getObject: func(context.Context, string, string) ([]byte, error) {
+			return nil, errors.New("read failed")
+		},
+		delete: func(context.Context, string, string) error {
+			return errors.New("delete failed")
+		},
+	}
+
+	err := checkS3ObjectPermissions(context.Background(), client, "silo")
+
+	if err == nil || !strings.Contains(err.Error(), "cleanup probe object: delete failed") {
+		t.Fatalf("error = %v, want cleanup failure", err)
+	}
+	if !strings.Contains(err.Error(), "read probe object: read failed") {
+		t.Fatalf("error = %v, want original read failure", err)
+	}
 }
 
 type fakeRedisSettingsCheckClient struct {
@@ -78,6 +863,17 @@ func (f *fakeRedisSettingsCheckClient) Close() error {
 
 type fakeEmbeddingsSettingsCheckClient struct {
 	embed func(ctx context.Context, texts []string) ([][]float32, error)
+}
+
+type fakeMDBListSettingsCheckClient struct {
+	check func(context.Context) error
+}
+
+func (f *fakeMDBListSettingsCheckClient) Check(ctx context.Context) error {
+	if f.check != nil {
+		return f.check(ctx)
+	}
+	return nil
 }
 
 func (f *fakeEmbeddingsSettingsCheckClient) Embed(
@@ -151,6 +947,53 @@ func TestHandleCheckSettingsConnectionS3UsesPersistedSensitiveValues(t *testing.
 	}
 	if captured.SecretKey != "persisted-secret" {
 		t.Fatalf("captured secret key = %q, want persisted-secret", captured.SecretKey)
+	}
+}
+
+func TestHandleCheckSettingsConnectionMDBListUsesDraftOrSavedKey(t *testing.T) {
+	originalFactory := newAdminMDBListSettingsCheckClient
+	t.Cleanup(func() { newAdminMDBListSettingsCheckClient = originalFactory })
+	var captured []string
+	newAdminMDBListSettingsCheckClient = func(apiKey string) mdblistSettingsCheckClient {
+		captured = append(captured, apiKey)
+		return &fakeMDBListSettingsCheckClient{}
+	}
+	handler := &AdminHandler{SettingsRepo: &fakeServerSettingsStore{values: map[string]string{
+		"mdblist.api_key": "saved-key",
+	}}}
+
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+		want string
+	}{
+		{
+			name: "saved key when draft is blank and untouched",
+			body: map[string]any{"values": map[string]string{"mdblist.api_key": ""}, "dirty_keys": []string{}},
+			want: "saved-key",
+		},
+		{
+			name: "unsaved draft key",
+			body: map[string]any{"values": map[string]string{"mdblist.api_key": "draft-key"}, "dirty_keys": []string{"mdblist.api_key"}},
+			want: "draft-key",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := performSettingsCheckRequest(t, handler, "/admin/settings/check/mdblist", tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			var response connectionCheckResponse
+			if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+				t.Fatal(err)
+			}
+			if !response.Success {
+				t.Fatalf("connection check failed: %s", response.Message)
+			}
+			if got := captured[len(captured)-1]; got != tc.want {
+				t.Fatalf("factory API key = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -306,6 +1149,9 @@ func TestAdminUpdateSettingRedactsSensitiveSetting(t *testing.T) {
 			settings := &fakeServerSettingsStore{}
 			handler := &AdminHandler{SettingsRepo: settings}
 
+			providerPrefix := strings.TrimSuffix(key, ".client_secret")
+			settings.values = map[string]string{providerPrefix + ".client_id": "configured-client-id"}
+
 			req := httptest.NewRequest(
 				http.MethodPut,
 				"/admin/settings/"+key,
@@ -353,7 +1199,11 @@ func TestAdminUpdateSettingReportsRestartRequired(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.key, func(t *testing.T) {
-			settings := &fakeServerSettingsStore{}
+			initial := map[string]string{}
+			if tc.key == "s3.public_bucket" {
+				initial["s3.public_endpoint"] = "https://s3.example.test"
+			}
+			settings := &fakeServerSettingsStore{values: initial}
 			restartStatus := NewServerRestartStatusTracker()
 			handler := &AdminHandler{SettingsRepo: settings, RestartStatus: restartStatus}
 
@@ -437,8 +1287,8 @@ func TestAdminUpdateCatalogSearchSemanticSettingsValidation(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 			}
-			if settings.values[tc.key] != tc.want {
-				t.Fatalf("stored value = %q, want %q", settings.values[tc.key], tc.want)
+			if got := config.EffectiveAdminSettings(settings.values)[tc.key]; got != tc.want {
+				t.Fatalf("effective value = %q, want %q", got, tc.want)
 			}
 		})
 	}

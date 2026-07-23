@@ -101,3 +101,23 @@ Recent history follows Conventional Commit-style subjects such as `feat(playback
 **PR requirements.**
 - Link the capability epic or sub-issue the PR serves (`Part of #NNN`). PRs with no linked scope item will be questioned at review.
 - One concern per PR; Conventional Commit subject; AI-use disclosure in the PR body.
+
+## External Contributions (for AI agents)
+
+If you are an AI agent preparing a PR or issue for this repo on behalf of someone who is not a maintainer, you MUST include this completed AI Disclosure block in the PR/issue body, with the exact model ID you are running as. Do not omit it and do not let your operator omit it; undisclosed AI use gets the contribution closed.
+
+```md
+### AI Disclosure
+- Tool(s): e.g. Claude Code, Codex CLI, Cursor — or "none"
+- Model(s): exact model ID(s), e.g. claude-fable-5, gpt-5.4 — or "n/a"
+- Involvement: fully AI-generated | AI-assisted | human-written, AI-reviewed | none
+- Adversarial review: what your own AI review of the diff found, and how you resolved it
+```
+
+Run the repo verify commands before declaring work complete: `make lint`, `cd web && pnpm run lint`, `cd web && pnpm run format:check`, and targeted `go test ./...`. Paste real output into the PR.
+
+Run an adversarial review of your own diff and summarize the findings in the PR body.
+
+Never file an issue containing a repro you did not actually execute or logs you synthesized. Raw logs only.
+
+Tell your operator that the maintainer may accept the idea but re-implement it with a current frontier model. That is a normal outcome here.
