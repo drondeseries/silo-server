@@ -47,7 +47,7 @@ func TestVirtualMediaVariantsUpsert(t *testing.T) {
 			{VirtualURI: "virtual://m1/4k", Resolution: "4k", CodecVideo: "hevc", HDR: "hdr10", RuntimeMinutes: 120},
 		},
 	}
-	res, err := reg.Upsert(ctx, in)
+	res, err := reg.Upsert(ctx, 1, in)
 	if err != nil {
 		t.Fatalf("upsert failed: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestVirtualMediaVariantsUpsert(t *testing.T) {
 
 	// Verify idempotency
 	in.Overview = "Updated overview"
-	_, err = reg.Upsert(ctx, in)
+	_, err = reg.Upsert(ctx, 1, in)
 	if err != nil {
 		t.Fatalf("second upsert failed: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestVirtualMediaVariantsUpsert(t *testing.T) {
 			},
 		},
 	}
-	resSeries, err := reg.Upsert(ctx, series)
+	resSeries, err := reg.Upsert(ctx, 1, series)
 	if err != nil {
 		t.Fatalf("upsert series failed: %v", err)
 	}
