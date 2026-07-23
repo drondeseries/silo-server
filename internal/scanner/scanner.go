@@ -919,6 +919,9 @@ func (s *Scanner) scanPaths(
 	if len(filePaths) == 0 && allowEmptyCleanup {
 		staleFileIDs = make([]int, 0, len(existingFiles))
 		for _, existing := range existingFiles {
+			if existing.IsVirtual() {
+				continue
+			}
 			staleFileIDs = append(staleFileIDs, existing.ID)
 		}
 	}
@@ -1640,6 +1643,9 @@ func (s *Scanner) applyScopedScan(
 	if forceDeleteAll && len(scope.filePaths) == 0 {
 		staleFileIDs = make([]int, 0, len(scope.existingFiles))
 		for _, existing := range scope.existingFiles {
+			if existing.IsVirtual() {
+				continue
+			}
 			if pathWithinAnyRoot(existing.FilePath, protectedRoots) {
 				continue
 			}
@@ -1898,6 +1904,9 @@ func (s *Scanner) sweepMissingAndReconcile(ctx context.Context, folder *models.M
 func collectStaleRemovedPathFileIDs(existingFiles []*scanStateFile, seenPaths map[string]bool, roots []string) []int {
 	ids := make([]int, 0)
 	for _, existing := range existingFiles {
+		if existing.IsVirtual() {
+			continue
+		}
 		if seenPaths[existing.FilePath] {
 			continue
 		}

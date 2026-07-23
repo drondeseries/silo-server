@@ -836,8 +836,8 @@ func (r *ItemRepository) PurgeVirtualPlaybackItems(ctx context.Context) (filesDe
 
 	// 2. Delete media items that have no remaining files (physical or virtual)
 	resItems, err := tx.Exec(ctx, `
-		DELETE FROM media_items 
-		WHERE content_id NOT IN (SELECT DISTINCT content_id FROM media_files)
+		DELETE FROM media_items mi
+		WHERE NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.content_id = mi.content_id)
 	`)
 	if err != nil {
 		return 0, 0, fmt.Errorf("deleting orphaned virtual items: %w", err)
