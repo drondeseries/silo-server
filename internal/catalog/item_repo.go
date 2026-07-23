@@ -632,29 +632,15 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 	if len(libraryIDs) == 0 {
 		return fmt.Errorf("virtual playback item requires at least one library")
 	}
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin virtual item transaction: %w", err)
+
+	type epInfo struct {
+		Season  int
+		Episode int
+		Title   string
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if err := r.UpsertTx(ctx, tx, item); err != nil {
-		return err
-	}
-	for _, libraryID := range libraryIDs {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO media_item_libraries (content_id, media_folder_id, first_seen_at)
-			VALUES ($1, $2, NOW()) ON CONFLICT DO NOTHING`, item.ContentID, libraryID); err != nil {
-			return fmt.Errorf("linking virtual item to library: %w", err)
-		}
-	}
-	virtualPath := "aiostreams://" + item.Type + "/" + strings.TrimSpace(item.ImdbID)
+	var airedEps []epInfo
+
 	if item.Type == "series" {
-		type epInfo struct {
-			Season  int
-			Episode int
-			Title   string
-		}
-		var airedEps []epInfo
 		now := time.Now().UTC()
 		client := &http.Client{Timeout: 10 * time.Second}
 
@@ -752,7 +738,25 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 		if len(airedEps) == 0 {
 			airedEps = append(airedEps, epInfo{Season: 1, Episode: 1, Title: "Episode 1"})
 		}
+	}
 
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin virtual item transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := r.UpsertTx(ctx, tx, item); err != nil {
+		return err
+	}
+	for _, libraryID := range libraryIDs {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO media_item_libraries (content_id, media_folder_id, first_seen_at)
+			VALUES ($1, $2, NOW()) ON CONFLICT DO NOTHING`, item.ContentID, libraryID); err != nil {
+			return fmt.Errorf("linking virtual item to library: %w", err)
+		}
+	}
+	virtualPath := "aiostreams://" + item.Type + "/" + strings.TrimSpace(item.ImdbID)
+	if item.Type == "series" {
 		createdSeasons := make(map[int]bool)
 		for _, ep := range airedEps {
 			if !createdSeasons[ep.Season] {
