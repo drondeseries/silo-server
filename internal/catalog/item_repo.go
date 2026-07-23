@@ -2,11 +2,16 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -644,40 +649,151 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 	}
 	virtualPath := "aiostreams://" + item.Type + "/" + strings.TrimSpace(item.ImdbID)
 	if item.Type == "series" {
-		seasonID := fmt.Sprintf("%s-1", strings.Replace(item.ContentID, "series-", "season-", 1))
-		episodeID := fmt.Sprintf("%s-1-1", strings.Replace(item.ContentID, "series-", "episode-", 1))
-		epVirtualPath := fmt.Sprintf("aiostreams://series/%s/1/1", strings.TrimSpace(item.ImdbID))
-
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO seasons (content_id, series_id, season_number, title, metadata_source)
-			VALUES ($1, $2, 1, 'Season 1', 'provider')
-			ON CONFLICT (series_id, season_number) DO NOTHING`, seasonID, item.ContentID); err != nil {
-			return fmt.Errorf("creating virtual season: %w", err)
+		type epInfo struct {
+			Season  int
+			Episode int
+			Title   string
 		}
+		var airedEps []epInfo
+		now := time.Now().UTC()
+		client := &http.Client{Timeout: 10 * time.Second}
 
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO episodes (content_id, series_id, season_id, season_number, episode_number, title, metadata_source)
-			VALUES ($1, $2, $3, 1, 1, 'Episode 1', 'provider')
-			ON CONFLICT (series_id, season_number, episode_number) DO NOTHING`, episodeID, item.ContentID, seasonID); err != nil {
-			return fmt.Errorf("creating virtual episode: %w", err)
-		}
-
-		for _, libraryID := range libraryIDs {
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO episode_libraries (episode_id, media_folder_id)
-				VALUES ($1, $2) ON CONFLICT DO NOTHING`, episodeID, libraryID); err != nil {
-				return fmt.Errorf("linking virtual episode library: %w", err)
+		imdbID := strings.TrimSpace(item.ImdbID)
+		if imdbID != "" {
+			endpoint := "https://v3-cinemeta.strem.io/meta/series/" + url.PathEscape(imdbID) + ".json"
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+			if err == nil {
+				resp, err := client.Do(req)
+				if err == nil {
+					if resp.StatusCode == http.StatusOK {
+						var payload struct {
+							Meta struct {
+								Videos []struct {
+									Season   int       `json:"season"`
+									Episode  int       `json:"episode"`
+									Title    string    `json:"title"`
+									Released time.Time `json:"released"`
+								} `json:"videos"`
+							} `json:"meta"`
+						}
+						if json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload) == nil {
+							for _, v := range payload.Meta.Videos {
+								if v.Season > 0 && v.Episode > 0 && !v.Released.IsZero() && !v.Released.After(now) {
+									t := v.Title
+									if t == "" {
+										t = fmt.Sprintf("Episode %d", v.Episode)
+									}
+									airedEps = append(airedEps, epInfo{Season: v.Season, Episode: v.Episode, Title: t})
+								}
+							}
+						}
+					}
+					resp.Body.Close()
+				}
 			}
 		}
 
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO media_files (content_id, episode_id, media_folder_id, file_path, file_size, container)
-			SELECT $1, $2, $3, $4, 0, 'virtual'
-			WHERE NOT EXISTS (
-				SELECT 1 FROM media_files WHERE episode_id = $2
-			)
-			ON CONFLICT (file_path) DO NOTHING`, item.ContentID, episodeID, libraryIDs[0], epVirtualPath); err != nil {
-			return fmt.Errorf("creating virtual episode file: %w", err)
+		if len(airedEps) == 0 {
+			lookupURL, err := url.Parse("https://api.tvmaze.com/lookup/shows")
+			if err == nil {
+				q := lookupURL.Query()
+				if imdbID != "" {
+					q.Set("imdb", imdbID)
+				} else if item.TvdbID != "" {
+					q.Set("thetvdb", item.TvdbID)
+				}
+				lookupURL.RawQuery = q.Encode()
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, lookupURL.String(), nil)
+				if err == nil {
+					resp, err := client.Do(req)
+					if err == nil {
+						if resp.StatusCode == http.StatusOK {
+							var show struct {
+								ID int `json:"id"`
+							}
+							if json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&show) == nil && show.ID > 0 {
+								episodesURL := fmt.Sprintf("https://api.tvmaze.com/shows/%d/episodes", show.ID)
+								epReq, err := http.NewRequestWithContext(ctx, http.MethodGet, episodesURL, nil)
+								if err == nil {
+									epResp, err := client.Do(epReq)
+									if err == nil {
+										if epResp.StatusCode == http.StatusOK {
+											var episodes []struct {
+												Season  int    `json:"season"`
+												Number  int    `json:"number"`
+												Name    string `json:"name"`
+												Airdate string `json:"airdate"`
+											}
+											if json.NewDecoder(io.LimitReader(epResp.Body, 4<<20)).Decode(&episodes) == nil {
+												for _, ep := range episodes {
+													if ep.Season > 0 && ep.Number > 0 && ep.Airdate != "" {
+														if t, pErr := time.Parse("2006-01-02", ep.Airdate); pErr == nil && !t.After(now) {
+															title := ep.Name
+															if title == "" {
+																title = fmt.Sprintf("Episode %d", ep.Number)
+															}
+															airedEps = append(airedEps, epInfo{Season: ep.Season, Episode: ep.Number, Title: title})
+														}
+													}
+												}
+											}
+										}
+										epResp.Body.Close()
+									}
+								}
+							}
+						}
+						resp.Body.Close()
+					}
+				}
+			}
+		}
+
+		if len(airedEps) == 0 {
+			airedEps = append(airedEps, epInfo{Season: 1, Episode: 1, Title: "Episode 1"})
+		}
+
+		createdSeasons := make(map[int]bool)
+		for _, ep := range airedEps {
+			if !createdSeasons[ep.Season] {
+				seasonID := fmt.Sprintf("%s-%d", strings.Replace(item.ContentID, "series-", "season-", 1), ep.Season)
+				if _, err := tx.Exec(ctx, `
+					INSERT INTO seasons (content_id, series_id, season_number, title, metadata_source)
+					VALUES ($1, $2, $3, $4, 'provider')
+					ON CONFLICT (series_id, season_number) DO NOTHING`, seasonID, item.ContentID, ep.Season, fmt.Sprintf("Season %d", ep.Season)); err != nil {
+					return fmt.Errorf("creating virtual season %d: %w", ep.Season, err)
+				}
+				createdSeasons[ep.Season] = true
+			}
+
+			seasonID := fmt.Sprintf("%s-%d", strings.Replace(item.ContentID, "series-", "season-", 1), ep.Season)
+			episodeID := fmt.Sprintf("%s-%d-%d", strings.Replace(item.ContentID, "series-", "episode-", 1), ep.Season, ep.Episode)
+			epVirtualPath := fmt.Sprintf("aiostreams://series/%s/%d/%d", strings.TrimSpace(item.ImdbID), ep.Season, ep.Episode)
+
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO episodes (content_id, series_id, season_id, season_number, episode_number, title, metadata_source)
+				VALUES ($1, $2, $3, $4, $5, $6, 'provider')
+				ON CONFLICT (series_id, season_number, episode_number) DO NOTHING`, episodeID, item.ContentID, seasonID, ep.Season, ep.Episode, ep.Title); err != nil {
+				return fmt.Errorf("creating virtual episode S%dE%d: %w", ep.Season, ep.Episode, err)
+			}
+
+			for _, libraryID := range libraryIDs {
+				if _, err := tx.Exec(ctx, `
+					INSERT INTO episode_libraries (episode_id, media_folder_id)
+					VALUES ($1, $2) ON CONFLICT DO NOTHING`, episodeID, libraryID); err != nil {
+					return fmt.Errorf("linking virtual episode library: %w", err)
+				}
+			}
+
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO media_files (content_id, episode_id, media_folder_id, file_path, file_size, container)
+				SELECT $1, $2, $3, $4, 0, 'virtual'
+				WHERE NOT EXISTS (
+					SELECT 1 FROM media_files WHERE episode_id = $2
+				)
+				ON CONFLICT (file_path) DO NOTHING`, item.ContentID, episodeID, libraryIDs[0], epVirtualPath); err != nil {
+				return fmt.Errorf("creating virtual episode file S%dE%d: %w", ep.Season, ep.Episode, err)
+			}
 		}
 	} else {
 		if _, err := tx.Exec(ctx, `
