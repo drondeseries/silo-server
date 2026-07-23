@@ -172,6 +172,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=sha,prefix=,format=short
+            type=raw,value={{date 'YYYYMMDD-HHmmss'}}
 
       - name: Create and push manifest list
         working-directory: ${{ runner.temp }}/digests
