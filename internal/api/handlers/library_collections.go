@@ -2979,8 +2979,7 @@ func (h *LibraryCollectionHandler) HandleImportTMDBCollection(w http.ResponseWri
 
 	run, err := h.service.SyncCollection(r.Context(), collection.ID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to sync TMDB collection")
-		return
+		slog.WarnContext(r.Context(), "TMDB collection sync failed during initial import", "collection_id", collection.ID, "error", err)
 	}
 
 	refreshed, err := h.repo.GetByID(r.Context(), collection.ID)
@@ -3087,16 +3086,7 @@ func (h *LibraryCollectionHandler) HandleImportTraktCollection(w http.ResponseWr
 
 	run, err := h.service.SyncCollection(r.Context(), collection.ID)
 	if err != nil {
-		slog.ErrorContext(r.Context(), "failed to sync imported Trakt collection", "component", "api",
-			"collection_id", collection.ID,
-			"library_id", req.LibraryID,
-			"title", req.Title,
-			"preset", preset,
-			"media_type", mediaType,
-			"error", err,
-		)
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to sync Trakt collection")
-		return
+		slog.WarnContext(r.Context(), "Trakt collection sync failed during initial import", "collection_id", collection.ID, "error", err)
 	}
 
 	refreshed, err := h.repo.GetByID(r.Context(), collection.ID)
