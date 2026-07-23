@@ -467,7 +467,7 @@ func (s *Scanner) reconcileAudiobookMissingFiles(ctx context.Context, folder *mo
 			return fmt.Errorf("listing existing audiobook files for %q: %w", root, err)
 		}
 		for _, mf := range existing {
-			if mf == nil || seenPaths[mf.FilePath] {
+			if mf == nil || mf.IsVirtual() || seenPaths[mf.FilePath] {
 				continue
 			}
 			if mf.MissingSince == nil {

@@ -240,7 +240,7 @@ func (s *Scanner) reconcilePodcastMissingFiles(ctx context.Context, folder *mode
 			return fmt.Errorf("listing existing podcast files for %q: %w", root, err)
 		}
 		for _, mf := range existing {
-			if mf == nil || seenPaths[mf.FilePath] {
+			if mf == nil || mf.IsVirtual() || seenPaths[mf.FilePath] {
 				continue
 			}
 			if mf.MissingSince == nil {

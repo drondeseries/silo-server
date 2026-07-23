@@ -115,6 +115,16 @@ type MediaFile struct {
 	UpdatedAt                    time.Time
 }
 
+// IsVirtual returns true if the media file is a zero-storage virtual playback reference.
+func (f *MediaFile) IsVirtual() bool {
+	if f == nil {
+		return false
+	}
+	return f.Container == "virtual" ||
+		strings.HasPrefix(f.FilePath, "aiostreams://") ||
+		strings.HasPrefix(f.FilePath, "virtual://")
+}
+
 // MediaChapter represents a single media chapter derived from embedded file metadata.
 type MediaChapter struct {
 	Index               int        `json:"index"`

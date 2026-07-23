@@ -2641,16 +2641,17 @@ func claimRepresentativeWindow(limit int) int {
 }
 
 // MarkMissing sets the missing_since timestamp for the given media file.
+// Virtual files (container='virtual' or file_path LIKE 'aiostreams://%') are never marked missing.
 func (r *FileRepository) MarkMissing(ctx context.Context, id int, since time.Time) error {
 	tag, err := r.pool.Exec(ctx,
-		"UPDATE media_files SET missing_since = $1, updated_at = NOW() WHERE id = $2",
+		"UPDATE media_files SET missing_since = $1, updated_at = NOW() WHERE id = $2 AND container <> 'virtual' AND file_path NOT LIKE 'aiostreams://%' AND file_path NOT LIKE 'virtual://%'",
 		since, id,
 	)
 	if err != nil {
 		return fmt.Errorf("marking file missing: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrFileNotFound
+		return nil
 	}
 	return nil
 }

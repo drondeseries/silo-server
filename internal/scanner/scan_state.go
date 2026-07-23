@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -50,6 +51,15 @@ type scanStateFile struct {
 	HasAudioTracks        bool
 	HasChapters           bool
 	ExternalSubtitlePaths []string
+}
+
+func (f *scanStateFile) IsVirtual() bool {
+	if f == nil {
+		return false
+	}
+	return f.Container == "virtual" ||
+		strings.HasPrefix(f.FilePath, "aiostreams://") ||
+		strings.HasPrefix(f.FilePath, "virtual://")
 }
 
 const scanStateColumns = `id, content_id, extra_id,
