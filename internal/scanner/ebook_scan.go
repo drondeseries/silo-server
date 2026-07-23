@@ -419,7 +419,7 @@ func (s *Scanner) reconcileMissingEbookFiles(ctx context.Context, folder *models
 			return fmt.Errorf("listing existing ebook files for %q: %w", root, err)
 		}
 		for _, mf := range existing {
-			if mf == nil || seenPaths[mf.FilePath] {
+			if mf == nil || mf.IsVirtual() || seenPaths[mf.FilePath] {
 				continue
 			}
 			if mf.MissingSince == nil {

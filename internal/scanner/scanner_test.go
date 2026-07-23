@@ -265,3 +265,30 @@ func TestScanSubtreeEbookLibraryRoutesToEbookScanner(t *testing.T) {
 		t.Fatal("ScanSubtree ebook result = nil, want empty result")
 	}
 }
+
+func TestIsVirtual(t *testing.T) {
+	tests := []struct {
+		name      string
+		container string
+		filePath  string
+		want      bool
+	}{
+		{"physical mkv", "mkv", "/media/movies/Test (2020)/Test.mkv", false},
+		{"virtual container", "virtual", "/media/movies/Test (2020)/Test.mkv", true},
+		{"aiostreams uri", "mkv", "aiostreams://movie/tt123456", true},
+		{"virtual uri", "mkv", "virtual://series/tt999/1/1", true},
+	}
+
+	for _, tt := range tests {
+		m := &models.MediaFile{Container: tt.container, FilePath: tt.filePath}
+		if got := m.IsVirtual(); got != tt.want {
+			t.Errorf("MediaFile.IsVirtual() [%s] = %v, want %v", tt.name, got, tt.want)
+		}
+
+		sf := &scanStateFile{Container: tt.container, FilePath: tt.filePath}
+		if got := sf.IsVirtual(); got != tt.want {
+			t.Errorf("scanStateFile.IsVirtual() [%s] = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+

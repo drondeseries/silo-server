@@ -870,7 +870,7 @@ func (s *Scanner) scanPaths(
 	// Mark files that were in the DB but not found on disk as missing.
 	now := time.Now().UTC()
 	for _, existing := range existingFiles {
-		if seenPaths[existing.FilePath] {
+		if existing.IsVirtual() || seenPaths[existing.FilePath] {
 			continue
 		}
 		// Only mark as missing if not already marked.
@@ -1620,7 +1620,7 @@ func (s *Scanner) applyScopedScan(
 
 	now := time.Now().UTC()
 	for _, existing := range scope.existingFiles {
-		if scope.seenPaths[existing.FilePath] {
+		if existing.IsVirtual() || scope.seenPaths[existing.FilePath] {
 			continue
 		}
 		if existing.MissingSince == nil {
