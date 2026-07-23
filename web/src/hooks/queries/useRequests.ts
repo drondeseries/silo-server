@@ -62,10 +62,8 @@ function isValidationFailure(err: unknown): boolean {
 }
 
 function invalidateRequestSurfaces(queryClient: ReturnType<typeof useQueryClient>) {
-  // requestKeys.all = ["requests"], so invalidating it cascades to nested keys,
-  // including requestKeys.search(...). Policy mutations rely on this to refresh
-  // viewer-scoped search results when request eligibility changes.
-  queryClient.invalidateQueries({ queryKey: requestKeys.all });
+  // Invalidate user request lists without wiping cached search & discovery results.
+  queryClient.invalidateQueries({ queryKey: ["requests", "mine"] });
   queryClient.invalidateQueries({ queryKey: adminKeys.requestsRoot() });
 }
 
