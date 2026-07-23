@@ -39,6 +39,7 @@ export function useProfiles() {
   const query = useQuery({
     queryKey: profileKeys.list(),
     queryFn: () => api<ProfileListResponse>("/profiles"),
+    staleTime: 60_000,
   });
 
   return {
