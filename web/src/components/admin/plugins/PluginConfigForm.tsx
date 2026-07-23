@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 
 import { SchemaForm } from "./SchemaForm";
-import { buildSchemaValues } from "./schemaFormUtils";
+import { buildSchemaValues, parseFieldTypes } from "./schemaFormUtils";
 
 type PluginConfigValue = Record<string, unknown>;
 
@@ -212,7 +212,7 @@ export function PluginConfigForm({
           size="sm"
           variant="outline"
           disabled={isSaving || isTesting}
-          onClick={() => onSave(schema.key, buildSchemaValues(descriptor, values))}
+          onClick={() => onSave(schema.key, buildSchemaValues(descriptor, values, parseFieldTypes(schema.json_schema)))}
         >
           {schema.admin_form?.submit_label || "Save config"}
         </Button>

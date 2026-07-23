@@ -193,7 +193,19 @@ export function coerceFieldValue(
       case "array":
       case "array:int":
       case "array:num": {
-        const arr = Array.isArray(raw) ? raw : [];
+        let arr: unknown[] = [];
+        if (Array.isArray(raw)) {
+          arr = raw;
+        } else if (typeof raw === "string" && raw.trim() !== "") {
+          try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+              arr = parsed;
+            }
+          } catch {
+            arr = [];
+          }
+        }
         if (fieldType === "array") return arr;
         if (fieldType === "array:int") return arr.map((v) => coerceNumericString(v));
         return arr.map((v) => coerceNumberString(v));
