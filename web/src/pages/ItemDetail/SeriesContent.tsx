@@ -3,7 +3,7 @@ import { useNavigate } from "react-router";
 import type { ItemDetail } from "@/api/types";
 import { useToggleFavorite } from "@/hooks/queries/favorites";
 import { useToggleWatchlist } from "@/hooks/queries/watchlist";
-import { useRefreshItemMetadata, useWatchedStateMutation } from "@/hooks/queries/items";
+import { useRefreshItemMetadata, useWatchedStateMutation, useDeleteItem } from "@/hooks/queries/items";
 import { useSimilarItems } from "@/hooks/queries/recommendations";
 import { useItemEpisodes, useSeasons } from "@/hooks/queries/episodes";
 import { useContinueWatching } from "@/hooks/queries/progress";
@@ -49,6 +49,7 @@ export default function SeriesContent({ item }: { item: ItemDetail & { type: "se
   const toggleFavoriteMutation = useToggleFavorite(item.content_id);
   const toggleWatchlistMutation = useToggleWatchlist(item.content_id);
   const refreshMetadataMutation = useRefreshItemMetadata();
+  const deleteItemMutation = useDeleteItem();
   const watchedMutation = useWatchedStateMutation(item);
   const setRatingMutation = useSetRating(item.content_id);
   const deleteRatingMutation = useDeleteRating(item.content_id);
@@ -185,6 +186,22 @@ export default function SeriesContent({ item }: { item: ItemDetail & { type: "se
             isRefreshing={refreshMetadataMutation.isPending}
             isAdmin={isAdmin}
             canCurateMetadata={canCurateMetadata}
+            onDeleteItem={
+              isAdmin
+                ? () => {
+                    if (
+                      window.confirm(
+                        `Are you sure you want to delete "${item.title ?? ""}" from the catalog?`,
+                      )
+                    ) {
+                      deleteItemMutation.mutate(item.content_id, {
+                        onSuccess: () => navigate("/catalog", { replace: true }),
+                      });
+                    }
+                  }
+                : undefined
+            }
+            isDeletingItem={deleteItemMutation.isPending}
             onEditMetadata={canCurateMetadata ? () => setEditOpen(true) : undefined}
             onMatchItem={canCurateMetadata ? () => setMatchOpen(true) : undefined}
             onSplitItem={canCurateMetadata ? () => setSplitOpen(true) : undefined}

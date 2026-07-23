@@ -1116,7 +1116,7 @@ func (f *Fetcher) ListOverlaySummaries(ctx context.Context, contentIDs []string,
 		var resolution *string
 		var codecAudio *string
 		var audioTracksJSON []byte
-		var hdr bool
+		var hdr *bool
 		var videoTracksJSON []byte
 		var codecVideo *string
 		var audioChannels *int
@@ -1135,7 +1135,7 @@ func (f *Fetcher) ListOverlaySummaries(ctx context.Context, contentIDs []string,
 		file := &models.MediaFile{
 			ContentID: contentID,
 			FilePath:  filePath,
-			HDR:       hdr,
+			HDR:       hdr != nil && *hdr,
 		}
 		if episodeID != nil {
 			file.EpisodeID = *episodeID

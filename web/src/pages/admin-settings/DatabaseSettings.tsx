@@ -4,9 +4,38 @@ import { ConnectionCheckAction } from "@/components/admin/ConnectionCheckAction"
 import { Badge } from "@/components/ui/badge";
 import { useCheckAdminSettingsConnection } from "@/hooks/queries/admin/settings";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
+import { Button } from "@/components/ui/button";
+import { usePurgeVirtualPlaybackItems } from "@/hooks/queries/admin/collections";
 import { SettingField } from "./SettingField";
 import { SaveBar } from "./SaveBar";
 import { FieldGroup } from "./FieldGroup";
+
+function PurgeVirtualButton() {
+  const purgeMutation = usePurgeVirtualPlaybackItems();
+
+  function handlePurge() {
+    if (
+      window.confirm(
+        "Are you sure you want to purge all virtual playback items?\n\nThis will remove all zero-storage virtual entries and clean up database-only items.",
+      )
+    ) {
+      purgeMutation.mutate();
+    }
+  }
+
+  return (
+    <Button
+      type="button"
+      variant="destructive"
+      size="sm"
+      className="shrink-0"
+      onClick={handlePurge}
+      disabled={purgeMutation.isPending}
+    >
+      {purgeMutation.isPending ? "Purging..." : "Purge Virtual Items"}
+    </Button>
+  );
+}
 
 const REDIS_KEYS = ["redis.url"];
 
@@ -158,6 +187,21 @@ export default function DatabaseSettings() {
             value={form.getValue("userdb.stale_grace_seconds")}
             onChange={(v) => form.setValue("userdb.stale_grace_seconds", v)}
           />
+        </FieldGroup>
+
+        <FieldGroup label="Danger Zone">
+          <div className="border-border/70 flex flex-col gap-3 py-3">
+            <div className="flex items-center justify-between gap-4">
+              <div className="space-y-1">
+                <span className="text-sm font-medium">Purge Virtual Playback Items</span>
+                <p className="text-muted-foreground text-xs leading-relaxed">
+                  Remove all zero-storage virtual files (<code>aiostreams://</code>) and database-only media items.
+                  This resets the catalog back to physical/local file state.
+                </p>
+              </div>
+              <PurgeVirtualButton />
+            </div>
+          </div>
         </FieldGroup>
       </div>
 

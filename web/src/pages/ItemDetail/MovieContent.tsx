@@ -4,7 +4,7 @@ import type { FileVersion, ItemDetail } from "@/api/types";
 import type { PlayerSubtitleTrackSignature, PrePlaySubtitleSelection } from "@/player/types";
 import { useToggleFavorite } from "@/hooks/queries/favorites";
 import { useToggleWatchlist } from "@/hooks/queries/watchlist";
-import { useRefreshItemMetadata, useWatchedStateMutation } from "@/hooks/queries/items";
+import { useRefreshItemMetadata, useWatchedStateMutation, useDeleteItem } from "@/hooks/queries/items";
 import { useSetRating, useDeleteRating } from "@/hooks/queries/ratings";
 import { useSimilarItems } from "@/hooks/queries/recommendations";
 import { useDeleteSubtitlePreference, useSetSubtitlePreference } from "@/hooks/queries/subtitles";
@@ -60,6 +60,7 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
   const toggleFavoriteMutation = useToggleFavorite(item.content_id);
   const toggleWatchlistMutation = useToggleWatchlist(item.content_id);
   const refreshMetadataMutation = useRefreshItemMetadata();
+  const deleteItemMutation = useDeleteItem();
   const watchedMutation = useWatchedStateMutation(item);
   const setRatingMutation = useSetRating(item.content_id);
   const deleteRatingMutation = useDeleteRating(item.content_id);
@@ -297,6 +298,22 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
             isAdmin={isAdmin}
             canCurateMetadata={canCurateMetadata}
             canEditMarkers={canEditMarkers}
+            onDeleteItem={
+              isAdmin
+                ? () => {
+                    if (
+                      window.confirm(
+                        `Are you sure you want to delete "${title}" from the catalog?`,
+                      )
+                    ) {
+                      deleteItemMutation.mutate(item.content_id, {
+                        onSuccess: () => navigate("/catalog", { replace: true }),
+                      });
+                    }
+                  }
+                : undefined
+            }
+            isDeletingItem={deleteItemMutation.isPending}
             onEditMetadata={canCurateMetadata ? () => setEditOpen(true) : undefined}
             onMatchItem={canCurateMetadata ? () => setMatchOpen(true) : undefined}
             onSplitItem={

@@ -96,6 +96,7 @@ export function CollectionTemplateConfigForm({
   const [limit, setLimit] = useState(template.default_limit ? String(template.default_limit) : "");
   const [syncSchedule, setSyncSchedule] = useState(template.default_sync_schedule ?? "");
   const [featured, setFeatured] = useState(template.featured ?? true);
+  const [virtualPlayback, setVirtualPlayback] = useState(false);
   const defaultProfileId = template.requires_profile ? (profiles[0]?.id ?? "") : "";
   const [profileId, setProfileId] = useState(defaultProfileId);
   const [mdblistUrl, setMdblistUrl] = useState(template.mdblist?.url ?? "");
@@ -142,6 +143,7 @@ export function CollectionTemplateConfigForm({
       title: title.trim() || template.title,
       description: description.trim() || undefined,
       featured,
+      virtual_playback: virtualPlayback,
       sync_schedule: syncSchedule.trim() || undefined,
       limit: parsedLimit,
       ...(posterMode === "custom"
@@ -326,6 +328,19 @@ export function CollectionTemplateConfigForm({
             <span className="text-muted-foreground text-xs">Surface in hero shelves</span>
             <Switch checked={featured} onCheckedChange={setFeatured} />
           </div>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <Label>Virtual Playback</Label>
+        <div className="border-border flex h-auto flex-col gap-1 rounded-md border p-3">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-medium">Zero-storage virtual playback</span>
+            <Switch checked={virtualPlayback} onCheckedChange={setVirtualPlayback} />
+          </div>
+          <p className="text-muted-foreground text-xs">
+            Create database-only entries for unmatched IMDb IDs and resolve them through AIOStreams.
+          </p>
         </div>
       </div>
 

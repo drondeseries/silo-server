@@ -3756,3 +3756,28 @@ func pointerStringValue(value *string) string {
 	}
 	return *value
 }
+
+// PurgeVirtualPlaybackItems handles POST /api/admin/collections/purge-virtual
+// Deletes all aiostreams:// virtual playback files and orphaned virtual media items.
+func (h *LibraryCollectionHandler) PurgeVirtualPlaybackItems(w http.ResponseWriter, r *http.Request) {
+	if h.itemRepo == nil {
+		http.Error(w, "item repository unavailable", http.StatusInternalServerError)
+		return
+	}
+	filesDeleted, itemsDeleted, err := h.itemRepo.PurgeVirtualPlaybackItems(r.Context())
+	if err != nil {
+		slog.ErrorContext(r.Context(), "failed to purge virtual playback items", "component", "api", "error", err)
+		http.Error(w, fmt.Sprintf("purge failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	sections.InvalidateResolvedListCache()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"success":       true,
+		"files_deleted": filesDeleted,
+		"items_deleted": itemsDeleted,
+		"message":       fmt.Sprintf("Successfully purged %d virtual files and %d virtual media items", filesDeleted, itemsDeleted),
+	})
+}

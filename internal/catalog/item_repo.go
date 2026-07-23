@@ -697,6 +697,93 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 	return nil
 }
 
+// PurgeVirtualPlaybackItems removes all zero-storage virtual files (aiostreams://)
+// and any media items that exist solely for virtual playback. Returns the count
+// of deleted virtual files and purged media items.
+func (r *ItemRepository) PurgeVirtualPlaybackItems(ctx context.Context) (filesDeleted int64, itemsDeleted int64, err error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin purge transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 1. Delete all virtual file entries
+	resFiles, err := tx.Exec(ctx, `DELETE FROM media_files WHERE left(file_path, 13) = 'aiostreams://'`)
+	if err != nil {
+		return 0, 0, fmt.Errorf("deleting virtual files: %w", err)
+	}
+	filesDeleted = resFiles.RowsAffected()
+
+	// 2. Delete media items that have no remaining files (physical or virtual)
+	resItems, err := tx.Exec(ctx, `
+		DELETE FROM media_items 
+		WHERE content_id NOT IN (SELECT DISTINCT content_id FROM media_files)
+	`)
+	if err != nil {
+		return 0, 0, fmt.Errorf("deleting orphaned virtual items: %w", err)
+	}
+	itemsDeleted = resItems.RowsAffected()
+
+	// 3. Clean up collection links referencing deleted items
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM library_collection_items 
+		WHERE media_item_id NOT IN (SELECT content_id FROM media_items)
+	`); err != nil {
+		return 0, 0, fmt.Errorf("cleaning collection links: %w", err)
+	}
+
+	// 4. Delete or reset requests that were associated with purged items
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM media_requests
+		WHERE status = 'completed'
+		  AND NOT EXISTS (
+			SELECT 1 FROM media_files mf
+			JOIN media_items mi ON mf.content_id = mi.content_id
+			WHERE (media_requests.imdb_id <> '' AND mi.imdb_id = media_requests.imdb_id)
+			   OR (media_requests.tmdb_id > 0 AND mi.tmdb_id = media_requests.tmdb_id::text)
+		  )
+	`); err != nil {
+		slog.WarnContext(ctx, "failed to clean up completed requests for purged virtual items", "component", "catalog", "error", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, 0, fmt.Errorf("commit purge transaction: %w", err)
+	}
+	return filesDeleted, itemsDeleted, nil
+}
+
+// DeleteItem removes a media item and its associated files, library links,
+// episodes, and collection entries from the catalog.
+func (r *ItemRepository) DeleteItem(ctx context.Context, contentID string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin delete item transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Clean up child tables
+	if _, err := tx.Exec(ctx, `DELETE FROM media_files WHERE content_id = $1`, contentID); err != nil {
+		return fmt.Errorf("deleting item media files: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM media_item_libraries WHERE content_id = $1`, contentID); err != nil {
+		return fmt.Errorf("deleting item library links: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM library_collection_items WHERE media_item_id = $1`, contentID); err != nil {
+		return fmt.Errorf("deleting item collection entries: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM episodes WHERE series_id = $1`, contentID); err != nil {
+		return fmt.Errorf("deleting show episodes: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM media_items WHERE content_id = $1`, contentID); err != nil {
+		return fmt.Errorf("deleting media item: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delete item transaction: %w", err)
+	}
+	return nil
+}
+
 // GetByID retrieves a media item by its content ID.
 func (r *ItemRepository) GetByID(ctx context.Context, contentID string) (*models.MediaItem, error) {
 	query := `SELECT ` + itemColumns + ` FROM media_items WHERE content_id = $1`

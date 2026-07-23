@@ -1012,6 +1012,7 @@ func NewRouter(deps Dependencies) chi.Router {
 		adminHandler.RestartStatus = restartStatus
 		adminHandler.CatalogSearchStatus = catalogSearchService
 		adminHandler.DiagnosticsStore = diagnosticsStore
+		adminHandler.ItemRepo = itemRepo
 		if settingsRepo != nil {
 			adminHandler.SettingsRepo = settingsRepo
 		}
@@ -2516,6 +2517,7 @@ func NewRouter(deps Dependencies) chi.Router {
 							r.Use(metadataItemAccess)
 							r.Post("/items/{id}/refresh-metadata", adminHandler.HandleRefreshItemMetadata)
 							r.Patch("/items/{id}/metadata", adminHandler.HandleUpdateItemMetadata)
+							r.Delete("/items/{id}", adminHandler.HandleDeleteItem)
 							if adminMatchHandler != nil {
 								r.Post("/items/{id}/match/search", adminMatchHandler.HandleSearchItemMatchCandidates)
 								r.Post("/items/{id}/match/apply", adminMatchHandler.HandleApplyItemMatch)
@@ -2798,6 +2800,7 @@ func NewRouter(deps Dependencies) chi.Router {
 									r.Post("/import/mdblist", libraryCollectionHandler.HandleImportMDBList)
 									r.Post("/import/tmdb", libraryCollectionHandler.HandleImportTMDBCollection)
 									r.Post("/import/trakt", libraryCollectionHandler.HandleImportTraktCollection)
+									r.Post("/purge-virtual", libraryCollectionHandler.PurgeVirtualPlaybackItems)
 								})
 							}
 							if libraryCollectionGroupHandler != nil {

@@ -589,3 +589,22 @@ export function useImportTraktCollection() {
     },
   });
 }
+
+export function usePurgeVirtualPlaybackItems() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: () =>
+      api<{ success: boolean; files_deleted: number; items_deleted: number; message: string }>(
+        "/admin/collections/purge-virtual",
+        { method: "POST" },
+      ),
+    onSuccess: (result) => {
+      toast.success(result.message || "Virtual playback items purged");
+      void invalidateAdminCollectionQueries(queryClient);
+    },
+    onError: (error) => {
+      toast.error(error instanceof Error ? error.message : "Failed to purge virtual playback items");
+    },
+  });
+}
