@@ -56,13 +56,7 @@ func (h *PlaybackHandler) startVirtualPlaybackV3(r *http.Request, req playback.S
 	}
 	planHash := sha256.Sum256([]byte(req.PlaybackAttemptID + "\x00" + file.FilePath))
 	planID := "virtual:" + hex.EncodeToString(planHash[:8])
-	clientInfo := playbackClientInfoFromRequest(r)
 	effectiveStreamURL := streamURL
-	// Web browsers cannot play raw MKV/remote virtual streams directly.
-	// Route Web clients (explicitly 'Silo Web' or 'web' client name) through Silo's /stream/{session_id} proxy.
-	if strings.EqualFold(clientInfo.Name, "Silo Web") || strings.EqualFold(clientInfo.Name, "web") {
-		effectiveStreamURL = h.playbackStreamURL(session)
-	}
 
 	plan := playback.PlanV3{
 		ProtocolVersion:      playback.ProtocolV3,
