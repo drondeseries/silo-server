@@ -5,11 +5,27 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 )
+
+type recordingQueueSyncer struct {
+	folderID int
+	scope    string
+}
+
+func (s *recordingQueueSyncer) SyncForFolder(context.Context, int) error {
+	return nil
+}
+
+func (s *recordingQueueSyncer) SyncInScope(_ context.Context, folderID int, scopePath string) error {
+	s.folderID = folderID
+	s.scope = scopePath
+	return nil
+}
 
 func TestCollectLogicalFilePaths_PreservesLogicalSymlinkRootPaths(t *testing.T) {
 	t.Parallel()
@@ -232,6 +248,9 @@ func TestWalkModeEbookAcceptsEbookExtensionsOnly(t *testing.T) {
 			t.Fatalf("walkModeEbook should reject %s", ext)
 		}
 	}
+	if !walkModeEbook.acceptsPath("Book.fb2.zip") {
+		t.Fatal("walkModeEbook should accept .fb2.zip compound extension")
+	}
 }
 
 func TestScanFolderEbookLibraryRoutesToEbookScanner(t *testing.T) {
@@ -292,3 +311,55 @@ func TestIsVirtual(t *testing.T) {
 	}
 }
 
+func TestScanFileEbookLibraryUsesEbookPipeline(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "book.epub")
+	if err := os.WriteFile(filePath, []byte("not a real epub"), 0o644); err != nil {
+		t.Fatalf("write fake ebook: %v", err)
+	}
+
+	err := (&Scanner{}).ScanFile(context.Background(), filePath, &models.MediaFolder{ID: 44, Type: "ebooks"})
+	if err == nil {
+		t.Fatal("ScanFile returned nil, want ebook parse failure")
+	}
+	if strings.Contains(err.Error(), "unrecognized video extension") {
+		t.Fatalf("ScanFile used video extension gate: %v", err)
+	}
+	if !strings.Contains(err.Error(), "folder_id=44") {
+		t.Fatalf("error = %q, want ebook scanner aggregate failure", err)
+	}
+}
+
+func TestScanFileMangaLibraryUsesMangaPipeline(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "chapter.cbz")
+	if err := os.WriteFile(filePath, []byte("not a real cbz"), 0o644); err != nil {
+		t.Fatalf("write fake manga: %v", err)
+	}
+
+	err := (&Scanner{}).ScanFile(context.Background(), filePath, &models.MediaFolder{ID: 45, Type: "manga"})
+	if err == nil {
+		t.Fatal("ScanFile returned nil, want manga parse failure")
+	}
+	if strings.Contains(err.Error(), "unrecognized video extension") {
+		t.Fatalf("ScanFile used video extension gate: %v", err)
+	}
+	if !strings.Contains(err.Error(), "folder_id=45") {
+		t.Fatalf("error = %q, want manga scanner aggregate failure", err)
+	}
+}
+
+func TestSyncVanishedVideoQueuesUsesParentAndExactFileScopes(t *testing.T) {
+	series := &recordingQueueSyncer{}
+	movie := &recordingQueueSyncer{}
+	filePath := filepath.Join("/media", "Movie", "Movie.mkv")
+	scanner := &Scanner{seriesQueueSyncer: series, movieQueueSyncer: movie}
+
+	if err := scanner.syncVanishedVideoQueues(context.Background(), 17, filePath); err != nil {
+		t.Fatalf("syncVanishedVideoQueues: %v", err)
+	}
+	if series.folderID != 17 || series.scope != filepath.Dir(filePath) {
+		t.Fatalf("series sync = folder %d scope %q", series.folderID, series.scope)
+	}
+	if movie.folderID != 17 || movie.scope != filepath.Clean(filePath) {
+		t.Fatalf("movie sync = folder %d scope %q", movie.folderID, movie.scope)
+	}
+}
