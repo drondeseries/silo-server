@@ -73,6 +73,7 @@ import (
 	// builtin registry on import; buildProviders resolves their seeded chain
 	// entries in-process (no gRPC).
 	_ "github.com/Silo-Server/silo-server/internal/metadata/nfo"
+	"github.com/Silo-Server/silo-server/internal/metadata/tmdb"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/nodeconfig"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
@@ -2060,7 +2061,7 @@ func main() {
 		}
 		requestReconcileSvc := mediarequests.NewService(
 			mediarequests.NewRepository(deps.DB, deps.SecretCipher),
-			nil,
+			tmdb.NewClient(cfg.TMDBAPIKey, 40),
 			mediarequests.NewCatalogPresence(
 				catalog.NewItemRepository(deps.DB),
 				catalog.NewProviderIDRepository(deps.DB),
