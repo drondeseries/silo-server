@@ -2570,6 +2570,9 @@ func main() {
 			if deps.FileRepo != nil {
 				compatDeps.FileResolver = deps.FileRepo
 			}
+			if pluginService != nil {
+				compatDeps.VirtualPlaybackResolver = pluginService
+			}
 
 			compatDeps.SubtitleRepo = subtitles.NewPgRepository(deps.DB, deps.SecretCipher)
 

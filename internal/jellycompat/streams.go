@@ -103,6 +103,16 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	virtualStreamURL, err := h.resolveVirtualPlayback(r.Context(), file, session.StreamAppUserID, session.ProfileID)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "BadGateway", "Failed to resolve virtual playback")
+		return
+	}
+	if virtualStreamURL != "" {
+		http.Redirect(w, r, virtualStreamURL, http.StatusTemporaryRedirect)
+		return
+	}
+
 	seekSeconds := seekSecondsFromTicks(r.URL.Query().Get("StartTimeTicks"))
 	if d := float64(source.Version.Duration); d > 0 && seekSeconds > d {
 		seekSeconds = d
@@ -181,6 +191,16 @@ func (h *PlaybackHandler) HandleDownload(w http.ResponseWriter, r *http.Request)
 	file, err := h.fileResolver.GetByID(r.Context(), version.FileID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "NotFound", "Media file not found")
+		return
+	}
+
+	virtualStreamURL, err := h.resolveVirtualPlayback(r.Context(), file, session.StreamAppUserID, session.ProfileID)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "BadGateway", "Failed to resolve virtual playback")
+		return
+	}
+	if virtualStreamURL != "" {
+		http.Redirect(w, r, virtualStreamURL, http.StatusTemporaryRedirect)
 		return
 	}
 
