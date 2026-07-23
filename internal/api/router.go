@@ -1347,6 +1347,9 @@ func NewRouter(deps Dependencies) chi.Router {
 			)
 		}
 		libraryCollectionService.MetadataRefresher, _ = deps.Refresher.(catalog.MetadataRefresher)
+		if deps.Config != nil {
+			libraryCollectionService.TMDBAPIKey = deps.Config.TMDBAPIKey
+		}
 		if libraryCollectionService.TMDBCollections == nil {
 			apiKey := ""
 			if deps.Config != nil {
