@@ -45,6 +45,9 @@ var runPluginConnectionCheck = func(
 	if err != nil {
 		return err
 	}
+	if capabilityID == "" {
+		return nil
+	}
 	capability := metadataProviderConnectionCheckCapability(manifest, capabilityID)
 	if !metadataProviderSupportsConnectionProbe(capability, "movie") {
 		slog.DebugContext(ctx,
@@ -257,11 +260,24 @@ func cloneConfigMap(value map[string]any) map[string]any {
 }
 
 func metadataProviderConnectionCheckCapabilityID(manifest *pluginv1.PluginManifest) (string, error) {
-	for _, capability := range manifest.GetCapabilities() {
-		if capability.GetType() != "metadata_provider.v1" {
-			continue
+	if manifest == nil || len(manifest.GetCapabilities()) == 0 {
+		return "", &ConnectionTestError{
+			Message: "Connection checks are not supported for this plugin yet.",
+			Cause:   ErrConnectionTestUnsupported,
 		}
-		return capability.GetId(), nil
+	}
+	for _, capability := range manifest.GetCapabilities() {
+		if capability.GetType() == "metadata_provider.v1" {
+			return capability.GetId(), nil
+		}
+	}
+	// Support active non-metadata capability types (such as request_router, scanner, http_routes)
+	// so their config test endpoint functions without requiring a metadata search probe.
+	for _, capability := range manifest.GetCapabilities() {
+		switch capability.GetType() {
+		case "request_router.v1", "http_routes.v1", "scan_source.v1", "scanner.v1":
+			return "", nil
+		}
 	}
 	return "", &ConnectionTestError{
 		Message: "Connection checks are not supported for this plugin yet.",
