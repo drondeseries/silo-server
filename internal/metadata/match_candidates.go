@@ -5,34 +5,49 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"unicode"
 
+	"github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/naming"
+	"github.com/Silo-Server/silo-server/internal/providerid"
 )
 
 // MatchCandidate represents a deduplicated search result grouped by normalized
 // provider IDs. Multiple raw SearchResult rows from different providers that
 // share the same TMDB/TVDB/IMDB IDs are collapsed into a single candidate.
 type MatchCandidate struct {
-	Title          string            `json:"title"`
-	Year           int               `json:"year"`
-	ContentType    string            `json:"content_type"`
-	ProviderIDs    map[string]string `json:"provider_ids"`
-	ImageURL       string            `json:"image_url,omitempty"`
-	Overview       string            `json:"overview,omitempty"`
-	Sources        []string          `json:"sources"`
-	AgreementHints []string          `json:"agreement_hints"`
-	DetailScore    int               `json:"-"`
+	Title           string            `json:"title"`
+	OriginalTitle   string            `json:"original_title,omitempty"`
+	TitleAliases    []TitleAlias      `json:"aliases,omitempty"`
+	TitleLanguage   string            `json:"title_language,omitempty"`
+	TitleIsFallback bool              `json:"title_is_fallback,omitempty"`
+	MatchedTitle    string            `json:"matched_title,omitempty"`
+	MatchScore      float64           `json:"match_score,omitempty"`
+	MatchReasons    []string          `json:"match_reasons,omitempty"`
+	Year            int               `json:"year"`
+	ContentType     string            `json:"content_type"`
+	ProviderIDs     map[string]string `json:"provider_ids"`
+	ImageURL        string            `json:"image_url,omitempty"`
+	Overview        string            `json:"overview,omitempty"`
+	Sources         []string          `json:"sources"`
+	AgreementHints  []string          `json:"agreement_hints"`
+	DetailScore     int               `json:"-"`
+	// ConflictingProviderIDKeys contains canonical provider IDs deliberately
+	// excluded after two other canonical IDs proved that provider results refer
+	// to the same work. These keys remain quarantined for the rest of the match
+	// pipeline so a later detail response cannot silently reintroduce them.
+	ConflictingProviderIDKeys []string `json:"-"`
+	titleRank                 int
 }
 
 var canonicalCandidateIDKeys = []string{"tmdb", "tvdb", "imdb"}
 
-func compatibleProviderIDs(left, right map[string]string) bool {
-	overlap := false
+func providerIDMergeEvidence(left, right map[string]string) (matches int, conflicts []string) {
 	for _, key := range canonicalCandidateIDKeys {
 		lv := strings.TrimSpace(left[key])
 		rv := strings.TrimSpace(right[key])
@@ -40,11 +55,23 @@ func compatibleProviderIDs(left, right map[string]string) bool {
 			continue
 		}
 		if lv != rv {
-			return false
+			conflicts = append(conflicts, key)
+			continue
 		}
-		overlap = true
+		matches++
 	}
-	return overlap
+	return matches, conflicts
+}
+
+func compatibleProviderIDs(left, right map[string]string) bool {
+	matches, conflicts := providerIDMergeEvidence(left, right)
+	if matches == 0 {
+		return false
+	}
+	// One agreeing ID plus one conflict is not consensus. Two independently
+	// agreeing canonical IDs are enough to prove identity while quarantining a
+	// stale third-party cross-reference.
+	return len(conflicts) == 0 || matches >= 2
 }
 
 func providerIDRichness(ids map[string]string) int {
@@ -57,9 +84,82 @@ func providerIDRichness(ids map[string]string) int {
 	return score
 }
 
+func sanitizeCandidateProviderIDs(ids map[string]string) map[string]string {
+	if len(ids) == 0 {
+		return nil
+	}
+	sanitized := make(map[string]string, len(ids))
+	for key, value := range ids {
+		key = strings.ToLower(strings.TrimSpace(key))
+		value, valid := sanitizeProviderIDValue(key, value)
+		if !valid {
+			continue
+		}
+		sanitized[key] = value
+	}
+	return sanitized
+}
+
+func sanitizeCanonicalProviderIDsInPlace(ids map[string]string) {
+	for _, key := range canonicalCandidateIDKeys {
+		value := strings.TrimSpace(ids[key])
+		if value == "" {
+			delete(ids, key)
+			continue
+		}
+		sanitized, valid := sanitizeProviderIDValue(key, value)
+		if !valid {
+			delete(ids, key)
+			continue
+		}
+		ids[key] = sanitized
+	}
+}
+
+func sanitizeProviderIDValue(key, value string) (string, bool) {
+	key = strings.ToLower(strings.TrimSpace(key))
+	value = strings.TrimSpace(value)
+	if key == "" || value == "" {
+		return "", false
+	}
+	switch key {
+	case "tmdb", "tvdb":
+		if !providerid.IsPositiveDecimal(value) {
+			return "", false
+		}
+	case "imdb":
+		value = strings.ToLower(value)
+		if !isValidIMDbProviderID(value) {
+			return "", false
+		}
+	}
+	return value, true
+}
+
+func sanitizedMatchHintProviderIDs(hints *MatchHints) *MatchHints {
+	if hints == nil {
+		return nil
+	}
+	sanitized := *hints
+	sanitized.TmdbID, _ = sanitizeProviderIDValue("tmdb", hints.TmdbID)
+	sanitized.TvdbID, _ = sanitizeProviderIDValue("tvdb", hints.TvdbID)
+	sanitized.ImdbID, _ = sanitizeProviderIDValue("imdb", hints.ImdbID)
+	return &sanitized
+}
+
+func isValidIMDbProviderID(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if !strings.HasPrefix(value, "tt") {
+		return false
+	}
+	digits := strings.TrimPrefix(value, "tt")
+	return len(digits) >= 7 && len(digits) <= 10 && providerid.IsPositiveDecimal(digits)
+}
+
 const (
-	minimumDetailTieBreakScore = 20
-	minimumDetailTieBreakGap   = 12
+	automaticMatchAcceptanceFloor = 55
+	minimumDetailTieBreakScore    = 20
+	minimumDetailTieBreakGap      = 12
 )
 
 func duplicateTieBreakWinner(hints *MatchHints, scoredCandidates []scoredMatchCandidate) (*MatchCandidate, bool) {
@@ -113,13 +213,13 @@ func duplicateTieBreakComparable(hints *MatchHints, left, right MatchCandidate) 
 		!strings.EqualFold(left.ContentType, right.ContentType) {
 		return false
 	}
-	if inferTitleSimilarity(left.Title, right.Title, hints.Year) != 1 {
+	if candidateToCandidateTitleSimilarity(left, right, hints.Year) != 1 {
 		return false
 	}
-	if inferTitleSimilarity(hints.Title, left.Title, hints.Year) != 1 {
+	if similarity, _ := bestCandidateTitleSimilarity(hints.Title, left, hints.Year); similarity != 1 {
 		return false
 	}
-	if inferTitleSimilarity(hints.Title, right.Title, hints.Year) != 1 {
+	if similarity, _ := bestCandidateTitleSimilarity(hints.Title, right, hints.Year); similarity != 1 {
 		return false
 	}
 	return samePrimaryProvider(left.ProviderIDs, right.ProviderIDs)
@@ -182,15 +282,23 @@ func normalizedKey(ids map[string]string) string {
 // provider IDs are unioned, sources list every provider slug that returned
 // the result, and agreement_hints notes when multiple providers agree.
 func NormalizeCandidates(results []SearchResult, contentType string) []MatchCandidate {
+	return NormalizeCandidatesForLanguage(results, contentType, "")
+}
+
+// NormalizeCandidatesForLanguage deduplicates results while preferring an
+// explicitly localized provider title over a provider-marked fallback.
+func NormalizeCandidatesForLanguage(results []SearchResult, contentType, language string) []MatchCandidate {
 	type bucket struct {
-		candidate MatchCandidate
-		sources   map[string]bool
+		candidate         MatchCandidate
+		sources           map[string]bool
+		conflictingIDKeys map[string]bool
 	}
 
 	ordered := make([]string, 0)
 	buckets := make(map[string]*bucket)
 
 	for _, sr := range results {
+		sr.ProviderIDs = sanitizeCandidateProviderIDs(sr.ProviderIDs)
 		key := ""
 		for _, existingKey := range ordered {
 			if compatibleProviderIDs(buckets[existingKey].candidate.ProviderIDs, sr.ProviderIDs) {
@@ -208,26 +316,43 @@ func NormalizeCandidates(results []SearchResult, contentType string) []MatchCand
 
 		b, exists := buckets[key]
 		if !exists {
+			title, titleLanguage, fallback, titleRank := preferredSearchResultTitle(sr, language)
 			b = &bucket{
 				candidate: MatchCandidate{
-					Title:       sr.Name,
-					Year:        sr.Year,
-					ContentType: contentType,
-					ProviderIDs: make(map[string]string),
-					ImageURL:    sr.ImageURL,
-					Overview:    sr.Overview,
+					Title:           title,
+					OriginalTitle:   sr.OriginalTitle,
+					TitleAliases:    copyTitleAliases(sr.TitleAliases, sr.Provider),
+					TitleLanguage:   titleLanguage,
+					TitleIsFallback: fallback,
+					titleRank:       titleRank,
+					Year:            sr.Year,
+					ContentType:     contentType,
+					ProviderIDs:     make(map[string]string),
+					ImageURL:        sr.ImageURL,
+					Overview:        sr.Overview,
 				},
-				sources: make(map[string]bool),
+				sources:           make(map[string]bool),
+				conflictingIDKeys: make(map[string]bool),
 			}
 			buckets[key] = b
 			ordered = append(ordered, key)
 		}
+		mergeCandidateTitles(&b.candidate, sr, language)
 
-		// Merge provider IDs.
+		// Merge provider IDs. When two canonical IDs agree but a third
+		// conflicts, the candidates are the same work and the disputed key is
+		// quarantined instead of allowing provider iteration order to choose it.
 		for k, v := range sr.ProviderIDs {
-			if v != "" {
-				b.candidate.ProviderIDs[k] = v
+			v = strings.TrimSpace(v)
+			if v == "" || b.conflictingIDKeys[k] {
+				continue
 			}
+			if existing := strings.TrimSpace(b.candidate.ProviderIDs[k]); existing != "" && existing != v && slices.Contains(canonicalCandidateIDKeys, k) {
+				delete(b.candidate.ProviderIDs, k)
+				b.conflictingIDKeys[k] = true
+				continue
+			}
+			b.candidate.ProviderIDs[k] = v
 		}
 
 		// Track source providers.
@@ -242,6 +367,7 @@ func NormalizeCandidates(results []SearchResult, contentType string) []MatchCand
 		if b.candidate.ImageURL == "" && sr.ImageURL != "" {
 			b.candidate.ImageURL = sr.ImageURL
 		}
+		b.candidate.DetailScore = candidateDetailScore(b.candidate)
 	}
 
 	// Build final list preserving insertion order.
@@ -255,6 +381,12 @@ func NormalizeCandidates(results []SearchResult, contentType string) []MatchCand
 		}
 		sort.Strings(sources)
 		b.candidate.Sources = sources
+		for _, key := range canonicalCandidateIDKeys {
+			if b.conflictingIDKeys[key] {
+				b.candidate.ConflictingProviderIDKeys = append(b.candidate.ConflictingProviderIDKeys, key)
+				b.candidate.AgreementHints = append(b.candidate.AgreementHints, "quarantined_"+key+"_id")
+			}
+		}
 
 		// Compute agreement hints from corroborating sources only: a local
 		// sidecar (nfo) echoing a remote result is not provider agreement.
@@ -275,15 +407,122 @@ func NormalizeCandidates(results []SearchResult, contentType string) []MatchCand
 	return candidates
 }
 
+func preferredSearchResultTitle(result SearchResult, language string) (string, string, bool, int) {
+	requested := baseMetadataLanguage(language)
+	resultLanguage := baseMetadataLanguage(result.TitleLanguage)
+	if strings.TrimSpace(result.Name) != "" && requested != "" && resultLanguage == requested && !result.TitleIsFallback {
+		return result.Name, resultLanguage, false, 3
+	}
+	for _, alias := range result.TitleAliases {
+		if strings.TrimSpace(alias.Title) != "" && requested != "" && baseMetadataLanguage(alias.Language) == requested {
+			return alias.Title, requested, false, 2
+		}
+	}
+	// Older plugins predate the language contract. Their primary title keeps
+	// normal first-provider priority; its original_title must not silently
+	// replace a title that may already be localized.
+	if strings.TrimSpace(result.Name) != "" && resultLanguage == "" && !result.TitleIsFallback {
+		return result.Name, "", false, 3
+	}
+	if requested != "" && strings.TrimSpace(result.OriginalTitle) != "" {
+		return result.OriginalTitle, baseMetadataLanguage(result.OriginalLanguage), true, 1
+	}
+	if strings.TrimSpace(result.Name) != "" {
+		return result.Name, resultLanguage, result.TitleIsFallback, 1
+	}
+	return result.OriginalTitle, baseMetadataLanguage(result.OriginalLanguage), true, 1
+}
+
+func baseMetadataLanguage(language string) string {
+	return lang.Canonical(strings.ReplaceAll(language, "_", "-"))
+}
+
+func copyTitleAliases(aliases []TitleAlias, provider string) []TitleAlias {
+	out := make([]TitleAlias, 0, len(aliases))
+	for _, alias := range aliases {
+		if alias.Provider == "" {
+			alias.Provider = provider
+		}
+		out = appendUniqueTitleAlias(out, alias)
+	}
+	return out
+}
+
+func mergeCandidateTitles(candidate *MatchCandidate, result SearchResult, language string) {
+	if candidate == nil {
+		return
+	}
+	if candidate.OriginalTitle == "" && strings.TrimSpace(result.OriginalTitle) != "" {
+		candidate.OriginalTitle = result.OriginalTitle
+	}
+	for _, alias := range copyTitleAliases(result.TitleAliases, result.Provider) {
+		candidate.TitleAliases = appendUniqueTitleAlias(candidate.TitleAliases, alias)
+	}
+	if strings.TrimSpace(result.OriginalTitle) != "" && !strings.EqualFold(result.OriginalTitle, candidate.Title) {
+		candidate.TitleAliases = appendUniqueTitleAlias(candidate.TitleAliases, TitleAlias{
+			Title: result.OriginalTitle, Language: baseMetadataLanguage(result.OriginalLanguage), Kind: titleAliasKindOriginal, Provider: result.Provider,
+		})
+	}
+	if strings.TrimSpace(result.Name) != "" && !strings.EqualFold(result.Name, candidate.Title) {
+		candidate.TitleAliases = appendUniqueTitleAlias(candidate.TitleAliases, TitleAlias{
+			Title: result.Name, Language: baseMetadataLanguage(result.TitleLanguage), Kind: titleAliasKindLocalized, Provider: result.Provider,
+		})
+	}
+
+	title, titleLanguage, fallback, titleRank := preferredSearchResultTitle(result, language)
+	if strings.TrimSpace(title) != "" && titleRank > candidate.titleRank {
+		candidate.Title = title
+		candidate.TitleLanguage = titleLanguage
+		candidate.TitleIsFallback = fallback
+		candidate.titleRank = titleRank
+	}
+}
+
+func appendUniqueTitleAlias(aliases []TitleAlias, alias TitleAlias) []TitleAlias {
+	alias.Title = strings.TrimSpace(alias.Title)
+	if alias.Title == "" {
+		return aliases
+	}
+	for _, existing := range aliases {
+		if strings.EqualFold(existing.Title, alias.Title) &&
+			baseMetadataLanguage(existing.Language) == baseMetadataLanguage(alias.Language) &&
+			strings.EqualFold(existing.Kind, alias.Kind) &&
+			strings.EqualFold(existing.Provider, alias.Provider) {
+			return aliases
+		}
+	}
+	return append(aliases, alias)
+}
+
+func candidateDetailScore(candidate MatchCandidate) int {
+	score := providerIDRichness(candidate.ProviderIDs) * 10
+	if candidate.Year != 0 {
+		score += 15
+	}
+	if strings.TrimSpace(candidate.Overview) != "" {
+		score += 20
+	}
+	if strings.TrimSpace(candidate.ImageURL) != "" {
+		score += 15
+	}
+	return score
+}
+
 // SearchAndNormalize is a convenience method that calls SearchProviders and
 // normalizes the results into MatchCandidates. Plugin-prefixed image URLs
 // (e.g. "metadb://...") are resolved to presigned HTTP URLs before returning.
 func (s *MetadataService) SearchAndNormalize(ctx context.Context, query SearchQuery, folderID int) ([]MatchCandidate, error) {
+	if strings.TrimSpace(query.Language) == "" {
+		query.Language = s.resolveFolderLanguage(ctx, folderID)
+	}
 	results, err := s.SearchProviders(ctx, query, folderID)
 	if err != nil {
 		return nil, err
 	}
-	candidates := NormalizeCandidates(results, query.ContentType)
+	candidates := NormalizeCandidatesForLanguage(results, query.ContentType, query.Language)
+	for i := range candidates {
+		annotateCandidateMatch(&candidates[i], &MatchHints{Title: query.Title, Year: query.Year, Type: query.ContentType})
+	}
 
 	if s.imageResolver != nil {
 		for i, c := range candidates {
@@ -300,11 +539,17 @@ func (s *MetadataService) SearchAndNormalize(ctx context.Context, query SearchQu
 }
 
 func scoreMatchCandidate(hints *MatchHints, candidate MatchCandidate) float64 {
+	score, _, _ := scoreMatchCandidateDetailed(hints, candidate)
+	return score
+}
+
+func scoreMatchCandidateDetailed(hints *MatchHints, candidate MatchCandidate) (float64, string, []string) {
 	if hints == nil {
-		return 0
+		return 0, "", nil
 	}
 
 	score := 0.0
+	reasons := make([]string, 0, 5)
 	trustedIDMatches := 0
 	for _, key := range trustedSearchIDKeys {
 		hintValue := trustedIDValue(hints, key)
@@ -314,26 +559,37 @@ func scoreMatchCandidate(hints *MatchHints, candidate MatchCandidate) float64 {
 		if candidate.ProviderIDs[key] == hintValue {
 			score += 100
 			trustedIDMatches++
+			reasons = append(reasons, "trusted_"+key+"_id")
 		}
 	}
 	if trustedIDMatches > 0 {
 		score += float64(trustedIDMatches * 10)
 	}
 
-	score += float64(len(candidate.Sources) * 12)
+	if sourceCount := candidateCorroboratingSourceCount(candidate); sourceCount > 0 {
+		score += float64(sourceCount * 12)
+		reasons = append(reasons, "provider_sources")
+	}
 
-	if strings.TrimSpace(hints.Title) != "" && strings.TrimSpace(candidate.Title) != "" {
-		titleSimilarity := inferTitleSimilarity(hints.Title, candidate.Title, hints.Year)
+	matchedTitle := ""
+	if strings.TrimSpace(hints.Title) != "" {
+		titleSimilarity, title := bestCandidateTitleSimilarity(hints.Title, candidate, hints.Year)
+		matchedTitle = title
 		if titleSimilarity == 1 {
 			score += 45
+			reasons = append(reasons, "exact_title")
 		} else {
 			score += titleSimilarity * 35
+			if titleSimilarity > 0 {
+				reasons = append(reasons, "coherent_title")
+			}
 		}
 	}
 
 	switch {
 	case hints.Year != 0 && candidate.Year == hints.Year:
 		score += 20
+		reasons = append(reasons, "exact_year")
 	case hints.Year != 0 && candidate.Year != 0 && math.Abs(float64(candidate.Year-hints.Year)) == 1:
 		score += 5
 	}
@@ -343,7 +599,41 @@ func scoreMatchCandidate(hints *MatchHints, candidate MatchCandidate) float64 {
 		score += float64(providerIDRichness(candidate.ProviderIDs))
 	}
 
-	return score
+	return score, matchedTitle, reasons
+}
+
+func candidateTitles(candidate MatchCandidate) []string {
+	titles := []string{candidate.Title, candidate.OriginalTitle}
+	for _, alias := range candidate.TitleAliases {
+		titles = append(titles, alias.Title)
+	}
+	return titles
+}
+
+func bestCandidateTitleSimilarity(hint string, candidate MatchCandidate, year int) (float64, string) {
+	bestScore := 0.0
+	bestTitle := ""
+	for _, title := range candidateTitles(candidate) {
+		score := inferTitleSimilarity(hint, title, year)
+		if score > bestScore {
+			bestScore = score
+			bestTitle = title
+		}
+	}
+	return bestScore, bestTitle
+}
+
+func annotateCandidateMatch(candidate *MatchCandidate, hints *MatchHints) {
+	if candidate == nil {
+		return
+	}
+	candidate.MatchScore, candidate.MatchedTitle, candidate.MatchReasons = scoreMatchCandidateDetailed(hints, *candidate)
+	if len(candidate.ConflictingProviderIDKeys) > 0 {
+		candidate.MatchReasons = append(candidate.MatchReasons, "provider_id_consensus")
+		for _, key := range candidate.ConflictingProviderIDKeys {
+			candidate.MatchReasons = append(candidate.MatchReasons, "quarantined_"+key+"_id")
+		}
+	}
 }
 
 type scoredMatchCandidate struct {
@@ -384,7 +674,7 @@ func candidatesAreSingleDistinctShow(best MatchCandidate, scored []scoredMatchCa
 		if c.candidate.Year == 0 || c.candidate.Year != best.Year {
 			return false
 		}
-		if inferTitleSimilarity(best.Title, c.candidate.Title, best.Year) != 1 {
+		if candidateToCandidateTitleSimilarity(best, c.candidate, best.Year) != 1 {
 			return false
 		}
 		for _, key := range canonicalCandidateIDKeys {
@@ -521,9 +811,10 @@ func selectInitialMatchCandidate(hints *MatchHints, candidates []MatchCandidate,
 
 	scoredCandidates := make([]scoredMatchCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
+		annotateCandidateMatch(&candidate, hints)
 		scoredCandidates = append(scoredCandidates, scoredMatchCandidate{
 			candidate: candidate,
-			score:     scoreMatchCandidate(hints, candidate),
+			score:     candidate.MatchScore,
 		})
 	}
 	sort.SliceStable(scoredCandidates, func(i, j int) bool {
@@ -556,15 +847,49 @@ func selectInitialMatchCandidate(hints *MatchHints, candidates []MatchCandidate,
 		}
 	}
 
-	best := scoredCandidates[0]
 	if trustedHintIDsPresent(hints) {
-		if candidateMatchesTrustedIDs(hints, best.candidate) {
-			return &best.candidate, true
+		// Provider searches can return noisy title-ranked results even for an ID
+		// query. A trusted local ID is decisive, so choose the highest-scored
+		// candidate that actually carries the matching ID instead of requiring
+		// the provider's first result to be correct.
+		for i := range scoredCandidates {
+			if candidateMatchesTrustedIDs(hints, scoredCandidates[i].candidate) {
+				return &scoredCandidates[i].candidate, true
+			}
 		}
 		return nil, false
 	}
 
-	if best.score < 55 {
+	// A title-only local sidecar is useful metadata, but it is not an
+	// independent search result. Once a remote candidate with canonical IDs is
+	// available, remove ID-less candidates from the automatic selection set so
+	// their presence cannot turn the remote result into a misleading
+	// multi-candidate score-gap win. They remain in the original candidate list
+	// for diagnostics.
+	if anyCandidateHasProviderIDs(scoredCandidates) {
+		eligible := make([]scoredMatchCandidate, 0, len(scoredCandidates))
+		for _, scored := range scoredCandidates {
+			if providerIDRichness(scored.candidate.ProviderIDs) > 0 {
+				eligible = append(eligible, scored)
+			}
+		}
+		scoredCandidates = eligible
+	}
+	if len(scoredCandidates) == 0 {
+		return nil, false
+	}
+
+	best := scoredCandidates[0]
+	if best.score < automaticMatchAcceptanceFloor {
+		return nil, false
+	}
+	// A known local year that conflicts with the provider by more than the
+	// tolerated release-date window is negative evidence, not something a high
+	// source-count score may erase. Trusted external IDs were handled above and
+	// remain decisive; title-only matches must respect this guard even when two
+	// providers return the same canonical item.
+	if hints != nil && hints.Year != 0 && best.candidate.Year != 0 &&
+		absYearDelta(best.candidate.Year, hints.Year) > 2 {
 		return nil, false
 	}
 	// A search that resolves to a single distinct show (one candidate, or the
@@ -588,7 +913,7 @@ func selectInitialMatchCandidate(hints *MatchHints, candidates []MatchCandidate,
 			// strong independent corroboration — it stands in for a missing hint year
 			// (folders without a "(YYYY)"). A lone single-source no-year result is NOT
 			// accepted here and stays subject to the single-candidate >=70 gate.
-			multiSourceCorroborated := distinctSourceCount(topGroup) >= 2
+			multiSourceCorroborated := hints.Year == 0 && distinctSourceCount(topGroup) >= 2
 			// An exact normalized-title match on a sole distinct show is strong
 			// corroboration on its own, even when the folder year is off by a year
 			// or two (festival vs wide-release date, regional release) — e.g.
@@ -596,13 +921,14 @@ func selectInitialMatchCandidate(hints *MatchHints, candidates []MatchCandidate,
 			// Bounded to ±2 years so same-title remakes decades apart still require
 			// a year or multi-source match. Uses the same normalizer as title scoring
 			// so "exact" here means a perfect title-similarity component.
+			titleSimilarity, _ := bestCandidateTitleSimilarity(hints.Title, best.candidate, hints.Year)
 			titleCorroborated := hints.Year != 0 && best.candidate.Year != 0 &&
 				absYearDelta(best.candidate.Year, hints.Year) <= 2 &&
-				normalizeTitleForScoring(best.candidate.Title) == normalizeTitleForScoring(hints.Title)
+				titleSimilarity == 1
 			// Year or source-count corroboration is only meaningful when the winning
 			// candidate is at least title-coherent with the scanner hint. Otherwise a
 			// high source/provider score can auto-accept an unrelated same-year result.
-			hintTitleCoherent := inferTitleSimilarity(hints.Title, best.candidate.Title, hints.Year) > 0
+			hintTitleCoherent := titleSimilarity > 0
 			if (hintTitleCoherent && (yearCorroborated || multiSourceCorroborated)) || titleCorroborated {
 				return pickByProviderPriority(topGroup, providerPriority), true
 			}
@@ -670,7 +996,20 @@ func exactTitleYearTypeMatch(hints *MatchHints, candidate MatchCandidate) bool {
 	if !candidateTypeMatchesHint(hints.Type, candidate.ContentType) {
 		return false
 	}
-	return inferTitleSimilarity(hints.Title, candidate.Title, hints.Year) == 1
+	similarity, _ := bestCandidateTitleSimilarity(hints.Title, candidate, hints.Year)
+	return similarity == 1
+}
+
+func candidateToCandidateTitleSimilarity(left, right MatchCandidate, year int) float64 {
+	best := 0.0
+	for _, leftTitle := range candidateTitles(left) {
+		for _, rightTitle := range candidateTitles(right) {
+			if similarity := inferTitleSimilarity(leftTitle, rightTitle, year); similarity > best {
+				best = similarity
+			}
+		}
+	}
+	return best
 }
 
 func candidatePrimaryProvider(candidate MatchCandidate) string {
@@ -710,6 +1049,22 @@ func trustedHintIDsPresent(hints *MatchHints) bool {
 	for _, key := range trustedSearchIDKeys {
 		if trustedIDValue(hints, key) != "" {
 			return true
+		}
+	}
+	return false
+}
+
+func candidatesConflictWithTrustedIDs(hints *MatchHints, candidates []MatchCandidate) bool {
+	if hints == nil {
+		return false
+	}
+	for _, candidate := range candidates {
+		for _, key := range trustedSearchIDKeys {
+			hintValue := strings.TrimSpace(trustedIDValue(hints, key))
+			candidateValue := strings.TrimSpace(candidate.ProviderIDs[key])
+			if hintValue != "" && candidateValue != "" && hintValue != candidateValue {
+				return true
+			}
 		}
 	}
 	return false
@@ -825,7 +1180,60 @@ func normalizeTitleForScoring(title string) string {
 		}
 	}
 
-	return strings.Join(strings.Fields(builder.String()), " ")
+	fields := strings.Fields(builder.String())
+	for i, field := range fields {
+		fields[i] = normalizeNumberWord(field)
+	}
+	return strings.Join(fields, " ")
+}
+
+var normalizedNumberWords = map[string]string{
+	"zero": "0", "zeroth": "0",
+	//nolint:goconst // This is a declarative number/ordinal lookup, not a domain label.
+	"one": "1", "first": "1",
+	"two": "2", "second": "2", //nolint:goconst // Ordinal word mapping, not a reusable domain value.
+	"three": "3", "third": "3",
+	"four": "4", "fourth": "4",
+	"five": "5", "fifth": "5",
+	"six": "6", "sixth": "6",
+	"seven": "7", "seventh": "7",
+	"eight": "8", "eighth": "8",
+	"nine": "9", "ninth": "9",
+	"ten": "10", "tenth": "10",
+	"eleven": "11", "eleventh": "11",
+	"twelve": "12", "twelfth": "12",
+	"thirteen": "13", "thirteenth": "13",
+	"fourteen": "14", "fourteenth": "14",
+	"fifteen": "15", "fifteenth": "15",
+	"sixteen": "16", "sixteenth": "16",
+	"seventeen": "17", "seventeenth": "17",
+	"eighteen": "18", "eighteenth": "18",
+	"nineteen": "19", "nineteenth": "19",
+	"twenty": "20", "twentieth": "20",
+}
+
+func normalizeNumberWord(value string) string {
+	if normalized, ok := normalizedNumberWords[value]; ok {
+		return normalized
+	}
+	for _, suffix := range []string{"st", "nd", "rd", "th"} {
+		if stem, ok := strings.CutSuffix(value, suffix); ok && isASCIIDigits(stem) {
+			return stem
+		}
+	}
+	return value
+}
+
+func isASCIIDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeNumericRune(r rune) (rune, bool) {

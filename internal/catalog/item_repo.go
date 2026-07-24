@@ -1615,13 +1615,26 @@ func (r *ItemRepository) buildFuzzySearchFromParsed(parsed parsedSearchQuery, it
 	// word-boundary extent of the title instead, and at equal thresholds it is
 	// a strict superset of % (the whole string is itself a valid extent). The
 	// same gin_trgm_ops index serves both operators.
-	conditions := []string{"public.normalize_search_text($1) <<% mi.title_normalized"}
+	// The alias arm is a scalar array subquery (InitPlan) for the same reason
+	// as the FTS builder's alias arms: `= ANY(param)` keeps the outer OR a
+	// BitmapOr over the two gin_trgm_ops indexes, where an `IN (subquery)` arm
+	// would force a seq scan evaluating <<% against every media_items row.
+	conditions := []string{`(
+		public.normalize_search_text($1) <<% mi.title_normalized OR
+		mi.content_id = ANY(COALESCE((
+			SELECT array_agg(DISTINCT mia.content_id) FROM media_item_aliases mia
+			WHERE public.normalize_search_text($1) <<% mia.normalized_title
+		), '{}'::text[]))
+	)`}
 	if minSimilarity > 0 {
 		// The floor is whole-title similarity, NOT word similarity: augmenting
 		// a query that already has hits must only admit near-identical titles,
 		// and word similarity rates embedded prefix words far too high (see
 		// fuzzyAugmentSimilarityFloor).
-		conditions = append(conditions, fmt.Sprintf("similarity(public.normalize_search_text($1), mi.title_normalized) >= $%d", argIdx))
+		conditions = append(conditions, fmt.Sprintf(`GREATEST(
+			similarity(public.normalize_search_text($1), mi.title_normalized),
+			COALESCE((SELECT MAX(similarity(public.normalize_search_text($1), mia.normalized_title)) FROM media_item_aliases mia WHERE mia.content_id = mi.content_id), 0)
+		) >= $%d`, argIdx))
 		args = append(args, minSimilarity)
 		argIdx++
 	}
@@ -1650,8 +1663,14 @@ func (r *ItemRepository) buildFuzzySearchFromParsed(parsed parsedSearchQuery, it
 		WITH scored AS (
 			SELECT
 				%s,
-				MAX(strict_word_similarity(public.normalize_search_text($1), mi.title_normalized)) AS fuzzy_rank,
-				MAX(similarity(public.normalize_search_text($1), mi.title_normalized)) AS fuzzy_full_rank
+				MAX(GREATEST(
+					strict_word_similarity(public.normalize_search_text($1), mi.title_normalized),
+					COALESCE((SELECT MAX(strict_word_similarity(public.normalize_search_text($1), mia.normalized_title)) FROM media_item_aliases mia WHERE mia.content_id = mi.content_id), 0)
+				)) AS fuzzy_rank,
+				MAX(GREATEST(
+					similarity(public.normalize_search_text($1), mi.title_normalized),
+					COALESCE((SELECT MAX(similarity(public.normalize_search_text($1), mia.normalized_title)) FROM media_item_aliases mia WHERE mia.content_id = mi.content_id), 0)
+				)) AS fuzzy_full_rank
 			FROM %s
 			%s
 			GROUP BY %s

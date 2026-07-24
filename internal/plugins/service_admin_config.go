@@ -109,12 +109,18 @@ func (s *Service) SetGlobalConfigWithClears(
 		return fmt.Errorf("persist plugin config: concurrent updates did not settle")
 	}
 
+	var stopErr error
 	if s.host != nil {
 		if err := s.host.Stop(installationID); err != nil && !errors.Is(err, pluginhost.ErrClientNotFound) {
-			return fmt.Errorf("reload plugin after config update: %w", err)
+			stopErr = fmt.Errorf("reload plugin after config update: %w", err)
 		}
 	}
-	return nil
+	// Configuration is part of metadata match input identity. Notify hooks
+	// after the old process has been stopped so resolver reloads observe the new
+	// runtime. The durable config changed even when stopping failed, so hooks
+	// still run before returning that error and parked rows are not left asleep.
+	s.OnLifecycleChange(ctx)
+	return stopErr
 }
 
 func validatedSecretClearSet(

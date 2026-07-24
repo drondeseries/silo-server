@@ -613,6 +613,7 @@ type catalogSearchDocument struct {
 	Title         string               `json:"title"`
 	SortTitle     string               `json:"sort_title,omitempty"`
 	OriginalTitle string               `json:"original_title,omitempty"`
+	Aliases       []string             `json:"-"`
 	TitleVariants []string             `json:"title_variants,omitempty"`
 	Year          int                  `json:"year,omitempty"`
 	Overview      string               `json:"overview,omitempty"`
@@ -718,6 +719,7 @@ func mixedCatalogSearchDocumentSQL(mediaPredicate, episodePredicate string, type
 				COALESCE(mi.title, ''),
 				COALESCE(mi.sort_title, ''),
 				COALESCE(mi.original_title, ''),
+				COALESCE(aliases.titles, ARRAY[]::text[]),
 				COALESCE(mi.year, 0),
 				COALESCE(mi.overview, ''),
 				COALESCE(mi.tagline, ''),
@@ -730,6 +732,11 @@ func mixedCatalogSearchDocumentSQL(mediaPredicate, episodePredicate string, type
 				COALESCE(libraries.ids, ARRAY[]::integer[])
 			FROM candidates c
 			JOIN media_items mi ON c.type <> 'episode' AND mi.content_id = c.content_id
+			LEFT JOIN LATERAL (
+				SELECT array_agg(DISTINCT mia.title ORDER BY mia.title) FILTER (WHERE btrim(mia.title) <> '') AS titles
+				FROM media_item_aliases mia
+				WHERE mia.content_id = mi.content_id
+			) aliases ON true
 			LEFT JOIN LATERAL (
 				SELECT array_agg(DISTINCT p.name) FILTER (WHERE p.name IS NOT NULL AND p.name <> '') AS names
 				FROM item_people ip
@@ -748,6 +755,7 @@ func mixedCatalogSearchDocumentSQL(mediaPredicate, episodePredicate string, type
 				COALESCE(NULLIF(BTRIM(e.title), ''), 'Episode ' || e.episode_number::text),
 				COALESCE(NULLIF(BTRIM(e.title), ''), 'Episode ' || e.episode_number::text),
 				''::text,
+				ARRAY[]::text[],
 				COALESCE(EXTRACT(YEAR FROM e.air_date)::integer, 0),
 				COALESCE(e.overview, ''),
 				''::text,
@@ -776,6 +784,7 @@ func scanCatalogSearchDocuments(rows pgx.Rows) ([]catalogSearchDocument, error) 
 			&doc.Title,
 			&doc.SortTitle,
 			&doc.OriginalTitle,
+			&doc.Aliases,
 			&doc.Year,
 			&doc.Overview,
 			&doc.Tagline,
@@ -965,12 +974,16 @@ func countCatalogSearchEligibleDocuments(ctx context.Context, q coverageQuerier,
 }
 
 func catalogSearchTitleVariants(doc catalogSearchDocument) []string {
-	return compactNonEmptyStrings([]string{
+	variants := []string{
 		doc.Title,
 		doc.SortTitle,
 		doc.OriginalTitle,
 		normalizeTitleForComparison(doc.Title),
 		normalizeTitleForComparison(doc.SortTitle),
 		normalizeTitleForComparison(doc.OriginalTitle),
-	})
+	}
+	for _, alias := range doc.Aliases {
+		variants = append(variants, alias, normalizeTitleForComparison(alias))
+	}
+	return compactNonEmptyStrings(variants)
 }

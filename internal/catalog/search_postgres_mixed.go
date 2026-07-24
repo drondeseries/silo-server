@@ -103,7 +103,7 @@ func (r *ItemRepository) buildMixedSearchSQLFromParsed(
 			setweight(to_tsvector('simple', public.normalize_search_text(COALESCE(mi.sort_title, ''))), 'B')
 		)`
 		mediaOverviewVector := `to_tsvector('english', COALESCE(mi.overview, ''))`
-		mediaConditions = append(mediaConditions, searchMatchCondition(mediaTitleVector, mediaOverviewVector))
+		mediaConditions = append(mediaConditions, searchMatchCondition(mediaTitleVector, mediaOverviewVector, mediaSearchAliasMatchArms()...))
 		if len(itemTypes) > 0 {
 			mediaConditions = append(mediaConditions, fmt.Sprintf("mi.type = ANY($%d)", argIdx))
 			args = append(args, mediaTypes)
@@ -157,6 +157,7 @@ func (r *ItemRepository) buildMixedSearchSQLFromParsed(
 	argIdx++
 
 	if includeMediaItems {
+		mediaAliasArms := mediaSearchAliasArms(exactIdx)
 		branches = append(branches, buildMixedSearchCandidateBranch(
 			"mi.content_id", "mi.type", "mi.title", "mi.year",
 			`(
@@ -167,6 +168,7 @@ func (r *ItemRepository) buildMixedSearchSQLFromParsed(
 			`to_tsvector('english', COALESCE(mi.overview, ''))`,
 			[]string{`mi.title_normalized`, `public.normalize_search_text(mi.original_title)`, `public.normalize_search_text(mi.sort_title)`},
 			"media_items mi", mediaConditions, exactIdx, yearIdx, phraseIdx,
+			&mediaAliasArms,
 		))
 	}
 	if includeEpisodes {
@@ -178,6 +180,7 @@ func (r *ItemRepository) buildMixedSearchSQLFromParsed(
 			[]string{episodeNormalizedTitle},
 			"episodes e JOIN media_items si ON si.content_id = e.series_id",
 			episodeConditions, exactIdx, yearIdx, phraseIdx,
+			nil,
 		))
 	}
 
@@ -252,11 +255,73 @@ func splitSearchItemTypes(itemTypes []string) (mediaTypes []string, includeEpiso
 	return mediaTypes, includeEpisodes
 }
 
-func searchMatchCondition(titleVector, overviewVector string) string {
+func searchMatchCondition(titleVector, overviewVector string, extraArms ...string) string {
 	titleQuery := `websearch_to_tsquery('simple', public.normalize_search_text($1))`
 	prefixQuery := `to_tsquery('simple', $2)`
-	return fmt.Sprintf(`((%s) @@ %s OR ($2 <> '' AND (%s) @@ %s) OR (%s) @@ websearch_to_tsquery('english', $1))`,
-		titleVector, titleQuery, titleVector, prefixQuery, overviewVector)
+	arms := []string{
+		fmt.Sprintf(`(%s) @@ %s`, titleVector, titleQuery),
+		fmt.Sprintf(`($2 <> '' AND (%s) @@ %s)`, titleVector, prefixQuery),
+		fmt.Sprintf(`(%s) @@ websearch_to_tsquery('english', $1)`, overviewVector),
+	}
+	arms = append(arms, extraArms...)
+	return "(" + strings.Join(arms, " OR ") + ")"
+}
+
+// mediaSearchAliasMatchArms are the alias arms OR'd into the media branch's
+// match condition. They are scalar array subqueries (InitPlans), NOT `IN
+// (subquery)` arms: an uncorrelated subquery result is a plain parameter, so
+// `content_id = ANY(...)` stays index-served and participates in the BitmapOr
+// with the title/overview GIN arms. An `IN (SELECT ...)` arm inside an OR has
+// no index path and forces a seq scan of media_items that rebuilds every
+// tsvector per row.
+func mediaSearchAliasMatchArms() []string {
+	return []string{
+		`mi.content_id = ANY(COALESCE((
+			SELECT array_agg(DISTINCT mia.content_id) FROM media_item_aliases mia
+			WHERE to_tsvector('simple', mia.normalized_title) @@ websearch_to_tsquery('simple', public.normalize_search_text($1))
+		), '{}'::text[]))`,
+		`($2 <> '' AND mi.content_id = ANY(COALESCE((
+			SELECT array_agg(DISTINCT mia.content_id) FROM media_item_aliases mia
+			WHERE to_tsvector('simple', mia.normalized_title) @@ to_tsquery('simple', $2)
+		), '{}'::text[])))`,
+	}
+}
+
+// mixedSearchAliasArms carries the media branch's provider-alias extensions to
+// the per-branch ranking SELECT. Episodes have no aliases and pass nil.
+type mixedSearchAliasArms struct {
+	exactArm      string // OR'd into exact_title_match
+	contiguousArm string // OR'd into contiguous_title_match
+	titleRank     string // GREATEST'd with title_rank
+	prefixRank    string // GREATEST'd with title_prefix_rank
+}
+
+// mediaSearchAliasArms builds the alias ranking arms for the media branch.
+// The correlated rank subqueries run per matched row only (content_id
+// lookups), and setweight(..., 'A') makes an alias hit rank like a real title
+// hit — an unweighted tsvector defaults to weight D (0.1), which buried exact
+// alias matches ~10x below partial real-title matches. The WHERE arms above
+// stay unweighted to keep matching idx_media_item_aliases_search_vector's
+// indexed expression.
+func mediaSearchAliasArms(exactIdx int) mixedSearchAliasArms {
+	return mixedSearchAliasArms{
+		exactArm: fmt.Sprintf(`mi.content_id IN (
+			SELECT mia.content_id FROM media_item_aliases mia
+			WHERE mia.normalized_title = $%d
+		)`, exactIdx),
+		contiguousArm: fmt.Sprintf(`mi.content_id IN (
+			SELECT mia.content_id FROM media_item_aliases mia
+			WHERE mia.normalized_title LIKE '%%' || $%d || '%%'
+		)`, exactIdx),
+		titleRank: `COALESCE((
+			SELECT MAX(ts_rank_cd(setweight(to_tsvector('simple', mia.normalized_title), 'A'), websearch_to_tsquery('simple', public.normalize_search_text($1))))
+			FROM media_item_aliases mia WHERE mia.content_id = mi.content_id
+		), 0)`,
+		prefixRank: `COALESCE((
+			SELECT MAX(ts_rank_cd(setweight(to_tsvector('simple', mia.normalized_title), 'A'), to_tsquery('simple', $2)))
+			FROM media_item_aliases mia WHERE mia.content_id = mi.content_id
+		), 0)`,
+	}
 }
 
 func buildMixedSearchCandidateBranch(
@@ -265,15 +330,27 @@ func buildMixedSearchCandidateBranch(
 	fromClause string,
 	conditions []string,
 	exactIdx, yearIdx, phraseIdx int,
+	aliasArms *mixedSearchAliasArms,
 ) string {
-	exactArms := make([]string, 0, len(exactTitleExprs))
-	contiguousArms := make([]string, 0, len(exactTitleExprs))
+	exactArms := make([]string, 0, len(exactTitleExprs)+1)
+	contiguousArms := make([]string, 0, len(exactTitleExprs)+1)
 	for _, expr := range exactTitleExprs {
 		exactArms = append(exactArms, fmt.Sprintf("%s = $%d", expr, exactIdx))
 		contiguousArms = append(contiguousArms, fmt.Sprintf("%s LIKE '%%' || $%d || '%%'", expr, exactIdx))
 	}
 	titleQuery := `websearch_to_tsquery('simple', public.normalize_search_text($1))`
 	prefixQuery := `to_tsquery('simple', $2)`
+	titleRankExpr := fmt.Sprintf("ts_rank_cd(%s, %s)", titleVector, titleQuery)
+	prefixRankExpr := fmt.Sprintf("ts_rank_cd(%s, %s)", titleVector, prefixQuery)
+	if aliasArms != nil {
+		// Alias exact/contiguous arms are hashed subplans in the CASE select
+		// list (evaluated per grouped row, hash built once); the rank arms are
+		// per-row correlated content_id lookups over the matched set only.
+		exactArms = append(exactArms, aliasArms.exactArm)
+		contiguousArms = append(contiguousArms, aliasArms.contiguousArm)
+		titleRankExpr = fmt.Sprintf("GREATEST(%s, %s)", titleRankExpr, aliasArms.titleRank)
+		prefixRankExpr = fmt.Sprintf("GREATEST(%s, %s)", prefixRankExpr, aliasArms.prefixRank)
+	}
 	return fmt.Sprintf(`
 		SELECT
 			%s AS content_id,
@@ -282,8 +359,8 @@ func buildMixedSearchCandidateBranch(
 			CASE WHEN $%d <> '' AND (%s) THEN 1 ELSE 0 END AS exact_title_match,
 			CASE WHEN $%d <> '' AND (%s) THEN 1 ELSE 0 END AS contiguous_title_match,
 			CASE WHEN $%d::int IS NOT NULL AND (%s) = $%d::int THEN 1 ELSE 0 END AS year_match,
-			ts_rank_cd(%s, %s) AS title_rank,
-			CASE WHEN $2 <> '' THEN ts_rank_cd(%s, %s) ELSE 0 END AS title_prefix_rank,
+			%s AS title_rank,
+			CASE WHEN $2 <> '' THEN %s ELSE 0 END AS title_prefix_rank,
 			ts_rank_cd(%s, websearch_to_tsquery('english', $1)) AS overview_rank,
 			CASE WHEN $%d <> '' THEN ts_rank_cd(%s, phraseto_tsquery('simple', public.normalize_search_text($%d))) ELSE 0 END AS phrase_rank
 		FROM %s
@@ -292,8 +369,8 @@ func buildMixedSearchCandidateBranch(
 		exactIdx, strings.Join(exactArms, " OR "),
 		exactIdx, strings.Join(contiguousArms, " OR "),
 		yearIdx, yearExpr, yearIdx,
-		titleVector, titleQuery,
-		titleVector, prefixQuery,
+		titleRankExpr,
+		prefixRankExpr,
 		overviewVector,
 		phraseIdx, titleVector, phraseIdx,
 		fromClause, strings.Join(conditions, " AND "))

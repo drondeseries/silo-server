@@ -2198,6 +2198,50 @@ func (r *FileRepository) CountUnmatchedMatchBacklogByFolder(ctx context.Context,
 	return total, nil
 }
 
+// CountUnmatchedMatchBacklogByFolders counts raw matcher work for multiple
+// libraries in one query. Libraries without eligible files are omitted.
+func (r *FileRepository) CountUnmatchedMatchBacklogByFolders(ctx context.Context, folderIDs []int, mode RawMatchBacklogMode) (map[int]int, error) {
+	counts := make(map[int]int, len(folderIDs))
+	if len(folderIDs) == 0 {
+		return counts, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT mf.media_folder_id, COUNT(*)
+		FROM media_files mf
+		JOIN media_folders folders ON folders.id = mf.media_folder_id
+		WHERE mf.media_folder_id = ANY($1)
+		  AND (mf.content_id IS NULL OR mf.content_id = '') AND mf.extra_id IS NULL
+		  AND mf.missing_since IS NULL
+		  AND mf.match_suppressed_at IS NULL
+		  AND folders.enabled = true
+		  AND (
+			$2 = 'generic'
+			OR ($2 = 'non_series' AND lower(trim(folders.type)) NOT IN ('series', 'tv', 'show', 'tvshows'))
+			OR (
+				$2 = 'mixed'
+				AND lower(trim(folders.type)) NOT IN ('series', 'tv', 'show', 'tvshows', 'movie', 'movies')
+				AND lower(trim(COALESCE(mf.base_type, ''))) NOT IN ('series', 'movie')
+			)
+		  )
+		GROUP BY mf.media_folder_id
+	`, folderIDs, string(normalizeRawMatchBacklogMode(mode)))
+	if err != nil {
+		return nil, fmt.Errorf("counting unmatched match backlog by folders: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var folderID, count int
+		if err := rows.Scan(&folderID, &count); err != nil {
+			return nil, fmt.Errorf("scanning unmatched match backlog counts: %w", err)
+		}
+		counts[folderID] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating unmatched match backlog counts: %w", err)
+	}
+	return counts, nil
+}
+
 // ListUnmatchedMatchBacklogByFolder lists raw unmatched files that are still
 // eligible for the background matcher.
 func (r *FileRepository) ListUnmatchedMatchBacklogByFolder(ctx context.Context, folderID int, mode RawMatchBacklogMode, limit int, offset int) ([]*models.MediaFile, int, error) {

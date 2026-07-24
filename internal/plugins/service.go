@@ -104,7 +104,7 @@ type Service struct {
 func (s *Service) SetEventDispatcher(d *EventDispatcher) { s.dispatcher = d }
 
 // AddLifecycleHook registers a callback invoked after plugin install, enable,
-// disable, uninstall, or preload lifecycle changes.
+// disable, uninstall, preload, or runtime-configuration changes.
 func (s *Service) AddLifecycleHook(hook func(context.Context)) {
 	if s == nil || hook == nil {
 		return

@@ -463,7 +463,7 @@ func TestItemRepo_Search_FTSQueryHasNoFuzzyArm(t *testing.T) {
 }
 
 // TestItemRepo_BuildFuzzySearchSQL asserts that the fuzzy fallback query scores
-// only on the indexed title_normalized column (no title tsvector rebuild),
+// only on indexed normalized title/alias columns (no title tsvector rebuild),
 // matches via strict word similarity so long titles stay reachable, ranks by
 // descending word similarity with whole-title closeness as tie-break, excludes
 // already-seen content_ids, and applies the same scope filters (type, manga
@@ -477,11 +477,14 @@ func TestItemRepo_BuildFuzzySearchSQL(t *testing.T) {
 	if !strings.Contains(dataSQL, "public.normalize_search_text($1) <<% mi.title_normalized") {
 		t.Fatalf("expected strict-word-similarity arm against title_normalized; got:\n%s", dataSQL)
 	}
-	if !strings.Contains(dataSQL, "MAX(strict_word_similarity(public.normalize_search_text($1), mi.title_normalized)) AS fuzzy_rank") {
+	if !strings.Contains(dataSQL, "strict_word_similarity(public.normalize_search_text($1), mi.title_normalized)") || !strings.Contains(dataSQL, "AS fuzzy_rank") {
 		t.Fatalf("expected strict word similarity ranking on title_normalized; got:\n%s", dataSQL)
 	}
-	if !strings.Contains(dataSQL, "MAX(similarity(public.normalize_search_text($1), mi.title_normalized)) AS fuzzy_full_rank") {
+	if !strings.Contains(dataSQL, "similarity(public.normalize_search_text($1), mi.title_normalized)") || !strings.Contains(dataSQL, "AS fuzzy_full_rank") {
 		t.Fatalf("expected whole-title similarity tie-break rank; got:\n%s", dataSQL)
+	}
+	if !strings.Contains(dataSQL, "<<% mia.normalized_title") {
+		t.Fatalf("expected alias trigram candidates; got:\n%s", dataSQL)
 	}
 	// The whole point of the separate query: it must never rebuild the title
 	// tsvectors that made the fused query slow.
@@ -539,7 +542,7 @@ func TestItemRepo_BuildFuzzySearchSQL_SimilarityFloor(t *testing.T) {
 	// Whole-title similarity, not word similarity: the augment floor must not
 	// admit embedded prefix words ("coral" scores 0.5 word-similarity to
 	// "coraline").
-	if !strings.Contains(floorSQL, "AND similarity(public.normalize_search_text($1), mi.title_normalized) >= $2") {
+	if !strings.Contains(floorSQL, ") >= $2") || !strings.Contains(floorSQL, "mia.normalized_title") {
 		t.Fatalf("expected explicit whole-title similarity floor predicate as $2; got:\n%s", floorSQL)
 	}
 	if len(floorArgs) < 2 || floorArgs[1] != fuzzyAugmentSimilarityFloor {
@@ -551,7 +554,7 @@ func TestItemRepo_BuildFuzzySearchSQL_SimilarityFloor(t *testing.T) {
 	}
 
 	baseSQL, _, baseArgs := repo.buildFuzzySearchSQL("avegners", []string{"movie"}, 20, 0, AccessFilter{}, true, nil, 0)
-	if strings.Contains(baseSQL, "AND similarity(public.normalize_search_text($1), mi.title_normalized) >= $2") {
+	if strings.Contains(baseSQL, ") >= $2") {
 		t.Fatalf("zero floor must not add a similarity predicate; got:\n%s", baseSQL)
 	}
 	if len(baseArgs) != len(floorArgs)-1 {

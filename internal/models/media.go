@@ -428,6 +428,15 @@ type MediaItem struct {
 	AddedAt                      *time.Time // populated by browse queries (MIN(mil.first_seen_at))
 }
 
+// MediaItemAlias is a provider-confirmed searchable title for a media item.
+type MediaItemAlias struct {
+	ContentID string
+	Title     string
+	Language  string
+	Kind      string
+	Provider  string
+}
+
 // Season represents a row in the seasons table.
 type Season struct {
 	ContentID               string
