@@ -331,6 +331,7 @@ describe("EpisodeContent", () => {
         resolution: "2160p",
         videoRangeLabel: "HDR",
         audioLabel: "EAC3",
+        variantLabel: "",
       },
     });
 
@@ -348,6 +349,7 @@ describe("EpisodeContent", () => {
         resolution: "1080p",
         videoRangeLabel: "",
         audioLabel: "AAC",
+        variantLabel: "",
       },
     });
   });

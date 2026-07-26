@@ -7,6 +7,7 @@ export interface SelectedMediaSummary {
   resolution: string;
   videoRangeLabel: string;
   audioLabel: string;
+  variantLabel: string;
 }
 
 export function resolveSelectedMediaSummary(
@@ -34,5 +35,6 @@ export function resolveSelectedMediaSummary(
     resolution: quality?.resolution ?? "",
     videoRangeLabel: selectedVersion ? videoRangeLabel(selectedVersion) : "",
     audioLabel: quality?.audioLabel ?? "",
+    variantLabel: selectedVersion?.edition_raw ?? "",
   };
 }

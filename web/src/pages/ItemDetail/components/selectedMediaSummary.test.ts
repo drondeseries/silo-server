@@ -47,6 +47,7 @@ describe("resolveSelectedMediaSummary", () => {
       resolution: "1080p",
       videoRangeLabel: "",
       audioLabel: "DTS",
+      variantLabel: "",
     });
   });
 
@@ -96,6 +97,7 @@ describe("resolveSelectedMediaSummary", () => {
       resolution: "",
       videoRangeLabel: "",
       audioLabel: "",
+      variantLabel: "",
     });
   });
 });

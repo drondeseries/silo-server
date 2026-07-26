@@ -282,6 +282,7 @@ describe("MovieContent", () => {
         resolution: "2160p",
         videoRangeLabel: "HDR",
         audioLabel: "EAC3",
+        variantLabel: "",
       },
     });
 
@@ -299,6 +300,7 @@ describe("MovieContent", () => {
         resolution: "1080p",
         videoRangeLabel: "",
         audioLabel: "DTS",
+        variantLabel: "",
       },
     });
   });
