@@ -40,13 +40,6 @@ export default function Home() {
   const [completedIds, setCompletedIds] = useState<Set<string>>(new Set());
   const activeSectionIdsRef = useRef<Set<string>>(new Set());
 
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      queryClient.setQueryData<number>(sectionKeys.homeRefreshSignal(), (value = 0) => value + 1);
-    }, 60_000);
-    return () => window.clearInterval(timer);
-  }, [queryClient]);
-
   useDocumentTitle("Home");
 
   const layout = useMemo(() => data?.sections ?? [], [data?.sections]);
@@ -101,7 +94,6 @@ export default function Home() {
           queryKey: sectionKeys.homeItems(sectionId),
           queryFn: ({ signal }) => fetchHomeSectionItems(sectionId, { signal }),
           staleTime: SECTION_STALE_TIME,
-          refetchInterval: 60_000,
         })
         .then((response) => {
           if (!activeSectionIdsRef.current.has(sectionId)) return;

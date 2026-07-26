@@ -27,6 +27,7 @@ import type {
   RequestUserLimit,
 } from "@/api/types";
 import { adminKeys, requestKeys } from "./keys";
+import { invalidateMediaSurfaceQueries } from "./mediaSurfaceRefresh";
 
 const REQUESTS_STALE_TIME = 30_000;
 const DISCOVER_BRAND_STALE_TIME = 24 * 60 * 60 * 1000;
@@ -67,6 +68,7 @@ function invalidateRequestSurfaces(queryClient: ReturnType<typeof useQueryClient
   // viewer-scoped search results when request eligibility changes.
   queryClient.invalidateQueries({ queryKey: requestKeys.all });
   queryClient.invalidateQueries({ queryKey: adminKeys.requestsRoot() });
+  void invalidateMediaSurfaceQueries(queryClient);
 }
 
 export function useRequestDiscovery() {

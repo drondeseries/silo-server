@@ -1,5 +1,5 @@
 import type { QueryClient } from "@tanstack/react-query";
-import { catalogKeys, collectionKeys, libraryCollectionKeys } from "./keys";
+import { catalogKeys, collectionKeys, libraryCollectionKeys, sectionKeys } from "./keys";
 
 export async function invalidateUserCollectionQueries(
   queryClient: QueryClient,
@@ -18,6 +18,7 @@ export async function invalidateLibraryCollectionQueries(queryClient: QueryClien
   await Promise.all([
     queryClient.invalidateQueries({ queryKey: libraryCollectionKeys.all }),
     queryClient.invalidateQueries({ queryKey: catalogKeys.all }),
+    queryClient.invalidateQueries({ queryKey: sectionKeys.all }),
   ]);
 }
 
