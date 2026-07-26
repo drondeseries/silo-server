@@ -101,6 +101,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GHCR_PAT }}
 
+      - name: Set UTC build timestamp
+        run: echo "BUILD_TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_ENV"
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -173,6 +176,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=raw,value=feat-virtual-playback,enable=${{ github.ref == 'refs/heads/feat/virtual-library-minimal' }}
+            type=raw,value=feat-virtual-playback-${{ env.BUILD_TIMESTAMP }},enable=${{ github.ref == 'refs/heads/feat/virtual-library-minimal' }}
             type=sha,prefix=,format=short
 
       - name: Create and push manifest list
