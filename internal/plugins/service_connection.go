@@ -41,9 +41,32 @@ var runPluginConnectionCheck = func(
 	client pluginClient,
 	manifest *pluginv1.PluginManifest,
 ) error {
-	capabilityID, err := metadataProviderConnectionCheckCapabilityID(manifest)
+	capabilityType, capabilityID, err := connectionCheckCapability(manifest)
 	if err != nil {
 		return err
+	}
+	if capabilityType == "request_router.v1" {
+		routerClient, err := client.RequestRouter(capabilityID)
+		if err != nil {
+			return &ConnectionTestError{Message: fmt.Sprintf("Failed to initialize the request router: %v", err), Cause: err}
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		result, err := routerClient.TestConnection(probeCtx, &pluginv1.TestConnectionRequest{
+			CapabilityId: capabilityID,
+			Connection:   &pluginv1.RouterConnection{},
+		})
+		if err != nil {
+			return &ConnectionTestError{Message: fmt.Sprintf("Connection check failed: %v", err), Cause: err}
+		}
+		if result == nil || !result.GetOk() {
+			message := "Connection check failed"
+			if result != nil && result.GetMessage() != "" {
+				message = result.GetMessage()
+			}
+			return &ConnectionTestError{Message: message}
+		}
+		return nil
 	}
 	capability := metadataProviderConnectionCheckCapability(manifest, capabilityID)
 	if !metadataProviderSupportsConnectionProbe(capability, "movie") {
@@ -143,7 +166,7 @@ func (s *Service) TestGlobalConfigWithClears(
 			Cause:   err,
 		}
 	}
-	if _, err := metadataProviderConnectionCheckCapabilityID(manifest); err != nil {
+	if _, _, err := connectionCheckCapability(manifest); err != nil {
 		return err
 	}
 
@@ -264,6 +287,18 @@ func metadataProviderConnectionCheckCapabilityID(manifest *pluginv1.PluginManife
 		return capability.GetId(), nil
 	}
 	return "", &ConnectionTestError{
+		Message: "Connection checks are not supported for this plugin yet.",
+		Cause:   ErrConnectionTestUnsupported,
+	}
+}
+
+func connectionCheckCapability(manifest *pluginv1.PluginManifest) (string, string, error) {
+	for _, capability := range manifest.GetCapabilities() {
+		if capability.GetType() == "metadata_provider.v1" || capability.GetType() == "request_router.v1" {
+			return capability.GetType(), capability.GetId(), nil
+		}
+	}
+	return "", "", &ConnectionTestError{
 		Message: "Connection checks are not supported for this plugin yet.",
 		Cause:   ErrConnectionTestUnsupported,
 	}

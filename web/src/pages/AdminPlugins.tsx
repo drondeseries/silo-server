@@ -517,7 +517,7 @@ function ConfigureDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Blocks className="h-5 w-5" />
-            {installation.plugin_id}
+            {pluginDisplayName(installation.plugin_id, installation.presentation)}
             <Badge variant="secondary" className="font-mono text-[11px]">
               {installation.version}
             </Badge>

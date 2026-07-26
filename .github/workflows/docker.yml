@@ -102,7 +102,8 @@ jobs:
           password: ${{ secrets.GHCR_PAT }}
 
       - name: Set UTC build timestamp
-        run: echo "BUILD_TIMESTAMP=$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_ENV"
+        id: timestamp
+        run: echo "value=$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata
         id: meta
@@ -176,7 +177,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=raw,value=feat-virtual-playback,enable=${{ github.ref == 'refs/heads/feat/virtual-library-minimal' }}
-            type=raw,value=feat-virtual-playback-${{ env.BUILD_TIMESTAMP }},enable=${{ github.ref == 'refs/heads/feat/virtual-library-minimal' }}
+            type=raw,value=feat-virtual-playback-${{ steps.timestamp.outputs.value }},enable=${{ github.ref == 'refs/heads/feat/virtual-library-minimal' }}
             type=sha,prefix=,format=short
 
       - name: Create and push manifest list
