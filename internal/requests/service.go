@@ -698,6 +698,16 @@ func (s *Service) Retry(ctx context.Context, viewer Viewer, id string) (*Request
 	if err != nil {
 		return nil, err
 	}
+	// Recover requests left approved/active by older fulfillment error paths.
+	// Approved requests with healthy targets are idempotent; only requests that
+	// reached this action explicitly are transitioned into the normal retry flow.
+	if req.Outcome == OutcomeActive && req.Status == StatusApproved {
+		failed, markErr := s.store.SetOutcome(ctx, req.ID, OutcomeFailed, viewer, "recovered stuck approved request")
+		if markErr != nil {
+			return nil, markErr
+		}
+		req = failed
+	}
 	if req.Outcome != OutcomeFailed {
 		return nil, ErrInvalidState
 	}
