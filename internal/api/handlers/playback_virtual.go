@@ -40,6 +40,10 @@ func (h *PlaybackHandler) startVirtualPlaybackV3(r *http.Request, req playback.S
 	ctx := playback.WithClientInfo(r.Context(), playbackClientInfoFromRequest(r))
 	probe, _ := probeVirtualStream(ctx, h.playbackConfig().FFmpegPath, streamURL)
 	audioTranscode := virtualAudioNeedsTranscode(req, probe.AudioCodec) && h.playbackConfig().FFmpegPath != ""
+	containerAdapt := virtualContainerNeedsAdaptation(req, probe.Container)
+	if containerAdapt && h.playbackConfig().FFmpegPath != "" {
+		audioTranscode = true
+	}
 	toneMapHDR := probe.HDR && !virtualClientSupportsHDR(req) && h.playbackConfig().FFmpegPath != ""
 	adaptVirtual := audioTranscode || toneMapHDR
 	var session *playback.Session
@@ -198,4 +202,18 @@ func virtualClientSupportsHDR(req playback.StartRequestV3) bool {
 		hdr = req.ClientPlaybackContext.Output.HDRDetails
 	}
 	return hdr != nil && (hdr.HDR10 || hdr.HDR10Plus || len(hdr.DolbyVisionProfiles) > 0)
+}
+
+func virtualContainerNeedsAdaptation(req playback.StartRequestV3, container string) bool {
+	container = strings.ToLower(strings.TrimSpace(container))
+	if container == "" {
+		return true
+	}
+	for _, supported := range req.Capabilities.Containers {
+		supported = strings.ToLower(strings.TrimSpace(supported))
+		if strings.Contains(container, supported) || (supported == "mp4" && strings.Contains(container, "mov")) {
+			return false
+		}
+	}
+	return true
 }

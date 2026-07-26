@@ -13,6 +13,7 @@ import (
 type virtualProbeResult struct {
 	VideoCodec string
 	AudioCodec string
+	Container  string
 	HDR        bool
 }
 
@@ -38,7 +39,7 @@ func probeVirtualStream(ctx context.Context, ffmpegPath, streamURL string) (virt
 	ffprobe := filepath.Join(filepath.Dir(ffmpegPath), "ffprobe")
 	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(probeCtx, ffprobe, "-v", "error", "-analyzeduration", "3000000", "-probesize", "5000000", "-show_entries", "stream=codec_type,codec_name,color_transfer,color_primaries", "-of", "json", streamURL)
+	cmd := exec.CommandContext(probeCtx, ffprobe, "-v", "error", "-analyzeduration", "3000000", "-probesize", "5000000", "-show_entries", "stream=codec_type,codec_name,color_transfer,color_primaries:format=format_name", "-of", "json", streamURL)
 	out, err := cmd.Output()
 	if err != nil {
 		virtualProbeCache.Lock()
@@ -53,11 +54,15 @@ func probeVirtualStream(ctx context.Context, ffmpegPath, streamURL string) (virt
 			Transfer  string `json:"color_transfer"`
 			Primaries string `json:"color_primaries"`
 		} `json:"streams"`
+		Format struct {
+			Name string `json:"format_name"`
+		} `json:"format"`
 	}
 	if err := json.Unmarshal(out, &payload); err != nil {
 		return virtualProbeResult{}, err
 	}
 	result := virtualProbeResult{}
+	result.Container = strings.ToLower(payload.Format.Name)
 	for _, stream := range payload.Streams {
 		switch stream.Type {
 		case "video":
