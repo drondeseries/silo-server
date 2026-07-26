@@ -3777,8 +3777,12 @@ func (h *LibraryCollectionHandler) PurgeVirtualPlaybackItems(w http.ResponseWrit
 		return
 	}
 	dryRun := strings.EqualFold(strings.TrimSpace(query.Get("dry_run")), "true") || query.Get("dry_run") == "1"
+	includeLegacy := true
+	if value := strings.TrimSpace(query.Get("include_legacy")); value != "" {
+		includeLegacy = strings.EqualFold(value, "true") || value == "1"
+	}
 	filesDeleted, itemsDeleted, err := h.itemRepo.PurgeVirtualPlaybackItems(r.Context(), catalog.VirtualPurgeOptions{
-		DryRun: dryRun, LibraryID: libraryID, InstallationID: installationID,
+		DryRun: dryRun, LibraryID: libraryID, InstallationID: installationID, IncludeLegacy: includeLegacy,
 	})
 	if err != nil {
 		slog.ErrorContext(r.Context(), "failed to purge virtual playback items", "component", "api", "error", err)
@@ -3790,7 +3794,7 @@ func (h *LibraryCollectionHandler) PurgeVirtualPlaybackItems(w http.ResponseWrit
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"success": true, "dry_run": dryRun, "files_deleted": filesDeleted, "items_deleted": itemsDeleted,
+		"success": true, "dry_run": dryRun, "include_legacy": includeLegacy, "files_deleted": filesDeleted, "items_deleted": itemsDeleted,
 		"message": fmt.Sprintf("%s %d virtual files and %d virtual media items", map[bool]string{true: "Would purge", false: "Purged"}[dryRun], filesDeleted, itemsDeleted),
 	})
 }

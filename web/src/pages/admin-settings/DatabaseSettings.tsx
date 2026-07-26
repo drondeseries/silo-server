@@ -4,6 +4,8 @@ import { ConnectionCheckAction } from "@/components/admin/ConnectionCheckAction"
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { usePurgeVirtualPlaybackItems } from "@/hooks/queries/admin/collections";
+import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
+import { useAdminPluginInstallations } from "@/hooks/queries/admin/plugins";
 import { useCheckAdminSettingsConnection } from "@/hooks/queries/admin/settings";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 import { SettingField } from "./SettingField";
@@ -24,7 +26,14 @@ export default function DatabaseSettings() {
   const form = useSettingsForm({ keys: useMemo(() => KEYS, []) });
   const checkConnection = useCheckAdminSettingsConnection();
   const purgeVirtual = usePurgeVirtualPlaybackItems();
+  const { data: libraries = [] } = useAdminLibraries();
+  const { data: installations = [] } = useAdminPluginInstallations();
   const [connectionResult, setConnectionResult] = useState<ConnectionCheckResponse | null>(null);
+  const [purgePreviewPending, setPurgePreviewPending] = useState(false);
+  const [purgeLibraryId, setPurgeLibraryId] = useState("0");
+  const [purgeInstallationId, setPurgeInstallationId] = useState("0");
+  const [purgeIncludeLegacy, setPurgeIncludeLegacy] = useState(true);
+  const [purgeResult, setPurgeResult] = useState<string | null>(null);
   const redisUrl = form.getValue("redis.url");
   const redisManagedByEnv = form.sensitiveManagedByEnv.includes("redis.url");
   const redisConfigured = redisUrl.trim() !== "" || form.sensitiveConfigured.includes("redis.url");
@@ -166,19 +175,71 @@ export default function DatabaseSettings() {
               Remove all zero-storage virtual files and their orphaned catalog items.
             </p>
           </div>
+          <div className="flex min-w-72 flex-col gap-2">
+            <SettingField
+              label="Library scope"
+              type="select"
+              options={[{ value: "0", label: "All libraries" }, ...libraries.map((library) => ({ value: String(library.id), label: library.name }))]}
+              value={purgeLibraryId}
+              onChange={setPurgeLibraryId}
+            />
+            <SettingField
+              label="Plugin scope"
+              type="select"
+              options={[{ value: "0", label: "All plugins" }, ...installations.map((installation) => ({ value: String(installation.id), label: installation.presentation?.display_name || installation.plugin_id }))]}
+              value={purgeInstallationId}
+              onChange={setPurgeInstallationId}
+            />
+            <SettingField
+              label="Include legacy aiostreams paths"
+              type="toggle"
+              value={purgeIncludeLegacy ? "true" : "false"}
+              onChange={(value) => setPurgeIncludeLegacy(value === "true")}
+            />
+          </div>
+          <div className="flex flex-col items-end gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={purgeVirtual.isPending || purgePreviewPending}
+            onClick={() => {
+              setPurgePreviewPending(true);
+              purgeVirtual.mutate(
+                {
+                  dryRun: true,
+                  libraryId: Number(purgeLibraryId) || undefined,
+                  installationId: Number(purgeInstallationId) || undefined,
+                  includeLegacy: purgeIncludeLegacy,
+                },
+                {
+                  onSuccess: (result) => setPurgeResult(result.message),
+                  onSettled: () => setPurgePreviewPending(false),
+                },
+              );
+            }}
+          >
+            {purgePreviewPending ? "Checking..." : "Preview Purge"}
+          </Button>
           <Button
             type="button"
             variant="destructive"
             size="sm"
-            disabled={purgeVirtual.isPending}
+            disabled={purgeVirtual.isPending || purgePreviewPending}
             onClick={() => {
               if (window.confirm("Purge all zero-storage virtual library items?")) {
-                purgeVirtual.mutate({});
+                purgeVirtual.mutate({
+                  libraryId: Number(purgeLibraryId) || undefined,
+                  installationId: Number(purgeInstallationId) || undefined,
+                  includeLegacy: purgeIncludeLegacy,
+                }, { onSuccess: (result) => setPurgeResult(result.message) });
               }
             }}
           >
             {purgeVirtual.isPending ? "Purging..." : "Purge Virtual Items"}
           </Button>
+          {purgeResult && <span className="text-muted-foreground text-xs">{purgeResult}</span>}
+          </div>
         </div>
       </FieldGroup>
 

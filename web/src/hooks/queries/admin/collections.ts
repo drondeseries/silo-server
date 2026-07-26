@@ -594,12 +594,25 @@ export function usePurgeVirtualPlaybackItems() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (options?: { dryRun?: boolean; libraryId?: number; installationId?: number }) =>
-      api<{ success: boolean; files_deleted: number; items_deleted: number; message: string }>(
+    mutationFn: (options?: {
+      dryRun?: boolean;
+      libraryId?: number;
+      installationId?: number;
+      includeLegacy?: boolean;
+    }) =>
+      api<{
+        success: boolean;
+        dry_run: boolean;
+        include_legacy: boolean;
+        files_deleted: number;
+        items_deleted: number;
+        message: string;
+      }>(
         `/admin/collections/purge-virtual?${new URLSearchParams({
           ...(options?.dryRun ? { dry_run: "true" } : {}),
           ...(options?.libraryId ? { library_id: String(options.libraryId) } : {}),
           ...(options?.installationId ? { installation_id: String(options.installationId) } : {}),
+          ...(options?.includeLegacy === false ? { include_legacy: "false" } : {}),
         })}`,
         { method: "POST" },
       ),
