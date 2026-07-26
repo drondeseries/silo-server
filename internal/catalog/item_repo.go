@@ -786,6 +786,14 @@ func virtualStreamID(item *models.MediaItem) string {
 	if item == nil {
 		return ""
 	}
+	// Series providers resolve episode streams most reliably by TVDB ID.
+	// Keep IMDb as a fallback for titles that have no TVDB mapping; movies
+	// continue to prefer IMDb.
+	if item.Type == "series" {
+		if id := strings.TrimSpace(item.TvdbID); id != "" {
+			return "tvdb:" + id
+		}
+	}
 	if id := strings.TrimSpace(item.ImdbID); id != "" {
 		return id
 	}
