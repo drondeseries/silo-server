@@ -1410,6 +1410,9 @@ export function CollectionEditForm({
   const [title, setTitle] = useState(collection.title ?? "");
   const [description, setDescription] = useState(collection.description ?? "");
   const [featured, setFeatured] = useState(collection.featured ?? false);
+  const [virtualPlayback, setVirtualPlayback] = useState(
+    collection.source_config?.virtual_playback === true,
+  );
   const [visibility, setVisibility] = useState<"visible" | "hidden">(collection.visibility);
   const [posterFile, setPosterFile] = useState<File | null>(null);
   const [backdropFile, setBackdropFile] = useState<File | null>(null);
@@ -1514,6 +1517,10 @@ export function CollectionEditForm({
           ...(parsedTraktLimit ? { limit: parsedTraktLimit } : {}),
         };
       }
+    }
+
+    if (sourceConfig) {
+      sourceConfig = { ...sourceConfig, virtual_playback: virtualPlayback };
     }
 
     const body: CreateLibraryCollectionRequest = {
@@ -1667,6 +1674,8 @@ export function CollectionEditForm({
         ) : null}
 
         <SyncScheduleField value={editSyncSchedule} onChange={setEditSyncSchedule} />
+
+        <VirtualPlaybackSwitch checked={virtualPlayback} onChange={setVirtualPlayback} />
 
         {isTMDBCollection ? (
           <div className="grid gap-4 md:grid-cols-2">
