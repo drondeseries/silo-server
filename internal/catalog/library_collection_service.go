@@ -723,6 +723,9 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 	if err := s.collections.ReplaceItems(ctx, collection.ID, matchedItems); err != nil {
 		return nil, err
 	}
+	if _, err := s.items.ReconcileCollectionVirtualItems(ctx, collection.LibraryIDs); err != nil {
+		return nil, err
+	}
 
 	status := "success"
 	if len(warnings) > 0 {
@@ -887,6 +890,9 @@ func (s *LibraryCollectionService) syncTMDBPresetCollection(ctx context.Context,
 	if err := s.collections.ReplaceItems(ctx, collection.ID, matchedItems); err != nil {
 		return nil, err
 	}
+	if _, err := s.items.ReconcileCollectionVirtualItems(ctx, collection.LibraryIDs); err != nil {
+		return nil, err
+	}
 
 	status := "success"
 	if len(warnings) > 0 {
@@ -1046,6 +1052,9 @@ func (s *LibraryCollectionService) syncTMDBFranchiseCollection(ctx context.Conte
 	)
 
 	if err := s.collections.ReplaceItems(ctx, collection.ID, matchedItems); err != nil {
+		return nil, err
+	}
+	if _, err := s.items.ReconcileCollectionVirtualItems(ctx, collection.LibraryIDs); err != nil {
 		return nil, err
 	}
 
@@ -1223,6 +1232,9 @@ func (s *LibraryCollectionService) syncTMDBDiscoverCollection(ctx context.Contex
 	)
 
 	if err := s.collections.ReplaceItems(ctx, collection.ID, matchedItems); err != nil {
+		return nil, err
+	}
+	if _, err := s.items.ReconcileCollectionVirtualItems(ctx, collection.LibraryIDs); err != nil {
 		return nil, err
 	}
 
@@ -1465,6 +1477,9 @@ func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, c
 	}
 
 	if err := s.collections.ReplaceItems(ctx, collection.ID, matchedItems); err != nil {
+		return nil, err
+	}
+	if _, err := s.items.ReconcileCollectionVirtualItems(ctx, collection.LibraryIDs); err != nil {
 		return nil, err
 	}
 
