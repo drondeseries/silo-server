@@ -32,6 +32,8 @@ export function buildQualitySummary(version: FileVersion): string {
 export function buildDetailLine(version: FileVersion): string {
   const parts: string[] = [];
 
+  if (version.edition_raw) parts.push(version.edition_raw);
+
   const size = formatFileSize(version.file_size);
   if (size) parts.push(size);
 

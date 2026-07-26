@@ -322,8 +322,8 @@ func upsertVirtualFileVariant(ctx context.Context, tx pgx.Tx, contentID, episode
 	_, err := tx.Exec(ctx, `
 		INSERT INTO media_files(
 			content_id,episode_id,media_folder_id,file_path,file_size,container,duration,probe_source,probe_updated_at,
-			resolution,codec_video,codec_audio,hdr,bitrate
-		) VALUES($1,NULLIF($2,''),$3,$4,0,'virtual',NULLIF($5,0),'virtual',now(),NULLIF($6,''),NULLIF($7,''),NULLIF($8,''),$9,NULLIF($10,0))
+			resolution,codec_video,codec_audio,hdr,bitrate,edition_raw
+		) VALUES($1,NULLIF($2,''),$3,$4,0,'virtual',NULLIF($5,0),'virtual',now(),NULLIF($6,''),NULLIF($7,''),NULLIF($8,''),$9,NULLIF($10,0),NULLIF($11,''))
 		ON CONFLICT (file_path) DO UPDATE SET 
 			content_id=EXCLUDED.content_id,
 			episode_id=EXCLUDED.episode_id,
@@ -339,8 +339,9 @@ func upsertVirtualFileVariant(ctx context.Context, tx pgx.Tx, contentID, episode
 			codec_video=EXCLUDED.codec_video,
 			codec_audio=EXCLUDED.codec_audio,
 			hdr=EXCLUDED.hdr,
-			bitrate=EXCLUDED.bitrate`,
-		contentID, episodeID, folderID, v.VirtualURI, runtimeSeconds(v.RuntimeMinutes), v.Resolution, v.CodecVideo, v.CodecAudio, isHDR, v.Bitrate)
+			bitrate=EXCLUDED.bitrate,
+			edition_raw=EXCLUDED.edition_raw`,
+		contentID, episodeID, folderID, v.VirtualURI, runtimeSeconds(v.RuntimeMinutes), v.Resolution, v.CodecVideo, v.CodecAudio, isHDR, v.Bitrate, v.Label)
 	if err != nil {
 		return fmt.Errorf("upsert virtual file variant: %w", err)
 	}
