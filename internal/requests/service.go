@@ -1363,7 +1363,7 @@ func (s *Service) submitApprovedRequest(ctx context.Context, req Request, actor 
 	}
 	conns, installationID, capabilityID, err := s.resolveRouterConnections(ctx, fc, req.MediaType)
 	if err != nil {
-		return nil, err
+		return s.markSubmissionFailed(ctx, req.ID, actor, err)
 	}
 	if len(conns) == 0 {
 		// Distinguish "no backend at all" from the migration breakage where an
@@ -1416,7 +1416,7 @@ func (s *Service) submitApprovedRequest(ctx context.Context, req Request, actor 
 	targets, msg, err := s.router.Fulfill(ctx, installationID, capabilityID, req, want, conns)
 	if err != nil {
 		slog.ErrorContext(ctx, "requests: router fulfill failed", "component", "requests", "request_id", req.ID, "err", err)
-		return nil, err
+		return s.markSubmissionFailed(ctx, req.ID, actor, err)
 	}
 	// Fulfill is allowed to create virtual catalog rows before returning. Flush
 	// shared home-section membership now so Recently Added reflects the change

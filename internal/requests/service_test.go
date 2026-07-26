@@ -2409,6 +2409,23 @@ func TestSubmitApprovedNoRouterFails(t *testing.T) {
 	}
 }
 
+func TestSubmitApprovedRouterErrorMarksRequestFailed(t *testing.T) {
+	store := newFakeStore()
+	store.integrations = []Integration{routerInst("router-1")}
+	svc := newTestService(store)
+	svc.SetRouterProvider(&fakeRouterProvider{fulfillErr: errors.New("plugin unavailable")})
+
+	req := Request{ID: "r1", MediaType: MediaTypeMovie, Status: StatusApproved, Outcome: OutcomeActive, RequestedByUserID: 7}
+	store.requests[req.ID] = &req
+	got, err := svc.submitApprovedRequest(context.Background(), req, Viewer{UserID: 7, IsAdmin: true}, nil)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if got.Outcome != OutcomeFailed || got.LastError != "plugin unavailable" {
+		t.Fatalf("request = %+v, want failed with plugin error", got)
+	}
+}
+
 func TestSubmitApprovedNoConnectionsFails(t *testing.T) {
 	store := newFakeStore() // no integrations
 	svc := newTestService(store)
