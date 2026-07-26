@@ -96,6 +96,7 @@ export function CollectionTemplateConfigForm({
   const [limit, setLimit] = useState(template.default_limit ? String(template.default_limit) : "");
   const [syncSchedule, setSyncSchedule] = useState(template.default_sync_schedule ?? "");
   const [featured, setFeatured] = useState(template.featured ?? true);
+  const [virtualPlayback, setVirtualPlayback] = useState(false);
   const defaultProfileId = template.requires_profile ? (profiles[0]?.id ?? "") : "";
   const [profileId, setProfileId] = useState(defaultProfileId);
   const [mdblistUrl, setMdblistUrl] = useState(template.mdblist?.url ?? "");
@@ -144,6 +145,7 @@ export function CollectionTemplateConfigForm({
       featured,
       sync_schedule: syncSchedule.trim() || undefined,
       limit: parsedLimit,
+      virtual_playback: virtualPlayback,
       ...(posterMode === "custom"
         ? { poster_source_url: customPosterUrl.trim() || undefined }
         : { poster_url: template.poster_path || undefined }),
@@ -330,6 +332,17 @@ export function CollectionTemplateConfigForm({
       </div>
 
       <SyncScheduleField value={syncSchedule} onChange={setSyncSchedule} />
+
+      <div className="border-border flex items-center justify-between rounded-lg border px-4 py-3">
+        <div>
+          <p className="text-sm font-medium">Zero-storage virtual playback</p>
+          <p className="text-muted-foreground text-xs">
+            Create database-only entries for items not already in the selected libraries and resolve
+            them through Silo Virtual Library.
+          </p>
+        </div>
+        <Switch checked={virtualPlayback} onCheckedChange={setVirtualPlayback} />
+      </div>
 
       <div className="border-border flex justify-end gap-2 border-t pt-4">
         <Button type="button" variant="ghost" onClick={onCancel} disabled={isPending}>
