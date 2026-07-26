@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - feat/virtual-playback-upstream
+      - feat/virtual-library-minimal
   workflow_dispatch:
 
 concurrency:
@@ -171,6 +172,7 @@ jobs:
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
+            type=raw,value=feat-virtual-playback,enable=${{ github.ref == 'refs/heads/feat/virtual-library-minimal' }}
             type=sha,prefix=,format=short
 
       - name: Create and push manifest list
