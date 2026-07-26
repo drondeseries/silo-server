@@ -41,18 +41,27 @@ func (h *PlaybackHandler) startVirtualPlaybackV3(r *http.Request, req playback.S
 	probe, _ := probeVirtualStream(ctx, h.playbackConfig().FFmpegPath, streamURL)
 	audioTranscode := virtualAudioNeedsTranscode(req, probe.AudioCodec) && h.playbackConfig().FFmpegPath != ""
 	containerAdapt := virtualContainerNeedsAdaptation(req, probe.Container)
+	// Browsers commonly advertise broad codec support while their actual MSE
+	// pipeline cannot decode E-AC-3, HEVC, or Dolby Vision reliably. Keep those
+	// virtual streams on the server adaptation path instead of handing the
+	// provider URL directly to the browser.
+	browser := virtualBrowserClient(req) || virtualBrowserUserAgent(r.UserAgent())
+	if browser && h.playbackConfig().FFmpegPath != "" {
+		audioTranscode = true
+	}
 	if containerAdapt && h.playbackConfig().FFmpegPath != "" {
 		audioTranscode = true
 	}
 	toneMapHDR := probe.HDR && !virtualClientSupportsHDR(req) && h.playbackConfig().FFmpegPath != ""
-	adaptVirtual := audioTranscode || toneMapHDR
+	videoTranscode := browser && probe.VideoCodec != "" && probe.VideoCodec != "h264" && h.playbackConfig().FFmpegPath != ""
+	adaptVirtual := audioTranscode || toneMapHDR || videoTranscode
 	var session *playback.Session
 	var err error
 	playMethod := playback.PlayDirect
 	if adaptVirtual {
 		playMethod = playback.PlayRemux
 	}
-	if toneMapHDR {
+	if toneMapHDR || videoTranscode {
 		playMethod = playback.PlayTranscode
 	}
 	if starter, ok := h.sessionMgr.(sessionStarterWithFilesContext); ok {
@@ -86,7 +95,7 @@ func (h *PlaybackHandler) startVirtualPlaybackV3(r *http.Request, req playback.S
 		videoCodec := "copy"
 		delivery := playback.DeliveryRemuxHLSV3
 		engine := playback.EngineMedia3HLSV3
-		if toneMapHDR {
+		if toneMapHDR || videoTranscode {
 			videoCodec = "h264"
 			delivery = playback.DeliveryTranscodeHLSV3
 		}
@@ -110,6 +119,9 @@ func (h *PlaybackHandler) startVirtualPlaybackV3(r *http.Request, req playback.S
 		}
 		if toneMapHDR {
 			plan.Transformations = append(plan.Transformations, playback.TransformationV3{Name: "hdr_to_sdr_tonemap", Executor: "server", RecipeVersion: "1", ValidatedClaims: []string{"sdr_output"}})
+		}
+		if videoTranscode && !toneMapHDR {
+			plan.Transformations = append(plan.Transformations, playback.TransformationV3{Name: "video_to_h264", Executor: "server", RecipeVersion: "1", ValidatedClaims: []string{"h264_decode"}})
 		}
 		if toneMapHDR {
 			plan.DecisionReason = "virtual_hdr_tonemap"
@@ -202,6 +214,20 @@ func virtualClientSupportsHDR(req playback.StartRequestV3) bool {
 		hdr = req.ClientPlaybackContext.Output.HDRDetails
 	}
 	return hdr != nil && (hdr.HDR10 || hdr.HDR10Plus || len(hdr.DolbyVisionProfiles) > 0)
+}
+
+func virtualBrowserClient(req playback.StartRequestV3) bool {
+	platform := strings.ToLower(strings.TrimSpace(req.ClientPlaybackContext.Platform))
+	formFactor := strings.ToLower(strings.TrimSpace(req.ClientPlaybackContext.FormFactor))
+	return platform == "web" || platform == "browser" || formFactor == "web" || formFactor == "browser"
+}
+
+func virtualBrowserUserAgent(userAgent string) bool {
+	ua := strings.ToLower(strings.TrimSpace(userAgent))
+	if ua == "" || strings.Contains(ua, "okhttp") || strings.Contains(ua, "android") {
+		return false
+	}
+	return strings.Contains(ua, "mozilla/") || strings.Contains(ua, "chrome/") || strings.Contains(ua, "safari/") || strings.Contains(ua, "firefox/")
 }
 
 func virtualContainerNeedsAdaptation(req playback.StartRequestV3, container string) bool {
