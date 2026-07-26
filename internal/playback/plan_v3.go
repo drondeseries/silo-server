@@ -65,6 +65,7 @@ type PlannerResultV3 struct {
 	TargetAudioChannels         int
 	TargetResolution            string
 	TargetBitrateKbps           int
+	ToneMapHDR                  bool
 	SubtitleTrackIndex          int
 	SubtitleTransportTrackIndex int
 	SubtitleBurnIn              bool

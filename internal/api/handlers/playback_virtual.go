@@ -38,17 +38,23 @@ func (h *PlaybackHandler) startVirtualPlaybackV3(r *http.Request, req playback.S
 	userID := apimw.GetUserID(r.Context())
 	profileID := apimw.GetProfileID(r.Context())
 	ctx := playback.WithClientInfo(r.Context(), playbackClientInfoFromRequest(r))
-	audioTranscode := virtualAudioNeedsTranscode(req) && h.playbackConfig().FFmpegPath != ""
+	probe, _ := probeVirtualStream(ctx, h.playbackConfig().FFmpegPath, streamURL)
+	audioTranscode := virtualAudioNeedsTranscode(req, probe.AudioCodec) && h.playbackConfig().FFmpegPath != ""
+	toneMapHDR := probe.HDR && !virtualClientSupportsHDR(req) && h.playbackConfig().FFmpegPath != ""
+	adaptVirtual := audioTranscode || toneMapHDR
 	var session *playback.Session
 	var err error
 	playMethod := playback.PlayDirect
-	if audioTranscode {
+	if adaptVirtual {
 		playMethod = playback.PlayRemux
 	}
+	if toneMapHDR {
+		playMethod = playback.PlayTranscode
+	}
 	if starter, ok := h.sessionMgr.(sessionStarterWithFilesContext); ok {
-		session, err = starter.StartSessionWithFilesContext(ctx, userID, profileID, file.ID, file.ID, playMethod, audioTranscode)
+		session, err = starter.StartSessionWithFilesContext(ctx, userID, profileID, file.ID, file.ID, playMethod, adaptVirtual)
 	} else {
-		session, err = h.sessionMgr.StartSessionWithFiles(userID, profileID, file.ID, file.ID, playMethod, audioTranscode)
+		session, err = h.sessionMgr.StartSessionWithFiles(userID, profileID, file.ID, file.ID, playMethod, adaptVirtual)
 	}
 	planHash := sha256.Sum256([]byte(req.PlaybackAttemptID + "\x00" + file.FilePath))
 	planID := "virtual:" + hex.EncodeToString(planHash[:8])
@@ -66,32 +72,45 @@ func (h *PlaybackHandler) startVirtualPlaybackV3(r *http.Request, req playback.S
 	// the local HLS transport and convert only the audio to AAC while copying
 	// the video bitstream. This keeps virtual playback compatible with browser
 	// and mobile decoders without forcing a video transcode.
-	if audioTranscode {
+	if adaptVirtual {
 		transportFile := *file
 		transportFile.FilePath = streamURL
 		transportFile.Container = "mkv"
-		transportFile.CodecVideo = "copy"
+		transportFile.CodecVideo = probe.VideoCodec
 		transportFile.Duration = 0
 		audioChannels := 2
+		videoCodec := "copy"
+		delivery := playback.DeliveryRemuxHLSV3
+		engine := playback.EngineMedia3HLSV3
+		if toneMapHDR {
+			videoCodec = "h264"
+			delivery = playback.DeliveryTranscodeHLSV3
+		}
 		plan := playback.PlanV3{
 			ProtocolVersion:      playback.ProtocolV3,
 			PlanID:               planID,
 			SessionID:            session.ID,
 			ExpiresAt:            playback.NewPlanExpiryV3(time.Now()),
-			Delivery:             playback.DeliveryRemuxHLSV3,
-			Engine:               playback.EngineMedia3HLSV3,
+			Delivery:             delivery,
+			Engine:               engine,
 			DecisionReason:       "virtual_audio_transcode",
 			RequestedMediaFileID: file.ID,
 			EffectiveMediaFileID: file.ID,
 			Source:               playback.SourceDescriptorV3{MediaFileID: file.ID},
 			Stream:               playback.StreamV3{Protocol: playback.StreamHLSV3, Container: "hls", MIMEType: "application/vnd.apple.mpegurl", Headers: map[string]string{}, HeaderRefresh: playback.HeaderRefreshSessionV3},
 			Timeline:             playback.TimelineV3{SourceStartSeconds: position, PlayerStartSeconds: position, CanSeekAnywhere: true, SeekRestoration: "player_position"},
-			EffectiveRecipe:      playback.EffectiveRecipeV3{VideoCodec: "copy", AudioCodec: "aac", AudioChannels: &audioChannels, AudioLayout: "stereo"},
+			EffectiveRecipe:      playback.EffectiveRecipeV3{VideoCodec: videoCodec, AudioCodec: "aac", AudioChannels: &audioChannels, AudioLayout: "stereo"},
 			Claims:               playback.ValidationClaimsV3{Audio: playback.AudioClaimsV3{Codec: "aac", Reason: "server_audio_adaptation"}},
 			Transformations:      []playback.TransformationV3{{Name: "audio_to_aac", Executor: "server", RecipeVersion: "1", ValidatedClaims: []string{"media3_audio_decode"}}},
 			RuntimeCorrections:   []string{}, DegradationWarnings: []playback.DegradationWarningV3{}, AppliedQuirks: []playback.AppliedQuirkV3{},
 		}
-		result := playback.PlannerResultV3{Plan: &plan, PlayMethod: playback.PlayRemux, TranscodeAudio: true, TargetVideoCodec: "copy", TargetAudioCodec: "aac", TargetAudioChannels: 2}
+		if toneMapHDR {
+			plan.Transformations = append(plan.Transformations, playback.TransformationV3{Name: "hdr_to_sdr_tonemap", Executor: "server", RecipeVersion: "1", ValidatedClaims: []string{"sdr_output"}})
+		}
+		if toneMapHDR {
+			plan.DecisionReason = "virtual_hdr_tonemap"
+		}
+		result := playback.PlannerResultV3{Plan: &plan, PlayMethod: playMethod, TranscodeAudio: true, TargetVideoCodec: videoCodec, TargetAudioCodec: "aac", TargetAudioChannels: 2, ToneMapHDR: toneMapHDR}
 		prepared, prepareErr := h.prepareLocalTransportV3(r, session, &transportFile, result)
 		if prepareErr != nil {
 			abort()
@@ -149,7 +168,15 @@ func (h *PlaybackHandler) startVirtualPlaybackV3(r *http.Request, req playback.S
 	}, nil
 }
 
-func virtualAudioNeedsTranscode(req playback.StartRequestV3) bool {
+func virtualAudioNeedsTranscode(req playback.StartRequestV3, sourceCodec string) bool {
+	if sourceCodec = strings.ToLower(strings.TrimSpace(sourceCodec)); sourceCodec != "" {
+		for _, codec := range req.Capabilities.CodecsAudio {
+			if strings.EqualFold(strings.TrimSpace(codec), sourceCodec) {
+				return false
+			}
+		}
+		return true
+	}
 	for _, codec := range req.Capabilities.CodecsAudio {
 		switch strings.ToLower(strings.TrimSpace(codec)) {
 		case "eac3", "ac3", "aac", "mp3", "opus", "flac":
@@ -163,4 +190,12 @@ func virtualAudioNeedsTranscode(req playback.StartRequestV3) bool {
 		}
 	}
 	return true
+}
+
+func virtualClientSupportsHDR(req playback.StartRequestV3) bool {
+	hdr := req.Capabilities.HDRDetails
+	if hdr == nil {
+		hdr = req.ClientPlaybackContext.Output.HDRDetails
+	}
+	return hdr != nil && (hdr.HDR10 || hdr.HDR10Plus || len(hdr.DolbyVisionProfiles) > 0)
 }
