@@ -15,5 +15,7 @@ export function supportedMediaTypesForConfig(
       : "";
   const derived = SERVICE_MEDIA_TYPES[serviceKind];
   if (derived) return [...derived];
-  return [...(source?.supported_media_types ?? [])];
+  const existing = source?.supported_media_types;
+  if (existing && existing.length > 0) return [...existing];
+  return ["movie", "series"];
 }

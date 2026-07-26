@@ -56,7 +56,7 @@ func MimeFromExtension(name string) string {
 // and Content-Type detection.
 func ServeDirectPlay(w http.ResponseWriter, r *http.Request, filePath string) error {
 	lower := strings.ToLower(filePath)
-	if strings.HasPrefix(lower, "aiostreams://") || strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "virtual://") {
+	if strings.HasPrefix(lower, "virtual://") || strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "virtual://") {
 		http.Redirect(w, r, filePath, http.StatusTemporaryRedirect)
 		return nil
 	}

@@ -58,7 +58,6 @@ func (f *scanStateFile) IsVirtual() bool {
 		return false
 	}
 	return f.Container == "virtual" ||
-		strings.HasPrefix(f.FilePath, "aiostreams://") ||
 		strings.HasPrefix(f.FilePath, "virtual://")
 }
 

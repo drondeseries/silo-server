@@ -1399,6 +1399,7 @@ func (s *Service) submitApprovedRequest(ctx context.Context, req Request, actor 
 	s.populateRequesterIdentity(ctx, &req)
 	targets, msg, err := s.router.Fulfill(ctx, installationID, capabilityID, req, want, conns)
 	if err != nil {
+		slog.ErrorContext(ctx, "requests: router fulfill failed", "component", "requests", "request_id", req.ID, "err", err)
 		return nil, err
 	}
 	// Fulfill is allowed to create virtual catalog rows before returning. Flush
@@ -1517,6 +1518,9 @@ func routerQualityConfigured(q Quality, conns []ResolvedRouterConnection) bool {
 		}
 		if hasRouterQualityKey(conn.Config) {
 			usesTieredDefaults = true
+		}
+		if q == Quality1080p && boolConfig(conn.Config, "is_default") {
+			return true
 		}
 		if q == Quality2160p && boolConfig(conn.Config, "is_default_4k") {
 			return true
