@@ -67,7 +67,6 @@ type TranscodeOpts struct {
 	// surround source. Ignored for copy/passthrough audio targets.
 	TargetAudioChannels int
 	TargetBitrateKbps   int     // max video bitrate in kbps; 0 = CRF-only (no cap)
-	ToneMapHDR          bool    // convert HDR input to SDR during video encoding
 	TotalDuration       float64 // total media duration in seconds (for VOD manifest)
 	FastStart           bool    // use superfast preset for faster first-segment production
 	NodeType            string
@@ -643,8 +642,6 @@ func appendVideoArgs(args []string, opts TranscodeOpts) []string {
 // in only one of them silently ships wrong cached artifacts).
 func appendVideoFilterArgs(args []string, opts TranscodeOpts) []string {
 	switch {
-	case opts.ToneMapHDR:
-		return append(args, "-vf", "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=bt2390,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p")
 	case bitmapBurnInActive(opts):
 		return appendBitmapSubtitleBurnInArgs(args, opts)
 	case opts.SubtitleBurnIn && opts.SubtitleTrackIndex >= 0:
