@@ -390,7 +390,7 @@ func isVirtualPlaybackFileV3(file *models.MediaFile) bool {
 	}
 	path := strings.ToLower(strings.TrimSpace(file.FilePath))
 	return strings.EqualFold(strings.TrimSpace(file.Container), "virtual") ||
-		strings.HasPrefix(path, "virtual://") || strings.HasPrefix(path, "virtual://")
+		strings.HasPrefix(path, "virtual://")
 }
 
 // planVideoTranscodeV3 always executes on the HLS engine, so the caller must
