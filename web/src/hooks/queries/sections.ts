@@ -79,6 +79,7 @@ export function useHomeLayout() {
     queryKey: sectionKeys.homeLayout(),
     queryFn: () => api<HomeLayoutResponse>("/home/layout"),
     staleTime: 5 * 60 * 1000,
+    refetchInterval: 60_000,
   });
 }
 
@@ -102,6 +103,7 @@ export function useLibraryLayout(libraryId: number) {
     queryKey: sectionKeys.libraryLayout(libraryId),
     queryFn: () => api<LibraryLayoutResponse>(`/library/${libraryId}/layout`),
     staleTime: 5 * 60 * 1000,
+    refetchInterval: 60_000,
     enabled: libraryId > 0,
   });
 }
@@ -111,6 +113,7 @@ export function useLibrarySections(libraryId: number) {
     queryKey: sectionKeys.library(libraryId),
     queryFn: () => api<SectionsResponse>(`/library/${libraryId}/sections`),
     staleTime: 5 * 60 * 1000,
+    refetchInterval: 60_000,
     enabled: libraryId > 0,
   });
 }

@@ -420,7 +420,7 @@ func (s *LibraryCollectionService) checkVirtualMediaAvailability(ctx context.Con
 }
 
 func (s *LibraryCollectionService) materializeVirtualCollectionEntry(ctx context.Context, libraryIDs []int, title, mediaType, imdbID string, tmdbID, tvdbID, year int) (*models.MediaItem, error) {
-	if strings.TrimSpace(imdbID) == "" {
+	if strings.TrimSpace(imdbID) == "" && tmdbID <= 0 && tvdbID <= 0 {
 		return nil, nil
 	}
 	itemType := "movie"

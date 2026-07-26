@@ -622,9 +622,25 @@ func nonNilStringSlice(values []string) []string {
 // MaterializeVirtualPlaybackItem atomically creates a catalog item, links it to
 // the selected libraries, and adds a zero-storage playback source. Existing
 // local files always suppress creation of the virtual source.
+func virtualStreamID(item *models.MediaItem) string {
+	if item == nil {
+		return ""
+	}
+	if id := strings.TrimSpace(item.ImdbID); id != "" {
+		return id
+	}
+	if id := strings.TrimSpace(item.TvdbID); id != "" {
+		return "tvdb:" + id
+	}
+	if id := strings.TrimSpace(item.TmdbID); id != "" {
+		return "tmdb:" + id
+	}
+	return ""
+}
+
 func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, item *models.MediaItem, libraryIDs []int) error {
-	if item == nil || item.ContentID == "" || strings.TrimSpace(item.ImdbID) == "" {
-		return fmt.Errorf("virtual playback item requires content and IMDb IDs")
+	if item == nil || item.ContentID == "" || virtualStreamID(item) == "" {
+		return fmt.Errorf("virtual playback item requires content and a provider ID")
 	}
 	if item.Type != "movie" && item.Type != "series" {
 		return fmt.Errorf("virtual playback item has unsupported type %q", item.Type)
@@ -755,7 +771,8 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 			return fmt.Errorf("linking virtual item to library: %w", err)
 		}
 	}
-	virtualPath := "virtual://" + item.Type + "/" + strings.TrimSpace(item.ImdbID)
+	streamID := virtualStreamID(item)
+	virtualPath := "virtual://" + item.Type + "/" + strings.ReplaceAll(streamID, ":", "/")
 	if item.Type == "series" {
 		createdSeasons := make(map[int]bool)
 		for _, ep := range airedEps {
@@ -772,7 +789,7 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 
 			seasonID := fmt.Sprintf("%s-%d", strings.Replace(item.ContentID, "series-", "season-", 1), ep.Season)
 			episodeID := fmt.Sprintf("%s-%d-%d", strings.Replace(item.ContentID, "series-", "episode-", 1), ep.Season, ep.Episode)
-			epVirtualPath := fmt.Sprintf("virtual://series/%s/%d/%d", strings.TrimSpace(item.ImdbID), ep.Season, ep.Episode)
+			epVirtualPath := fmt.Sprintf("virtual://series/%s/%d/%d", strings.ReplaceAll(streamID, ":", "/"), ep.Season, ep.Episode)
 
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO episodes (content_id, series_id, season_id, season_number, episode_number, title, metadata_source)

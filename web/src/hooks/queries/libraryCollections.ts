@@ -19,6 +19,7 @@ export function libraryCollectionsQueryOptions(libraryId: number) {
         groups: data.groups ?? [],
       })),
     enabled: Number.isFinite(libraryId) && libraryId > 0,
+    refetchInterval: 60_000,
   };
 }
 
@@ -46,6 +47,7 @@ export function useLibraryUserCollections(libraryId: number) {
         `/library/${libraryId}/user-collections`,
       ).then((data) => data.collections ?? []),
     enabled: Number.isFinite(libraryId) && libraryId > 0,
+    refetchInterval: 60_000,
   });
 }
 
