@@ -972,7 +972,13 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 				WHERE NOT EXISTS (
 					SELECT 1 FROM media_files WHERE episode_id = $2
 				)
-				ON CONFLICT (file_path) DO NOTHING`, item.ContentID, episodeID, libraryIDs[0], epVirtualPath); err != nil {
+				ON CONFLICT (file_path) DO UPDATE SET
+					content_id = EXCLUDED.content_id,
+					episode_id = EXCLUDED.episode_id,
+					media_folder_id = EXCLUDED.media_folder_id,
+					container = 'virtual',
+					missing_since = NULL,
+					updated_at = NOW()`, item.ContentID, episodeID, libraryIDs[0], epVirtualPath); err != nil {
 				return fmt.Errorf("creating virtual episode file S%dE%d: %w", ep.Season, ep.Episode, err)
 			}
 		}
