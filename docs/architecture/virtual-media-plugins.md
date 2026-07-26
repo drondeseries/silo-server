@@ -1,7 +1,7 @@
 # Virtual media plugin integration
 
 Silo supports storage-free catalog entries through an additive RuntimeHost
-contract. Plugins submit validated metadata and `aiostreams://` URIs; the host
+contract. Plugins submit validated metadata and standard `virtual://` URIs; the host
 owns persistence, indexing, metadata refresh, authorization, and playback.
 
 ## Trust boundary
@@ -34,7 +34,7 @@ The resolver runs at playback time so signed upstream URLs are not persisted.
 
 The server administrator installs a Silo build containing this host contract,
 then installs a compatible virtual-library plugin. The plugin configuration
-contains the AIOStreams manifest URL, movie library ID, series library ID, an
+contains the provider manifest URL, movie library ID, series library ID, an
 optional TMDB credential, and a durable monitored-queue path. Database access
 is neither requested nor supported.
 
