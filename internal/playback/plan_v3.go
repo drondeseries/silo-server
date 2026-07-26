@@ -567,6 +567,15 @@ func ResolveQualityPolicyV3(request StartRequestV3, source SourceDescriptorV3) Q
 		explicitRung = true
 	default:
 		maxHeight := resolutionHeightV3(request.Capabilities.MaxResolution)
+		// Virtual/plugin-backed sources often have no local probe dimensions.
+		// Do not interpret the device's maximum resolution as a request to
+		// upscale an unknown source (for example, a 720p provider stream to
+		// 2160p).  Auto quality starts conservatively at 1080p; explicit
+		// quality preferences still select their requested rung.
+		if targetHeight <= 0 {
+			targetHeight = 1080
+			reason = "quality_auto_unknown_source"
+		}
 		if maxHeight > 0 && (targetHeight == 0 || maxHeight < targetHeight) {
 			targetHeight = maxHeight
 			reason = "quality_device_limit"

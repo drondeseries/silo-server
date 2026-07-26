@@ -2794,7 +2794,10 @@ func (r *FileRepository) DeleteByIDs(ctx context.Context, ids []int) (int, error
 	}
 
 	tag, err := r.pool.Exec(ctx,
-		"DELETE FROM media_files WHERE id = ANY($1)",
+		// Scanner reconciliation must never remove zero-storage virtual
+		// playback rows. Explicit virtual purge/delete operations use their
+		// catalog repositories and do not call this physical-file helper.
+		"DELETE FROM media_files WHERE id = ANY($1) AND container <> 'virtual' AND file_path NOT LIKE 'virtual://%'",
 		ids,
 	)
 	if err != nil {

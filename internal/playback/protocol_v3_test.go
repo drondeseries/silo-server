@@ -709,6 +709,16 @@ func TestResolveQualityPolicyV3MeteredWithoutEvidencePrefersConservativeRung(t *
 	}
 }
 
+func TestResolveQualityPolicyV3UnknownSourceDoesNotUpscaleInAuto(t *testing.T) {
+	req := validStartRequestV3()
+	req.QualityPreference = "auto"
+	req.Capabilities.MaxResolution = "4320p"
+	result := ResolveQualityPolicyV3(req, SourceDescriptorV3{})
+	if result.Height != 1080 || result.Reason != "quality_auto_unknown_source" {
+		t.Fatalf("unknown virtual source auto quality = %#v", result)
+	}
+}
+
 func TestPlanPlaybackV3HDRDeviceCapFallsBackToOriginalQuality(t *testing.T) {
 	file := detailedFixtureFileV3()
 	req := validStartRequestV3()
