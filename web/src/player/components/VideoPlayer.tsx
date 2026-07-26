@@ -56,7 +56,7 @@ import type {
   SeriesContext,
   SubtitleMode,
 } from "../types";
-import { mediaElementDuration, toMediaTime, toPlayerTime } from "../utils/mediaTimeline";
+import { mediaDurationSeconds, toMediaTime, toPlayerTime } from "../utils/mediaTimeline";
 import {
   copyWatchTogetherInvite,
   endWatchTogetherRoom,
@@ -744,12 +744,8 @@ export function VideoPlayer({
   const buildExitState = useCallback((): PlaybackExitState => {
     const video = videoRef.current;
     const positionSeconds = toMediaTime(video?.currentTime ?? currentTime, streamOriginRef.current);
-    const durationSeconds =
-      duration > 0
-        ? duration
-        : backendDurationRef.current > 0
-          ? backendDurationRef.current
-          : undefined;
+    // positionSeconds is media time, so the runtime paired with it must be too.
+    const durationSeconds = mediaDurationSeconds(backendDurationRef.current, duration);
 
     return {
       positionSeconds,
@@ -1482,13 +1478,13 @@ export function VideoPlayer({
       }
     };
     const onDurationChange = () => {
-      // A growing HLS EVENT playlist reports only the segments produced so
-      // far. Once the backend supplied a canonical or verified full duration,
-      // keep that session value stable instead of letting the seek bar grow
-      // every time FFmpeg appends a segment. A verified source-duration
-      // upgrade arrives through backendDuration and the effect above.
-      const nextDuration = mediaElementDuration(backendDurationRef.current, video.duration);
-      if (nextDuration !== null) setDuration(nextDuration);
+      if (video.duration && isFinite(video.duration)) {
+        // For HLS EVENT playlists still being transcoded, the video element
+        // reports duration based on segments produced so far. Prefer the
+        // known total duration from metadata when available.
+        if (backendDurationRef.current && video.duration < backendDurationRef.current) return;
+        setDuration(video.duration);
+      }
     };
     const onProgress = () => setBuffered(video.buffered);
     const onVolumeChange = () => {
