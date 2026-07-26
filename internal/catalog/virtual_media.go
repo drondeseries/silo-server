@@ -153,11 +153,11 @@ func validateVirtualMedia(in VirtualMedia) error {
 	if in.VirtualURI == "" && len(in.Variants) == 0 {
 		return fmt.Errorf("%w: VirtualURI or Variants are required", ErrInvalidVirtualMedia)
 	}
-	if in.VirtualURI != "" && !strings.HasPrefix(in.VirtualURI, "aiostreams://") && !strings.HasPrefix(in.VirtualURI, "virtual://") {
+	if in.VirtualURI != "" && !strings.HasPrefix(in.VirtualURI, "virtual://") {
 		return fmt.Errorf("%w: unsupported virtual URI", ErrInvalidVirtualMedia)
 	}
 	for _, v := range in.Variants {
-		if !strings.HasPrefix(v.VirtualURI, "aiostreams://") && !strings.HasPrefix(v.VirtualURI, "virtual://") {
+		if !strings.HasPrefix(v.VirtualURI, "virtual://") {
 			return fmt.Errorf("%w: unsupported virtual URI in variant", ErrInvalidVirtualMedia)
 		}
 	}

@@ -294,7 +294,7 @@ func TestIsVirtual(t *testing.T) {
 	}{
 		{"physical mkv", "mkv", "/media/movies/Test (2020)/Test.mkv", false},
 		{"virtual container", "virtual", "/media/movies/Test (2020)/Test.mkv", true},
-		{"aiostreams uri", "mkv", "aiostreams://movie/tt123456", true},
+		{"streaming uri", "mkv", "virtual://movie/tt123456", true},
 		{"virtual uri", "mkv", "virtual://series/tt999/1/1", true},
 	}
 

@@ -14,7 +14,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/playback"
 )
 
-const virtualPlaybackPrefix = "aiostreams://"
+const virtualPlaybackPrefix = "virtual://"
 
 type VirtualPlaybackResolver interface {
 	ResolveVirtualPlayback(ctx context.Context, virtualPath string, userID int, profileID string) (string, error)

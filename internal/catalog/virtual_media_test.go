@@ -8,11 +8,11 @@ func TestValidateVirtualMedia(t *testing.T) {
 		input   VirtualMedia
 		wantErr bool
 	}{
-		{"movie", VirtualMedia{LibraryID: "1", MediaType: "movie", Title: "Example", IMDbID: "tt1", VirtualURI: "aiostreams://movie/tt1"}, false},
-		{"series", VirtualMedia{LibraryID: "2", MediaType: "series", Title: "Example", TVDBID: "42", VirtualURI: "aiostreams://series/tt1"}, false},
-		{"wrong type", VirtualMedia{LibraryID: "1", MediaType: "show", Title: "Example", IMDbID: "tt1", VirtualURI: "aiostreams://series/tt1"}, true},
+		{"movie", VirtualMedia{LibraryID: "1", MediaType: "movie", Title: "Example", IMDbID: "tt1", VirtualURI: "virtual://movie/tt1"}, false},
+		{"series", VirtualMedia{LibraryID: "2", MediaType: "series", Title: "Example", TVDBID: "42", VirtualURI: "virtual://series/tt1"}, false},
+		{"wrong type", VirtualMedia{LibraryID: "1", MediaType: "show", Title: "Example", IMDbID: "tt1", VirtualURI: "virtual://series/tt1"}, true},
 		{"non virtual URI", VirtualMedia{LibraryID: "1", MediaType: "movie", Title: "Example", IMDbID: "tt1", VirtualURI: "https://example.test/file"}, true},
-		{"missing identity", VirtualMedia{LibraryID: "1", MediaType: "movie", Title: "Example", VirtualURI: "aiostreams://movie/unknown"}, true},
+		{"missing identity", VirtualMedia{LibraryID: "1", MediaType: "movie", Title: "Example", VirtualURI: "virtual://movie/unknown"}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

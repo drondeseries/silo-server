@@ -755,7 +755,7 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 			return fmt.Errorf("linking virtual item to library: %w", err)
 		}
 	}
-	virtualPath := "aiostreams://" + item.Type + "/" + strings.TrimSpace(item.ImdbID)
+	virtualPath := "virtual://" + item.Type + "/" + strings.TrimSpace(item.ImdbID)
 	if item.Type == "series" {
 		createdSeasons := make(map[int]bool)
 		for _, ep := range airedEps {
@@ -772,7 +772,7 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 
 			seasonID := fmt.Sprintf("%s-%d", strings.Replace(item.ContentID, "series-", "season-", 1), ep.Season)
 			episodeID := fmt.Sprintf("%s-%d-%d", strings.Replace(item.ContentID, "series-", "episode-", 1), ep.Season, ep.Episode)
-			epVirtualPath := fmt.Sprintf("aiostreams://series/%s/%d/%d", strings.TrimSpace(item.ImdbID), ep.Season, ep.Episode)
+			epVirtualPath := fmt.Sprintf("virtual://series/%s/%d/%d", strings.TrimSpace(item.ImdbID), ep.Season, ep.Episode)
 
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO episodes (content_id, series_id, season_id, season_number, episode_number, title, metadata_source)
@@ -805,9 +805,9 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 			SELECT $1, $2, $3, 0, 'virtual'
 			WHERE NOT EXISTS (
 				SELECT 1 FROM media_files
-				WHERE content_id = $1 AND left(file_path, 13) <> $4
+				WHERE content_id = $1 AND left(file_path, 10) <> $4
 			)
-			ON CONFLICT (file_path) DO NOTHING`, item.ContentID, libraryIDs[0], virtualPath, "aiostreams://"); err != nil {
+			ON CONFLICT (file_path) DO NOTHING`, item.ContentID, libraryIDs[0], virtualPath, "virtual://"); err != nil {
 			return fmt.Errorf("creating virtual playback file: %w", err)
 		}
 	}
@@ -817,7 +817,7 @@ func (r *ItemRepository) MaterializeVirtualPlaybackItem(ctx context.Context, ite
 	return nil
 }
 
-// PurgeVirtualPlaybackItems removes all zero-storage virtual files (aiostreams://)
+// PurgeVirtualPlaybackItems removes all zero-storage virtual files (virtual://)
 // and any media items that exist solely for virtual playback. Returns the count
 // of deleted virtual files and purged media items.
 func (r *ItemRepository) PurgeVirtualPlaybackItems(ctx context.Context) (filesDeleted int64, itemsDeleted int64, err error) {
@@ -828,7 +828,7 @@ func (r *ItemRepository) PurgeVirtualPlaybackItems(ctx context.Context) (filesDe
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	// 1. Delete all virtual file entries
-	resFiles, err := tx.Exec(ctx, `DELETE FROM media_files WHERE left(file_path, 13) = 'aiostreams://'`)
+	resFiles, err := tx.Exec(ctx, `DELETE FROM media_files WHERE left(file_path, 10) = 'virtual://'`)
 	if err != nil {
 		return 0, 0, fmt.Errorf("deleting virtual files: %w", err)
 	}

@@ -3749,7 +3749,7 @@ func pointerStringValue(value *string) string {
 }
 
 // PurgeVirtualPlaybackItems handles POST /api/admin/collections/purge-virtual
-// Deletes all aiostreams:// virtual playback files and orphaned virtual media items.
+// Deletes all virtual:// virtual playback files and orphaned virtual media items.
 func (h *LibraryCollectionHandler) PurgeVirtualPlaybackItems(w http.ResponseWriter, r *http.Request) {
 	if h.itemRepo == nil {
 		http.Error(w, "item repository unavailable", http.StatusInternalServerError)

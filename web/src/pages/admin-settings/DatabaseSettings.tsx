@@ -189,7 +189,7 @@ export default function DatabaseSettings() {
               <div className="space-y-1">
                 <span className="text-sm font-medium">Purge Virtual Playback Items</span>
                 <p className="text-muted-foreground text-xs leading-relaxed">
-                  Remove all zero-storage virtual files (<code>aiostreams://</code>) and database-only media items.
+                  Remove all zero-storage virtual files (<code>virtual://</code>) and database-only media items.
                   This resets the catalog back to physical/local file state.
                 </p>
               </div>

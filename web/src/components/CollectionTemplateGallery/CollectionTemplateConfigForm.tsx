@@ -339,7 +339,7 @@ export function CollectionTemplateConfigForm({
             <Switch checked={virtualPlayback} onCheckedChange={setVirtualPlayback} />
           </div>
           <p className="text-muted-foreground text-xs">
-            Create database-only entries for unmatched IMDb IDs and resolve them through AIOStreams.
+            Create database-only entries for unmatched IMDb IDs and resolve them through streaming provider.
           </p>
         </div>
       </div>

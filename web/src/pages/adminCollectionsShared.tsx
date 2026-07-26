@@ -1362,7 +1362,7 @@ export function MDBListImportForm({
           <div>
             <p className="text-sm font-medium">Zero-storage virtual playback</p>
             <p className="text-muted-foreground text-xs">
-              Create database-only movie entries for unmatched IMDb IDs and resolve them through AIOStreams.
+              Create database-only movie entries for unmatched IMDb IDs and resolve them through streaming provider.
             </p>
           </div>
           <Switch checked={virtualPlayback} onCheckedChange={setVirtualPlayback} />

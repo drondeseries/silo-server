@@ -16,7 +16,7 @@ const virtualPlaybackCapabilityID = "virtual-playback"
 
 var ErrVirtualPlaybackResolverNotInstalled = errors.New("virtual playback resolver is not installed")
 
-// ResolveVirtualPlayback delegates an aiostreams URI to the first enabled
+// ResolveVirtualPlayback delegates an streaming URI to the first enabled
 // plugin advertising the reserved virtual-playback HTTP routes capability.
 func (s *Service) ResolveVirtualPlayback(ctx context.Context, virtualPath string, userID int, profileID string) (string, error) {
 	if s == nil || s.installations == nil {
