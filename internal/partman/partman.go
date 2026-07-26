@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -18,6 +19,12 @@ import (
 // default partition already holds a row that belongs in the new partition's
 // range. See incident docs/continuum-to-silo-postgres-migration.md.
 const pgCheckViolation = "23514"
+
+// pgInvalidTableDefinition is returned when concurrent CREATE PARTITION
+// statements briefly contend on the same range. The losing transaction must
+// verify that the winner created the exact partition it wanted before
+// treating the error as harmless.
+const pgInvalidTableDefinition = "42P16"
 
 const deleteBatchSize = 10000
 
@@ -73,6 +80,15 @@ func (m *Manager) EnsureFuturePartitions(ctx context.Context) error {
 		// drain those rows out of default and attach the partition so the rows
 		// land where they belong. Any other error is genuine and propagates.
 		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgInvalidTableDefinition {
+			exists, verifyErr := m.partitionHasBounds(ctx, name, lower, upper)
+			if verifyErr != nil {
+				return fmt.Errorf("create partition %s: verify concurrent create: %w", name, verifyErr)
+			}
+			if exists {
+				continue
+			}
+		}
 		if !errors.As(err, &pgErr) || pgErr.Code != pgCheckViolation {
 			return fmt.Errorf("create partition %s: %w", name, err)
 		}
@@ -82,6 +98,29 @@ func (m *Manager) EnsureFuturePartitions(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (m *Manager) partitionHasBounds(ctx context.Context, name string, lower, upper time.Time) (bool, error) {
+	var bound string
+	err := m.pool.QueryRow(ctx, `
+		SELECT pg_get_expr(child.relpartbound, child.oid)
+		FROM pg_inherits
+		JOIN pg_class parent ON parent.oid = pg_inherits.inhparent
+		JOIN pg_class child ON child.oid = pg_inherits.inhrelid
+		JOIN pg_namespace ns ON ns.oid = child.relnamespace
+		WHERE parent.relname = $1 AND child.relname = $2 AND ns.nspname = 'public'
+	`, m.table, name).Scan(&bound)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	parsedLower, parsedUpper, err := parsePartitionBounds(bound)
+	if err != nil {
+		return false, err
+	}
+	return parsedLower.Equal(lower.UTC()) && parsedUpper.Equal(upper.UTC()), nil
 }
 
 // healDefaultConflict recovers from the case where CREATE … PARTITION OF failed
@@ -314,6 +353,22 @@ func parsePartitionUpperBound(bound string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("unrecognized partition bound: %q", bound)
 	}
 	return parseBoundTimestamp(matches[2])
+}
+
+func parsePartitionBounds(bound string) (time.Time, time.Time, error) {
+	matches := partitionBoundsRE.FindStringSubmatch(bound)
+	if len(matches) != 3 {
+		return time.Time{}, time.Time{}, fmt.Errorf("unrecognized partition bound: %q", bound)
+	}
+	lower, err := parseBoundTimestamp(matches[1])
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	upper, err := parseBoundTimestamp(matches[2])
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	return lower, upper, nil
 }
 
 func parseBoundTimestamp(value string) (time.Time, error) {
