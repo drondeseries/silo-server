@@ -1070,6 +1070,25 @@ func (r *ItemRepository) GetByIDs(ctx context.Context, contentIDs []string) ([]*
 	return scanItems(rows)
 }
 
+// NeedsVirtualSeriesMaterialization reports whether a series is a virtual
+// collection item whose episode hierarchy has not been created yet. This lets
+// collection sync repair entries that were inserted before episode lookup
+// completed, without touching local media-backed series.
+func (r *ItemRepository) NeedsVirtualSeriesMaterialization(ctx context.Context, contentID string) (bool, error) {
+	var needs bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT mi.type = 'series'
+			AND (mi.virtual_source = 'collection' OR EXISTS (
+				SELECT 1 FROM media_files mf
+				WHERE mf.content_id = mi.content_id
+				  AND (mf.container = 'virtual' OR mf.file_path LIKE 'virtual://%')
+			))
+			AND NOT EXISTS (SELECT 1 FROM episodes ep WHERE ep.series_id = mi.content_id)
+		FROM media_items mi
+		WHERE mi.content_id = $1`, contentID).Scan(&needs)
+	return needs, err
+}
+
 // GetStatusByIDs returns a map of content_id → status for the requested IDs.
 // Missing IDs are absent from the result rather than returned with empty values.
 func (r *ItemRepository) GetStatusByIDs(ctx context.Context, ids []string) (map[string]string, error) {

@@ -89,6 +89,13 @@ type TraktCollectionFetcher interface {
 	GetUserList(ctx context.Context, user, list string, limit int, accessToken string) ([]TraktCollectionEntry, error)
 }
 
+func tvdbIDValue(id *int) int {
+	if id != nil {
+		return *id
+	}
+	return 0
+}
+
 // TraktAccessTokenResolver returns a profile-scoped Trakt access token for
 // personalized recommendation collection sync.
 type TraktAccessTokenResolver interface {
@@ -479,6 +486,24 @@ func (s *LibraryCollectionService) materializeVirtualCollectionEntry(ctx context
 	return item, nil
 }
 
+// repairExistingVirtualSeries fills in seasons/episodes for a virtual series
+// that was already present when a collection was synced. Collection matching
+// must be idempotent: finding the parent item cannot mean the child hierarchy
+// is complete.
+func (s *LibraryCollectionService) repairExistingVirtualSeries(ctx context.Context, libraryIDs []int, item *models.MediaItem, title, mediaType, imdbID string, tmdbID, tvdbID, year int) (*models.MediaItem, error) {
+	if item == nil || (mediaType != "tv" && mediaType != "series") {
+		return item, nil
+	}
+	needs, err := s.items.NeedsVirtualSeriesMaterialization(ctx, item.ContentID)
+	if err != nil {
+		return nil, err
+	}
+	if !needs {
+		return item, nil
+	}
+	return s.materializeVirtualCollectionEntry(ctx, libraryIDs, title, mediaType, imdbID, tmdbID, tvdbID, year)
+}
+
 func (s *LibraryCollectionService) SyncCollection(ctx context.Context, collectionID string) (*models.LibraryCollectionSyncRun, error) {
 	return s.SyncCollectionWithOptions(ctx, collectionID, SyncCollectionOptions{})
 }
@@ -585,11 +610,21 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 				lookup = seriesLookup
 			}
 
-			if len(pickCandidatesByPriority(lookup, entry, itemType)) > 0 {
+			candidates := pickCandidatesByPriority(lookup, entry, itemType)
+			if len(candidates) > 0 {
+				if itemType == "series" && sourceEnablesVirtualPlayback(collection.SourceConfig) {
+					existing, getErr := s.items.GetByID(ctx, candidates[0])
+					if getErr != nil {
+						return nil, getErr
+					}
+					if _, repairErr := s.repairExistingVirtualSeries(ctx, collection.LibraryIDs, existing, entry.Title, itemType, entry.IMDbID, entry.ID, tvdbIDValue(entry.TVDBID), entry.ReleaseYear); repairErr != nil {
+						return nil, repairErr
+					}
+				}
 				continue
 			}
 
-			if strings.TrimSpace(entry.IMDbID) == "" {
+			if strings.TrimSpace(entry.IMDbID) == "" && entry.ID <= 0 && (entry.TVDBID == nil || *entry.TVDBID <= 0) {
 				slog.WarnContext(ctx, "MDBList sync: missing IMDb ID for virtual playback", "title", entry.Title)
 				unmaterializableWarnings[i] = fmt.Sprintf("Missing IMDb ID for virtual playback: %s", entry.Title)
 				continue
@@ -821,6 +856,12 @@ func (s *LibraryCollectionService) syncTMDBPresetCollection(ctx context.Context,
 		if err != nil {
 			return nil, err
 		}
+		if item != nil && cfg.VirtualPlayback {
+			item, err = s.repairExistingVirtualSeries(ctx, collection.LibraryIDs, item, entry.Title, entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID, 0)
+			if err != nil {
+				return nil, err
+			}
+		}
 		if item == nil && cfg.VirtualPlayback {
 			item, err = s.materializeVirtualCollectionEntry(ctx, collection.LibraryIDs, entry.Title, entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID, 0)
 			if err != nil {
@@ -993,6 +1034,12 @@ func (s *LibraryCollectionService) syncTMDBFranchiseCollection(ctx context.Conte
 		item, err := s.resolveTMDBEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
+		}
+		if item != nil && cfg.VirtualPlayback {
+			item, err = s.repairExistingVirtualSeries(ctx, collection.LibraryIDs, item, entry.Title, entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID, 0)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if item == nil && cfg.VirtualPlayback {
 			item, err = s.materializeVirtualCollectionEntry(ctx, collection.LibraryIDs, entry.Title, entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID, 0)
@@ -1177,6 +1224,12 @@ func (s *LibraryCollectionService) syncTMDBDiscoverCollection(ctx context.Contex
 		item, err := s.resolveTMDBEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
+		}
+		if item != nil && cfg.VirtualPlayback {
+			item, err = s.repairExistingVirtualSeries(ctx, collection.LibraryIDs, item, entry.Title, entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID, 0)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if item == nil && cfg.VirtualPlayback {
 			item, err = s.materializeVirtualCollectionEntry(ctx, collection.LibraryIDs, entry.Title, entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID, 0)
@@ -1437,6 +1490,12 @@ func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, c
 		item, err := s.resolveTraktEntry(ctx, collection.LibraryIDs, entry)
 		if err != nil {
 			return nil, err
+		}
+		if item != nil && virtualPlayback {
+			item, err = s.repairExistingVirtualSeries(ctx, collection.LibraryIDs, item, entry.Title, entry.MediaType, entry.IMDbID, entry.TMDBID, entry.TVDBID, entry.Year)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if item == nil && virtualPlayback {
 			item, err = s.materializeVirtualCollectionEntry(ctx, collection.LibraryIDs, entry.Title, entry.MediaType, entry.IMDbID, entry.TMDBID, entry.TVDBID, entry.Year)
