@@ -4,8 +4,11 @@ const (
 	DefaultRepositoryURL  = "https://raw.githubusercontent.com/Silo-Server/silo-plugins/main/manifest.json"
 	DefaultRepositoryName = "Silo maintained"
 
-	ApprovedCommunityRepositoryURL  = "https://raw.githubusercontent.com/Silo-Community/silo-plugins/main/manifest.json"
-	ApprovedCommunityRepositoryName = "Approved community"
+	ApprovedCommunityRepositoryURL     = "https://raw.githubusercontent.com/Silo-Community/silo-plugins/main/manifest.json"
+	ApprovedCommunityRepositoryName    = "Approved community"
+	VirtualLibraryRepositoryURL        = "https://raw.githubusercontent.com/drondeseries/silo-virtual-library/main/catalog.json"
+	VirtualLibraryRepositoryName       = "Virtual Library"
+	VirtualLibraryRepositoryManagedKey = "virtual-library"
 
 	OfficialRepositoryManagedKey          = "official"
 	ApprovedCommunityRepositoryManagedKey = "approved-community"
@@ -37,6 +40,12 @@ var managedRepositoryDefinitions = []managedRepositoryDefinition{
 		URL:         ApprovedCommunityRepositoryURL,
 		DisplayName: ApprovedCommunityRepositoryName,
 		SourceKind:  RepositorySourceApprovedCommunity,
+	},
+	{
+		Key:         VirtualLibraryRepositoryManagedKey,
+		URL:         VirtualLibraryRepositoryURL,
+		DisplayName: VirtualLibraryRepositoryName,
+		SourceKind:  RepositorySourceExternal,
 	},
 }
 
