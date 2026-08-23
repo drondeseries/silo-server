@@ -5,7 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io/fs"
+	"mime"
 	"net/http"
+	pathpkg "path"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -113,6 +116,13 @@ type renderedShell struct {
 func (h *frontendHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	path := r.URL.Path
+	if strings.HasPrefix(path, "/assets/") && isPrecompressedAssetPath(path) {
+		// Sidecars are implementation details selected through content
+		// negotiation. Serving them directly exposes the compressed bytes without
+		// Content-Encoding and creates a second public URL for the same asset.
+		http.NotFound(w, r)
+		return
+	}
 
 	// Dynamic branding endpoints must be handled before the static file
 	// server, which would otherwise serve the bundled defaults shadowing
@@ -139,6 +149,10 @@ func (h *frontendHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// immutable: a new build produces new URLs, which is what
 				// lets browsers cache them for a year yet pick up deploys.
 				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+				w.Header().Set("Vary", "Accept-Encoding")
+				if r.Header.Get("Range") == "" && h.servePrecompressedAsset(w, r, path) {
+					return
+				}
 			} else {
 				// Every other bundled file (service worker, icons, vendor
 				// bundles) keeps its URL across builds, so it must be
@@ -183,6 +197,129 @@ func (h *frontendHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("ETag", shell.etag)
 	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(shell.body))
+}
+
+func isPrecompressedAssetPath(path string) bool {
+	return strings.HasSuffix(path, ".js.br") ||
+		strings.HasSuffix(path, ".js.gz") ||
+		strings.HasSuffix(path, ".css.br") ||
+		strings.HasSuffix(path, ".css.gz")
+}
+
+func (h *frontendHandler) servePrecompressedAsset(
+	w http.ResponseWriter,
+	r *http.Request,
+	assetPath string,
+) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+
+	acceptEncoding := strings.Join(r.Header.Values("Accept-Encoding"), ",")
+	for _, encoding := range precompressedEncodingPreferences(acceptEncoding) {
+		suffix := "." + encoding
+		if encoding == "gzip" {
+			suffix = ".gz"
+		}
+		sidecarPath := assetPath + suffix
+		f, err := WebDistFS.Open(strings.TrimPrefix(sidecarPath, "/"))
+		if err != nil {
+			continue
+		}
+		info, statErr := f.Stat()
+		_ = f.Close()
+		if statErr != nil || info.IsDir() {
+			continue
+		}
+
+		if contentType := mime.TypeByExtension(pathpkg.Ext(assetPath)); contentType != "" {
+			w.Header().Set("Content-Type", contentType)
+		}
+		w.Header().Set("Content-Encoding", encoding)
+
+		encodedRequest := r.Clone(r.Context())
+		encodedURL := *r.URL
+		encodedURL.Path = sidecarPath
+		encodedRequest.URL = &encodedURL
+		h.fileServer.ServeHTTP(w, encodedRequest)
+		return true
+	}
+	return false
+}
+
+func precompressedEncodingPreferences(header string) []string {
+	qualities := make(map[string]float64)
+	wildcardQuality := -1.0
+
+	for value := range strings.SplitSeq(header, ",") {
+		parts := strings.Split(value, ";")
+		coding := strings.ToLower(strings.TrimSpace(parts[0]))
+		if coding == "" {
+			continue
+		}
+
+		quality := 1.0
+		valid := true
+		for _, parameter := range parts[1:] {
+			key, rawValue, found := strings.Cut(strings.TrimSpace(parameter), "=")
+			if !strings.EqualFold(strings.TrimSpace(key), "q") {
+				continue
+			}
+			if !found {
+				valid = false
+				break
+			}
+			parsed, err := strconv.ParseFloat(strings.TrimSpace(rawValue), 64)
+			if err != nil || parsed < 0 || parsed > 1 {
+				valid = false
+				break
+			}
+			quality = parsed
+		}
+		if !valid {
+			continue
+		}
+
+		if coding == "*" {
+			wildcardQuality = quality
+			continue
+		}
+		qualities[coding] = quality
+	}
+
+	qualityFor := func(coding string) float64 {
+		if quality, ok := qualities[coding]; ok {
+			return quality
+		}
+		if wildcardQuality >= 0 {
+			return wildcardQuality
+		}
+		return 0
+	}
+
+	brotliQuality := qualityFor("br")
+	gzipQuality := qualityFor("gzip")
+	if brotliQuality <= 0 && gzipQuality <= 0 {
+		return nil
+	}
+
+	encodings := make([]string, 0, 2)
+	if brotliQuality >= gzipQuality {
+		if brotliQuality > 0 {
+			encodings = append(encodings, "br")
+		}
+		if gzipQuality > 0 {
+			encodings = append(encodings, "gzip")
+		}
+		return encodings
+	}
+	if gzipQuality > 0 {
+		encodings = append(encodings, "gzip")
+	}
+	if brotliQuality > 0 {
+		encodings = append(encodings, "br")
+	}
+	return encodings
 }
 
 // brandedShell returns the branding-rendered index.html and its ETag, reusing
