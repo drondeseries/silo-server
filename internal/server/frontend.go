@@ -150,7 +150,7 @@ func (h *frontendHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// lets browsers cache them for a year yet pick up deploys.
 				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 				w.Header().Set("Vary", "Accept-Encoding")
-				if r.Header.Get("Range") == "" && h.servePrecompressedAsset(w, r, path) {
+				if h.servePrecompressedAsset(w, r, path) {
 					return
 				}
 			} else {
@@ -221,39 +221,51 @@ func (h *frontendHandler) servePrecompressedAsset(
 	}
 
 	acceptEncoding := strings.Join(r.Header.Values("Accept-Encoding"), ",")
-	for _, encoding := range precompressedEncodingPreferences(acceptEncoding) {
-		suffix := "." + encoding
-		if encoding == gzipContentEncoding {
-			suffix = ".gz"
-		}
-		sidecarPath := assetPath + suffix
-		f, err := WebDistFS.Open(strings.TrimPrefix(sidecarPath, "/"))
-		if err != nil {
-			continue
-		}
-		info, statErr := f.Stat()
-		_ = f.Close()
-		if statErr != nil || info.IsDir() {
-			continue
-		}
+	encodings, identityAcceptable := precompressedEncodingPreferences(acceptEncoding)
+	useIdentityRange := r.Method == http.MethodGet && r.Header.Get("Range") != "" && identityAcceptable
+	if !useIdentityRange {
+		for _, encoding := range encodings {
+			suffix := "." + encoding
+			if encoding == gzipContentEncoding {
+				suffix = ".gz"
+			}
+			sidecarPath := assetPath + suffix
+			f, err := WebDistFS.Open(strings.TrimPrefix(sidecarPath, "/"))
+			if err != nil {
+				continue
+			}
+			info, statErr := f.Stat()
+			_ = f.Close()
+			if statErr != nil || info.IsDir() {
+				continue
+			}
 
-		if contentType := mime.TypeByExtension(pathpkg.Ext(assetPath)); contentType != "" {
-			w.Header().Set("Content-Type", contentType)
-		}
-		w.Header().Set("Content-Encoding", encoding)
-		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+			if contentType := mime.TypeByExtension(pathpkg.Ext(assetPath)); contentType != "" {
+				w.Header().Set("Content-Type", contentType)
+			}
+			w.Header().Set("Content-Encoding", encoding)
+			w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 
-		encodedRequest := r.Clone(r.Context())
-		encodedURL := *r.URL
-		encodedURL.Path = sidecarPath
-		encodedRequest.URL = &encodedURL
-		h.fileServer.ServeHTTP(w, encodedRequest)
+			encodedRequest := r.Clone(r.Context())
+			encodedURL := *r.URL
+			encodedURL.Path = sidecarPath
+			encodedRequest.URL = &encodedURL
+			if encodedRequest.Header.Get("Range") != "" {
+				// Range is ignored on HEAD and when GET cannot use identity.
+				encodedRequest.Header.Del("Range")
+			}
+			h.fileServer.ServeHTTP(w, encodedRequest)
+			return true
+		}
+	}
+	if !identityAcceptable {
+		w.WriteHeader(http.StatusNotAcceptable)
 		return true
 	}
 	return false
 }
 
-func precompressedEncodingPreferences(header string) []string {
+func precompressedEncodingPreferences(header string) ([]string, bool) {
 	qualities := make(map[string]float64)
 	wildcardQuality := -1.0
 
@@ -305,8 +317,14 @@ func precompressedEncodingPreferences(header string) []string {
 
 	brotliQuality := qualityFor(brotliContentEncoding)
 	gzipQuality := qualityFor(gzipContentEncoding)
+	identityAcceptable := true
+	if identityQuality, ok := qualities["identity"]; ok {
+		identityAcceptable = identityQuality > 0
+	} else if wildcardQuality == 0 {
+		identityAcceptable = false
+	}
 	if brotliQuality <= 0 && gzipQuality <= 0 {
-		return nil
+		return nil, identityAcceptable
 	}
 
 	encodings := make([]string, 0, 2)
@@ -317,7 +335,7 @@ func precompressedEncodingPreferences(header string) []string {
 		if gzipQuality > 0 {
 			encodings = append(encodings, gzipContentEncoding)
 		}
-		return encodings
+		return encodings, identityAcceptable
 	}
 	if gzipQuality > 0 {
 		encodings = append(encodings, gzipContentEncoding)
@@ -325,7 +343,7 @@ func precompressedEncodingPreferences(header string) []string {
 	if brotliQuality > 0 {
 		encodings = append(encodings, brotliContentEncoding)
 	}
-	return encodings
+	return encodings, identityAcceptable
 }
 
 // brandedShell returns the branding-rendered index.html and its ETag, reusing

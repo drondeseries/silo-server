@@ -151,7 +151,11 @@ function buildWatchLocationState(request: WatchRouteRequest) {
 
 function PlaybackPreparingScreen() {
   return (
-    <div className="bg-background fixed inset-0 z-50 flex items-center justify-center px-6">
+    <div
+      className="bg-background fixed inset-0 z-50 flex items-center justify-center px-6"
+      role="status"
+      aria-live="polite"
+    >
       <div className="surface-panel-subtle animate-in fade-in flex min-w-[260px] flex-col items-center gap-4 rounded-[1.8rem] px-8 py-7 text-center duration-300">
         <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white" />
         <div className="space-y-1">
