@@ -206,6 +206,11 @@ func isPrecompressedAssetPath(path string) bool {
 		strings.HasSuffix(path, ".css.gz")
 }
 
+const (
+	brotliContentEncoding = "br"
+	gzipContentEncoding   = "gzip"
+)
+
 func (h *frontendHandler) servePrecompressedAsset(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -218,7 +223,7 @@ func (h *frontendHandler) servePrecompressedAsset(
 	acceptEncoding := strings.Join(r.Header.Values("Accept-Encoding"), ",")
 	for _, encoding := range precompressedEncodingPreferences(acceptEncoding) {
 		suffix := "." + encoding
-		if encoding == "gzip" {
+		if encoding == gzipContentEncoding {
 			suffix = ".gz"
 		}
 		sidecarPath := assetPath + suffix
@@ -297,8 +302,8 @@ func precompressedEncodingPreferences(header string) []string {
 		return 0
 	}
 
-	brotliQuality := qualityFor("br")
-	gzipQuality := qualityFor("gzip")
+	brotliQuality := qualityFor(brotliContentEncoding)
+	gzipQuality := qualityFor(gzipContentEncoding)
 	if brotliQuality <= 0 && gzipQuality <= 0 {
 		return nil
 	}
@@ -306,18 +311,18 @@ func precompressedEncodingPreferences(header string) []string {
 	encodings := make([]string, 0, 2)
 	if brotliQuality >= gzipQuality {
 		if brotliQuality > 0 {
-			encodings = append(encodings, "br")
+			encodings = append(encodings, brotliContentEncoding)
 		}
 		if gzipQuality > 0 {
-			encodings = append(encodings, "gzip")
+			encodings = append(encodings, gzipContentEncoding)
 		}
 		return encodings
 	}
 	if gzipQuality > 0 {
-		encodings = append(encodings, "gzip")
+		encodings = append(encodings, gzipContentEncoding)
 	}
 	if brotliQuality > 0 {
-		encodings = append(encodings, "br")
+		encodings = append(encodings, brotliContentEncoding)
 	}
 	return encodings
 }
