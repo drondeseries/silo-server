@@ -241,6 +241,7 @@ func (h *frontendHandler) servePrecompressedAsset(
 			w.Header().Set("Content-Type", contentType)
 		}
 		w.Header().Set("Content-Encoding", encoding)
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 
 		encodedRequest := r.Clone(r.Context())
 		encodedURL := *r.URL
