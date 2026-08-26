@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import { useImageLoaded } from "@/hooks/useImageLoaded";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import MediaItemMenu from "@/components/MediaItemMenu";
@@ -36,9 +37,11 @@ export default function SectionItemCard({ item, libraryId }: SectionItemCardProp
   const { cardPresentation } = useUICustomization();
   const showCaption = cardPresentation.caption !== "artwork";
   const showMetadata = cardPresentation.caption === "title_metadata";
+  const cardRef = useRef<HTMLDivElement>(null);
+  const displayTitle = episodeLabels ? episodeLabels.seriesTitle : item.title;
 
   return (
-    <div className="media-card group/card">
+    <div ref={cardRef} className="media-card media-card-longpress group/card">
       <div className="relative">
         <ViewTransitionLink to={itemHref} className="block overflow-hidden rounded-xl">
           <div
@@ -99,13 +102,13 @@ export default function SectionItemCard({ item, libraryId }: SectionItemCardProp
           libraryId={libraryId}
           userState={item.user_state}
           variant="poster"
+          longPressRef={cardRef}
+          itemTitle={displayTitle}
         />
       </div>
       {showCaption ? (
         <ViewTransitionLink to={itemHref} className="block px-1 pt-3">
-          <div className="truncate text-[14px] font-semibold tracking-tight">
-            {episodeLabels ? episodeLabels.seriesTitle : item.title}
-          </div>
+          <div className="truncate text-[14px] font-semibold tracking-tight">{displayTitle}</div>
           {showMetadata && upcomingEvent ? (
             <>
               {subtitle && (
