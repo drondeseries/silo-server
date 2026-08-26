@@ -216,7 +216,17 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 		audioOK = true
 		audioClaims.Reason = "no_audio_track"
 	}
-	containerOK := containsFoldV3(input.Request.Capabilities.Containers, source.Container)
+	// Apple AVPlayer clients (tvOS, iOS, macOS) advertise "mkv" in their
+	// container list but AVPlayer cannot play raw Matroska over HTTP progressive.
+	// Detect and correct this before containerOK is evaluated so the planner
+	// selects a remux route instead of returning an unplayable direct stream.
+	// The quirk is recorded on base below, after base is initialised.
+	mkvQuirk, mkvQuirkFired := appleAVPlayerMKVContainerFallback(source, input.Request)
+	effectiveContainers := input.Request.Capabilities.Containers
+	if mkvQuirkFired {
+		effectiveContainers = filterContainersV3(effectiveContainers, "mkv", "matroska")
+	}
+	containerOK := containsFoldV3(effectiveContainers, source.Container)
 	hlsDeliveryOK := deliveryAvailableV3(input.Request, DeliveryClassHLSV3)
 	// DV strip eligibility is split by executor pool: a progressive remux
 	// executes on this process's ffmpeg, while an HLS remux may run on a
@@ -279,6 +289,9 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 	base.AvailableQualities = availableQualitiesV3(input, source)
 	base.Subtitle.Inventory = BuildSubtitleInventoryV3(file, input.AdditionalSubtitles)
 	base.Claims.Audio.Passthrough = passthrough
+	if mkvQuirkFired {
+		appendAppliedQuirkV3(&base, *mkvQuirk, "")
+	}
 	if source.DynamicRange == DynamicRangeHDRUnknownV3 && (rangeOK || clientManagedRange) {
 		base.DegradationWarnings = append(base.DegradationWarnings, DegradationWarningV3{
 			Code:    "hdr_range_assumed_hdr10",
@@ -294,7 +307,7 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 		})
 	}
 	if !routeVideoMetadataCompleteV3(source) {
-		return terminalPlannerResultV3("source_metadata_incomplete", "The source is missing video metadata required for a validated playback route.", true)
+		return terminalPlannerResultV3WithDetail("source_metadata_incomplete", "The source is missing video metadata required for a validated playback route.", routeVideoMetadataGapsDetailV3(source), true)
 	}
 	if !videoOK && videoEvidenceInsufficient {
 		// The client's flat codec lists claim this stream, but its evidence
@@ -1340,6 +1353,13 @@ func planAttemptedV3(plan PlanV3, outputContextID string, attempted []string) bo
 func terminalPlannerResultV3(reason, message string, retryable bool) PlannerResultV3 {
 	return PlannerResultV3{Terminal: &TerminalV3{Reason: reason, Message: message, Retryable: retryable}, SubtitleTrackIndex: -1, SubtitleTransportTrackIndex: -1}
 }
+
+// terminalPlannerResultV3WithDetail is terminalPlannerResultV3 with a
+// diagnostic detail line naming the probe fields that blocked the route.
+func terminalPlannerResultV3WithDetail(reason, message, detail string, retryable bool) PlannerResultV3 {
+	return PlannerResultV3{Terminal: &TerminalV3{Reason: reason, Message: message, Retryable: retryable, Detail: detail}, SubtitleTrackIndex: -1, SubtitleTransportTrackIndex: -1}
+}
+
 func subtitlePolicyNameV3(f SubtitleFidelityV3) string {
 	if f == SubtitleFidelityPreserveV3 {
 		return "require_authored_fidelity"

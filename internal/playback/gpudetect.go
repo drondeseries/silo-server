@@ -367,7 +367,7 @@ func listRenderDevices(driDir string) []string {
 	var accessible []string
 	for _, dev := range matches {
 		if f, err := os.Open(dev); err == nil {
-			f.Close()
+			_ = f.Close()
 			accessible = append(accessible, dev)
 		}
 	}
@@ -401,7 +401,7 @@ func isNVIDIADevice(renderDevPath string) bool {
 
 func hasNVIDIADevice() bool {
 	if file, err := os.Open(defaultNVIDIAControlDevice); err == nil {
-		file.Close()
+		_ = file.Close()
 		return true
 	}
 	matches, err := filepath.Glob(defaultNVIDIADeviceGlob)
@@ -410,7 +410,7 @@ func hasNVIDIADevice() bool {
 	}
 	for _, dev := range matches {
 		if file, err := os.Open(dev); err == nil {
-			file.Close()
+			_ = file.Close()
 			return true
 		}
 	}
@@ -438,7 +438,7 @@ type RenderDeviceInfo struct {
 func describeRenderDevice(renderDevPath string) string {
 	name := filepath.Base(renderDevPath)
 	vendor := readSysfsID(filepath.Join(sysClassDRMDir, name, "device", "vendor"))
-	label := ""
+	var label string
 	switch vendor {
 	case "0x8086":
 		label = "Intel GPU"

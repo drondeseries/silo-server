@@ -194,7 +194,7 @@ func (s *Service) CancelByLibrary(ctx context.Context, libraryID int) (int, erro
 		return 0, nil
 	}
 
-	cancelled, err := s.CancelAcceptedByLibrary(ctx, libraryID)
+	canceled, err := s.CancelAcceptedByLibrary(ctx, libraryID)
 	if err != nil {
 		return 0, err
 	}
@@ -210,7 +210,7 @@ func (s *Service) CancelByLibrary(ctx context.Context, libraryID int) (int, erro
 
 	activeRuns, err := s.repo.ListActive(ctx)
 	if err != nil {
-		return cancelled, err
+		return canceled, err
 	}
 	for _, run := range activeRuns {
 		if run == nil || run.MediaFolderID != libraryID {
@@ -218,16 +218,16 @@ func (s *Service) CancelByLibrary(ctx context.Context, libraryID int) (int, erro
 		}
 		_, changed, err := s.repo.MarkCancelled(ctx, run.ID)
 		if err != nil {
-			return cancelled, err
+			return canceled, err
 		}
 		if changed {
-			cancelled++
+			canceled++
 			if cancelledRun, err := s.repo.GetByID(ctx, run.ID); err == nil {
 				s.publish(ctx, "scan.cancelled", cancelledRun)
 			}
 		}
 	}
-	return cancelled, nil
+	return canceled, nil
 }
 
 func (s *Service) ListActive(ctx context.Context) ([]evt.ScanRun, error) {
@@ -487,7 +487,7 @@ func (s *Service) cancelRun(runID string) {
 
 	run, changed, err := s.repo.MarkCancelled(ctx, runID)
 	if err != nil {
-		slog.Warn("scan queue: failed to mark cancelled", "scan_id", runID, "error", err)
+		slog.Warn("scan queue: failed to mark canceled", "scan_id", runID, "error", err)
 		return
 	}
 	if changed {

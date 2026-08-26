@@ -79,7 +79,7 @@ func waitForCacheEntry(t *testing.T, c *SubtitleCache, source string, track int)
 
 func readAllAndClose(t *testing.T, f *os.File) string {
 	t.Helper()
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	data, err := io.ReadAll(f)
 	if err != nil {
 		t.Fatal(err)
@@ -539,6 +539,35 @@ func TestServeSUPExtractWindowedMissWarmsOnce(t *testing.T) {
 	mu.Unlock()
 	if last.InputPath != entryPath(t, c, source, 0) || !last.InputIsExtractedSup {
 		t.Fatalf("post-warm windowed extract must read the cached track: %+v", last)
+	}
+}
+
+func TestServeSUPExtractWindowedRemoteInputSkipsDetachedWarm(t *testing.T) {
+	c, source := newTestCache(t)
+	opts := windowedSupOpts(source, 0, 100, 3600)
+	opts.CacheIdentity = "virtual://movie/tt123?profile=1080p"
+	opts.DisableBackgroundWarm = true
+
+	var warmCalls, windowCalls int
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/sub.sup?windowed=1", nil)
+	err := c.ServeSUPExtract(recorder, request, opts, func(_ context.Context, extractOpts StreamExtractOpts) error {
+		if extractOpts.AllowWindow {
+			windowCalls++
+			_, writeErr := extractOpts.Writer.Write([]byte("WINDOW"))
+			return writeErr
+		}
+		warmCalls++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if windowCalls != 1 || warmCalls != 0 {
+		t.Fatalf("extract calls: window=%d warm=%d, want window=1 warm=0", windowCalls, warmCalls)
+	}
+	if recorder.Body.String() != "WINDOW" {
+		t.Fatalf("windowed body = %q", recorder.Body.String())
 	}
 }
 

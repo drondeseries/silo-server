@@ -79,6 +79,7 @@ import {
   useUpdateRequestSettings,
   useUpdateRequestUserLimit,
 } from "@/hooks/queries/useRequests";
+import { requestRouterConnectionDefaults } from "./requestRouterConnectionDefaults";
 import {
   formatMediaType,
   formatRequestDate,
@@ -942,9 +943,11 @@ function IntegrationEditor({
     soleInstallation !== undefined ? String(soleInstallation.installationID) : undefined;
   useEffect(() => {
     if (form.installation_id || soleInstallation === undefined) return;
+    const defaults = requestRouterConnectionDefaults(soleInstallation.capability.metadata);
     onChange({
       installation_id: String(soleInstallation.installationID),
       capability_id: soleInstallation.capability.id,
+      ...(defaults ? { base_url: defaults.baseURL, api_key_ref: defaults.apiKey } : {}),
     });
     // onChange identity is stable per card; intentionally depend on the data only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -963,6 +966,17 @@ function IntegrationEditor({
         entry.capability.id === form.capability_id,
     ) ?? installations.find((entry) => entry.installationID === selectedInstallationID);
 
+  const selectedDefaults = requestRouterConnectionDefaults(selected?.capability.metadata);
+  useEffect(() => {
+    if (!selectedDefaults || form.base_url.trim() || form.api_key_ref.trim() || form.has_api_key) {
+      return;
+    }
+    onChange({ base_url: selectedDefaults.baseURL, api_key_ref: selectedDefaults.apiKey });
+    // Default metadata is stable for an installed capability. Only fill a fully
+    // empty connection; never overwrite an administrator's saved credentials.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDefaults?.baseURL, selectedDefaults?.apiKey]);
+
   // Switching the selected plugin must drop the previous plugin's config (so its
   // keys never reach the new plugin's schema in the options probe or save) and
   // clear stale save errors (handled by patchForm -> clearSaveErrors).
@@ -975,9 +989,13 @@ function IntegrationEditor({
     ) {
       return; // no actual change; keep existing config
     }
+    const defaults = requestRouterConnectionDefaults(entry.capability.metadata);
     patchForm({
       installation_id: String(entry.installationID),
       capability_id: entry.capability.id,
+      base_url: defaults?.baseURL ?? "",
+      api_key_ref: defaults?.apiKey ?? "",
+      has_api_key: false,
     });
     onConfigChange({});
   }
@@ -1021,17 +1039,11 @@ function IntegrationEditor({
   }, [options, descriptor]);
 
   const saving = createIntegration.isPending || updateIntegration.isPending;
-  // New instances must carry an API key (there's no saved key to fall back on);
-  // edits may leave it blank to keep the stored key (has_api_key).
-  const hasApiKey = form.api_key_ref.trim().length > 0 || form.has_api_key;
   // schemaValid is reported by SchemaForm via onValidityChange. With no descriptor
-  // (no plugin form) there's nothing to validate, so the chrome checks govern.
-  const canSave =
-    form.name.trim().length > 0 &&
-    form.base_url.trim().length > 0 &&
-    hasApiKey &&
-    hasInstallation &&
-    (!descriptor || schemaValid);
+  // (no plugin form) there's nothing to validate. Connection credentials are
+  // optional at the host layer because some request-router plugins are entirely
+  // self-contained; plugins that need them reject the save through Validate.
+  const canSave = form.name.trim().length > 0 && hasInstallation && (!descriptor || schemaValid);
 
   function handleSave() {
     // Coercion is driven by the plugin's declared json_schema types so e.g. a
@@ -1097,7 +1109,7 @@ function IntegrationEditor({
             placeholder="Connection name"
           />
         </Field>
-        <Field label="API key or setting key">
+        <Field label="API key or setting key (optional)">
           <Input
             value={form.api_key_ref}
             onChange={(event) => patchForm({ api_key_ref: event.target.value })}
@@ -1106,7 +1118,7 @@ function IntegrationEditor({
         </Field>
       </div>
 
-      <Field label="Base URL">
+      <Field label="Base URL (optional)">
         <Input
           value={form.base_url}
           onChange={(event) => patchForm({ base_url: event.target.value })}

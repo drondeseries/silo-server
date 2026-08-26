@@ -32,6 +32,20 @@ describe("buildQualitySummary", () => {
     expect(buildQualitySummary(version)).toBe("2160p · HEVC · HDR · TrueHD");
   });
 
+  it("labels the just-in-time virtual results action", () => {
+    expect(buildQualitySummary(makeVersion({ file_path: "virtual://movie/tt1?results=all" }))).toBe(
+      "More results…",
+    );
+  });
+
+  it("does not label returned result files as the action", () => {
+    expect(
+      buildQualitySummary(
+        makeVersion({ file_path: "virtual://movie/tt1?results=all&result=abc123" }),
+      ),
+    ).toBe("1080p · H264 · AAC");
+  });
+
   it("omits HDR segment when hdr is false", () => {
     const version = makeVersion({
       resolution: "1080p",

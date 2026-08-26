@@ -810,6 +810,7 @@ type TerminalV3 struct {
 	Reason    string `json:"reason"`
 	Message   string `json:"message"`
 	Retryable bool   `json:"retryable"`
+	Detail    string `json:"detail,omitempty"`
 }
 
 type DecisionResponseV3 struct {
@@ -1239,6 +1240,14 @@ func NewTerminalResponseV3(reason, message string, retryable bool) DecisionRespo
 		Outcome:         OutcomeAdaptationUnavailableV3,
 		Terminal:        &TerminalV3{Reason: reason, Message: message, Retryable: retryable},
 	}
+}
+
+// NewTerminalResponseFromTerminalV3 builds a decision response from an existing
+// terminal, preserving the diagnostic detail line.
+func NewTerminalResponseFromTerminalV3(terminal *TerminalV3) DecisionResponseV3 {
+	response := NewTerminalResponseV3(terminal.Reason, terminal.Message, terminal.Retryable)
+	response.Terminal.Detail = terminal.Detail
+	return response
 }
 
 func NewPlanExpiryV3(now time.Time) string { return now.Add(MaxTokenTTL).UTC().Format(time.RFC3339) }

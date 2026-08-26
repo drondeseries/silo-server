@@ -98,7 +98,7 @@ func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]s
 	if err != nil {
 		return nil, fmt.Errorf("subdl: search request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -147,7 +147,7 @@ func (p *Provider) Download(ctx context.Context, id string) ([]byte, subtitles.S
 	if err != nil {
 		return nil, "", fmt.Errorf("subdl: download request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -185,7 +185,7 @@ func extractSubtitleFromZip(data []byte) ([]byte, subtitles.SubtitleFormat, erro
 				return nil, "", fmt.Errorf("subdl: open zip entry: %w", err)
 			}
 			content, err := io.ReadAll(rc)
-			rc.Close()
+			_ = rc.Close()
 			if err != nil {
 				return nil, "", fmt.Errorf("subdl: read zip entry: %w", err)
 			}

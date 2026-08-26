@@ -261,7 +261,7 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 		seekSeconds = d
 	}
 	requiresAudioBoost := method == string(playback.PlayRemux) && source.TranscodeAudio && compatSourceAudioChannels(*source) > 0
-	if h.NodePlanner != nil && h.JWTSecret != "" {
+	if h.NodePlanner != nil && h.JWTSecret != "" && shouldUseCompatNodePool(*source, nil) {
 		plan := h.planCompatProxySession(r.Context(), playSession.UpstreamSessionID, source.Version.Bitrate, requiresAudioBoost)
 		if redirectURL, redirectErr := h.buildProxyRedirectURL(playSession.ID, playSession.UpstreamSessionID, method, file, *source, session, playSession.CreatedAt, "", seekSeconds, plan.ProxyNode); redirectErr == nil {
 			http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
@@ -350,6 +350,21 @@ func (h *PlaybackHandler) HandleDownload(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	var virtualSourceURI string
+	var virtualOwnerID int
+	if source := h.boundVirtualDownloadSource(session, newCaseInsensitiveQuery(r.URL.Query()).Get("PlaySessionId"), version.FileID, firstNonEmpty(r.URL.Query().Get("mediaSourceId"), r.URL.Query().Get("MediaSourceId"))); source != nil {
+		version = source.Version
+		virtualSourceURI = source.VirtualSourceURI
+		virtualOwnerID = source.VirtualSourceOwnerInstallationID
+	} else if isCompatVirtualPath(version.FilePath) || strings.EqualFold(strings.TrimSpace(version.Container), "virtual") {
+		var prepareErr error
+		version, virtualSourceURI, virtualOwnerID, prepareErr = h.prepareVirtualPlaybackVersion(r.Context(), session, version)
+		if prepareErr != nil {
+			writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to resolve virtual playback")
+			return
+		}
+	}
+
 	if h.fileResolver == nil {
 		writeError(w, http.StatusInternalServerError, "ServerError", "File resolver not available")
 		return
@@ -359,9 +374,46 @@ func (h *PlaybackHandler) HandleDownload(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, "NotFound", "Media file not found")
 		return
 	}
-	// §4.2b: a download has a user but no stable playback session, so it is a
-	// Transfer rather than a logical session.
-	attachCompatTransfer(r.Context(), session, version.FileID)
+
+	if virtualSourceURI != "" {
+		source := PlaybackMediaSource{
+			FileID: version.FileID, Version: version,
+			VirtualSourceURI:                 virtualSourceURI,
+			VirtualSourceOwnerInstallationID: virtualOwnerID,
+		}
+		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(virtualDownloadName(version)))
+		if streamErr := h.serveVirtualDirect(w, r, session, source); streamErr != nil {
+			writeError(w, http.StatusBadGateway, "PlaybackUnavailable", "Failed to stream virtual playback")
+		}
+		return
+	}
+
+	if isCompatVirtualFile(file) || isCompatVirtualPath(version.FilePath) {
+		playSessionID := firstNonEmpty(r.URL.Query().Get("PlaySessionId"), r.URL.Query().Get("playSessionId"))
+		mediaSourceID := firstNonEmpty(r.URL.Query().Get("MediaSourceId"), r.URL.Query().Get("mediaSourceId"))
+		boundSource := h.boundVirtualDownloadSource(session, playSessionID, version.FileID, mediaSourceID)
+		source := PlaybackMediaSource{}
+		if boundSource != nil {
+			source = *boundSource
+		} else {
+			resolved, err := h.resolveAndProbeVirtualSource(r.Context(), file, session.StreamAppUserID, session.ProfileID)
+			if err != nil {
+				writeCompatUpstreamError(w, err)
+				return
+			}
+			source = PlaybackMediaSource{
+				FileID:                           version.FileID,
+				Version:                          applyVirtualProbeToVersion(version, resolved.file),
+				VirtualSourceURI:                 resolved.uri,
+				VirtualSourceOwnerInstallationID: resolved.ownerID,
+			}
+		}
+		w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(virtualDownloadName(source.Version)))
+		if err := h.serveVirtualDirect(w, r, session, source); err != nil {
+			writeCompatUpstreamError(w, err)
+		}
+		return
+	}
 
 	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(filepath.Base(file.FilePath)))
 	_ = playback.ServeDirectPlay(w, r, file.FilePath)
@@ -514,7 +566,7 @@ func (h *PlaybackHandler) HandleMasterManifest(w http.ResponseWriter, r *http.Re
 
 	// In distributed mode admins can disable the local fallback so the API
 	// server never transcodes when no eligible node exists.
-	if h.NodePlanner != nil && !adoptedLocal && !nodepool.LocalTranscodeFallbackAllowed(r.Context(), h.SettingsRepo) {
+	if h.NodePlanner != nil && !adoptedLocal && !isCompatVirtualSource(*source) && !nodepool.LocalTranscodeFallbackAllowed(r.Context(), h.SettingsRepo) {
 		if playSession.UpstreamSessionID != "" {
 			h.releaseCompatSessionReservation(playSession.UpstreamSessionID)
 			h.teardownPlaySession(context.WithoutCancel(r.Context()), playSession, nil, nil)
@@ -1738,6 +1790,10 @@ func (h *PlaybackHandler) upstreamRecipeCard(ps *PlaybackSession, cs *Session, s
 	if ps != nil && !ps.CreatedAt.IsZero() {
 		card.OriginalStartedAt = ps.CreatedAt
 	}
+	if isCompatVirtualSource(source) {
+		card.InputPath = source.VirtualSourceURI
+		card.VirtualSourceOwnerInstallationID = source.VirtualSourceOwnerInstallationID
+	}
 	return card
 }
 
@@ -1902,6 +1958,20 @@ func (h *PlaybackHandler) ensureUpstreamPlayback(ctx context.Context, compatSess
 	}
 	if err != nil {
 		return nil, err
+	}
+	if isCompatVirtualSource(source) {
+		setter, ok := h.sessionMgr.(virtualSourceSetter)
+		if !ok {
+			_ = h.sessionMgr.StopSession(session.ID)
+			return nil, errors.New("session manager cannot bind a virtual playback source")
+		}
+		if err := setter.SetVirtualSource(session.ID, source.VirtualSourceURI, source.VirtualSourceOwnerInstallationID); err != nil {
+			_ = h.sessionMgr.StopSession(session.ID)
+			return nil, fmt.Errorf("bind virtual playback source: %w", err)
+		}
+		if rebound, getErr := h.sessionMgr.GetSession(session.ID); getErr == nil && rebound != nil {
+			session = rebound
+		}
 	}
 	_ = h.syncUpstreamAudioSelection(&PlaybackSession{
 		UpstreamSessionID:  session.ID,

@@ -111,6 +111,19 @@ type Dependencies struct {
 	// Settings (optional; reads server_settings for watched threshold, etc.)
 	SettingsRepo SettingsReader
 
+	// Virtual playback dependencies are optional. When configured, Jellyfin
+	// clients negotiate and transport virtual files through the same provider
+	// resolution and transient probing pipeline as native clients.
+	VirtualMediaResolver        VirtualMediaResolver
+	VirtualMediaRefreshResolver VirtualMediaRefreshResolver
+	VirtualPlaybackStreamLister VirtualPlaybackStreamLister
+	VirtualSourceProber         VirtualSourceProber
+	RemoteStreamRelay           RemoteStreamRelay
+	// AllowInsecureVirtual reports whether a plugin installation has explicitly
+	// enabled allow_insecure_http for private/local stream URLs. When nil or
+	// false, virtual streams use the strict SSRF-protected relay path.
+	AllowInsecureVirtual func(installationID int) bool
+
 	// Subtitle support (optional)
 	SubtitleRepo subtitles.Repository // optional; downloaded subtitle support
 	S3Client     subtitles.S3Client   // optional
@@ -174,7 +187,7 @@ func (s *Server) SessionStore() *SessionStore {
 }
 
 // StartBackgroundTasks starts background goroutines tied to the server lifecycle.
-// Call this once after constructing the server; goroutines stop when ctx is cancelled.
+// Call this once after constructing the server; goroutines stop when ctx is canceled.
 // The returned channel closes after the initial terminal recovery scan so
 // callers can order broader stale-session sweeps behind authoritative compat
 // recovery without delaying HTTP startup.

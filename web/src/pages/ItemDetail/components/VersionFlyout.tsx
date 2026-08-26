@@ -8,16 +8,31 @@ import {
 import { formatFileSize, mapAudioLabel } from "@/lib/mediaFormat";
 import { videoRangeLabel } from "@/lib/videoRange";
 import { extractSourceHint } from "./versionFormatUtils";
-import { resolutionScore } from "./versionRankingUtils";
+import { audioScore, resolutionScore } from "./versionRankingUtils";
 
 // ---------------------------------------------------------------------------
 // Exported helper functions (also used by tests)
 // ---------------------------------------------------------------------------
 
 export function buildQualitySummary(version: FileVersion): string {
+  if (version.file_path) {
+    try {
+      const parsed = new URL(version.file_path, "http://silo.local");
+      if (parsed.searchParams.get("results") === "all" && !parsed.searchParams.has("result")) {
+        return "More results…";
+      }
+    } catch {
+      // Fall through to the regular media quality summary for malformed paths.
+    }
+  }
   const parts: string[] = [];
 
   if (version.resolution) parts.push(version.resolution);
+
+  const textToScan = [version.file_name, version.edition_raw].filter(Boolean).join(" ");
+  const sourceHint = textToScan ? extractSourceHint(textToScan) : null;
+  if (sourceHint) parts.push(sourceHint);
+
   if (version.codec_video) parts.push(version.codec_video.toUpperCase());
   const rangeLabel = videoRangeLabel(version);
   if (rangeLabel) parts.push(rangeLabel);
@@ -35,7 +50,8 @@ export function buildDetailLine(version: FileVersion): string {
   const size = formatFileSize(version.file_size);
   if (size) parts.push(size);
 
-  const hint = version.file_name ? extractSourceHint(version.file_name) : null;
+  const textToScan = [version.file_name, version.edition_raw].filter(Boolean).join(" ");
+  const hint = textToScan ? extractSourceHint(textToScan) : null;
   if (hint) parts.push(hint);
 
   return parts.join(" · ");
@@ -43,7 +59,11 @@ export function buildDetailLine(version: FileVersion): string {
 
 export function sortByResolution(versions: FileVersion[]): FileVersion[] {
   return [...versions].sort(
-    (a, b) => resolutionScore(b.resolution) - resolutionScore(a.resolution),
+    (a, b) =>
+      resolutionScore(b.resolution) - resolutionScore(a.resolution) ||
+      Number(b.hdr) - Number(a.hdr) ||
+      audioScore(b.codec_audio) - audioScore(a.codec_audio) ||
+      (b.file_size ?? 0) - (a.file_size ?? 0),
   );
 }
 
@@ -79,7 +99,7 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
             </span>
 
             <span className="min-w-0 flex-1">
-              <span className="text-foreground block truncate text-sm font-medium">
+              <span className="text-foreground block truncate text-sm font-semibold">
                 {qualitySummary}
               </span>
               {detailLine && (

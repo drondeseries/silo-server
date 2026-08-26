@@ -234,7 +234,7 @@ func (h *NodeHandler) HandleForceReloadNodes(w http.ResponseWriter, r *http.Requ
 				results[idx] = result
 				return
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
 				result.Status = "ok"
 			} else {
@@ -286,7 +286,7 @@ func (h *NodeHandler) HandleForceReloadNode(w http.ResponseWriter, r *http.Reque
 		}}})
 		return
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	status := "ok"
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {

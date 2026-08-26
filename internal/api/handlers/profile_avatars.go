@@ -237,7 +237,7 @@ func (h *ProfileHandler) HandleUploadAvatar(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "bad_request", "Missing avatar file")
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	if posterExtension(header.Header.Get("Content-Type")) == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "Unsupported image type; use JPEG, PNG, or WebP")

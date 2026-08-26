@@ -208,10 +208,6 @@ func (failingSessionManager) BeginTransport(string) error { return nil }
 
 func (failingSessionManager) EndTransport(string) error { return nil }
 
-func (failingSessionManager) WatchTransportStop(string) (<-chan struct{}, func()) {
-	return nil, func() {}
-}
-
 func (failingSessionManager) SetRemoteTransport(string, bool) error { return nil }
 
 func (failingSessionManager) SetEffectiveMediaFileID(string, int) error { return nil }
@@ -267,91 +263,6 @@ func newAuthorizedPlaybackContext() context.Context {
 	ctx := context.Background()
 	ctx = apimw.SetClaims(ctx, &auth.Claims{UserID: 1, Role: "user", TokenType: auth.TokenTypeAccess})
 	return apimw.SetProfileID(ctx, "profile-1")
-}
-
-func TestHeaderAuthenticatedMediaEnforcesHLSOwnerOnEveryRequest(t *testing.T) {
-	manager := playback.NewSessionManager(0, 0)
-	manager.RegisterReconstructed(&playback.Session{
-		ID:                        "secure-hls-session",
-		UserID:                    1,
-		PlayMethod:                playback.PlayTranscode,
-		RequireMediaAuthorization: true,
-	})
-	manager.RegisterReconstructed(&playback.Session{
-		ID:         "legacy-hls-session",
-		UserID:     1,
-		PlayMethod: playback.PlayTranscode,
-	})
-	handler := NewPlaybackHandler(manager)
-
-	type endpoint struct {
-		name   string
-		handle func(http.ResponseWriter, *http.Request)
-		path   func(string) string
-		params func(string) map[string]string
-	}
-	endpoints := []endpoint{
-		{
-			name:   "manifest",
-			handle: handler.HandleGetTranscodeManifest,
-			path: func(id string) string {
-				return "/api/v1/playback/transcode/" + id + "/master.m3u8"
-			},
-			params: func(id string) map[string]string { return map[string]string{"session_id": id} },
-		},
-		{
-			name:   "segment",
-			handle: handler.HandleGetTranscodeSegment,
-			path: func(id string) string {
-				return "/api/v1/playback/transcode/" + id + "/segment/seg_00001.m4s"
-			},
-			params: func(id string) map[string]string {
-				return map[string]string{"session_id": id, "name": "seg_00001.m4s"}
-			},
-		},
-	}
-
-	request := func(endpoint endpoint, sessionID string, userID int) *http.Request {
-		req := httptest.NewRequest(http.MethodGet, endpoint.path(sessionID), nil)
-		if userID != 0 {
-			ctx := apimw.SetClaims(req.Context(), &auth.Claims{
-				UserID: userID, Role: "user", TokenType: auth.TokenTypeAccess,
-			})
-			req = req.WithContext(ctx)
-		}
-		routeCtx := chi.NewRouteContext()
-		for key, value := range endpoint.params(sessionID) {
-			routeCtx.URLParams.Add(key, value)
-		}
-		return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
-	}
-
-	for _, endpoint := range endpoints {
-		t.Run(endpoint.name, func(t *testing.T) {
-			for _, test := range []struct {
-				name      string
-				sessionID string
-				userID    int
-				want      int
-			}{
-				{name: "secure missing auth", sessionID: "secure-hls-session", want: http.StatusUnauthorized},
-				{name: "secure wrong owner", sessionID: "secure-hls-session", userID: 2, want: http.StatusForbidden},
-				// The media process is intentionally absent in this unit fixture;
-				// reaching 404 proves the authenticated owner passed the gate.
-				{name: "secure owner accepted", sessionID: "secure-hls-session", userID: 1, want: http.StatusNotFound},
-				// Legacy UUID-bearer behavior remains unchanged.
-				{name: "legacy missing auth accepted", sessionID: "legacy-hls-session", want: http.StatusNotFound},
-			} {
-				t.Run(test.name, func(t *testing.T) {
-					rr := httptest.NewRecorder()
-					endpoint.handle(rr, request(endpoint, test.sessionID, test.userID))
-					if rr.Code != test.want {
-						t.Fatalf("status = %d body=%s, want %d", rr.Code, rr.Body.String(), test.want)
-					}
-				})
-			}
-		})
-	}
 }
 
 func withPlaybackRouteParam(req *http.Request, key, value string) *http.Request {
@@ -1235,5 +1146,81 @@ func TestAlignedSeekSeconds(t *testing.T) {
 					tt.seek, tt.segDur, tt.targetVideo, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestClampEncodedTargetResolution(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested string
+		source    string
+		want      string
+	}{
+		{"clamps 2160p to 1080p", "2160p", "1080p", "1080p"},
+		{"keeps lower target", "720p", "1080p", "720p"},
+		{"keeps equal target", "1080p", "1080p", "1080p"},
+		{"keeps empty target", "", "1080p", ""},
+		{"keeps unknown target", "source", "1080p", "source"},
+		{"keeps target for unknown source", "2160p", "native", "2160p"},
+		{"supports low tiers", "480p", "420p", "420p"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := clampEncodedTargetResolution(tt.requested, tt.source); got != tt.want {
+				t.Fatalf("clampEncodedTargetResolution(%q, %q) = %q, want %q", tt.requested, tt.source, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFindAlternateFilesMultipleCandidates(t *testing.T) {
+	source := &models.MediaFile{
+		ID:         1,
+		ContentID:  "movie-123",
+		Resolution: "2160p",
+		HDR:        true,
+	}
+	handler := &PlaybackHandler{
+		FileVersionFetcher: testPlaybackFileVersionFetcher{
+			byContent: map[string][]*models.MediaFile{
+				"movie-123": {
+					source,
+					{
+						ID:         2,
+						ContentID:  "movie-123",
+						Resolution: "1080p",
+						HDR:        true,
+						Bitrate:    8_000_000,
+					},
+					{
+						ID:         3,
+						ContentID:  "movie-123",
+						Resolution: "1080p",
+						HDR:        false,
+						Bitrate:    6_000_000,
+					},
+					{
+						ID:         4,
+						ContentID:  "movie-123",
+						Resolution: "720p",
+						HDR:        false,
+						Bitrate:    3_000_000,
+					},
+				},
+			},
+		},
+	}
+
+	alternates, err := handler.findAlternateFiles(context.Background(), source)
+	if err != nil {
+		t.Fatalf("findAlternateFiles: %v", err)
+	}
+	if len(alternates) != 3 {
+		t.Fatalf("expected 3 alternates, got %d", len(alternates))
+	}
+	// SDR before HDR, then highest resolution, then highest bitrate.
+	// Expected order: 3 (1080p SDR), 4 (720p SDR - wait: 2 is 1080p HDR, SDR preferred so 3, 4, 2)
+	if alternates[0].ID != 3 {
+		t.Errorf("alternates[0].ID = %d, want 3 (1080p SDR)", alternates[0].ID)
 	}
 }

@@ -100,7 +100,7 @@ func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]s
 	if err != nil {
 		return nil, fmt.Errorf("subsource: search request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -149,7 +149,7 @@ func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]s
 	if err != nil {
 		return nil, fmt.Errorf("subsource: subtitle request: %w", err)
 	}
-	defer subResp.Body.Close()
+	defer func() { _ = subResp.Body.Close() }()
 
 	if subResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(subResp.Body)
@@ -218,7 +218,7 @@ func (p *Provider) fetchSubtitles(ctx context.Context, movieID int, lang string)
 	if err != nil {
 		return nil, err
 	}
-	defer subResp.Body.Close()
+	defer func() { _ = subResp.Body.Close() }()
 
 	if subResp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("subsource: subtitle list returned %d", subResp.StatusCode)
@@ -246,7 +246,7 @@ func (p *Provider) Download(ctx context.Context, id string) ([]byte, subtitles.S
 	if err != nil {
 		return nil, "", fmt.Errorf("subsource: download request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -293,7 +293,7 @@ func extractSubtitleFromZip(data []byte) ([]byte, subtitles.SubtitleFormat, erro
 				return nil, "", fmt.Errorf("subsource: open zip entry: %w", err)
 			}
 			content, err := io.ReadAll(rc)
-			rc.Close()
+			_ = rc.Close()
 			if err != nil {
 				return nil, "", fmt.Errorf("subsource: read zip entry: %w", err)
 			}

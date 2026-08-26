@@ -531,7 +531,7 @@ func ListProgress(db *sql.DB, profileID string, status string, limit, offset int
 	if err != nil {
 		return nil, fmt.Errorf("listing progress: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []WatchProgress
 	for rows.Next() {
@@ -576,7 +576,7 @@ func ListProgressSince(db *sql.DB, profileID string, cursor int64, limit int) ([
 	if err != nil {
 		return nil, cursor, fmt.Errorf("listing progress since: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	next := cursor
 	var results []WatchProgress
@@ -631,7 +631,7 @@ func ListProgressByMediaItems(db *sql.DB, profileID string, mediaItemIDs []strin
 	if err != nil {
 		return nil, fmt.Errorf("listing progress by media items: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var wp WatchProgress
@@ -769,7 +769,7 @@ func ListHistory(db *sql.DB, profileID string, limit, offset int) ([]WatchHistor
 	if err != nil {
 		return nil, fmt.Errorf("listing history: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []WatchHistoryEntry
 	for rows.Next() {
@@ -812,7 +812,7 @@ func ListCompletedHistory(db *sql.DB, query userstore.CompletedHistoryQuery) ([]
 	if err != nil {
 		return nil, fmt.Errorf("listing completed history: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []WatchHistoryEntry
 	for rows.Next() {
@@ -851,7 +851,7 @@ func ListCompletedHistoryItems(db *sql.DB, query userstore.CompletedHistoryItemQ
 	if err != nil {
 		return nil, fmt.Errorf("listing completed history items: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []userstore.CompletedHistoryItem
 	for rows.Next() {
@@ -932,7 +932,7 @@ func RemoveHistoryItems(db *sql.DB, profileID string, mediaItemIDs []string, rem
 	if err != nil {
 		return fmt.Errorf("begin remove history items: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	removedAtText := removedAt.UTC().Format(time.RFC3339)
 	targetValues := make([]string, len(mediaItemIDs))
@@ -1080,7 +1080,7 @@ func VisibleHistoryTimestamps(db *sql.DB, profileID string, mediaItemIDs []strin
 	if err != nil {
 		return nil, fmt.Errorf("listing visible history timestamps: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var mediaItemID string

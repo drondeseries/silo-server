@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -66,7 +67,8 @@ const fileColumns = `id, content_id, episode_id, extra_id, season_number, episod
 	presentation_kind, presentation_group_key, presentation_part_index, presentation_part_total,
 	multi_episode_start, multi_episode_end,
 	multiple_pps, multiple_pps_scan_size, multiple_pps_scan_mtime,
-	probe_source, probe_updated_at, match_attempted_at, missing_since, created_at, updated_at`
+	probe_source, probe_updated_at, match_attempted_at, missing_since, created_at, updated_at,
+	virtual_owner_installation_id`
 
 const overlayFileColumns = `content_id, episode_id, media_folder_id, file_path,
 	codec_video, codec_audio, resolution, audio_channels, hdr, container,
@@ -90,7 +92,8 @@ const mfFileColumns = `mf.id, mf.content_id, mf.episode_id, mf.extra_id, mf.seas
 	mf.presentation_kind, mf.presentation_group_key, mf.presentation_part_index, mf.presentation_part_total,
 	mf.multi_episode_start, mf.multi_episode_end,
 	mf.multiple_pps, mf.multiple_pps_scan_size, mf.multiple_pps_scan_mtime,
-	mf.probe_source, mf.probe_updated_at, mf.match_attempted_at, mf.missing_since, mf.created_at, mf.updated_at`
+	mf.probe_source, mf.probe_updated_at, mf.match_attempted_at, mf.missing_since, mf.created_at, mf.updated_at,
+	mf.virtual_owner_installation_id`
 
 // scanMediaFile scans a single row into a *models.MediaFile.
 func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
@@ -126,6 +129,7 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	var presentationKind, presentationGroupKey *string
 	var chapterThumbnailRetryAfter *time.Time
 	var videoTracksJSON, audioTracksJSON, subtitleTracksJSON, externalSubtitlesJSON, chaptersJSON []byte
+	var virtualOwnerInstallationID *int
 
 	err := row.Scan(
 		&f.ID,
@@ -213,6 +217,7 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 		&f.MissingSince,
 		&f.CreatedAt,
 		&f.UpdatedAt,
+		&virtualOwnerInstallationID,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -236,6 +241,10 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	}
 	if episodeNumber != nil {
 		f.EpisodeNumber = *episodeNumber
+	}
+	if virtualOwnerInstallationID != nil {
+		f.VirtualOwnerInstallationID = *virtualOwnerInstallationID
+		f.VirtualOwnerInstallationSet = true
 	}
 	if canonicalRootPath != nil {
 		f.CanonicalRootPath = *canonicalRootPath
@@ -439,6 +448,7 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		var presentationKind, presentationGroupKey *string
 		var chapterThumbnailRetryAfter *time.Time
 		var videoTracksJSON, audioTracksJSON, subtitleTracksJSON, externalSubtitlesJSON, chaptersJSON []byte
+		var virtualOwnerInstallationID *int
 
 		err := rows.Scan(
 			&f.ID,
@@ -526,6 +536,7 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 			&f.MissingSince,
 			&f.CreatedAt,
 			&f.UpdatedAt,
+			&virtualOwnerInstallationID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning media file row: %w", err)
@@ -642,6 +653,10 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		}
 		if multiEpisodeEnd != nil {
 			f.MultiEpisodeEnd = *multiEpisodeEnd
+		}
+		if virtualOwnerInstallationID != nil {
+			f.VirtualOwnerInstallationID = *virtualOwnerInstallationID
+			f.VirtualOwnerInstallationSet = true
 		}
 		f.MarkersSource = markersSource
 		f.MarkersConfidence = markersConfidence
@@ -812,6 +827,38 @@ func serializeJSONB(v any) ([]byte, error) {
 
 // Upsert inserts or updates a media file by file_path (ON CONFLICT DO UPDATE).
 // Returns the resulting row.
+// SaveCopySafetyVerdict persists the multi-PPS bitstream scan result so the
+// first play after a restart does not re-read the opening seconds of remote
+// media. Validity is re-checked against the file's size on load.
+func (r *FileRepository) SaveCopySafetyVerdict(ctx context.Context, id int, multi bool, size int64) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE media_files
+		SET copy_safety_multi=$2, copy_safety_checked_size=$3, copy_safety_checked_at=NOW()
+		WHERE id=$1`, id, multi, size)
+	return err
+}
+
+// LoadCopySafetyVerdict returns the persisted multi-PPS verdict for id when a
+// scan was recorded for the same file size.
+func (r *FileRepository) LoadCopySafetyVerdict(ctx context.Context, id int, size int64) (multi bool, ok bool, err error) {
+	var (
+		multiVal *bool
+		sizeVal  *int64
+	)
+	err = r.pool.QueryRow(ctx, `
+		SELECT copy_safety_multi, copy_safety_checked_size
+		FROM media_files
+		WHERE id=$1 AND copy_safety_multi IS NOT NULL
+		  AND copy_safety_checked_size=$2`, id, size).Scan(&multiVal, &sizeVal)
+	if err != nil {
+		return false, false, err
+	}
+	if multiVal == nil || sizeVal == nil || *sizeVal != size {
+		return false, false, nil
+	}
+	return *multiVal, true, nil
+}
+
 func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*models.MediaFile, error) {
 	subtitleTracksJSON, err := serializeJSONB(mf.SubtitleTracks)
 	if err != nil {
@@ -869,7 +916,7 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		edition_raw, edition_key, edition_confidence, edition_source,
 		presentation_kind, presentation_group_key, presentation_part_index, presentation_part_total,
 		multi_episode_start, multi_episode_end,
-		probe_source, probe_updated_at, missing_since
+		probe_source, probe_updated_at, missing_since, virtual_owner_installation_id
 	) VALUES (
 		$1, $2, $3, $4, $5,
 		$6, $7, $8, $9, $10,
@@ -881,9 +928,9 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		$39, $40, $41, $42,
 		$43, $44, $45, $46,
 		$47, $48,
-		$49, $50, $51
+		$49, $50, $51, $52
 	)
-	ON CONFLICT (file_path) DO UPDATE SET
+	ON CONFLICT (file_path) WHERE virtual_owner_installation_id IS NULL DO UPDATE SET
 		content_id = CASE
 			WHEN EXCLUDED.extra_id IS NOT NULL THEN NULL
 			ELSE COALESCE(EXCLUDED.content_id, media_files.content_id)
@@ -996,9 +1043,215 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		probeSource,
 		mf.ProbeUpdatedAt,
 		mf.MissingSince,
+		virtualOwnerInstallationValue(mf),
 	)
 
 	return scanMediaFile(row)
+}
+
+func virtualOwnerInstallationValue(mf models.MediaFile) any {
+	if mf.VirtualOwnerInstallationSet || mf.VirtualOwnerInstallationID > 0 {
+		return mf.VirtualOwnerInstallationID
+	}
+	return nil
+}
+
+// VirtualCandidate is provider-neutral technical metadata for one ephemeral
+// stream choice. URI must remain a canonical virtual:// handle; provider URLs
+// are resolved only when playback opens the selected file.
+type VirtualCandidate struct {
+	OwnerInstallationID int
+	URI                 string
+	Label               string
+	Resolution          string
+	CodecVideo          string
+	CodecAudio          string
+	HDR                 string
+	FileSize            int64
+	Bitrate             int
+	AudioLanguages      []string
+	SubtitleLanguages   []string
+}
+
+// ReplaceVirtualCandidates atomically replaces the just-in-time candidates
+// for one canonical source, episode, profile, and plugin owner. Provider result
+// IDs can change between requests; replacement prevents stale rows from
+// accumulating forever while retaining other profiles and installations.
+func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *models.MediaFile, candidates []VirtualCandidate) error {
+	if r == nil || r.pool == nil {
+		return errors.New("file repository is not configured")
+	}
+	if source == nil || source.ContentID == "" || source.VirtualOwnerInstallationID <= 0 {
+		return errors.New("virtual candidate source and installation owner are required")
+	}
+	if len(candidates) > 50 {
+		candidates = candidates[:50]
+	}
+	group, ok := virtualCandidateGroup(source.FilePath)
+	if !ok {
+		return errors.New("virtual candidate source URI is invalid")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin virtual candidate replacement: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	keep := make(map[int]struct{}, len(candidates))
+	owners := map[int]struct{}{source.VirtualOwnerInstallationID: {}}
+	for _, candidate := range candidates {
+		ownerInstallationID := candidate.OwnerInstallationID
+		if ownerInstallationID <= 0 {
+			ownerInstallationID = source.VirtualOwnerInstallationID
+		}
+		owners[ownerInstallationID] = struct{}{}
+		candidateGroup, candidateOK := virtualCandidateGroup(candidate.URI)
+		if !candidateOK || candidateGroup != group || !virtualCandidateSelection(candidate.URI) {
+			return fmt.Errorf("virtual candidate URI is outside its source group")
+		}
+		fileSize := candidate.FileSize
+		if fileSize < 0 {
+			fileSize = 0
+		}
+		audioTracks, err := json.Marshal(languageAudioTracks(candidate.AudioLanguages))
+		if err != nil {
+			return fmt.Errorf("marshal virtual candidate audio tracks: %w", err)
+		}
+		subtitleTracks, err := json.Marshal(languageSubtitleTracks(candidate.SubtitleLanguages))
+		if err != nil {
+			return fmt.Errorf("marshal virtual candidate subtitle tracks: %w", err)
+		}
+		var id int
+		err = tx.QueryRow(ctx, `
+			INSERT INTO media_files (
+				content_id, episode_id, media_folder_id, file_path, file_size,
+				resolution, codec_video, codec_audio, hdr, container, bitrate,
+				edition_raw, audio_tracks, subtitle_tracks, probe_source,
+				probe_updated_at, virtual_owner_installation_id
+			) VALUES (
+				$1, NULLIF($2,''), $3, $4, $5,
+				NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), $9, 'virtual',
+				NULLIF($10,0), $11, $12, $13, 'virtual', NOW(), $14
+			)
+			ON CONFLICT (file_path, virtual_owner_installation_id, media_folder_id)
+				WHERE virtual_owner_installation_id IS NOT NULL
+			DO UPDATE SET
+				content_id=EXCLUDED.content_id,
+				episode_id=EXCLUDED.episode_id,
+				media_folder_id=EXCLUDED.media_folder_id,
+				file_size=EXCLUDED.file_size,
+				resolution=EXCLUDED.resolution,
+				codec_video=EXCLUDED.codec_video,
+				codec_audio=EXCLUDED.codec_audio,
+				hdr=EXCLUDED.hdr,
+				container='virtual',
+				bitrate=EXCLUDED.bitrate,
+				edition_raw=EXCLUDED.edition_raw,
+				audio_tracks=EXCLUDED.audio_tracks,
+				subtitle_tracks=EXCLUDED.subtitle_tracks,
+				probe_source='virtual',
+				probe_updated_at=NOW(),
+				missing_since=NULL,
+				updated_at=NOW()
+			RETURNING id`,
+			source.ContentID, source.EpisodeID, source.MediaFolderID, candidate.URI,
+			fileSize, candidate.Resolution, candidate.CodecVideo,
+			candidate.CodecAudio, candidate.HDR != "", candidate.Bitrate,
+			candidate.Label, audioTracks, subtitleTracks,
+			ownerInstallationID,
+		).Scan(&id)
+		if err != nil {
+			return fmt.Errorf("upsert virtual candidate: %w", err)
+		}
+		keep[id] = struct{}{}
+	}
+
+	ownerIDs := make([]int64, 0, len(owners))
+	for ownerID := range owners {
+		ownerIDs = append(ownerIDs, int64(ownerID))
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT id, file_path
+		FROM media_files
+		WHERE content_id=$1
+		  AND COALESCE(episode_id,'')=$2
+		  AND media_folder_id=$3
+		  AND virtual_owner_installation_id=ANY($4::bigint[])
+		  AND (container='virtual' OR file_path LIKE 'virtual://%')`,
+		source.ContentID, source.EpisodeID, source.MediaFolderID, ownerIDs)
+	if err != nil {
+		return fmt.Errorf("list existing virtual candidates: %w", err)
+	}
+	var stale []int
+	for rows.Next() {
+		var id int
+		var path string
+		if err := rows.Scan(&id, &path); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan existing virtual candidate: %w", err)
+		}
+		existingGroup, valid := virtualCandidateGroup(path)
+		if !valid || existingGroup != group || !virtualCandidateSelection(path) {
+			continue
+		}
+		if _, exists := keep[id]; !exists {
+			stale = append(stale, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate existing virtual candidates: %w", err)
+	}
+	rows.Close()
+	if len(stale) > 0 && len(keep) > 0 {
+		if _, err := tx.Exec(ctx, `DELETE FROM media_files WHERE id = ANY($1::bigint[])`, stale); err != nil {
+			return fmt.Errorf("delete stale virtual candidates: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit virtual candidate replacement: %w", err)
+	}
+	return nil
+}
+
+func virtualCandidateGroup(raw string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "virtual" || parsed.Host == "" {
+		return "", false
+	}
+	query := parsed.Query()
+	query.Del("result")
+	parsed.RawQuery = query.Encode()
+	parsed.Fragment = ""
+	return parsed.String(), true
+}
+
+func virtualCandidateSelection(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(parsed.Query().Get("result")) != ""
+}
+
+func languageAudioTracks(languages []string) []models.AudioTrack {
+	result := make([]models.AudioTrack, 0, len(languages))
+	for _, language := range languages {
+		if language = strings.TrimSpace(language); language != "" {
+			result = append(result, models.AudioTrack{Language: language})
+		}
+	}
+	return result
+}
+
+func languageSubtitleTracks(languages []string) []models.SubtitleTrack {
+	result := make([]models.SubtitleTrack, 0, len(languages))
+	for _, language := range languages {
+		if language = strings.TrimSpace(language); language != "" {
+			result = append(result, models.SubtitleTrack{Language: language})
+		}
+	}
+	return result
 }
 
 // identityColumnDefaults normalizes the identity/grouping zero values the way
@@ -1198,61 +1451,6 @@ func (r *FileRepository) SetChapterThumbnailFailure(
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrFileNotFound
-	}
-	return nil
-}
-
-// UpdateMultiplePPS records the H.264 multi-PPS copy-safety verdict together
-// with the size and mtime it was computed from, so a later read can tell
-// whether the file has been rewritten since. A nil scanMtime records a verdict
-// for a row that has no file mtime; reading it back validates on size alone.
-//
-// It deliberately does not go through Upsert: that path also clears
-// match_suppressed_at and missing_since, which a copy-safety scan has no
-// business touching.
-//
-// The write is conditional on the row still holding the generation that was
-// scanned. A scan reads the opening seconds of a file over storage that can be
-// slow, so an old-generation scan finishing late would otherwise stamp its
-// verdict — and its stale size and mtime — over the replacement generation's,
-// re-validating a verdict for bytes that are gone and condemning (or clearing
-// the condemnation of) a file nobody scanned. A superseded write reports
-// ErrStaleCopySafetyScan rather than succeeding silently, because the caller
-// must also refrain from notifying live sessions on the strength of it.
-//
-// Both sides of the mtime predicate are normalized to microseconds, exactly as
-// MediaFile.PersistedVideoCopyVerdict normalizes them when it reads the verdict
-// back: Postgres stores timestamptz at microsecond resolution while a
-// filesystem mtime carries nanoseconds, so comparing the raw values would make
-// every write for a row whose mtime came from a stat call fail.
-func (r *FileRepository) UpdateMultiplePPS(ctx context.Context, fileID int, multiplePPS bool, scanSize int64, scanMtime *time.Time) error {
-	var normalizedMtime *time.Time
-	if scanMtime != nil {
-		normalized := models.NormalizeFileModifiedAt(*scanMtime)
-		normalizedMtime = &normalized
-	}
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE media_files
-		SET multiple_pps = $2,
-		    multiple_pps_scan_size = $3,
-		    multiple_pps_scan_mtime = $4,
-		    updated_at = NOW()
-		WHERE id = $1
-		  AND file_size = $3
-		  AND date_trunc('microseconds', file_modified_at) IS NOT DISTINCT FROM $4::timestamptz`,
-		fileID,
-		multiplePPS,
-		scanSize,
-		normalizedMtime,
-	)
-	if err != nil {
-		return fmt.Errorf("updating multiple pps verdict: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		// The row is gone, or it no longer carries the size and mtime that were
-		// scanned. Both mean the same thing to every caller: this verdict does
-		// not describe the file as it stands.
-		return ErrStaleCopySafetyScan
 	}
 	return nil
 }
@@ -1542,7 +1740,7 @@ func (r *FileRepository) upsertAndClearMarkers(ctx context.Context, fileID int, 
 	if err != nil {
 		return false, fmt.Errorf("begin marker mutation transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	state, err := loadMarkerMutationState(ctx, tx, fileID)
 	if err != nil {
@@ -2003,6 +2201,22 @@ func (r *FileRepository) GetByID(ctx context.Context, id int) (*models.MediaFile
 	return scanMediaFile(r.pool.QueryRow(ctx, query, id))
 }
 
+// ClearVirtualResultPin strips the pinned ?result= selection from a virtual
+// file's path so the next playback re-lists live provider candidates instead
+// of resolving a cached link that just failed (expired or 5xx-ing debrid
+// links otherwise brick the title: the pin survives every failover). No-op
+// when the row has no pin or vanished concurrently.
+func (r *FileRepository) ClearVirtualResultPin(ctx context.Context, fileID int) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE media_files
+		SET file_path = regexp_replace(file_path, '\?result=[^&]*$', '')
+		WHERE id = $1 AND file_path LIKE '%?result=%'`, fileID)
+	if err != nil {
+		return fmt.Errorf("clear virtual result pin for file %d: %w", fileID, err)
+	}
+	return nil
+}
+
 // GetByIDs retrieves media files by primary key.
 func (r *FileRepository) GetByIDs(ctx context.Context, ids []int) ([]*models.MediaFile, error) {
 	if len(ids) == 0 {
@@ -2256,7 +2470,7 @@ func (r *FileRepository) MarkMatchAttempted(ctx context.Context, fileID int) err
 	return err
 }
 
-// IsMatchSuppressed reports whether a raw unmatched file has been cancelled
+// IsMatchSuppressed reports whether a raw unmatched file has been canceled
 // from background matching.
 func (r *FileRepository) IsMatchSuppressed(ctx context.Context, fileID int) (bool, error) {
 	var suppressed bool
@@ -2748,7 +2962,7 @@ func claimRepresentativeWindow(limit int) int {
 // MarkMissing sets the missing_since timestamp for the given media file.
 func (r *FileRepository) MarkMissing(ctx context.Context, id int, since time.Time) error {
 	tag, err := r.pool.Exec(ctx,
-		"UPDATE media_files SET missing_since = $1, updated_at = NOW() WHERE id = $2",
+		"UPDATE media_files SET missing_since = $1, updated_at = NOW() WHERE id = $2 AND container <> 'virtual' AND file_path NOT LIKE 'virtual://%'",
 		since, id,
 	)
 	if err != nil {
@@ -2774,7 +2988,10 @@ func (r *FileRepository) MarkMissing(ctx context.Context, id int, since time.Tim
 // Returns the number of rows deleted.
 func (r *FileRepository) DeleteMissingByFolder(ctx context.Context, folderID int, gracePeriod time.Duration, protectedRoots []string) (int, error) {
 	cutoff := time.Now().UTC().Add(-gracePeriod)
-	query := "DELETE FROM media_files WHERE media_folder_id = $1 AND missing_since IS NOT NULL AND missing_since < $2"
+	// Virtual plugin-backed files are not present on the local filesystem by
+	// design. They must never be treated as missing physical files by scanner
+	// cleanup, otherwise a scan/restart disables playback for every virtual item.
+	query := "DELETE FROM media_files WHERE media_folder_id = $1 AND missing_since IS NOT NULL AND missing_since < $2 AND container <> 'virtual' AND file_path NOT LIKE 'virtual://%'"
 	args := []any{folderID, cutoff}
 	if clauses, clauseArgs := rootCoverageClauses(protectedRoots, len(args)+1); len(clauses) > 0 {
 		query += " AND NOT (" + strings.Join(clauses, " OR ") + ")"
@@ -2793,7 +3010,7 @@ func (r *FileRepository) DeleteMissingByFolder(ctx context.Context, folderID int
 //
 // This is the proactive counterpart to ListRootsWithOnlyMissingFiles. That
 // query requires a root to have NO live rows left, which means it can only
-// recognise a lost mount after a scan has already marked its files missing —
+// recognize a lost mount after a scan has already marked its files missing —
 // i.e. after the damage is done. For deciding whether to mark in the first
 // place, the question is simply "does the catalog believe anything lives
 // here", because an empty-but-reachable directory that still owns cataloged
@@ -2908,7 +3125,7 @@ func (r *FileRepository) DeleteByIDs(ctx context.Context, ids []int) (int, error
 // longer covered by any configured root.
 func (r *FileRepository) ListIDsOutsideRoots(ctx context.Context, folderID int, roots []string) ([]int, error) {
 	if len(roots) == 0 {
-		rows, err := r.pool.Query(ctx, `SELECT id FROM media_files WHERE media_folder_id = $1`, folderID)
+		rows, err := r.pool.Query(ctx, `SELECT id FROM media_files WHERE media_folder_id = $1 AND container <> 'virtual' AND file_path NOT LIKE 'virtual://%'`, folderID)
 		if err != nil {
 			return nil, fmt.Errorf("querying file ids outside roots: %w", err)
 		}
@@ -2933,7 +3150,7 @@ func (r *FileRepository) ListIDsOutsideRoots(ctx context.Context, folderID int, 
 	coveredClauses, coveredArgs := rootCoverageClauses(roots, 2)
 	args = append(args, coveredArgs...)
 
-	query := `SELECT id FROM media_files WHERE media_folder_id = $1 AND NOT (` + strings.Join(coveredClauses, " OR ") + `)`
+	query := `SELECT id FROM media_files WHERE media_folder_id = $1 AND container <> 'virtual' AND file_path NOT LIKE 'virtual://%' AND NOT (` + strings.Join(coveredClauses, " OR ") + `)`
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying file ids outside roots: %w", err)
@@ -3021,7 +3238,7 @@ func (r *FileRepository) ListByObservedRootPath(ctx context.Context, folderID in
 func (r *FileRepository) GetByContentID(ctx context.Context, contentID string) ([]*models.MediaFile, error) {
 	query := `SELECT ` + fileColumns + ` FROM media_files
 		WHERE content_id = $1 AND missing_since IS NULL
-		ORDER BY id ASC`
+		ORDER BY (container = 'virtual') ASC, id ASC`
 	rows, err := r.pool.Query(ctx, query, contentID)
 	if err != nil {
 		return nil, fmt.Errorf("querying files by content_id: %w", err)
@@ -3783,4 +4000,59 @@ func pathPrefixLike(pathPrefix string) string {
 // rows that live at or under that root; see pathscope.CoverageClauses.
 func rootCoverageClauses(roots []string, firstArg int) ([]string, []any) {
 	return pathscope.CoverageClauses("file_path", roots, firstArg)
+}
+
+// UpdateMultiplePPS records the H.264 multi-PPS copy-safety verdict together
+// with the size and mtime it was computed from, so a later read can tell
+// whether the file has been rewritten since. A nil scanMtime records a verdict
+// for a row that has no file mtime; reading it back validates on size alone.
+//
+// It deliberately does not go through Upsert: that path also clears
+// match_suppressed_at and missing_since, which a copy-safety scan has no
+// business touching.
+//
+// The write is conditional on the row still holding the generation that was
+// scanned. A scan reads the opening seconds of a file over storage that can be
+// slow, so an old-generation scan finishing late would otherwise stamp its
+// verdict — and its stale size and mtime — over the replacement generation's,
+// re-validating a verdict for bytes that are gone and condemning (or clearing
+// the condemnation of) a file nobody scanned. A superseded write reports
+// ErrStaleCopySafetyScan rather than succeeding silently, because the caller
+// must also refrain from notifying live sessions on the strength of it.
+//
+// Both sides of the mtime predicate are normalized to microseconds, exactly as
+// MediaFile.PersistedVideoCopyVerdict normalizes them when it reads the verdict
+// back: Postgres stores timestamptz at microsecond resolution while a
+// filesystem mtime carries nanoseconds, so comparing the raw values would make
+// every write for a row whose mtime came from a stat call fail.
+func (r *FileRepository) UpdateMultiplePPS(ctx context.Context, fileID int, multiplePPS bool, scanSize int64, scanMtime *time.Time) error {
+	var normalizedMtime *time.Time
+	if scanMtime != nil {
+		normalized := models.NormalizeFileModifiedAt(*scanMtime)
+		normalizedMtime = &normalized
+	}
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE media_files
+		SET multiple_pps = $2,
+		    multiple_pps_scan_size = $3,
+		    multiple_pps_scan_mtime = $4,
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND file_size = $3
+		  AND date_trunc('microseconds', file_modified_at) IS NOT DISTINCT FROM $4::timestamptz`,
+		fileID,
+		multiplePPS,
+		scanSize,
+		normalizedMtime,
+	)
+	if err != nil {
+		return fmt.Errorf("updating multiple pps verdict: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// The row is gone, or it no longer carries the size and mtime that were
+		// scanned. Both mean the same thing to every caller: this verdict does
+		// not describe the file as it stands.
+		return ErrStaleCopySafetyScan
+	}
+	return nil
 }

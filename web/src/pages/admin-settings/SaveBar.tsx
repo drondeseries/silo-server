@@ -18,7 +18,7 @@ export function SaveBar({
   restartRequired,
 }: SaveBarProps) {
   return (
-    <div className="surface-panel-subtle mt-6 rounded-xl p-4">
+    <div className="surface-panel-subtle sticky bottom-4 z-10 mt-6 rounded-xl p-4 shadow-lg backdrop-blur-md">
       {restartRequired && (
         <div className="text-foreground/80 mb-3 flex items-center gap-2 text-xs">
           <AlertTriangle className="h-3.5 w-3.5" />

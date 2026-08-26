@@ -29,6 +29,7 @@ POST /api/v1/admin/collections/import/tmdb	non-media
 POST /api/v1/admin/collections/import/trakt	non-media
 PUT /api/v1/admin/collections/order	non-media
 POST /api/v1/admin/collections/preview	non-media
+POST /api/v1/admin/collections/purge-virtual	non-media
 GET /api/v1/admin/collections/template-bundles	non-media
 POST /api/v1/admin/collections/template-bundles/{bundleID}/apply	non-media
 POST /api/v1/admin/collections/template-bundles/{bundleID}/apply-job	non-media
@@ -76,6 +77,7 @@ POST /api/v1/admin/invite-codes/	non-media
 DELETE /api/v1/admin/invite-codes/{id}	non-media
 PUT /api/v1/admin/invite-codes/{id}	non-media
 POST /api/v1/admin/invite-codes/{id}/top-up	non-media
+DELETE /api/v1/admin/items/{id}	non-media
 GET /api/v1/admin/items/{id}/files	non-media
 POST /api/v1/admin/items/{id}/merge	non-media
 PATCH /api/v1/admin/items/{id}/metadata	non-media
@@ -149,7 +151,6 @@ GET /api/v1/admin/settings/sensitive-status	non-media
 GET /api/v1/admin/settings/{key}	non-media
 PUT /api/v1/admin/settings/{key}	non-media
 GET /api/v1/admin/stats	non-media
-GET /api/v1/admin/stream-telemetry/parity	non-media
 GET /api/v1/admin/subtitle-providers/	non-media
 PUT /api/v1/admin/subtitle-providers/{provider}/	non-media
 POST /api/v1/admin/subtitle-providers/{provider}/test	non-media

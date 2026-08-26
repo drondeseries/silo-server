@@ -202,7 +202,7 @@ func (r *LibraryCollectionGroupRepository) Reorder(ctx context.Context, libraryI
 	if err != nil {
 		return fmt.Errorf("beginning group reorder: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	realIDs := make([]string, 0, len(orderedIDs))
 	realPositions := make([]int, 0, len(orderedIDs))

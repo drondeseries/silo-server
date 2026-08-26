@@ -387,3 +387,30 @@ func containsAtLeastV3(values []int, wanted int) bool {
 	}
 	return false
 }
+
+// routeVideoMetadataGapsDetailV3 names the descriptor fields that left a
+// source unroutable, so terminals and decision logs identify the probe
+// deficiency directly instead of leaving every report to guess which field
+// the scanner never filled.
+func routeVideoMetadataGapsDetailV3(source SourceDescriptorV3) string {
+	var missing []string
+	if source.VideoCodec == "" {
+		missing = append(missing, "video codec")
+	}
+	if source.BitDepth <= 0 {
+		missing = append(missing, "bit depth")
+	}
+	if source.Width <= 0 || source.Height <= 0 {
+		missing = append(missing, "resolution")
+	}
+	if source.FrameRate <= 0 {
+		missing = append(missing, "frame rate")
+	}
+	if source.BitrateKbps <= 0 {
+		missing = append(missing, "bitrate")
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	return "missing: " + strings.Join(missing, ", ")
+}

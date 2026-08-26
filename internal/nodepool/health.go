@@ -32,7 +32,7 @@ func CheckNode(ctx context.Context, n *Node) (healthy bool, activeJobs, egressKb
 	if err != nil {
 		return false, 0, 0
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return false, 0, 0
@@ -65,7 +65,7 @@ func NewHealthChecker(proxyPool *ProxyPool, transcodePool *TranscodePool, repo *
 	}
 }
 
-// Start runs health checks in a background goroutine. Stops when ctx is cancelled.
+// Start runs health checks in a background goroutine. Stops when ctx is canceled.
 func (hc *HealthChecker) Start(ctx context.Context) {
 	go func() {
 		hc.checkAll(ctx)

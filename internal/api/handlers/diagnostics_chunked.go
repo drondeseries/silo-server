@@ -326,7 +326,7 @@ func (h *DiagnosticsHandler) HandleChunkedUploadChunk(w http.ResponseWriter, r *
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, diagnostics.UploadChunkBytes+1)
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 
 	session, err := h.chunkSessions.manager.PutChunk(r.Context(), uploadID, chunkIndex, r.Body, r.ContentLength)
 	if err != nil {
@@ -414,7 +414,7 @@ func (h *DiagnosticsHandler) HandleChunkedUploadComplete(w http.ResponseWriter, 
 		writeError(w, http.StatusInternalServerError, "internal_error", "Diagnostics upload failed")
 		return
 	}
-	defer bundle.Close()
+	defer func() { _ = bundle.Close() }()
 
 	profileID := strings.TrimSpace(r.Header.Get("X-Profile-Id"))
 	var profileIDPtr *string

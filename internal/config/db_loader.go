@@ -320,6 +320,7 @@ func LoadFromDB(m map[string]string) (*Config, error) {
 	cfg.Playback.FFmpegPath = stringOr(m, "playback.ffmpeg_path", "/usr/lib/jellyfin-ffmpeg/ffmpeg")
 	cfg.Playback.TranscodeDir = stringOr(m, playbackTranscodeDirSettingKey, DefaultTranscodeDir)
 	cfg.Playback.HWAccel = stringOr(m, "playback.hw_accel", "auto")
+	cfg.Playback.SoftwareFallback = stringOr(m, "playback.software_fallback", "allow")
 	cfg.Playback.HWDevice = stringOr(m, "playback.hw_device", "")
 	chapterThumbnailWorkers, err := intOr(m, "playback.chapter_thumbnail_workers", 1)
 	if err != nil {
@@ -337,7 +338,11 @@ func LoadFromDB(m map[string]string) (*Config, error) {
 		return nil, err
 	}
 	cfg.Playback.TranscodeEnabled = transcodeEnabled
-
+	maxVirtualFailoverAttempts, err := intOr(m, "playback.max_virtual_failover_attempts", 5)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Playback.MaxVirtualFailoverAttempts = maxVirtualFailoverAttempts
 	// Redis
 	cfg.Redis.URL = stringOr(m, "redis.url", "")
 	cfg.Redis.SentinelMaster = stringOr(m, "redis.sentinel_master", "")

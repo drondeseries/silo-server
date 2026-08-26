@@ -33,7 +33,7 @@ func CreateCollection(db *sql.DB, input userstore.CreateCollectionInput) (*Colle
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.Exec(
 		`INSERT INTO personal_collections (
@@ -106,7 +106,7 @@ func ListCollections(db *sql.DB, profileID string) ([]Collection, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var collections []Collection
 	for rows.Next() {
@@ -144,7 +144,7 @@ func attachCollectionProfiles(db *sql.DB, profileID string, collections []Collec
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	byCollection := make(map[string][]string, len(collections))
 	for rows.Next() {
@@ -177,7 +177,7 @@ func UpdateCollection(db *sql.DB, input userstore.UpdateCollectionInput) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	now := nowUTC()
 	if input.Name != nil {
@@ -209,7 +209,7 @@ func UpdateCollection(db *sql.DB, input userstore.UpdateCollectionInput) error {
 				return err
 			}
 		}
-		allowed := []string{}
+		var allowed []string
 		if input.AllowedProfileIDs != nil {
 			allowed = *input.AllowedProfileIDs
 		} else {
@@ -238,7 +238,7 @@ func DeleteCollection(db *sql.DB, id string) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.Exec(`DELETE FROM personal_collection_items WHERE collection_id = ?`, id); err != nil {
 		return err
@@ -284,7 +284,7 @@ func ListCollectionItems(db *sql.DB, collectionID string) ([]CollectionItem, err
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var items []CollectionItem
 	for rows.Next() {
@@ -305,7 +305,7 @@ func listCollectionProfiles(db *sql.DB, collectionID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	return scanCollectionProfiles(rows)
 }
 
@@ -317,7 +317,7 @@ func listCollectionProfilesTx(tx *sql.Tx, collectionID string) ([]string, error)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	return scanCollectionProfiles(rows)
 }
 

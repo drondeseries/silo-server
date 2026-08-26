@@ -22,6 +22,7 @@ import { UICustomizationProvider } from "@/contexts/UICustomizationProvider";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import ImpersonationBanner from "@/components/ImpersonationBanner";
 import { loadStoredImpersonationAdminSession } from "@/lib/impersonationSession";
+import { reportDeviceCapabilitiesIfNeeded } from "@/lib/deviceCapabilities";
 import { Toaster } from "@/components/ui/sonner";
 import { RealtimeEventsProvider } from "@/components/RealtimeEventsProvider";
 import { useEventChannel } from "@/components/realtimeEventsContext";
@@ -290,6 +291,19 @@ function QueryCacheManager() {
     prevProfileId.current = profile?.id;
   }, [user, profile?.id, qc]);
 
+  return null;
+}
+
+// DeviceCapabilityReporter fires the browser's codec capability report once
+// per authenticated session so virtual streams can be ranked for this device.
+function DeviceCapabilityReporter() {
+  const { user, profile, loading } = useAuth();
+  const reportedRef = useRef(false);
+  useEffect(() => {
+    if (loading || !user || !profile || reportedRef.current) return;
+    reportedRef.current = true;
+    void reportDeviceCapabilitiesIfNeeded();
+  }, [loading, user, profile]);
   return null;
 }
 
@@ -666,6 +680,7 @@ export default function App() {
                           <PlaybackCapabilityPrewarmer />
                           <RealtimeEventChannels />
                           <ScrollRestorationManager />
+                          <DeviceCapabilityReporter />
                           <RouteAnnouncer />
                           <QueryCacheManager />
                           <AppChrome />

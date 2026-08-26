@@ -16,11 +16,6 @@ GET /stream/subtitles/{token}/{track}/fonts	media	playback	viewer_egress	true	tr
 GET /stream/transcode/{token}/master.m3u8	media	manifest	viewer_egress	true	true
 HEAD /stream/transcode/{token}/master.m3u8	media	manifest	viewer_egress	true	true
 GET /stream/transcode/{token}/segment/{name}	media	playback	viewer_egress	true	true
-GET /stream/v3/{session_id}	media	playback	viewer_egress	true	true
-HEAD /stream/v3/{session_id}	media	playback	viewer_egress	true	true
-GET /stream/v3/{session_id}/master.m3u8	media	manifest	viewer_egress	true	true
-HEAD /stream/v3/{session_id}/master.m3u8	media	manifest	viewer_egress	true	true
-GET /stream/v3/{session_id}/segment/{name}	media	playback	viewer_egress	true	true
 # fixture 2
 POST /admin/force-reload	non-media
 GET /api/v1/health	non-media
@@ -39,8 +34,3 @@ GET /stream/subtitles/{token}/{track}/fonts	media	playback	viewer_egress	true	tr
 GET /stream/transcode/{token}/master.m3u8	media	manifest	viewer_egress	true	true
 HEAD /stream/transcode/{token}/master.m3u8	media	manifest	viewer_egress	true	true
 GET /stream/transcode/{token}/segment/{name}	media	playback	viewer_egress	true	true
-GET /stream/v3/{session_id}	media	playback	viewer_egress	true	true
-HEAD /stream/v3/{session_id}	media	playback	viewer_egress	true	true
-GET /stream/v3/{session_id}/master.m3u8	media	manifest	viewer_egress	true	true
-HEAD /stream/v3/{session_id}/master.m3u8	media	manifest	viewer_egress	true	true
-GET /stream/v3/{session_id}/segment/{name}	media	playback	viewer_egress	true	true

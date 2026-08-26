@@ -278,6 +278,15 @@ func (s *Server) restartSessionLocked(ctx context.Context, sessionID string, ses
 }
 
 // NewServer creates a new transcode server.
+func playbackHWAccel(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "qsv", "vaapi", "nvenc", "cuda", "videotoolbox", "amf":
+		return true
+	default:
+		return false
+	}
+}
+
 func NewServer(watcher *nodeconfig.Watcher, tracker *nodesessions.Tracker) *Server {
 	var trackerImpl sessionTracker
 	if tracker != nil {
@@ -878,7 +887,7 @@ func (s *Server) trackDownloadPrepare(ctx context.Context, info nodesessions.Ses
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(HealthResponse{
+	_ = json.NewEncoder(w).Encode(HealthResponse{
 		Status:     "ok",
 		ActiveJobs: s.activeJobs.Load(),
 	})
@@ -912,7 +921,7 @@ func (s *Server) handleHWCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 	info.Transformations = registry.Advertised()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(info)
+	_ = json.NewEncoder(w).Encode(info)
 }
 
 func toneMapCapabilityResolveTimeout(hardwareBackend, hardwareDevice string) time.Duration {
@@ -1103,6 +1112,13 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	session, err := playback.StartTranscode(r.Context(), opts)
+	if err != nil && playbackHWAccel(opts.HWAccel) && softwareFallbackAllowed(cfg.Playback.SoftwareFallback) {
+		slog.WarnContext(r.Context(), "hardware transcode start failed; falling back to software",
+			"component", "transcodenode", "hw_accel", opts.HWAccel, "error", err)
+		swOpts := opts
+		swOpts.HWAccel = "none"
+		session, err = playback.StartTranscode(r.Context(), swOpts)
+	}
 	if err != nil {
 		unlock()
 		slog.ErrorContext(r.Context(), "start transcode", "component", "transcodenode", "error", err, "session", req.SessionID, "playback_session_id", req.SessionID)
@@ -1149,13 +1165,17 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(TranscodeStartResponse{
+	_ = json.NewEncoder(w).Encode(TranscodeStartResponse{
 		SessionID:          req.SessionID,
 		Status:             "started",
 		HWAccel:            effectiveHWAccel,
 		ToneMapMode:        session.Opts().ToneMapMode,
 		AudioRecipeVersion: req.AudioRecipeVersion,
 	})
+}
+
+func softwareFallbackAllowed(value string) bool {
+	return !strings.EqualFold(strings.TrimSpace(value), "gpu_only")
 }
 
 func (s *Server) requireApprovedInputPath(w http.ResponseWriter, r *http.Request, path string) bool {

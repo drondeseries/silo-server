@@ -918,7 +918,7 @@ func (s *Scanner) scanPaths(
 		return nil, walkErr
 	}
 
-	// If the scan was cancelled, return partial results without marking
+	// If the scan was canceled, return partial results without marking
 	// files as missing or deleting records — that would corrupt state.
 	if ctx.Err() != nil {
 		return result, ctx.Err()
@@ -1078,6 +1078,9 @@ func (s *Scanner) scanFolderByRoots(
 	unreachableRoots := make([]string, 0)
 	suspectRoots := make([]string, 0)
 	for i, root := range configuredRoots {
+		if isVirtualRootPath(root) {
+			continue
+		}
 		probe := configuredProbes[i]
 		if !probe.Reachable {
 			logUnreachableRoot(ctx, folder.ID, root, probe)
@@ -1169,7 +1172,7 @@ func (s *Scanner) scanFolderByRoots(
 			//
 			// Suspect-empty children are protected unless the operator has
 			// explicitly confirmed cleanup — that confirmation is the
-			// deliberate way to retire an emptied root, and honouring it here
+			// deliberate way to retire an emptied root, and honoring it here
 			// is what stops the allowance being consumed to no effect.
 			// Unreachable roots are protected either way: an outage is never
 			// a confirmation to erase a root's catalog.
@@ -1354,7 +1357,7 @@ func (s *Scanner) scanFolderByRoots(
 	}
 
 	// Reuse the same protected set the scoped cleanup used, so membership
-	// removal and the trash sweep below honour roots the mid-loop re-probe
+	// removal and the trash sweep below honor roots the mid-loop re-probe
 	// found offline. Rebuilding from only the initial probe here would let a
 	// child that dropped during this scan have its already-missing rows hard
 	// deleted once they pass the removal grace — by the very scan that
@@ -1453,12 +1456,20 @@ func probeUnreachableRoots(ctx context.Context, folderID int, roots []string) []
 	var unreachable []string
 	probes := rootcheck.ProbeManyWithTimeout(ctx, roots, rootcheck.DefaultProbeTimeout)
 	for i, root := range roots {
+		if isVirtualRootPath(root) {
+			continue
+		}
 		if probe := probes[i]; !probe.Reachable {
 			logUnreachableRoot(ctx, folderID, root, probe)
 			unreachable = append(unreachable, root)
 		}
 	}
 	return unreachable
+}
+
+func isVirtualRootPath(root string) bool {
+	raw := strings.TrimSpace(strings.ToLower(root))
+	return raw == "virtual" || strings.HasPrefix(raw, "virtual://")
 }
 
 func logUnreachableRoot(ctx context.Context, folderID int, root string, probe rootcheck.Result) {
@@ -1522,7 +1533,7 @@ func (s *Scanner) suspectEmptyRoots(ctx context.Context, folderID int, configure
 	// latter made this protection reactive: on the first scan after a mount
 	// dropped, the rows are still live, the root is not classified suspect,
 	// and the scan marks everything missing — the exact outage this guards
-	// against, recognised only in time to protect the wreckage.
+	// against, recognized only in time to protect the wreckage.
 	suspect, err := s.fileRepo.ListRootsWithCatalogedFiles(ctx, folderID, emptyRoots)
 	if err != nil {
 		return nil, fmt.Errorf("listing suspect-empty roots for folder %d: %w", folderID, err)
@@ -2073,10 +2084,17 @@ func cleanScanRoots(paths []string) []string {
 	out := make([]string, 0, len(paths))
 	seen := make(map[string]bool, len(paths))
 	for _, rawPath := range paths {
-		if strings.TrimSpace(rawPath) == "" {
+		trimmed := strings.TrimSpace(rawPath)
+		if trimmed == "" {
 			continue
 		}
-		path := filepath.Clean(rawPath)
+		// Virtual roots have no filesystem presence — their media is
+		// populated by plugins via UpsertVirtualMedia.  Skip them so
+		// the scanner never tries to walk or probe a virtual:// path.
+		if strings.HasPrefix(trimmed, "virtual://") {
+			continue
+		}
+		path := filepath.Clean(trimmed)
 		if path == "" || path == "." || seen[path] {
 			continue
 		}
@@ -3192,6 +3210,7 @@ func shouldSkipStableConfirmedScanState(
 	return true
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func scannerUpdateReasons(
 	existing *models.MediaFile,
 	fileSize int64,
@@ -3267,7 +3286,7 @@ func sameFileModifiedAt(existing *time.Time, current time.Time) bool {
 }
 
 func normalizeFileModifiedAt(ts time.Time) time.Time {
-	return models.NormalizeFileModifiedAt(ts)
+	return ts.UTC().Truncate(time.Microsecond)
 }
 
 func needsCriticalProbeRepairScanState(file *scanStateFile) bool {
@@ -3684,6 +3703,7 @@ func scanStateGroupAssignmentChanged(existing *scanStateFile, assignment fileGro
 	return !identityEvidenceEqual(existing.IdentityJSON, assignment.EvidenceJSON)
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func rootAssignmentChanged(existing *models.MediaFile, assignment fileRootAssignment, libraryType string) bool {
 	if existing == nil {
 		return true
@@ -3735,6 +3755,7 @@ func rootAssignmentChanged(existing *models.MediaFile, assignment fileRootAssign
 	}
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func groupAssignmentChanged(existing *models.MediaFile, assignment fileGroupAssignment) bool {
 	if existing == nil {
 		return true
@@ -3783,6 +3804,16 @@ func applyProbeData(mf *models.MediaFile, probe *ProbeData, probeSource string) 
 	mf.Container = probe.Container
 	mf.Duration = probe.Duration
 	mf.Bitrate = probe.Bitrate
+	if mf.Bitrate <= 0 && mf.Duration > 0 && mf.FileSize > 0 {
+		// ffprobe legitimately omits format.bit_rate for some containers. Size
+		// over duration is a conservative upper bound (it counts every stream
+		// plus container overhead) and satisfies the playback planner's
+		// completeness gate; without it such rows fail planning forever while
+		// looking healthy to NeedsCriticalProbeRepair. The walk always knows
+		// FileSize before this runs, so every reprobe of a flagged row
+		// converges instead of looping.
+		mf.Bitrate = int(impliedBitrateBps(mf.FileSize, float64(mf.Duration)) / 1000)
+	}
 	mf.ProbeSource = probeSource
 
 	now := time.Now().UTC()

@@ -174,7 +174,7 @@ func (h *DiagnosticsHandler) HandleUpload(w http.ResponseWriter, r *http.Request
 		h.writeDiagnosticsMultipartError(r.Context(), userID, w, err)
 		return
 	}
-	defer bundlePart.Close()
+	defer func() { _ = bundlePart.Close() }()
 
 	profileID := strings.TrimSpace(r.Header.Get("X-Profile-Id"))
 	var profileIDPtr *string

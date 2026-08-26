@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
@@ -740,6 +741,7 @@ func TestStartRemoteToneMapReportsConfirmedExecutorAndFallback(t *testing.T) {
 			var dispatches atomic.Int32
 			capabilities := tonemap.Capabilities{
 				{Mode: tonemap.ModeHardware, Backend: tonemap.BackendQSV, Filter: tonemap.HardwareFilterOpenCL, SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ}},
+				{Mode: tonemap.ModeHardware, Backend: tonemap.BackendQSV, Filter: tonemap.HardwareFilterVAAPI, SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ}},
 				{Mode: tonemap.ModeSoftware, Backend: tonemap.BackendSoftware, Filter: tonemap.SoftwareFilterBT2390, SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ}},
 			}
 			node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -820,6 +822,7 @@ func TestStartRemoteToneMapTimeoutFallsBackToSoftwareAfterCleanup(t *testing.T) 
 	var cleaned atomic.Bool
 	capabilities := tonemap.Capabilities{
 		{Mode: tonemap.ModeHardware, Backend: tonemap.BackendQSV, Filter: tonemap.HardwareFilterOpenCL, SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ}},
+		{Mode: tonemap.ModeHardware, Backend: tonemap.BackendQSV, Filter: tonemap.HardwareFilterVAAPI, SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ}},
 		{Mode: tonemap.ModeSoftware, Backend: tonemap.BackendSoftware, Filter: tonemap.SoftwareFilterBT2390, SourceKinds: []tonemap.SourceKind{tonemap.SourcePQ}},
 	}
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1061,6 +1064,42 @@ func TestStartRemoteTranscode_NodeRestartReconstruct(t *testing.T) {
 	}
 	if card.InputPath != "/media/movie.mkv" {
 		t.Fatalf("recipe InputPath = %q, want /media/movie.mkv", card.InputPath)
+	}
+}
+
+func TestStartRemoteTranscode_VirtualRecipeUsesCanonicalSource(t *testing.T) {
+	recipeStore := &stubRecipeNodeStore{}
+	var received transcodenode.TranscodeStartRequest
+	node := fakeTranscodeNode(t, &received)
+	handler, _, playbackStore := newRemoteTranscodeHandler(t, node.URL, recipeStore)
+	playbackStore.Put(PlaybackSession{
+		ID:                 "play-virtual",
+		CompatToken:        "token-virtual",
+		UpstreamSessionID:  "upstream-1",
+		UpstreamPlayMethod: "transcode",
+		MediaSources: []PlaybackMediaSource{{
+			FileID:                           42,
+			Version:                          catalog.FileVersion{FileID: 42, FilePath: "virtual://movie/tt1234567", Container: "virtual"},
+			VirtualSourceURI:                 "virtual://movie/tt1234567?result=stable",
+			VirtualSourceOwnerInstallationID: 19,
+		}},
+	})
+
+	source := PlaybackMediaSource{
+		FileID:                           42,
+		Version:                          catalog.FileVersion{FileID: 42, FilePath: "virtual://movie/tt1234567", Container: "virtual"},
+		VirtualSourceURI:                 "virtual://movie/tt1234567?result=stable",
+		VirtualSourceOwnerInstallationID: 19,
+	}
+	if err := handler.startRemoteTranscode(context.Background(), "play-virtual", "upstream-1", source, &models.MediaFile{ID: 42, FilePath: "virtual://movie/tt1234567", VirtualOwnerInstallationID: 19}, 0, node.URL); err != nil {
+		t.Fatalf("startRemoteTranscode: %v", err)
+	}
+	card, ok := recipeStore.Get("upstream-1")
+	if !ok {
+		t.Fatal("expected virtual recipe in control-plane store")
+	}
+	if card.InputPath != source.VirtualSourceURI || card.VirtualSourceOwnerInstallationID != 19 {
+		t.Fatalf("recipe source = %q owner %d, want %q owner 19", card.InputPath, card.VirtualSourceOwnerInstallationID, source.VirtualSourceURI)
 	}
 }
 

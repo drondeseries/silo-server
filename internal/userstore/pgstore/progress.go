@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -614,7 +615,7 @@ func (s *PostgresUserStore) GetProgress(ctx context.Context, profileID, mediaIte
 		s.userID, profileID, mediaItemID,
 	)
 	wp, err := scanWatchProgress(row)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -1292,7 +1293,7 @@ func (s *PostgresUserStore) RemoveHistoryItems(
 	if err != nil {
 		return fmt.Errorf("begin remove history items: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, `
 		WITH target(media_item_id) AS (

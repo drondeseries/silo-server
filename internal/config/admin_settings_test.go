@@ -23,6 +23,9 @@ func TestEffectiveAdminSettingsUsesRuntimeDefaults(t *testing.T) {
 	if got := effective["playback.transcode_enabled"]; got != "true" {
 		t.Fatalf("playback.transcode_enabled = %q, want true", got)
 	}
+	if got := effective["playback.max_virtual_failover_attempts"]; got != "5" {
+		t.Fatalf("playback.max_virtual_failover_attempts = %q, want 5", got)
+	}
 	if got := effective["theme.catalog_url"]; got != DefaultThemeCatalogURL {
 		t.Fatalf("theme.catalog_url = %q, want %q", got, DefaultThemeCatalogURL)
 	}
@@ -251,6 +254,17 @@ func TestNormalizeAdminSettingRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+func TestNormalizeAdminSettingAcceptsSoftwareFallbackPolicy(t *testing.T) {
+	for _, value := range []string{"allow", "gpu_only"} {
+		if got, err := NormalizeAdminSetting("playback.software_fallback", value); err != nil || got != value {
+			t.Fatalf("NormalizeAdminSetting(%q) = %q, %v", value, got, err)
+		}
+	}
+	if _, err := NormalizeAdminSetting("playback.software_fallback", "sometimes"); err == nil {
+		t.Fatal("NormalizeAdminSetting accepted invalid software fallback policy")
+	}
+}
+
 func TestNormalizeAdminSettingAcceptsApprovedThemeCatalogURL(t *testing.T) {
 	got, err := NormalizeAdminSetting(
 		"theme.catalog_url",
@@ -312,5 +326,22 @@ func TestNormalizeAdminSettingCanonicalizesRedisURL(t *testing.T) {
 	}
 	if got != "rediss://cache.example.invalid:6380/2" {
 		t.Fatalf("normalized Redis URL = %q", got)
+	}
+}
+
+func TestNormalizeAdminSettingMaxVirtualFailoverAttempts(t *testing.T) {
+	got, err := NormalizeAdminSetting("playback.max_virtual_failover_attempts", " 10 ")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "10" {
+		t.Fatalf("NormalizeAdminSetting() = %q, want 10", got)
+	}
+
+	if _, err := NormalizeAdminSetting("playback.max_virtual_failover_attempts", "0"); err == nil {
+		t.Fatal("expected error for 0 max failover attempts")
+	}
+	if _, err := NormalizeAdminSetting("playback.max_virtual_failover_attempts", "51"); err == nil {
+		t.Fatal("expected error for > 50 max failover attempts")
 	}
 }

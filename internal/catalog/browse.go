@@ -587,6 +587,8 @@ func (r *BrowseRepository) buildBrowsePlan(filters BrowseFilters) (browseQueryPl
 // ListXxx distinct-value methods.  If the returned earlyEmpty flag is true the
 // caller should return an empty result immediately (e.g. when LibraryIDs is an
 // empty slice).
+//
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func filterWhereClause(filters BrowseFilters) (fromClause, whereClause string, args []any, earlyEmpty bool) {
 	return filterWhereClauseForSource(filters, "media_items mi", "")
 }

@@ -163,7 +163,7 @@ func (h *EventsHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) 
 		)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	configureWebSocket(conn)
 	conn.SetReadLimit(maxEventsFrameBytes)
 

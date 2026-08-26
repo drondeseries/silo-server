@@ -250,7 +250,7 @@ func (c *Client) doGet(ctx context.Context, path string, accessToken string, des
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if attempt < maxRetries {
 				if err := sleepContext(ctx, retryAfterOrDefault(resp, attempt)); err != nil {
 					return err
@@ -260,7 +260,7 @@ func (c *Client) doGet(ctx context.Context, path string, accessToken string, des
 			return fmt.Errorf("trakt: rate limited after %d retries", maxRetries)
 		}
 		if resp.StatusCode >= 500 {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if attempt < maxRetries {
 				if err := sleepContext(ctx, time.Duration(1<<attempt)*time.Second); err != nil {
 					return err
@@ -271,12 +271,12 @@ func (c *Client) doGet(ctx context.Context, path string, accessToken string, des
 		}
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			return fmt.Errorf("trakt: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 
 		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(dest)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if decodeErr != nil {
 			return fmt.Errorf("trakt: decode response: %w", decodeErr)
 		}

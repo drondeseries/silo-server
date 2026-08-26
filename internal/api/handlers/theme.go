@@ -92,7 +92,7 @@ func (h *ThemeHandler) HandleDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "download_failed", "Failed to fetch theme file")
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		writeError(w, http.StatusBadGateway, "download_failed", "Theme file returned non-200")
@@ -178,7 +178,7 @@ func (h *ThemeHandler) HandleCatalog(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "catalog_unavailable", "Theme catalog is unavailable")
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		if cached != nil {

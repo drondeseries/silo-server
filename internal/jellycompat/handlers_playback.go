@@ -211,6 +211,10 @@ type PlaybackWatchStopConfirmer interface {
 }
 
 // PlaybackHandler serves Jellyfin playback negotiation endpoints.
+type virtualSourceSetter interface {
+	SetVirtualSource(sessionID, virtualURI string, ownerInstallationID int) error
+}
+
 type PlaybackHandler struct {
 	cfg                     *config.Config
 	content                 ContentService
@@ -257,6 +261,18 @@ type PlaybackHandler struct {
 	// compatLocalTranscodeReady is a test seam invoked after manifest readiness
 	// and before lifecycle-locked publication. Production leaves it nil.
 	compatLocalTranscodeReady func(*playback.TranscodeSession)
+
+	DeviceProfilePersister      DeviceProfilePersister
+	VirtualMediaResolver        VirtualMediaResolver
+	VirtualMediaRefreshResolver VirtualMediaRefreshResolver
+	VirtualPlaybackStreamLister VirtualPlaybackStreamLister
+	VirtualSourceProber         VirtualSourceProber
+	RemoteStreamRelay           RemoteStreamRelay
+	// AllowInsecureVirtual reports whether the owning plugin installation has
+	// explicitly enabled allow_insecure_http for private/local stream URLs. When
+	// nil or false, virtual streams are proxied through the strict SSRF-protected
+	// relay path.
+	AllowInsecureVirtual func(installationID int) bool
 }
 
 // recipeNodePutter persists and removes a remote transcode's reconstruction
@@ -874,6 +890,25 @@ func NewPlaybackHandler(
 			HWAccel:      h.HWAccel,
 		}
 	}
+
+	h.tm.ResolveInput = func(ctx context.Context, mediaFileID, ownerInstallationID, userID int, profileID, canonicalPath string) (string, func(), error) {
+		if !isCompatVirtualPath(canonicalPath) {
+			return "", nil, nil
+		}
+		if h.VirtualMediaResolver == nil || h.RemoteStreamRelay == nil {
+			return "", nil, errors.New("virtual playback reconstruction is not configured")
+		}
+		resolved, err := h.VirtualMediaResolver.ResolveVirtualMedia(ctx, canonicalPath, ownerInstallationID, userID, profileID)
+		if err != nil {
+			return "", nil, err
+		}
+		insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(ownerInstallationID)
+		relayURL, cleanup, err := registerRemoteStreamInput(ctx, h.RemoteStreamRelay, resolved, insecure)
+		if err != nil {
+			return "", nil, err
+		}
+		return relayURL, cleanup, nil
+	}
 	if reg, ok := sessionMgr.(interface {
 		GetSession(string) (*playback.Session, error)
 		RegisterReconstructed(*playback.Session) *playback.Session
@@ -1374,21 +1409,26 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	// token of their own, so without a persisted recipe a node or central restart
 	// cannot rebuild ffmpeg and segment serves 404.
 	opts := playback.TranscodeOpts{
-		SessionID:           upstreamSessionID,
-		InputPath:           reqBody.InputPath,
-		SourceVideoCodec:    reqBody.SourceVideoCodec,
-		SourceVideoProfile:  reqBody.SourceVideoProfile,
-		SourceVideoBitDepth: reqBody.SourceVideoBitDepth,
-		SeekSeconds:         reqBody.SeekSeconds,
-		StartSegmentNumber:  reqBody.StartSegmentNumber,
-		TargetCodecVideo:    reqBody.TargetCodecVideo,
-		TargetCodecAudio:    reqBody.TargetCodecAudio,
-		VideoSampleEntry:    reqBody.VideoSampleEntry,
-		SegmentDuration:     reqBody.SegmentDuration,
-		AudioTrackIndex:     reqBody.AudioTrackIndex,
-		SourceAudioChannels: reqBody.SourceAudioChannels,
-		TargetAudioChannels: reqBody.TargetAudioChannels,
-		TotalDuration:       reqBody.TotalDuration,
+		SessionID:                        upstreamSessionID,
+		InputPath:                        reqBody.InputPath,
+		CanonicalInputPath:               file.FilePath,
+		VirtualSourceOwnerInstallationID: source.VirtualSourceOwnerInstallationID,
+		SourceVideoCodec:                 reqBody.SourceVideoCodec,
+		SourceAudioChannels:              reqBody.SourceAudioChannels,
+		SourceVideoProfile:               reqBody.SourceVideoProfile,
+		SourceVideoBitDepth:              reqBody.SourceVideoBitDepth,
+		SeekSeconds:                      reqBody.SeekSeconds,
+		StartSegmentNumber:               reqBody.StartSegmentNumber,
+		TargetCodecVideo:                 reqBody.TargetCodecVideo,
+		TargetCodecAudio:                 reqBody.TargetCodecAudio,
+		TargetAudioChannels:              reqBody.TargetAudioChannels,
+		VideoSampleEntry:                 reqBody.VideoSampleEntry,
+		SegmentDuration:                  reqBody.SegmentDuration,
+		AudioTrackIndex:                  reqBody.AudioTrackIndex,
+		TotalDuration:                    reqBody.TotalDuration,
+	}
+	if isCompatVirtualSource(source) {
+		opts.CanonicalInputPath = source.VirtualSourceURI
 	}
 	toneMapRecipe.apply(&opts)
 	opts.HWAccel = strings.TrimSpace(nodeResponse.HWAccel)

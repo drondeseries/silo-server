@@ -44,17 +44,32 @@ func (p *interestTrackingProvider) ForUser(ctx context.Context, userID int) (use
 	// send callers down a fast path that can only fail.
 	registry, hasDevices := store.(userstore.DeviceRegistry)
 	rollup, hasRollup := store.(userstore.SeriesEpisodeRollupStore)
+	profiles, hasProfiles := store.(userstore.DeviceProfileRegistry)
+
 	switch {
 	case hasDevices && hasRollup:
-		return &interestTrackingStoreWithDevicesAndRollup{
+		res := &interestTrackingStoreWithDevicesAndRollup{
 			interestTrackingStore:    tracked,
 			DeviceRegistry:           registry,
 			SeriesEpisodeRollupStore: rollup,
-		}, nil
+		}
+		if hasProfiles {
+			res.DeviceProfileRegistry = profiles
+		}
+		return res, nil
 	case hasDevices:
-		return &interestTrackingStoreWithDevices{
+		res := &interestTrackingStoreWithDevices{
 			interestTrackingStore: tracked,
 			DeviceRegistry:        registry,
+		}
+		if hasProfiles {
+			res.DeviceProfileRegistry = profiles
+		}
+		return res, nil
+	case hasProfiles:
+		return &interestTrackingStoreWithProfiles{
+			interestTrackingStore: tracked,
+			DeviceProfileRegistry: profiles,
 		}, nil
 	case hasRollup:
 		return &interestTrackingStoreWithRollup{
@@ -79,6 +94,12 @@ type interestTrackingStore struct {
 type interestTrackingStoreWithDevices struct {
 	*interestTrackingStore
 	userstore.DeviceRegistry
+	userstore.DeviceProfileRegistry
+}
+
+type interestTrackingStoreWithProfiles struct {
+	*interestTrackingStore
+	userstore.DeviceProfileRegistry
 }
 
 // interestTrackingStoreWithRollup adds the series-rollup capability only when
@@ -97,6 +118,7 @@ type interestTrackingStoreWithRollup struct {
 type interestTrackingStoreWithDevicesAndRollup struct {
 	*interestTrackingStore
 	userstore.DeviceRegistry
+	userstore.DeviceProfileRegistry
 	userstore.SeriesEpisodeRollupStore
 }
 
@@ -104,6 +126,8 @@ var _ userstore.SettingValueCompareAndSetter = (*interestTrackingStore)(nil)
 var _ userstore.SettingMutationTransactioner = (*interestTrackingStore)(nil)
 var _ userstore.SettingValueCompareAndSetter = (*interestTrackingStoreWithDevices)(nil)
 var _ userstore.SettingMutationTransactioner = (*interestTrackingStoreWithDevices)(nil)
+var _ userstore.SettingValueCompareAndSetter = (*interestTrackingStoreWithProfiles)(nil)
+var _ userstore.SettingMutationTransactioner = (*interestTrackingStoreWithProfiles)(nil)
 
 // Optional store capabilities must survive the decorator. Embedding the
 // UserStore interface promotes only that interface's methods, so each of these

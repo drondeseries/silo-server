@@ -68,11 +68,8 @@ type FolderRepository interface {
 	GetByID(ctx context.Context, id int) (*models.MediaFolder, error)
 }
 
-// ProbeEnsurer repairs probe metadata. Only the repair half is needed here:
-// chapter extraction reads Chapters, never the H.264 copy-safety verdict, so
-// this deliberately does not ask for the bitstream scan.
 type ProbeEnsurer interface {
-	EnsureProbeOnly(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
+	Ensure(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
 }
 
 type SettingsReader interface {
@@ -545,7 +542,7 @@ func (s *Service) ensureChapters(ctx context.Context, file *models.MediaFile, no
 		return file, nil
 	}
 
-	ensured, err := s.probeEnsurer.EnsureProbeOnly(ctx, file)
+	ensured, err := s.probeEnsurer.Ensure(ctx, file)
 	if err == nil && ensured != nil {
 		return ensured, nil
 	}
@@ -588,6 +585,9 @@ func (s *Service) extractFrame(
 	seekSeconds float64,
 	hdrPolicy string,
 ) ([]byte, string, error) {
+	if file != nil && (strings.HasPrefix(strings.ToLower(file.FilePath), "virtual://") || strings.EqualFold(file.Container, "virtual")) {
+		return nil, "virtual_unsupported", wrapReason("virtual_unsupported", fmt.Errorf("chapter thumbnail extraction is not supported for virtual media"))
+	}
 	if s.extractFrameFunc != nil {
 		return s.extractFrameFunc(ctx, file, seekSeconds, hdrPolicy)
 	}
@@ -812,7 +812,7 @@ func (s *Service) enqueue(req ChapterThumbnailRequest, priority bool) bool {
 
 	s.mu.Lock()
 	enqueued := false
-	action := ""
+	var action string
 
 	if priority {
 		if existing, ok := s.queuedPriority[req.FileID]; ok {

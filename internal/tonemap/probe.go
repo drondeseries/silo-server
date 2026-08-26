@@ -20,6 +20,10 @@ const (
 	probeTimeoutSlack   = time.Second
 	probeEndpointSlack  = 20 * time.Second
 	probeRequestSlack   = 5 * time.Second
+
+	// remoteProbeCommandTimeout bounds a single preflight command against a
+	// remote (http) or virtual:// source, where latency is network-bound.
+	remoteProbeCommandTimeout = 30 * time.Second
 )
 
 // One deterministic 64x64 Main 10 HEVC frame. Keeping the compressed fixture

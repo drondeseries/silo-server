@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ComponentProps } from "react";
 import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
@@ -35,9 +36,11 @@ const playBranches: Array<[string, Partial<ActionBarProps>]> = [
 
 function renderActionBar(overrides: Partial<ActionBarProps> = {}) {
   return render(
-    <MemoryRouter>
-      <ActionBar playHref="/watch/movie-1" {...overrides} />
-    </MemoryRouter>,
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter>
+        <ActionBar playHref="/watch/movie-1" {...overrides} />
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 

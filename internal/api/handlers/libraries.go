@@ -227,7 +227,7 @@ type scanCancelRequest struct {
 }
 
 type scanCancelResponse struct {
-	Cancelled int `json:"cancelled"`
+	Canceled  int `json:"canceled"`
 	LibraryID int `json:"library_id"`
 }
 
@@ -832,15 +832,15 @@ func (h *LibraryHandler) HandleDeleteLibrary(w http.ResponseWriter, r *http.Requ
 	}
 
 	if h.ingester != nil {
-		cancelled := h.ingester.CancelLibrary(folder.ID)
-		slog.InfoContext(r.Context(), "library delete: cancelled running scans", "component", "api", "library_id", folder.ID, "cancelled", cancelled)
+		canceled := h.ingester.CancelLibrary(folder.ID)
+		slog.InfoContext(r.Context(), "library delete: canceled running scans", "component", "api", "library_id", folder.ID, "canceled", canceled)
 	}
 	if h.ScanQueue != nil {
 		queuedCancelled, err := h.ScanQueue.CancelAcceptedByLibrary(r.Context(), folder.ID)
 		if err != nil {
 			slog.WarnContext(r.Context(), "library delete: failed to cancel queued scans", "component", "api", "library_id", folder.ID, "error", err)
 		} else if queuedCancelled > 0 {
-			slog.InfoContext(r.Context(), "library delete: cancelled queued scans", "component", "api", "library_id", folder.ID, "cancelled", queuedCancelled)
+			slog.InfoContext(r.Context(), "library delete: canceled queued scans", "component", "api", "library_id", folder.ID, "canceled", queuedCancelled)
 		}
 	}
 	publishEventJob(r.Context(), h.EventsHub, "job.created", job)
@@ -955,7 +955,7 @@ func (h *LibraryHandler) HandleScanCancel(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	cancelled := 0
+	canceled := 0
 	if h.ScanQueue != nil {
 		queuedCancelled, err := h.ScanQueue.CancelByLibrary(r.Context(), req.LibraryID)
 		if err != nil {
@@ -963,21 +963,21 @@ func (h *LibraryHandler) HandleScanCancel(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to cancel scans")
 			return
 		}
-		cancelled += queuedCancelled
+		canceled += queuedCancelled
 	}
 	if h.ingester != nil {
-		cancelled += h.ingester.CancelLibrary(req.LibraryID)
+		canceled += h.ingester.CancelLibrary(req.LibraryID)
 	}
 	for _, run := range h.cancelActiveScans(req.LibraryID) {
 		h.publishScanEvent(r.Context(), "scan.cancelled", run)
 	}
-	slog.InfoContext(r.Context(), "scan: cancelled running scans", "component", "api",
+	slog.InfoContext(r.Context(), "scan: canceled running scans", "component", "api",
 		"library_id", req.LibraryID,
-		"cancelled", cancelled,
+		"canceled", canceled,
 	)
 
 	writeJSON(w, http.StatusOK, scanCancelResponse{
-		Cancelled: cancelled,
+		Canceled:  canceled,
 		LibraryID: req.LibraryID,
 	})
 }
@@ -1217,7 +1217,7 @@ func (h *LibraryHandler) markScanCancelled(scanID string) {
 		return
 	}
 	now := time.Now().UTC()
-	run.Status = "cancelled"
+	run.Status = "canceled"
 	run.CompletedAt = &now
 	h.ScanRegistry.MarkTerminal(run)
 	h.publishScanEvent(context.Background(), "scan.cancelled", run)
@@ -1364,6 +1364,7 @@ func boolPtr(v bool) *bool {
 	return &v
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (h *LibraryHandler) publishCatalogStatsInvalidation(eventType, payload string) {
 	if h.EventBus == nil {
 		return
@@ -1394,11 +1395,11 @@ type libraryMetadataMatchQueueStatusResponse struct {
 type libraryMetadataMatchQueueActionResponse struct {
 	Status           string                                  `json:"status"`
 	LibraryID        int                                     `json:"library_id"`
-	MovieCancelled   int                                     `json:"movie_cancelled,omitempty"`
-	SeriesCancelled  int                                     `json:"series_cancelled,omitempty"`
-	RawFileCancelled int                                     `json:"raw_file_cancelled,omitempty"`
+	MovieCancelled   int                                     `json:"movie_canceled,omitempty"`
+	SeriesCancelled  int                                     `json:"series_canceled,omitempty"`
+	RawFileCancelled int                                     `json:"raw_file_canceled,omitempty"`
 	RawFileRetried   int                                     `json:"raw_file_retried,omitempty"`
-	TotalCancelled   int                                     `json:"total_cancelled,omitempty"`
+	TotalCancelled   int                                     `json:"total_canceled,omitempty"`
 	Queue            libraryMetadataMatchQueueStatusResponse `json:"queue"`
 }
 
@@ -1736,12 +1737,12 @@ func (h *LibraryHandler) HandleCancelMetadataMatchQueue(w http.ResponseWriter, r
 
 	status, err := h.metadataMatchQueueStatus(r.Context(), id)
 	if err != nil {
-		slog.ErrorContext(r.Context(), "metadata queue: failed to load cancelled queue status", "component", "api", "library_id", id, "error", err)
+		slog.ErrorContext(r.Context(), "metadata queue: failed to load canceled queue status", "component", "api", "library_id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load metadata matcher queue")
 		return
 	}
 	writeJSON(w, http.StatusOK, libraryMetadataMatchQueueActionResponse{
-		Status:           "cancelled",
+		Status:           "canceled",
 		LibraryID:        id,
 		MovieCancelled:   movieCancelled,
 		SeriesCancelled:  seriesCancelled,
@@ -1949,7 +1950,7 @@ func (h *LibraryHandler) HandleUploadPoster(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "bad_request", "Missing poster file")
 		return
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	// Validate content type.
 	ct := header.Header.Get("Content-Type")

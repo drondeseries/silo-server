@@ -25,7 +25,7 @@ const (
 	StatusRunning   = "running"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
-	StatusCancelled = "cancelled"
+	StatusCancelled = "canceled"
 
 	libraryClaimAdvisoryLockID int64 = 8_500_001
 )

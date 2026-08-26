@@ -2,29 +2,18 @@ package playback
 
 import (
 	"encoding/json"
-	"sync"
+	"errors"
 	"testing"
 	"time"
 )
 
 type dispatchTestConn struct {
-	mu       sync.Mutex
 	messages []any
 }
 
 func (c *dispatchTestConn) WriteJSON(v any) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.messages = append(c.messages, v)
 	return nil
-}
-
-// sent is the safe reader for tests where a command is dispatched from a
-// background goroutine rather than inline.
-func (c *dispatchTestConn) sent() []any {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]any(nil), c.messages...)
 }
 
 func TestCommandDispatcherDispatchToSession(t *testing.T) {
@@ -125,7 +114,7 @@ func TestCommandDispatcherDisconnectedTarget(t *testing.T) {
 	}
 
 	result := dispatcher.DispatchToSession(command, 0, nil)
-	if result.DispatchErr != ErrRealtimeConnectionNotFound {
+	if !errors.Is(result.DispatchErr, ErrRealtimeConnectionNotFound) {
 		t.Fatalf("DispatchErr = %v, want %v", result.DispatchErr, ErrRealtimeConnectionNotFound)
 	}
 }
@@ -138,7 +127,7 @@ func TestCommandDispatcherMissingTarget(t *testing.T) {
 	}
 
 	result := dispatcher.DispatchToSession(command, 0, nil)
-	if result.DispatchErr != ErrSessionNotFound {
+	if !errors.Is(result.DispatchErr, ErrSessionNotFound) {
 		t.Fatalf("DispatchErr = %v, want %v", result.DispatchErr, ErrSessionNotFound)
 	}
 }

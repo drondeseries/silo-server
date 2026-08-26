@@ -250,12 +250,11 @@ export default function ContinueWatchingCard(props: ContinueWatchingCardProps) {
             {/* Hover dim behind the play button */}
             <div className="media-card-hover-dim absolute inset-0 bg-black/0 transition-colors duration-150" />
 
-            {/* Progress bar — inset pill so a full bar doesn't read as a
-                stray edge along the artwork */}
+            {/* Progress bar */}
             {!isNextUp && progressPercent > 0 && (
-              <div className="absolute inset-x-2.5 bottom-2 h-[3px] overflow-hidden rounded-full bg-black/40">
+              <div className="bg-background/40 absolute inset-x-0 bottom-0 h-[3px]">
                 <div
-                  className="h-full rounded-full transition-all duration-300"
+                  className="h-full transition-all duration-300"
                   style={{
                     width: `${Math.min(progressPercent, 100)}%`,
                     background: "var(--primary)",

@@ -76,6 +76,15 @@ func NeedsCriticalProbeRepair(file *models.MediaFile) bool {
 			return true
 		}
 	}
+	// A probed video row without any bitrate fails the playback planner's
+	// completeness gate forever while looking healthy to this check. The
+	// FileSize guard keeps the trigger convergent: with size and duration
+	// known, applyProbeData's implied-bitrate fallback always fills the
+	// field on the reprobe. Rows without a known size are left alone —
+	// reprobing them could never populate a value.
+	if file.Bitrate <= 0 && file.FileSize > 0 {
+		return true
+	}
 	if file.Chapters == nil {
 		return true
 	}
@@ -175,6 +184,51 @@ func (r copySafetyResult) matches(file *models.MediaFile) bool {
 		return r.mtime == nil && file.FileModifiedAt == nil
 	}
 	return sameFileModifiedAt(r.mtime, *file.FileModifiedAt)
+}
+
+// ProbeVirtualSource probes a virtual (plugin-provided) stream for playback
+// metadata without letting the provider's signed URL replace the canonical
+// virtual URI on the resulting row.
+func ProbeVirtualSource(
+	ctx context.Context,
+	ffprobePath, ffmpegPath, sourceURL string,
+	file *models.MediaFile,
+	dvStripProbe func(context.Context, string) bool,
+) (*models.MediaFile, error) {
+	if file == nil {
+		return nil, nil
+	}
+	probe, err := ProbeFile(ctx, ffprobePath, sourceURL)
+	if err != nil {
+		return file, err
+	}
+	updated := *file
+	applyProbeData(&updated, probe, "virtual")
+	// Technical metadata belongs to this playback attempt, but the source
+	// identity must remain the canonical virtual URI. Persisting or carrying a
+	// provider's signed URL beyond the probe makes restart/resume depend on an
+	// expiring credential and can leak it through plans and recipe cards.
+	updated.FilePath = file.FilePath
+	if needsCopySafetyProbe(&updated) {
+		scanCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		multi, scanErr := DetectMultiplePPSH264(scanCtx, ffmpegPath, sourceURL)
+		cancel()
+		if scanErr != nil {
+			updated = *fileWithCopySafety(&updated, nil, true)
+		} else {
+			updated = *fileWithMultiplePPS(&updated, multi)
+		}
+	}
+	if dvStripProbe != nil && len(updated.VideoTracks) > 0 {
+		track := updated.VideoTracks[0]
+		if track.DVProfile == 7 || track.DVProfile == 8 {
+			value := dvStripProbe(ctx, sourceURL)
+			tracks := append([]models.VideoTrack(nil), updated.VideoTracks...)
+			tracks[0].DVRPUStrippable = &value
+			updated.VideoTracks = tracks
+		}
+	}
+	return &updated, nil
 }
 
 func NewPlaybackProbeEnsurer(fileRepo *FileRepository, ffprobePath, ffmpegPath string, timeout time.Duration) *PlaybackProbeEnsurer {

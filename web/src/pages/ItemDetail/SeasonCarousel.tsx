@@ -37,7 +37,7 @@ export default function SeasonCarousel({ seasons }: SeasonCarouselProps) {
           </button>
         )}
 
-        <div ref={emblaRef} className="embla__viewport -mt-1 overflow-hidden pt-1 pb-5">
+        <div ref={emblaRef} className="embla__viewport overflow-hidden pb-5">
           <ul role="list" className="embla__container flex cursor-grab list-none gap-4">
             {sorted.map((season) => {
               const userData = season.user_data;
@@ -82,12 +82,11 @@ export default function SeasonCarousel({ seasons }: SeasonCarouselProps) {
                         </div>
                       )}
 
-                      {/* Progress bar — inset pill so a full bar doesn't read
-                          as a stray edge along the artwork */}
+                      {/* Progress bar — thin line at the bottom of the poster */}
                       {(isCompleted || hasProgress) && (
-                        <div className="absolute inset-x-2.5 bottom-2 h-[3px] overflow-hidden rounded-full bg-black/40">
+                        <div className="absolute inset-x-0 bottom-0 h-[3px] bg-black/40">
                           <div
-                            className="h-full rounded-full transition-all duration-300"
+                            className="h-full transition-all duration-300"
                             style={{
                               width: isCompleted ? "100%" : `${progressPercent}%`,
                               background: isCompleted ? "#4caf50" : "var(--primary)",

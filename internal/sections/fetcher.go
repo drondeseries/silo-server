@@ -1088,7 +1088,7 @@ func (f *Fetcher) ListOverlaySummaries(ctx context.Context, contentIDs []string,
 	}
 
 	rows, err := f.pool.Query(ctx, `
-		SELECT content_id, episode_id, file_path, resolution, codec_audio, audio_tracks, hdr, video_tracks,
+		SELECT content_id, episode_id, file_path, resolution, codec_audio, audio_tracks, COALESCE(hdr, false), video_tracks,
 		       codec_video, audio_channels, container, subtitle_tracks, external_subtitles, edition_key
 		FROM media_files
 		WHERE (content_id = ANY($1) OR episode_id = ANY($1)) AND missing_since IS NULL
@@ -1300,7 +1300,7 @@ func (f *Fetcher) fetchCollection(ctx context.Context, s ResolvedSection, librar
 		return f.fetchUserCollection(ctx, s, libraryID, libraryIDs, userID, profileID, filter, userCollID)
 	}
 
-	// Library collection path (existing behaviour).
+	// Library collection path (existing behavior).
 	if f.CollectionRepo == nil {
 		return nil, 0, fmt.Errorf("collection sections require a collection repository")
 	}
@@ -2688,8 +2688,8 @@ func (f *Fetcher) fetchEpisodeTargetsByContentIDs(ctx context.Context, contentID
 			e.content_id,
 			e.series_id,
 			e.title,
-			e.overview,
-			e.runtime,
+			COALESCE(e.overview, ''),
+			COALESCE(e.runtime, 0),
 			e.rating_imdb,
 			COALESCE(NULLIF(s.poster_path, ''), NULLIF(si.poster_path, ''), NULLIF(e.still_path, ''), '') AS poster_path,
 			COALESCE(NULLIF(s.poster_thumbhash, ''), NULLIF(si.poster_thumbhash, ''), NULLIF(e.still_thumbhash, ''), '') AS poster_thumbhash,
@@ -2698,11 +2698,11 @@ func (f *Fetcher) fetchEpisodeTargetsByContentIDs(ctx context.Context, contentID
 			e.air_date,
 			si.title,
 			si.genres,
-			si.content_rating,
+			COALESCE(si.content_rating, ''),
 			COALESCE(NULLIF(e.still_path, ''), NULLIF(si.backdrop_path, ''), '') AS backdrop_path,
 			COALESCE(NULLIF(e.still_thumbhash, ''), NULLIF(si.backdrop_thumbhash, ''), '') AS backdrop_thumbhash,
-			si.logo_path,
-			si.status
+			COALESCE(si.logo_path, ''),
+			COALESCE(si.status, '')
 		FROM %s
 		WHERE %s
 	`, fromClause, strings.Join(conditions, " AND "))
@@ -3345,6 +3345,7 @@ func buildLibraryScope(libraryID *int, libraryIDs []int, configLibraryIDs []int,
 	return fromClause, conditions, args, argIdx
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func fetchSortClause(sort, order string) string {
 	dir := "DESC"
 	if order == "asc" {

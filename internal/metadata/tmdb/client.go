@@ -119,7 +119,7 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if attempt < maxRetries {
 				backoff := retryAfterOrDefault(resp, attempt)
 				select {
@@ -133,7 +133,7 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 		}
 
 		if resp.StatusCode >= 500 {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if attempt < maxRetries {
 				backoff := time.Duration(1<<attempt) * time.Second
 				select {
@@ -148,7 +148,7 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			var apiErr apiError
 			if err := json.Unmarshal(body, &apiErr); err == nil && apiErr.StatusMessage != "" {
 				return fmt.Errorf("tmdb: HTTP %d: %s", resp.StatusCode, apiErr.StatusMessage)
@@ -157,7 +157,7 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 		}
 
 		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(dest)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if decodeErr != nil {
 			return fmt.Errorf("tmdb: decode response: %w", decodeErr)
 		}
@@ -489,10 +489,15 @@ func (c *Client) GetCollectionPreset(ctx context.Context, preset, mediaType, tim
 				if title == "" {
 					title = item.Name
 				}
+				releaseDate := item.ReleaseDate
+				if releaseDate == "" {
+					releaseDate = item.FirstAirDate
+				}
 				results = append(results, CollectionResult{
-					ID:        item.ID,
-					MediaType: item.MediaType,
-					Title:     title,
+					ID:          item.ID,
+					MediaType:   item.MediaType,
+					Title:       title,
+					ReleaseDate: releaseDate,
 				})
 			}
 			if page >= resp.TotalPages {
@@ -506,9 +511,10 @@ func (c *Client) GetCollectionPreset(ctx context.Context, preset, mediaType, tim
 				}
 				for _, item := range resp.Results {
 					results = append(results, CollectionResult{
-						ID:        item.ID,
-						MediaType: "tv",
-						Title:     item.Name,
+						ID:          item.ID,
+						MediaType:   "tv",
+						Title:       item.Name,
+						ReleaseDate: item.FirstAirDate,
 					})
 				}
 				if page >= resp.TotalPages {
@@ -523,9 +529,10 @@ func (c *Client) GetCollectionPreset(ctx context.Context, preset, mediaType, tim
 			}
 			for _, item := range resp.Results {
 				results = append(results, CollectionResult{
-					ID:        item.ID,
-					MediaType: "movie",
-					Title:     item.Title,
+					ID:          item.ID,
+					MediaType:   "movie",
+					Title:       item.Title,
+					ReleaseDate: item.ReleaseDate,
 				})
 			}
 			if page >= resp.TotalPages {
@@ -538,9 +545,10 @@ func (c *Client) GetCollectionPreset(ctx context.Context, preset, mediaType, tim
 			}
 			for _, item := range resp.Results {
 				results = append(results, CollectionResult{
-					ID:        item.ID,
-					MediaType: "movie",
-					Title:     item.Title,
+					ID:          item.ID,
+					MediaType:   "movie",
+					Title:       item.Title,
+					ReleaseDate: item.ReleaseDate,
 				})
 			}
 			if page >= resp.TotalPages {
@@ -553,9 +561,10 @@ func (c *Client) GetCollectionPreset(ctx context.Context, preset, mediaType, tim
 			}
 			for _, item := range resp.Results {
 				results = append(results, CollectionResult{
-					ID:        item.ID,
-					MediaType: "tv",
-					Title:     item.Name,
+					ID:          item.ID,
+					MediaType:   "tv",
+					Title:       item.Name,
+					ReleaseDate: item.FirstAirDate,
 				})
 			}
 			if page >= resp.TotalPages {
@@ -613,9 +622,10 @@ func (c *Client) Discover(ctx context.Context, mediaType string, params Discover
 			}
 			for _, item := range resp.Results {
 				results = append(results, CollectionResult{
-					ID:        item.ID,
-					MediaType: "tv",
-					Title:     item.Name,
+					ID:          item.ID,
+					MediaType:   "tv",
+					Title:       item.Name,
+					ReleaseDate: item.FirstAirDate,
 				})
 			}
 			if page >= resp.TotalPages || len(resp.Results) == 0 {
@@ -630,9 +640,10 @@ func (c *Client) Discover(ctx context.Context, mediaType string, params Discover
 		}
 		for _, item := range resp.Results {
 			results = append(results, CollectionResult{
-				ID:        item.ID,
-				MediaType: "movie",
-				Title:     item.Title,
+				ID:          item.ID,
+				MediaType:   "movie",
+				Title:       item.Title,
+				ReleaseDate: item.ReleaseDate,
 			})
 		}
 		if page >= resp.TotalPages || len(resp.Results) == 0 {
@@ -1077,6 +1088,49 @@ func pickMovieCertification(rd *releaseDatesResponse) string {
 		return fallbackUS
 	}
 	return fallbackAny
+}
+
+// HasDigitalRelease reports whether a movie has any Digital, Physical, or TV
+// release date on record that is <= today — i.e. it is no longer
+// theatrical-only. Titles with no release-date data at all are treated as
+// released (true): the gate must not mass-skip poorly-populated TMDB entries,
+// and the caller's existing date-based checks already cover future releases.
+func (c *Client) HasDigitalRelease(ctx context.Context, tmdbID int) (bool, error) {
+	var resp releaseDatesResponse
+	if err := c.doGet(ctx, fmt.Sprintf("/movie/%d/release_dates", tmdbID), &resp); err != nil {
+		return false, err
+	}
+	if len(resp.Results) == 0 {
+		return true, nil
+	}
+	return HasDigitalOrPhysicalRelease(&resp), nil
+}
+
+// HasDigitalOrPhysicalRelease reports whether TMDB release dates contain a
+// Digital (4), Physical (5), or TV (6) release date that is <= today.
+func HasDigitalOrPhysicalRelease(rd *releaseDatesResponse) bool {
+	if rd == nil {
+		return false
+	}
+	now := time.Now().UTC().Truncate(24 * time.Hour)
+	for _, country := range rd.Results {
+		for _, entry := range country.ReleaseDates {
+			if entry.Type == 4 || entry.Type == 5 || entry.Type == 6 {
+				dateStr := strings.TrimSpace(entry.ReleaseDate)
+				if dateStr == "" {
+					continue
+				}
+				if len(dateStr) >= 10 {
+					dateStr = dateStr[:10]
+				}
+				t, err := time.Parse("2006-01-02", dateStr)
+				if err == nil && !t.After(now) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func pickTVRating(cr *contentRatingsResponse) string {

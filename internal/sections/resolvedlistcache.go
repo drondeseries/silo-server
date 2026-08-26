@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -143,7 +144,10 @@ func blockingResolvedListRebuild(ctx context.Context, key string, now time.Time,
 	if err != nil {
 		return nil, 0, err
 	}
-	res := value.(buildResult)
+	res, ok := value.(buildResult)
+	if !ok {
+		return nil, 0, fmt.Errorf("unexpected resolved list result %T", value)
+	}
 	return cloneMediaItems(res.items), res.total, nil
 }
 
@@ -206,6 +210,17 @@ func resolvedListSet(key string, items []*models.MediaItem, total int, now time.
 		refreshAfter: now.Add(resolvedListRefreshAfter),
 		expiresAt:    now.Add(resolvedListTTL),
 	}
+	resolvedListCacheMu.Unlock()
+}
+
+// InvalidateResolvedListCache removes cached shared section memberships. Call
+// this after catalog membership changes outside the scanner (for example, when
+// a request-router plugin registers virtual media directly). Per-user overlays
+// are not stored here and need no invalidation.
+func InvalidateResolvedListCache() {
+	resolvedListCacheMu.Lock()
+	resolvedListCache = make(map[string]resolvedListEntry)
+	resolvedListLastPrune = time.Time{}
 	resolvedListCacheMu.Unlock()
 }
 

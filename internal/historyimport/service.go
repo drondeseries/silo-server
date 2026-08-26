@@ -444,13 +444,13 @@ func (s *Service) executeRun(run *Run, provider Provider) {
 	defer cancel()
 
 	// Wait for a concurrency slot. The run stays in "queued" status until
-	// a slot opens. If the context is cancelled (server shutdown or admin
+	// a slot opens. If the context is canceled (server shutdown or admin
 	// cancel), the goroutine exits without executing.
 	select {
 	case s.runSemaphore <- struct{}{}:
 		defer func() { <-s.runSemaphore }()
 	case <-ctx.Done():
-		slog.Info("history import: run cancelled while queued", "run_id", run.ID)
+		slog.Info("history import: run canceled while queued", "run_id", run.ID)
 		return
 	}
 

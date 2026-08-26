@@ -218,7 +218,7 @@ func (d *DurableCompatPlaybackStore) replaceUnstartedNegotiation(
 
 	var removed []string
 	if session.CompatToken != "" && session.ClientDeviceID != "" && session.RouteItemID != "" {
-		scope := session.CompatToken + "\x00" + session.ClientDeviceID + "\x00" + session.RouteItemID
+		scope := session.CompatToken + "\x1f" + session.ClientDeviceID + "\x1f" + session.RouteItemID
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, scope); err != nil {
 			return nil, err
 		}

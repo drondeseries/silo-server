@@ -10,6 +10,19 @@ import (
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
 
+func TestIsHardwareTranscodeRecognizesAutoAndQSV(t *testing.T) {
+	for _, hw := range []string{"qsv", "vaapi", "nvenc", "auto", "QSV", "Auto"} {
+		if !IsHardwareTranscode(hw) {
+			t.Errorf("IsHardwareTranscode(%q) = false, want true", hw)
+		}
+	}
+	for _, hw := range []string{"none", "", "cpu", "soft"} {
+		if IsHardwareTranscode(hw) {
+			t.Errorf("IsHardwareTranscode(%q) = true, want false", hw)
+		}
+	}
+}
+
 // TestSegmentRecoveryDecisionWaitsWhileRestarting covers half of issue #243's
 // seek-freeze: while a restart is already in flight, a concurrent segment
 // request must WAIT for the restart's output rather than trigger another

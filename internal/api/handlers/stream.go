@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -17,6 +20,7 @@ import (
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/remotestream"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
@@ -51,12 +55,6 @@ type StreamHandler struct {
 	// PlaybackConfig returns the current playback config; read it through
 	// ffmpegPath(). May be nil (tests).
 	PlaybackConfig func() config.PlaybackConfig
-	// CopySafetyRacer gates and covers a revived progressive remux: it answers
-	// whether this replica already condemns a video stream-copy of the source,
-	// and re-engages the copy-safety race for one whose verdict is still open.
-	// Optional — without it a revived remux is gated on the persisted row alone
-	// and no race is started here.
-	CopySafetyRacer PlaybackCopySafetyRacer
 	// SubtitleCache stores full-track PGS (.sup) extracts under the transcode
 	// dir so repeat selections skip the whole-file ffmpeg demux. May be nil
 	// (tests / minimal setups) — extraction then always streams uncached.
@@ -64,6 +62,15 @@ type StreamHandler struct {
 	SubtitleRepo  subtitles.Repository // optional; enables S3-sourced subtitles
 	S3Client      subtitles.S3Client   // optional; needed for fetching S3 subtitles
 	S3Bucket      string               // bucket for subtitle storage
+	// VirtualMediaResolver resolves virtual:// URIs to a real provider URL.
+	// Required for embedded subtitle extraction from virtual sources.
+	VirtualMediaResolver VirtualMediaResolver
+	// RemoteStreamRelay pins the resolved provider URL to a loopback relay
+	// so ffmpeg reads through it with a stable IP.
+	RemoteStreamRelay *remotestream.Relay
+	// AllowInsecureVirtual reports whether the owning plugin installation has
+	// explicitly enabled allow_insecure_http for private/local stream hosts.
+	AllowInsecureVirtual func(installationID int) bool
 }
 
 // ffmpegPath returns the currently configured ffmpeg binary path.
@@ -72,6 +79,33 @@ func (h *StreamHandler) ffmpegPath() string {
 		return h.PlaybackConfig().FFmpegPath
 	}
 	return ""
+}
+
+// resolveVirtualInputURI resolves a virtual:// file path to a relay URL that
+// ffmpeg can open. Virtual sources are provider-neutral URIs, not FFmpeg
+// inputs, so embedded subtitle extraction must resolve through the relay
+// before spawning ffmpeg — otherwise ffprobe fails on a "Protocol not found"
+// error.
+func (h *StreamHandler) resolveVirtualInputURI(
+	ctx context.Context,
+	file *models.MediaFile,
+	userID int,
+	profileID string,
+) (string, func(), error) {
+	inputPath, err := resolveVirtualMediaPath(
+		ctx, h.VirtualMediaResolver, file.FilePath,
+		file.VirtualOwnerInstallationID, userID, profileID,
+	)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve virtual input: %w", err)
+	}
+	if h.RemoteStreamRelay == nil {
+		return inputPath, nil, nil
+	}
+	if h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(file.VirtualOwnerInstallationID) {
+		return h.RemoteStreamRelay.RegisterInsecure(ctx, inputPath)
+	}
+	return h.RemoteStreamRelay.Register(ctx, inputPath)
 }
 
 // NewStreamHandler creates a new StreamHandler backed by the given session
@@ -111,8 +145,8 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	// ?seek= query for remux), so no runtime beyond the Session needs rebuilding.
 	// Without a token (or signing secret) reconstruct is off, collapsing to a
 	// plain GetSession + ownership check.
-	card, claims := verifiedStreamCardFromToken(r.URL.Query().Get(streamTokenParam), sessionID, h.JWTSecret)
-	session, status, reconstructed := h.TM.LoadOrReconstructSessionDetail(r.Context(), h.sessionMgr.GetSession, sessionID, userID, card)
+	card := streamCardFromToken(r.URL.Query().Get(streamTokenParam), sessionID, h.JWTSecret)
+	session, status := h.TM.LoadOrReconstructSession(r.Context(), h.sessionMgr.GetSession, sessionID, userID, card)
 	switch status {
 	case playback.SessionMissing:
 		writePlaybackSessionNotFound(w)
@@ -122,12 +156,6 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	case playback.SessionForbidden:
 		writeError(w, http.StatusForbidden, "forbidden", "Session belongs to another user")
-		return
-	case playback.SessionUnauthorized:
-		// Defensive against invariant drift, not a reachable path: this caller
-		// resolves a non-zero user before loading. Falling through would
-		// dereference the nil session the status carries.
-		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
 		return
 	}
 
@@ -153,23 +181,26 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		writePlaybackFilePreflightError(w, err)
 		return
 	}
-	attachPlaybackSession(r.Context(), session, claims)
 
-	// A reconstructed remux replays a recipe committed before the copy-safety
-	// verdict existed, and no notifier can reach it — see playback_copy_safety.go.
-	// One that the verdict does not condemn re-engages the race here, which is
-	// what gives the single long response below something able to withdraw it.
-	// Starting that race before the abort watcher is registered is safe: a
-	// verdict fast enough to stop the session first leaves WatchTransportStop
-	// with no session to watch, and it reports the stop it missed.
-	if reconstructed && session.PlayMethod == playback.PlayRemux &&
-		videoCopyRevivalRefused(r.Context(), h.CopySafetyRacer, file, sessionID) {
-		// The reconstruct already registered the session; tear it down again so
-		// the refusal leaves no half-live session behind the client's replan.
-		h.abortPlaybackSession(r.Context(), session)
-		writePlaybackSessionNotFound(w)
-		return
+	// Bind to the session's planned virtual URI when available: the catalog
+	// row's path is mutable (candidate rotation), but the session captured
+	// the exact URI that was resolved and probed during planning.
+	if session.VirtualSourceURI != "" && isVirtualPlaybackFile(file) {
+		file.FilePath = session.VirtualSourceURI
 	}
+
+	inputPath := file.FilePath
+	releaseInput := func() {}
+	if isVirtualPlaybackFile(file) && h.VirtualMediaResolver != nil {
+		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID)
+		if resolveErr != nil {
+			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
+			return
+		}
+		inputPath = resolved
+		releaseInput = cleanup
+	}
+	defer releaseInput()
 
 	switch session.PlayMethod {
 	case playback.PlayDirect:
@@ -178,7 +209,33 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				_ = h.sessionMgr.EndTransport(sessionID)
 			}()
 		}
-		if err := playback.ServeDirectPlay(w, r, file.FilePath); err != nil {
+		if isVirtualPlaybackFile(file) && strings.HasPrefix(inputPath, "http://") {
+			targetURL, err := url.Parse(inputPath)
+			if err != nil {
+				h.handleTransportStartFailure(r.Context(), session, file, err)
+				return
+			}
+			// This proxy forwards client headers to the target by design; that
+			// is only safe because virtual inputs always resolve to the local
+			// relay. Assert the invariant rather than trusting every caller.
+			if host := targetURL.Hostname(); host != "127.0.0.1" && host != "::1" && host != "[::1]" {
+				err := fmt.Errorf("virtual direct-play proxy target %q is not the local relay", targetURL.Host)
+				h.handleTransportStartFailure(r.Context(), session, file, err)
+				return
+			}
+			proxy := &httputil.ReverseProxy{
+				Director: func(req *http.Request) {
+					req.URL.Scheme = targetURL.Scheme
+					req.URL.Host = targetURL.Host
+					req.URL.Path = targetURL.Path
+					req.URL.RawQuery = targetURL.RawQuery
+					req.Host = targetURL.Host
+				},
+			}
+			proxy.ServeHTTP(w, r)
+			return
+		}
+		if err := playback.ServeDirectPlay(w, r, inputPath); err != nil {
 			h.handleTransportStartFailure(r.Context(), session, file, err)
 		}
 
@@ -188,12 +245,6 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				_ = h.sessionMgr.EndTransport(sessionID)
 			}()
 		}
-		// A progressive remux runs for the length of the title behind a single
-		// response, so a stop decided while it is playing — a copy-safety
-		// verdict withdrawing the route, an admin kill — has to reach the
-		// stream itself. Nothing else can: the ffmpeg belongs to this request.
-		abort, releaseAbort := h.sessionMgr.WatchTransportStop(sessionID)
-		defer releaseAbort()
 		seekSeconds := 0.0
 		if seekStr := r.URL.Query().Get("seek"); seekStr != "" {
 			if s, err := strconv.ParseFloat(seekStr, 64); err == nil && s >= 0 {
@@ -204,7 +255,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		// audio/mp4 for it, and a declared-tier client refuses to attach a
 		// source buffer whose advertised type its probe rejected — so the
 		// response has to keep the same promise the plan made.
-		if err := playback.ServeRemuxWithOptions(w, r, file.FilePath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, file.PrimaryDVProfile(), playback.RemuxServeOptions{
+		if err := playback.ServeRemuxWithOptions(w, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, file.PrimaryDVProfile(), playback.RemuxServeOptions{
 			DVMode:                 session.RemuxDVMode,
 			FFmpegPath:             h.ffmpegPath(),
 			ContentType:            playback.RemuxContentType(file.IsAudioOnly()),
@@ -212,7 +263,6 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			SourceAudioChannels:    session.SourceAudioChannels,
 			TargetAudioChannels:    session.TargetAudioChannels,
 			TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
-			Abort:                  abort,
 		}); err != nil {
 			h.handleTransportStartFailure(r.Context(), session, file, err)
 		}
@@ -261,7 +311,6 @@ func (h *StreamHandler) HandleSubtitle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "Session belongs to another user")
 		return
 	}
-	attachPlaybackSession(r.Context(), session, nil)
 
 	fileID, err := subtitleSourceFileID(r, session)
 	if err != nil {
@@ -528,7 +577,6 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusForbidden, "forbidden", "Session belongs to another user")
 		return
 	}
-	attachPlaybackSession(r.Context(), session, nil)
 
 	fileID, err := subtitleSourceFileID(r, session)
 	if err != nil {
@@ -569,7 +617,18 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	fonts, err := playback.ExtractAttachedSubtitleFonts(r.Context(), file.FilePath, h.ffmpegPath())
+	inputPath := file.FilePath
+	releaseInput := func() {}
+	if isVirtualPlaybackFile(file) && h.VirtualMediaResolver != nil {
+		inputPath, releaseInput, err = h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
+			return
+		}
+	}
+	defer releaseInput()
+
+	fonts, err := playback.ExtractAttachedSubtitleFonts(r.Context(), inputPath, h.ffmpegPath())
 	if err != nil {
 		slog.WarnContext(r.Context(), "subtitle font extraction failed", "component", "api",
 			"file_id", file.ID,
@@ -697,6 +756,22 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		AllowWindow:     allowWindow,
 		FFmpegPath:      h.ffmpegPath(),
 	}
+	// Virtual sources are provider-neutral URIs, not FFmpeg inputs. Resolve
+	// through the relay so ffmpeg reads the real stream. Subtitle extraction
+	// spawns its own ffmpeg independent of the video pipeline, so it must
+	// resolve separately even though the transcode transport already did.
+	releaseInput := func() {}
+	if isVirtualPlaybackFile(file) && h.VirtualMediaResolver != nil && h.RemoteStreamRelay != nil {
+		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID)
+		if resolveErr != nil {
+			writeError(w, http.StatusBadGateway, "virtual_resolve_failed",
+				"Failed to resolve virtual source for subtitle extraction.")
+			return
+		}
+		opts.InputPath = resolved
+		releaseInput = cleanup
+	}
+	defer releaseInput()
 	if len(requestedFormat) > 0 && requestedFormat[0] == "vtt" {
 		// Only text sources can be converted to WebVTT. A bitmap track (PGS
 		// reaches here because it is deliverable as .sup; DVD/DVB are rejected

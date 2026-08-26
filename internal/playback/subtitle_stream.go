@@ -18,6 +18,10 @@ import (
 type StreamExtractOpts struct {
 	// InputPath is the path to the source media file.
 	InputPath string
+	// CacheIdentity is a credential-free, stable identity for a transient
+	// remote input. When set, subtitle caching uses a bounded ten-minute
+	// generation instead of requiring os.Stat on InputPath.
+	CacheIdentity string
 	// TrackIndex is the subtitle stream ordinal within the container
 	// (matches ffmpeg's `0:s:N` specifier). Callers pass the same index
 	// they would to ExtractSubtitle.
@@ -49,6 +53,11 @@ type StreamExtractOpts struct {
 	// [Script Info] header exists only at stream offset 0, so a seeked
 	// extract would be structurally broken.
 	AllowWindow bool
+	// DisableBackgroundWarm prevents a windowed PGS miss from starting a
+	// detached full-track extract. Remote relay inputs use request-scoped
+	// registrations, so a detached warm must not outlive that registration.
+	// Local files leave this false and retain the normal cache-warm behavior.
+	DisableBackgroundWarm bool
 	// InputIsExtractedSup marks InputPath as a cached full-track .sup
 	// elementary stream (a previous full extract, produced with -copyts so
 	// its timestamps are absolute source PTS) rather than the original
@@ -119,7 +128,7 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 	if waitErr != nil {
 		// ExitError with non-zero status is ffmpeg reporting a real
 		// problem. Client disconnect (copy failed) manifests as the
-		// context being cancelled, which surfaces here as ffmpeg being
+		// context being canceled, which surfaces here as ffmpeg being
 		// killed — propagate it as a regular cancellation error.
 		if ctx.Err() != nil {
 			return ctx.Err()

@@ -158,9 +158,10 @@ func (c MatcherConfig) TVSeriesRootQueueEnabled() bool {
 
 // PlaybackConfig holds transcoding and playback settings.
 type PlaybackConfig struct {
-	FFmpegPath   string `yaml:"ffmpeg_path"`
-	TranscodeDir string `yaml:"transcode_dir"`
-	HWAccel      string `yaml:"hw_accel"`
+	FFmpegPath       string `yaml:"ffmpeg_path"`
+	TranscodeDir     string `yaml:"transcode_dir"`
+	HWAccel          string `yaml:"hw_accel"`
+	SoftwareFallback string `yaml:"software_fallback"`
 	// HWDevice is the GPU render device for hardware transcodes. A single
 	// path pins every GPU workload to that device; a comma-separated list
 	// (e.g. "/dev/dri/renderD128,/dev/dri/renderD129") balances workloads
@@ -178,6 +179,7 @@ type PlaybackConfig struct {
 	ChapterThumbnailExecution    string `yaml:"chapter_thumbnail_execution"`
 	ChapterThumbnailNodeCapacity int    `yaml:"chapter_thumbnail_node_capacity"`
 	TranscodeEnabled             bool   `yaml:"transcode_enabled"`
+	MaxVirtualFailoverAttempts   int    `yaml:"max_virtual_failover_attempts"`
 }
 
 // RedisConfig holds Redis connection settings.
@@ -497,6 +499,7 @@ func setDefaults() *configRaw {
 			FFmpegPath:                   "/usr/lib/jellyfin-ffmpeg/ffmpeg",
 			TranscodeDir:                 DefaultTranscodeDir,
 			HWAccel:                      "auto",
+			SoftwareFallback:             "allow",
 			ChapterThumbnailWorkers:      1,
 			ChapterThumbnailExecution:    "local",
 			ChapterThumbnailNodeCapacity: 1,

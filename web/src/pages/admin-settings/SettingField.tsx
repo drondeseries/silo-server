@@ -132,6 +132,7 @@ export function SettingField({
         <Input
           id={controlId}
           type="number"
+          min={0}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           disabled={disabled}
@@ -161,7 +162,7 @@ export function SettingField({
         disabled={disabled}
         className="max-w-md"
         placeholder={hint}
-        aria-describedby={hint && type === "duration" ? hintId : undefined}
+        aria-describedby={hint ? hintId : undefined}
       />
       {hint && type === "duration" && (
         <p id={hintId} className="text-muted-foreground text-xs">

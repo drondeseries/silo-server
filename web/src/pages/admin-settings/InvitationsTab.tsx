@@ -9,7 +9,6 @@ import {
 } from "@/hooks/queries/admin/invitations";
 import { useAccessGroups } from "@/hooks/queries/admin/accessGroups";
 import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
-import { effectiveAccessGroupID } from "@/components/UserPolicyFields";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -296,7 +295,7 @@ function CreateInvitationForm({
       {
         email,
         role,
-        access_group_id: effectiveAccessGroupID(role, accessGroupID),
+        access_group_id: accessGroupID,
         library_ids: libraryIDs,
         create_profile: createProfile,
         show_tour: showTour,
@@ -357,9 +356,8 @@ function CreateInvitationForm({
         <div className="space-y-2">
           <Label>Access group</Label>
           <Select
-            value={role === "admin" || accessGroupID === null ? "default" : String(accessGroupID)}
+            value={accessGroupID === null ? "default" : String(accessGroupID)}
             onValueChange={(v) => setAccessGroupID(v === "default" ? null : Number(v))}
-            disabled={role === "admin"}
           >
             <SelectTrigger>
               <SelectValue />

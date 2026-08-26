@@ -104,7 +104,7 @@ func TestHandleHWAccelAggregatesAllHealthyNodes(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		json.NewEncoder(w).Encode(playback.HWAccelInfo{
+		_ = json.NewEncoder(w).Encode(playback.HWAccelInfo{
 			Resolved:      "qsv",
 			RenderDevices: []string{"/dev/dri/renderD128", "/dev/dri/renderD129"},
 			RenderDeviceDetails: []playback.RenderDeviceInfo{
@@ -115,7 +115,7 @@ func TestHandleHWAccelAggregatesAllHealthyNodes(t *testing.T) {
 	}))
 	defer nodeA.Close()
 	nodeB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(playback.HWAccelInfo{
+		_ = json.NewEncoder(w).Encode(playback.HWAccelInfo{
 			Resolved:      "vaapi",
 			RenderDevices: []string{"/dev/dri/renderD128"},
 			RenderDeviceDetails: []playback.RenderDeviceInfo{

@@ -10,6 +10,7 @@ import {
   Plus,
   RotateCcw,
   X,
+  Trash2,
 } from "lucide-react";
 import { useLocation } from "react-router";
 import { useViewTransitionNavigate } from "@/hooks/useViewTransition";
@@ -18,7 +19,7 @@ import { useOptionalAuth } from "@/hooks/useAuth";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
-import { useRefreshItemMetadata, useWatchedStateMutation } from "@/hooks/queries/items";
+import { useDeleteMediaItem, useRefreshItemMetadata, useWatchedStateMutation } from "@/hooks/queries/items";
 import { type DismissHomeItemVariables, useDismissHomeItem } from "@/hooks/queries/homeDismissals";
 import { useToggleFavorite } from "@/hooks/queries/favorites";
 import { useToggleWatchlist } from "@/hooks/queries/watchlist";
@@ -69,7 +70,8 @@ type MediaItemMenuEntry =
         | "viewPlayHistory"
         | "refreshMetadata"
         | "editMetadata"
-        | "matchItem";
+        | "matchItem"
+        | "deleteItem";
       label: string;
     }
   | { kind: "separator" };
@@ -189,6 +191,12 @@ export function buildMediaItemMenuModel({
           },
         );
       }
+
+      entries.push({
+        kind: "action",
+        key: "deleteItem",
+        label: "Delete Item",
+      });
     }
   }
 
@@ -254,6 +262,8 @@ function MediaItemMenuActionIcon({
       return <MediaActionIcon action="editMetadata" />;
     case "matchItem":
       return <MediaActionIcon action="matchItem" />;
+    case "deleteItem":
+      return <Trash2 aria-hidden="true" className="size-4 text-red-500" />;
   }
 }
 
@@ -678,6 +688,8 @@ export default function MediaItemMenu({
     );
   }
 
+  const deleteMediaItem = useDeleteMediaItem();
+
   async function handleFavoriteToggle() {
     await runOptimisticToggle("is_favorite", favoriteMutation.isPending, (_, previousValue) =>
       favoriteMutation.mutateAsync(previousValue),
@@ -733,6 +745,16 @@ export default function MediaItemMenu({
       }
       case "editMetadata": {
         setMetadataAction("edit");
+        return;
+      }
+      case "deleteItem": {
+        if (
+          window.confirm(
+            "Delete this show/movie from library? Home and sections will update immediately.",
+          )
+        ) {
+          deleteMediaItem.mutate(contentId);
+        }
         return;
       }
       case "matchItem": {

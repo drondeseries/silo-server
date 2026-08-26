@@ -977,6 +977,7 @@ func (f *fakeRedisSettingsCheckClient) Close() error {
 	return nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 type fakeEmbeddingsSettingsCheckClient struct {
 	embed func(ctx context.Context, texts []string) ([][]float32, error)
 }
@@ -992,6 +993,7 @@ func (f *fakeMDBListSettingsCheckClient) Check(ctx context.Context) error {
 	return nil
 }
 
+//nolint:unused // Retained for compatibility with dormant integration paths.
 func (f *fakeEmbeddingsSettingsCheckClient) Embed(
 	ctx context.Context,
 	texts []string,

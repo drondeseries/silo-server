@@ -23,6 +23,7 @@ const KEYS = [
   "playback.transcode_hardware_tone_map_enabled",
   "playback.transcode_software_tone_map_enabled",
   "allow_4k_transcode",
+  "playback.software_fallback",
   "enable_transcode_throttle",
   "transcode_throttle_seconds",
   "playback.chapter_thumbnail_workers",
@@ -32,6 +33,7 @@ const KEYS = [
   "playback.chapter_thumbnail_software_tone_map_enabled",
   "playback.watched_threshold",
   "playback.min_resume_threshold",
+  "playback.max_virtual_failover_attempts",
 ];
 
 export default function PlaybackSettings() {
@@ -196,6 +198,17 @@ export default function PlaybackSettings() {
             onChange={(v) => form.setValue("allow_4k_transcode", v)}
           />
           <SettingField
+            label="Hardware Transcode Failure"
+            type="select"
+            hint="Allow CPU fallback when GPU transcoding fails, or require GPU-only playback to avoid high CPU usage."
+            value={form.getValue("playback.software_fallback") || "allow"}
+            onChange={(v) => form.setValue("playback.software_fallback", v)}
+            options={[
+              { value: "allow", label: "Allow CPU fallback" },
+              { value: "gpu_only", label: "GPU only" },
+            ]}
+          />
+          <SettingField
             label="Enable Transcode Throttling"
             type="toggle"
             value={form.getValue("enable_transcode_throttle")}
@@ -276,6 +289,13 @@ export default function PlaybackSettings() {
             hint="Ignore progress below this % of duration (default: 5)"
             value={form.getValue("playback.min_resume_threshold")}
             onChange={(v) => form.setValue("playback.min_resume_threshold", v)}
+          />
+          <SettingField
+            label="Max Virtual Failover Attempts"
+            type="number"
+            hint="Maximum alternate stream candidates to probe or failover across during playback startup (1–50, default: 5)"
+            value={form.getValue("playback.max_virtual_failover_attempts")}
+            onChange={(v) => form.setValue("playback.max_virtual_failover_attempts", v)}
           />
         </FieldGroup>
       </div>

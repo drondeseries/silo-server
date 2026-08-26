@@ -18,14 +18,6 @@ var proxyMediaRoutes = []streamtelemetry.MediaRoute{
 	proxyRoute(http.MethodGet, "/stream/transcode/{token}/master.m3u8", streamtelemetry.ClassManifest, true),
 	proxyRoute(http.MethodHead, "/stream/transcode/{token}/master.m3u8", streamtelemetry.ClassManifest, true),
 	proxyRoute(http.MethodGet, "/stream/transcode/{token}/segment/{name}", streamtelemetry.ClassPlayback, true),
-	// authorized_media_origins_v1: same viewer egress, different proof of
-	// entitlement — a Redis grant plus the caller's own bearer token, never a
-	// stream token — so these carry their own canonical session key.
-	grantRoute(http.MethodGet, "/stream/v3/{session_id}", streamtelemetry.ClassPlayback, true),
-	grantRoute(http.MethodHead, "/stream/v3/{session_id}", streamtelemetry.ClassPlayback, true),
-	grantRoute(http.MethodGet, "/stream/v3/{session_id}/master.m3u8", streamtelemetry.ClassManifest, true),
-	grantRoute(http.MethodHead, "/stream/v3/{session_id}/master.m3u8", streamtelemetry.ClassManifest, true),
-	grantRoute(http.MethodGet, "/stream/v3/{session_id}/segment/{name}", streamtelemetry.ClassPlayback, true),
 	proxyRoute(http.MethodGet, "/stream/subtitles/{token}/{track}", streamtelemetry.ClassPlayback, true),
 	proxyRoute(http.MethodGet, "/stream/subtitles/{token}/{track}/fonts", streamtelemetry.ClassPlayback, true),
 	proxyRoute(http.MethodGet, "/downloads/file/{token}", streamtelemetry.ClassTransfer, false),

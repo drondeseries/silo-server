@@ -148,7 +148,6 @@ func episodeCatalogBaseRelationForLibraries(
 		  AND el_scope_out.media_folder_id = ANY($%d)
 	)`, argIdx))
 		args = append(args, disabledLibraryIDs)
-		argIdx++
 	}
 
 	relation := fmt.Sprintf(

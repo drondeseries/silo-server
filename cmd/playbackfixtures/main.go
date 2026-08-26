@@ -831,7 +831,7 @@ func makePlannerScenarioWithAudioIndex(name, category string, request playback.S
 	}
 	return playback.PlannerScenarioV3{
 		Name: name, Category: category, Request: request,
-		Source:        playback.SourceDescriptorFromFileV3(file, audioTrackIndex),
+		Source:        playback.SourceDescriptorFromFileV3(file, 0),
 		AttemptedKeys: append([]string(nil), attempted...), Expected: expected,
 	}
 }

@@ -82,9 +82,9 @@ export default function SeasonEpisodeGrid({
                   {!episode.user_data?.played &&
                     (episode.user_data?.position_seconds ?? 0) > 0 &&
                     (episode.user_data?.duration_seconds ?? 0) > 0 && (
-                      <div className="absolute inset-x-2 bottom-1.5 h-[3px] overflow-hidden rounded-full bg-black/40">
+                      <div className="absolute inset-x-0 bottom-0 h-[3px] bg-black/40">
                         <div
-                          className="progress-fill h-full rounded-full"
+                          className="progress-fill h-full rounded-r-sm"
                           style={{
                             width: `${Math.max(
                               0,

@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ConnectionCheckResponse } from "@/api/types";
 import { ConnectionCheckAction } from "@/components/admin/ConnectionCheckAction";
+import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { usePurgeVirtualPlaybackItems } from "@/hooks/queries/admin/collections";
+import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
+import { useAdminPluginInstallations } from "@/hooks/queries/admin/plugins";
 import { useCheckAdminSettingsConnection } from "@/hooks/queries/admin/settings";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 import { SettingField } from "./SettingField";
@@ -22,12 +26,40 @@ const KEYS = [
 export default function DatabaseSettings() {
   const form = useSettingsForm({ keys: useMemo(() => KEYS, []) });
   const checkConnection = useCheckAdminSettingsConnection();
+  const purgeVirtual = usePurgeVirtualPlaybackItems();
+  const { data: librariesData } = useAdminLibraries();
+  const { data: pluginInstallations } = useAdminPluginInstallations();
   const [connectionResult, setConnectionResult] = useState<ConnectionCheckResponse | null>(null);
+  const [purgeLibraryID, setPurgeLibraryID] = useState("all");
+  const [purgeInstallationID, setPurgeInstallationID] = useState("all");
   const redisUrl = form.getValue("redis.url");
   const redisManagedByEnv = form.sensitiveManagedByEnv.includes("redis.url");
   const redisConfigured = redisUrl.trim() !== "" || form.sensitiveConfigured.includes("redis.url");
   const [redisEnabledOverride, setRedisEnabledOverride] = useState<boolean | null>(null);
   const effectiveRedisEnabled = redisEnabledOverride ?? redisConfigured;
+
+  const libraryOptions = useMemo(() => {
+    const opts = [{ value: "all", label: "All Libraries" }];
+    if (librariesData) {
+      for (const lib of librariesData) {
+        opts.push({ value: String(lib.id), label: `${lib.name} (ID: ${lib.id})` });
+      }
+    }
+    return opts;
+  }, [librariesData]);
+
+  const pluginOptions = useMemo(() => {
+    const opts = [{ value: "all", label: "All Plugins" }];
+    if (pluginInstallations) {
+      for (const plugin of pluginInstallations) {
+        opts.push({
+          value: String(plugin.id),
+          label: `${plugin.plugin_id} v${plugin.version} (ID: ${plugin.id})`,
+        });
+      }
+    }
+    return opts;
+  }, [pluginInstallations]);
 
   useEffect(() => {
     if (form.dirtyCount === 0) {
@@ -152,6 +184,81 @@ export default function DatabaseSettings() {
           )}
         </FieldGroup>
       </div>
+
+      <FieldGroup label="Danger Zone">
+        <div className="flex flex-col justify-between gap-4 py-3 sm:flex-row sm:items-center">
+          <div className="space-y-1">
+            <span className="text-sm font-medium">Purge Virtual Library</span>
+            <p className="text-muted-foreground text-xs">
+              Remove all zero-storage virtual files and their orphaned catalog items.
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={purgeVirtual.isPending}
+              onClick={() => {
+                const libraryId = Number.parseInt(purgeLibraryID, 10);
+                const installationId = Number.parseInt(purgeInstallationID, 10);
+                purgeVirtual.mutate({
+                  dryRun: true,
+                  libraryId: libraryId > 0 ? libraryId : undefined,
+                  installationId: installationId > 0 ? installationId : undefined,
+                });
+              }}
+            >
+              {purgeVirtual.isPending && purgeVirtual.variables?.dryRun
+                ? "Previewing..."
+                : "Preview Purge"}
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              size="sm"
+              disabled={purgeVirtual.isPending}
+              onClick={() => {
+                const libraryId = Number.parseInt(purgeLibraryID, 10);
+                const installationId = Number.parseInt(purgeInstallationID, 10);
+                const scope =
+                  libraryId > 0 || installationId > 0 ? "the selected scope" : "all virtual items";
+                if (
+                  window.confirm(
+                    `Purge all zero-storage virtual library items for ${scope}? This cannot be undone.`,
+                  )
+                ) {
+                  purgeVirtual.mutate({
+                    dryRun: false,
+                    libraryId: libraryId > 0 ? libraryId : undefined,
+                    installationId: installationId > 0 ? installationId : undefined,
+                  });
+                }
+              }}
+            >
+              {purgeVirtual.isPending && !purgeVirtual.variables?.dryRun
+                ? "Purging..."
+                : "Purge Virtual Items"}
+            </Button>
+          </div>
+        </div>
+        <div className="grid gap-3 pt-2 pb-1 md:grid-cols-2">
+          <SettingField
+            label="Library Scope"
+            type="select"
+            options={libraryOptions}
+            value={purgeLibraryID}
+            onChange={setPurgeLibraryID}
+          />
+          <SettingField
+            label="Plugin Installation Scope"
+            type="select"
+            options={pluginOptions}
+            value={purgeInstallationID}
+            onChange={setPurgeInstallationID}
+          />
+        </div>
+      </FieldGroup>
 
       <SaveBar
         dirtyCount={form.dirtyCount}

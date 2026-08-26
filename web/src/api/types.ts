@@ -1657,6 +1657,7 @@ export interface ImportMDBListCollectionRequest {
   description?: string;
   url: string;
   limit?: number;
+  virtual_playback?: boolean;
   featured?: boolean;
   poster_url?: string;
   poster_source_url?: string;
@@ -1690,6 +1691,7 @@ export interface ImportTMDBCollectionRequest {
   time_window?: "day" | "week";
   media_type: "movie" | "tv" | "all";
   limit?: number;
+  virtual_playback?: boolean;
   featured?: boolean;
   poster_url?: string;
   poster_source_url?: string;
@@ -1719,6 +1721,7 @@ export interface ImportTraktCollectionRequest {
   profile_id?: string;
   list_url?: string;
   limit?: number;
+  virtual_playback?: boolean;
   featured?: boolean;
   poster_url?: string;
   poster_source_url?: string;
@@ -2514,10 +2517,6 @@ export interface AdminSession {
   target_resolution?: string;
   target_video_codec?: string;
   target_audio_codec?: string;
-  /** Channel count the transcode actually encodes. Absent when the reporting
-   * node did not know it — render the target codec with no channel layout
-   * rather than falling back to `source_audio_channels`. */
-  target_audio_channels?: number | null;
   target_bitrate_kbps: number | null;
   transcode_hw_accel?: string;
   tone_map_mode?: string;
@@ -3071,6 +3070,10 @@ export interface UserDevice {
   is_current_device: boolean;
   /** How many settings this (profile, device) pair overrides. */
   changed_count: number;
+  /** Present when this device has reported (or been seeded with) a capability profile. */
+  capability_fingerprint?: string;
+  /** client | admin | seed — how the capability profile was recorded. */
+  capability_source?: string;
 }
 
 export interface UserDeviceListResponse {

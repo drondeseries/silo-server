@@ -89,9 +89,8 @@ type playbackSessionRow struct {
 
 // playbackSessionsCapabilitiesResponse advertises the additive fields of the
 // live admin session payload so independently deployed clients (Android,
-// Apple) can feature-detect them. The advertised fields are omitempty on the
-// wire, so absence on a row is otherwise indistinguishable from an older
-// server.
+// Apple) can feature-detect them. Optional row fields cannot otherwise
+// distinguish unsupported data from a supported but currently absent fact.
 type playbackSessionsCapabilitiesResponse struct {
 	// EffectivePlayMethod reports that rows carry effective_play_method.
 	EffectivePlayMethod bool `json:"effective_play_method"`
@@ -111,9 +110,8 @@ type playbackSessionsCapabilitiesResponse struct {
 	ClientBuild bool `json:"client_build"`
 	// ClientChannel reports that rows carry client_channel.
 	ClientChannel bool `json:"client_channel"`
-	// TargetAudioChannels reports that rows carry target_audio_channels;
-	// absent on a row then means the reporting node did not know the encoded
-	// layout.
+	// TargetAudioChannels reports that rows carry the encoded output channel
+	// count the transcode actually produces.
 	TargetAudioChannels bool `json:"target_audio_channels"`
 }
 
@@ -225,7 +223,6 @@ func (l *PlaybackSessionsLoader) Load(
 			COALESCE(s.target_resolution, ''),
 			COALESCE(s.target_video_codec, ''),
 			COALESCE(s.target_audio_codec, ''),
-			s.target_audio_channels,
 			s.target_bitrate_kbps,
 			COALESCE(s.transcode_hw_accel, ''),
 			COALESCE(s.tone_map_mode, ''),
@@ -289,7 +286,6 @@ func (l *PlaybackSessionsLoader) Load(
 		}
 		s.PosterURL = l.presignPosterURL(r, posterPath)
 		s.StreamBitrateKbps = streamBitrateKbps
-		s.TargetAudioChannels = targetAudioChannels
 		s.TargetBitrateKbps = targetBitrateKbps
 		s.SourceBitrateKbps = sourceBitrateKbps
 		s.SourceAudioChannels = sourceAudioChannels

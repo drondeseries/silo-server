@@ -12,7 +12,7 @@ interface UseSettingsFormOptions {
 }
 
 export function useSettingsForm({ keys }: UseSettingsFormOptions) {
-  const { data: settings, isLoading } = useAdminServerSettings();
+  const { data: settings, isLoading, isError } = useAdminServerSettings();
   const { data: sensitiveData, isError: sensitiveStatusError } = useAdminSensitiveStatus();
   const updateSettings = useUpdateServerSettings();
 
@@ -97,7 +97,7 @@ export function useSettingsForm({ keys }: UseSettingsFormOptions) {
   );
 
   const save = useCallback(async () => {
-    if (dirty.size === 0) return;
+    if (dirty.size === 0 || !settings) return;
     const submittedKeys = Array.from(dirty);
     const values = Object.fromEntries(submittedKeys.map((key) => [key, localValues[key] ?? ""]));
     const submittedVersions = new Map(
@@ -147,6 +147,7 @@ export function useSettingsForm({ keys }: UseSettingsFormOptions) {
 
   return {
     isLoading,
+    isError,
     getValue,
     setValue,
     resetValue,

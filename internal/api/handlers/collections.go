@@ -1031,8 +1031,7 @@ func (h *CollectionHandler) processCollectionPoster(
 		switch {
 		case err == nil:
 			fileData = data
-		case err == http.ErrMissingFile:
-			// fall through to source URL handling
+		case errors.Is(err, http.ErrMissingFile):
 		default:
 			return fmt.Errorf("poster: %w", err)
 		}

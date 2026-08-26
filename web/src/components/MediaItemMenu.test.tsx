@@ -1,4 +1,6 @@
+import type React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
@@ -6,6 +8,20 @@ import type { ItemDetail } from "@/api/types";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import MediaItemMenu, { buildMediaItemMenuModel, MetadataActionDialogHost } from "./MediaItemMenu";
 import { mediaItemMenuTriggerClassName } from "./mediaItemMenuTrigger";
+
+const testQueryClient = new QueryClient({
+  defaultOptions: { queries: { retry: false } },
+});
+
+function renderWithProviders(ui: React.ReactElement) {
+  const result = render(<QueryClientProvider client={testQueryClient}>{ui}</QueryClientProvider>);
+  return {
+    ...result,
+    rerender: (rerenderUi: React.ReactElement) =>
+      result.rerender(<QueryClientProvider client={testQueryClient}>{rerenderUi}</QueryClientProvider>),
+  };
+}
+
 
 const mocks = vi.hoisted(() => ({
   useCatalogItemDetail: vi.fn(),
@@ -48,6 +64,7 @@ vi.mock("@/hooks/queries/watchlist", () => ({
 
 vi.mock("@/hooks/queries/items", () => ({
   useRefreshItemMetadata: () => ({ isPending: false, mutate: vi.fn() }),
+  useDeleteMediaItem: () => ({ isPending: false, mutate: vi.fn() }),
   useWatchedStateMutation: () => ({
     isPending: false,
     mutateAsync: (...args: unknown[]) => mocks.toggleWatched(...args),
@@ -153,13 +170,15 @@ describe("buildMediaItemMenuModel", () => {
     });
     const actions = model.filter((item) => item.kind === "action");
 
-    expect(actions).toHaveLength(6);
+    expect(actions).toHaveLength(7);
     expect(actions[0]?.label).toBe("Play from Beginning");
     expect(actions[1]?.label).toBe("Mark Unwatched");
     expect(actions[2]?.label).toBe("View Play History");
     expect(actions[3]?.label).toBe("Refresh Metadata");
     expect(actions[4]?.label).toBe("Edit Metadata");
     expect(actions[5]?.label).toBe("Match Item");
+    expect(actions[6]?.label).toBe("Delete Item");
+    expect(actions[6]?.label).toBe("Delete Item");
   });
 
   it("omits admin actions for non-admin users", () => {
@@ -193,7 +212,7 @@ describe("buildMediaItemMenuModel", () => {
     });
     const labels = model.filter((item) => item.kind === "action").map((item) => item.label);
 
-    expect(labels).toEqual(["Refresh Metadata", "Edit Metadata", "Match Item"]);
+    expect(labels).toEqual(["Refresh Metadata", "Edit Metadata", "Match Item", "Delete Item"]);
     expect(labels).not.toContain("View Play History");
   });
 
@@ -393,7 +412,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("drops pointer focus when the trigger closes the menu so hover exit can hide it", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -417,7 +436,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("returns focus to the trigger when a keyboard user closes the menu", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -441,7 +460,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("still returns keyboard focus after a cancelled pointer press inside the menu", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -466,7 +485,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("renders a matching bottom-left favorite control for poster cards", () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -486,7 +505,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("shows matching eye state in the hover control and three-dot menu", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -516,7 +535,7 @@ describe("MediaItemMenu trigger visibility", () => {
         resolveWatched = resolve;
       }),
     );
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -554,7 +573,7 @@ describe("MediaItemMenu trigger visibility", () => {
 
   it("rolls the watched eye back when the request fails", async () => {
     mocks.toggleWatched.mockRejectedValueOnce(new Error("request failed"));
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -575,7 +594,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("uses the swipe-safe pointer path for the watched shortcut", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -599,7 +618,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("shows the eye on opted-in wide cards and sizes narrow poster controls independently", () => {
-    const { rerender } = render(
+    const { rerender } = renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -663,7 +682,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("limits automatic poster eyes to movies and series", () => {
-    const { rerender } = render(
+    const { rerender } = renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="episode-1"
@@ -693,7 +712,7 @@ describe("MediaItemMenu trigger visibility", () => {
 
   it("uses matching action icons and sizes the menu to its longest entry", async () => {
     mocks.authState = { user: { role: "admin" } };
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -732,7 +751,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("toggles through the shared favorite mutation and updates the heart immediately", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -758,7 +777,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("toggles on a short pointer release even when a carousel consumes the click", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -781,7 +800,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("keeps watched and favorite actions working for an unpaired mouse click", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -822,7 +841,7 @@ describe("MediaItemMenu trigger visibility", () => {
         />
       </MemoryRouter>
     );
-    const { rerender } = render(renderMenu());
+    const { rerender } = renderWithProviders(renderMenu());
 
     fireEvent.click(screen.getByRole("button", { name: "Mark Watched" }));
     expect(screen.getByRole("button", { name: "Mark Unwatched" })).toBeTruthy();
@@ -835,7 +854,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("does not toggle when a captured pointer is released outside the button", () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -866,7 +885,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("does not favorite when a swipe returns near its starting point", () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -887,7 +906,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("keeps the poster heart in sync when favorite state changes through the menu", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -908,7 +927,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("unfavorites through the heart and updates the matching menu action", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -930,7 +949,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("unfavorites through the menu and clears the poster heart", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -954,7 +973,7 @@ describe("MediaItemMenu trigger visibility", () => {
 
   it("rolls the heart back when the favorite request fails", async () => {
     mocks.toggleFavorite.mockRejectedValueOnce(new Error("request failed"));
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -973,7 +992,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("keeps the favorite shortcut off wide cards and collection-disabled menus", () => {
-    const { rerender } = render(
+    const { rerender } = renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"
@@ -1002,7 +1021,7 @@ describe("MediaItemMenu trigger visibility", () => {
   });
 
   it("can hide the poster heart without removing the favorite menu action", async () => {
-    render(
+    renderWithProviders(
       <MemoryRouter>
         <MediaItemMenu
           contentId="movie-1"

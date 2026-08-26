@@ -258,7 +258,7 @@ func (s *Service) Cancel(ctx context.Context, id int64) error {
 	// No in-flight goroutine (e.g. another node, or never started): best-effort
 	// terminal transition if it is still active.
 	if !job.Status.Terminal() {
-		return s.repo.FailJob(ctx, id, JobStatusCancelled, "cancelled")
+		return s.repo.FailJob(ctx, id, JobStatusCancelled, "canceled")
 	}
 	return nil
 }
@@ -268,7 +268,7 @@ func (s *Service) dispatch(job Job) {
 	s.runner.Dispatch(job.ID, func(ctx context.Context) {
 		s.run(ctx, &job)
 	}, func(ctx context.Context) {
-		_ = s.repo.FailJob(ctx, job.ID, JobStatusCancelled, "cancelled before start")
+		_ = s.repo.FailJob(ctx, job.ID, JobStatusCancelled, "canceled before start")
 	})
 }
 
@@ -611,10 +611,10 @@ func (s *Service) finishWithErrorNotify(ctx context.Context, job *Job, err error
 	status := JobStatusFailed
 	msg := llm.Truncate(err.Error(), 500)
 	// Only a genuine cancellation (user cancel, or shutdown via cancel) becomes
-	// "cancelled". A deadline/timeout (context.DeadlineExceeded) stays "failed".
+	// "canceled". A deadline/timeout (context.DeadlineExceeded) stays "failed".
 	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 		status = JobStatusCancelled
-		msg = "cancelled"
+		msg = "canceled"
 	}
 	if dbErr := s.repo.FailJob(context.WithoutCancel(ctx), job.ID, status, msg); dbErr != nil {
 		s.logger.WarnContext(ctx, "failed to record subtitle ai job failure", "job", job.ID, "error", dbErr)

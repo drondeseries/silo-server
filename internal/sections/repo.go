@@ -288,7 +288,7 @@ func (r *Repository) Reorder(ctx context.Context, entries []ReorderEntry) error 
 	if err != nil {
 		return fmt.Errorf("beginning reorder transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	for _, e := range entries {
 		if _, err := tx.Exec(ctx, "UPDATE page_sections SET position = $1, updated_at = NOW() WHERE id = $2", e.Position, e.ID); err != nil {
@@ -325,7 +325,7 @@ func (r *Repository) RestoreDefaults(ctx context.Context, scope string, libraryI
 	if err != nil {
 		return nil, fmt.Errorf("beginning restore transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	// Delete existing sections for this scope+library.
 	if libraryID != nil {
@@ -453,7 +453,7 @@ func (r *Repository) EnsureHomeContinueListeningSection(ctx context.Context) (*P
 	if err != nil {
 		return nil, fmt.Errorf("beginning continue listening transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var existingID string
 	err = tx.QueryRow(ctx, `
@@ -607,7 +607,7 @@ func (r *Repository) CreateMany(ctx context.Context, rows []*PageSection) error 
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	for _, row := range rows {
 		id, err := idgen.NextID()

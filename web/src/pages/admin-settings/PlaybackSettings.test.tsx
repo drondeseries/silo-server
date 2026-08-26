@@ -81,6 +81,106 @@ describe("PlaybackSettings CPU tone mapping", () => {
     expect(toggle).toHaveAttribute("aria-checked", "true");
     expect(toggle).toHaveAttribute("disabled");
   });
+
+  it("includes playback.max_virtual_failover_attempts in keys and renders input", () => {
+    useSettingsFormMock.mockReturnValue(
+      makeForm({
+        "playback.max_virtual_failover_attempts": "8",
+      }),
+    );
+
+    const markup = renderToStaticMarkup(<PlaybackSettings />);
+    expect(useSettingsFormMock.mock.calls[0]?.[0]?.keys).toContain(
+      "playback.max_virtual_failover_attempts",
+    );
+    expect(markup).toContain("Max Virtual Failover Attempts");
+    expect(markup).toContain('value="8"');
+  });
+});
+
+describe("PlaybackSettings transcode tone mapping", () => {
+  it("registers independent hardware and software settings disabled by default", () => {
+    useSettingsFormMock.mockReturnValue(makeForm({ "playback.hw_accel": "auto" }));
+
+    const markup = renderToStaticMarkup(<PlaybackSettings />);
+    const keys = useSettingsFormMock.mock.calls[0]?.[0]?.keys as string[];
+
+    expect(keys).toContain("playback.transcode_hardware_tone_map_enabled");
+    expect(keys).toContain("playback.transcode_software_tone_map_enabled");
+    expect(settingSwitch(markup, "Enable Hardware HDR Tone Mapping")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(settingSwitch(markup, "Enable Software HDR Tone Mapping")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
+
+  it("keeps the two policies independent", () => {
+    useSettingsFormMock.mockReturnValue(
+      makeForm({
+        "playback.hw_accel": "qsv",
+        "playback.transcode_hardware_tone_map_enabled": "true",
+        "playback.transcode_software_tone_map_enabled": "false",
+      }),
+    );
+
+    const markup = renderToStaticMarkup(<PlaybackSettings />);
+
+    expect(settingSwitch(markup, "Enable Hardware HDR Tone Mapping")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(settingSwitch(markup, "Enable Software HDR Tone Mapping")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+  });
+
+  it("keeps hardware tone mapping configurable for remote executors when local acceleration is off", () => {
+    useSettingsFormMock.mockReturnValue(
+      makeForm({
+        "playback.hw_accel": "none",
+        "playback.transcode_hardware_tone_map_enabled": "true",
+      }),
+    );
+
+    const toggle = settingSwitch(
+      renderToStaticMarkup(<PlaybackSettings />),
+      "Enable Hardware HDR Tone Mapping",
+    );
+
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(toggle).not.toHaveAttribute("disabled");
+  });
+
+  it("keeps hardware tone mapping configurable when one detected executor is software-only", () => {
+    useHWAccelDetectionMock.mockReturnValue({
+      data: {
+        resolved: "none",
+        nodes: [
+          { node_url: "http://software-node", resolved: "none" },
+          { node_url: "http://gpu-node", resolved: "qsv" },
+        ],
+      },
+      isLoading: false,
+    });
+    useSettingsFormMock.mockReturnValue(
+      makeForm({
+        "playback.hw_accel": "auto",
+        "playback.transcode_hardware_tone_map_enabled": "true",
+      }),
+    );
+
+    const toggle = settingSwitch(
+      renderToStaticMarkup(<PlaybackSettings />),
+      "Enable Hardware HDR Tone Mapping",
+    );
+
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(toggle).not.toHaveAttribute("disabled");
+  });
 });
 
 describe("PlaybackSettings transcode tone mapping", () => {
