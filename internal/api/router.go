@@ -1050,6 +1050,9 @@ func NewRouter(deps Dependencies) chi.Router {
 				playbackHandler.VirtualFileLookup = func(ctx context.Context, path string) (*models.MediaFile, error) {
 					return deps.FileRepo.GetByPath(ctx, path)
 				}
+				playbackHandler.VirtualCandidateFileLookup = func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
+					return deps.FileRepo.GetVirtualCandidateByNeutralPath(ctx, path, contentID, episodeID, ownerInstallationID)
+				}
 				playbackHandler.VirtualEpisodeFileLookup = func(ctx context.Context, episodeID string) (*models.MediaFile, error) {
 					files, err := deps.FileRepo.GetByEpisodeID(ctx, episodeID)
 					if err == nil && len(files) > 0 {
@@ -2983,6 +2986,7 @@ func NewRouter(deps Dependencies) chi.Router {
 						r.Group(func(r chi.Router) {
 							r.Use(apimw.RequireProfile)
 							r.Post("/start", playbackHandler.HandleStartPlayback)
+							r.Post("/prefetch", playbackHandler.HandlePrefetchVirtualPlayback)
 							r.Post("/{session_id}/replan", playbackHandler.HandleReplanPlaybackV3)
 							r.Post("/route-events", playbackHandler.HandlePlaybackRouteEventV3)
 							r.Post("/{session_id}/progress", playbackHandler.HandleUpdateProgress)

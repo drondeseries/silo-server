@@ -66,6 +66,18 @@ export async function fetchCatalogSeasonDetail(
   );
 }
 
+export async function prefetchVirtualPlayback(
+  fileIds: number[],
+  options?: RequestInit,
+): Promise<void> {
+  await api<void>("/playback/prefetch", {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(options?.headers ?? {}) },
+    body: JSON.stringify({ file_ids: fileIds.slice(0, 2) }),
+  });
+}
+
 export async function fetchCatalogSeasonEpisodes(
   seriesId: string,
   seasonNum: number,

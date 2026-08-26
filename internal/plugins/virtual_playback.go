@@ -1391,20 +1391,22 @@ func isTruthy(val any) bool {
 
 // Virtual playback caching policy, from shortest to longest lifetime so a
 // stale resolved transport URL can never outlive the listing that produced it:
-//   - resolvedURLMemoTTL: transient provider URLs (rotation-safe), 30s.
+//   - resolvedURLMemoTTL: transient provider URLs (rotation-safe), 5m.
 //   - virtualStreamsCacheTTL: bounded stream-listing cache, 1m (clamped by
 //     provider metadata to [minVirtualStreamsCacheTTL, maxVirtualStreamsCacheTTL]).
 //
-// The memo is deliberately much shorter than the listing cache: a resolved URL
-// must be re-fetched as soon as the listing used to reach it could be stale.
+// The memo is shorter than the listing cache: a resolved URL must be
+// re-fetched before the listing used to reach it goes stale. The 5-minute
+// TTL keeps repeat plays warm across brief idle windows while a background
+// refresh chain refreshes the URL ~10s before expiry.
 const (
-	resolvedURLMemoTTL           = 30 * time.Second
+	resolvedURLMemoTTL           = 5 * time.Minute
 	resolvedURLMemoMax           = 256
 	resolvedURLMemoSweepInterval = 5 * time.Second
 	// maxResolvedRefreshChain bounds background warm-refresh cycles per
-	// resolved URL: ~3 × 25s ≈ 75-90s of warmth, enough to cover a playback
-	// startup window without an immortal goroutine/timer chain.
-	maxResolvedRefreshChain = 3
+	// resolved URL: ~6 × 290s ≈ 29 minutes of warmth, enough to cover
+	// extended browsing sessions without an immortal goroutine/timer chain.
+	maxResolvedRefreshChain = 6
 )
 
 func resolvedURLMemoKey(virtualPath string, userID int, profileID string, ownerInstallationID int) string {
@@ -1499,11 +1501,11 @@ func (s *Service) storeResolvedURLDepth(virtualPath string, userID int, profileI
 		return
 	}
 	s.resolvedURLs[key] = resolvedURLEntry{url: url, resolvedAt: now, cancel: bgCancel, refreshes: depth + 1}
-	// Spawn a background refresh that wakes 5s before the 30s TTL expires,
+	// Spawn a background refresh that wakes 10s before the TTL expires,
 	// keeping the memo warm for active playback sessions.
 	depth += 1
 	go func() {
-		timer := time.NewTimer(25 * time.Second)
+		timer := time.NewTimer(resolvedURLMemoTTL - 10*time.Second)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
@@ -1514,14 +1516,14 @@ func (s *Service) storeResolvedURLDepth(virtualPath string, userID int, profileI
 }
 
 // refreshResolvedURL re-resolves a provider URL in the background to keep the
-// memo warm before the 30s TTL expires. If the re-resolution fails the
+// memo warm before the TTL expires. If the re-resolution fails the
 // existing entry stays until natural expiry.
 func (s *Service) refreshResolvedURL(ctx context.Context, virtualPath string, userID int, profileID string, ownerInstallationID int, depth int) {
 	if s == nil || ctx.Err() != nil {
 		return
 	}
 	// Bypass the memo: this refresh exists to obtain a FRESH provider URL.
-	// Reading our own 25s-old memo would be a no-op that pins potentially
+	// Reading our own nearly-expired memo would be a no-op that pins potentially
 	// stale URLs past their rotation lifetime.
 	streamURL, err := s.resolveVirtualPlaybackWithRouting(ctx, virtualPath, userID, profileID, VirtualPlaybackRouting{OwnerInstallationID: ownerInstallationID}, true)
 	if err != nil || streamURL == "" {

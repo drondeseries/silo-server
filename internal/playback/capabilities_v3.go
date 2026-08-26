@@ -28,7 +28,7 @@ func SourceDescriptorFromFileV3(file *models.MediaFile, audioIndex int) SourceDe
 	source := SourceDescriptorV3{
 		MediaFileID:        file.ID,
 		DurationSeconds:    SourceDurationSecondsV3(file),
-		Container:          normalizeCodecV3(file.Container),
+		Container:          normalizeContainerV3(file.Container),
 		VideoCodec:         normalizeCodecV3(file.CodecVideo),
 		AudioCodec:         normalizeCodecV3(file.CodecAudio),
 		AudioChannels:      file.AudioChannels,
@@ -330,6 +330,23 @@ func dimensionsFromResolutionV3(value string) (int, int) {
 	default:
 		return 0, 0
 	}
+}
+
+func normalizeContainerV3(value string) string {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(value)), ",")
+	for _, part := range parts {
+		switch strings.TrimSpace(part) {
+		case "matroska", "webm":
+			return "mkv"
+		case "mov", "m4a":
+			return "mp4"
+		case "mpegts", "mpeg-ts":
+			return "ts"
+		case "mp4", "mkv", "ts", "m2ts", "avi", "flv", "wmv", "mpeg", "mpg", "ogv", "3gp":
+			return strings.TrimSpace(part)
+		}
+	}
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func normalizeCodecV3(value string) string {

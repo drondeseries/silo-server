@@ -2242,6 +2242,21 @@ func (r *FileRepository) GetByPath(ctx context.Context, path string) (*models.Me
 	return scanMediaFile(r.pool.QueryRow(ctx, query, path))
 }
 
+// GetVirtualCandidateByNeutralPath retrieves a virtual candidate while ignoring
+// the provider's rotating result selection.
+func (r *FileRepository) GetVirtualCandidateByNeutralPath(ctx context.Context, neutralPath, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
+	query := `SELECT ` + fileColumns + `
+		FROM media_files
+		WHERE virtual_owner_installation_id = $1
+		  AND content_id = $2
+		  AND COALESCE(episode_id, '') = COALESCE($3, '')
+		  AND regexp_replace(regexp_replace(file_path, '[?&]result=[^&]*', '', 'g'), '[?&]$', '') = $4
+		  AND missing_since IS NULL
+		ORDER BY id
+		LIMIT 1`
+	return scanMediaFile(r.pool.QueryRow(ctx, query, ownerInstallationID, contentID, episodeID, neutralPath))
+}
+
 // IsActivePath reports whether path is the exact logical path of a media file
 // that is still active in the catalog. Scanner paths are authoritative here:
 // they deliberately preserve readable symlinks instead of replacing them with

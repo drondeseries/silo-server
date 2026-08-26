@@ -284,8 +284,8 @@ func TestIsUnplayableVirtualURI(t *testing.T) {
 	}
 }
 
-func TestVirtualEpisodeFallbackLookupUsesEpisodeID(t *testing.T) {
-	calledEpisodeLookup := false
+func TestVirtualCandidateLookupUsesStableEpisodeIdentity(t *testing.T) {
+	calledCandidateLookup := false
 	calledContentLookup := false
 
 	h := &PlaybackHandler{
@@ -297,12 +297,12 @@ func TestVirtualEpisodeFallbackLookupUsesEpisodeID(t *testing.T) {
 				{URI: "virtual://series/tt11198330/3/2?result=fresh123", CodecVideo: "h264", Resolution: "1080p"},
 			}, nil
 		}),
-		VirtualEpisodeFileLookup: func(ctx context.Context, episodeID string) (*models.MediaFile, error) {
-			calledEpisodeLookup = true
-			if episodeID != "episode-tvdb-371572-3-2" {
-				t.Fatalf("VirtualEpisodeFileLookup called with %q, want episode-tvdb-371572-3-2", episodeID)
+		VirtualCandidateFileLookup: func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error) {
+			calledCandidateLookup = true
+			if path != "virtual://series/tt11198330/3/2" || episodeID != "episode-tvdb-371572-3-2" {
+				t.Fatalf("VirtualCandidateFileLookup called with path=%q episode=%q", path, episodeID)
 			}
-			return &models.MediaFile{ID: 5323060, MediaFolderID: 32, FilePath: "virtual://series/tt11198330/3/2", EpisodeID: episodeID}, nil
+			return &models.MediaFile{ID: 5323060, MediaFolderID: 32, FilePath: path, EpisodeID: episodeID}, nil
 		},
 		VirtualContentFileLookup: func(ctx context.Context, contentID string) (*models.MediaFile, error) {
 			calledContentLookup = true
@@ -323,14 +323,14 @@ func TestVirtualEpisodeFallbackLookupUsesEpisodeID(t *testing.T) {
 		t.Fatalf("resolveVirtualPlaybackSource failed: %v", err)
 	}
 
-	if !calledEpisodeLookup {
-		t.Fatal("expected VirtualEpisodeFileLookup to be called for episode file")
+	if !calledCandidateLookup {
+		t.Fatal("expected VirtualCandidateFileLookup to be called for episode file")
 	}
 	if calledContentLookup {
 		t.Fatal("VirtualContentFileLookup should NOT be called when EpisodeID is present")
 	}
 	if resolved.File.ID != 5323060 {
-		t.Fatalf("resolved file ID = %d, want 5323060 (episode row, not series row 5293604)", resolved.File.ID)
+		t.Fatalf("resolved file ID = %d, want 5323060 (candidate row)", resolved.File.ID)
 	}
 }
 

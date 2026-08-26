@@ -33,7 +33,32 @@ const (
 	defaultMaxVirtualFailoverAttempts = 5
 	virtualStartupBudget              = 60 * time.Second
 	virtualProbeBudget                = 15 * time.Second
+	maxVirtualPlaybackPrefetchFiles   = 2
+	virtualPlaybackPrefetchBudget     = 20 * time.Second
 )
+
+func (h *PlaybackHandler) PrefetchVirtualPlayback(ctx context.Context, files []*models.MediaFile, profileID string) {
+	if h == nil || h.VirtualPlaybackResolver == nil || len(files) == 0 || profileID == "" {
+		return
+	}
+	userID := apimw.GetUserID(ctx)
+	if userID == 0 {
+		return
+	}
+	if len(files) > maxVirtualPlaybackPrefetchFiles {
+		files = files[:maxVirtualPlaybackPrefetchFiles]
+	}
+	prefetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), virtualPlaybackPrefetchBudget)
+	go func() {
+		defer cancel()
+		for _, file := range files {
+			if prefetchCtx.Err() != nil || file == nil || !isVirtualPlaybackFile(file) {
+				continue
+			}
+			_, _ = h.VirtualPlaybackResolver.ResolveVirtualPlayback(prefetchCtx, virtualPlaybackNeutralKey(file.FilePath), userID, profileID, file.VirtualOwnerInstallationID)
+		}
+	}()
+}
 
 func (h *PlaybackHandler) maxVirtualFailoverAttempts(ctx context.Context) int {
 	if h != nil && h.SettingsRepo != nil {
@@ -353,24 +378,17 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		transient := *file
 		transient.FilePath = cand.URI
 		transient.VirtualOwnerInstallationID = oid
+		dbFile := (*models.MediaFile)(nil)
 		if h.VirtualFileLookup != nil {
-			if dbFile, err := h.VirtualFileLookup(attemptCtx, cand.URI); err == nil && dbFile != nil && dbFile.ID > 0 {
-				transient.ID = dbFile.ID
-				transient.MediaFolderID = dbFile.MediaFolderID
-			}
+			dbFile, _ = h.VirtualFileLookup(attemptCtx, cand.URI)
 		}
-		if transient.ID == 0 {
-			if file.EpisodeID != "" && h.VirtualEpisodeFileLookup != nil {
-				if dbFile, err := h.VirtualEpisodeFileLookup(attemptCtx, file.EpisodeID); err == nil && dbFile != nil && dbFile.ID > 0 {
-					transient.ID = dbFile.ID
-					transient.MediaFolderID = dbFile.MediaFolderID
-				}
-			} else if file.EpisodeID == "" && h.VirtualContentFileLookup != nil && file.ContentID != "" {
-				if dbFile, err := h.VirtualContentFileLookup(attemptCtx, file.ContentID); err == nil && dbFile != nil && dbFile.ID > 0 {
-					transient.ID = dbFile.ID
-					transient.MediaFolderID = dbFile.MediaFolderID
-				}
-			}
+		if (dbFile == nil || dbFile.ID <= 0) && h.VirtualCandidateFileLookup != nil {
+			dbFile, _ = h.VirtualCandidateFileLookup(attemptCtx, virtualPlaybackNeutralKey(cand.URI), file.ContentID, file.EpisodeID, oid)
+		}
+		if dbFile != nil && dbFile.ID > 0 {
+			transient = *dbFile
+			transient.FilePath = cand.URI
+			transient.VirtualOwnerInstallationID = oid
 		}
 		if transient.Duration <= 0 {
 			if file.Duration > 0 {
@@ -1314,13 +1332,20 @@ func resolutionHeight(label string) int {
 // canSkipProbeForContainer returns true for container formats that ffmpeg
 // handles natively without needing ffprobe metadata. When a candidate
 // already declares codecs, we skip the probe for these formats.
+// ffprobe may return compound formats like "matroska,webm" or capitalized
+// variants like "Matroska"; we check whether any recognized token appears.
 func canSkipProbeForContainer(container string) bool {
-	switch strings.ToLower(strings.TrimSpace(container)) {
-	case "mp4", "mkv", "webm", "ts", "m2ts", "mov", "avi", "flv", "wmv", "m4v", "mpeg", "mpg", "ogv", "3gp":
-		return true
-	default:
+	lowered := strings.ToLower(strings.TrimSpace(container))
+	if lowered == "" {
 		return false
 	}
+	known := []string{"mp4", "mkv", "webm", "ts", "m2ts", "mov", "avi", "flv", "wmv", "m4v", "mpeg", "mpg", "ogv", "3gp", "matroska"}
+	for _, k := range known {
+		if lowered == k || strings.Contains(lowered, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // completeVirtualVideoEvidenceV3 reports whether a virtual file carries the

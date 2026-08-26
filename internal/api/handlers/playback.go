@@ -191,6 +191,37 @@ type copySeekAnchorResolver func(
 // VirtualFileLookup looks up an existing media file row by its file path or virtual URI.
 type VirtualFileLookup func(ctx context.Context, path string) (*models.MediaFile, error)
 
+type VirtualCandidateFileLookup func(ctx context.Context, path, contentID, episodeID string, ownerInstallationID int) (*models.MediaFile, error)
+
+type VirtualPlaybackPrefetchRequest struct {
+	FileIDs []int `json:"file_ids"`
+}
+
+func (h *PlaybackHandler) HandlePrefetchVirtualPlayback(w http.ResponseWriter, r *http.Request) {
+	var req VirtualPlaybackPrefetchRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.FileIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "At least one file ID is required")
+		return
+	}
+	if len(req.FileIDs) > maxVirtualPlaybackPrefetchFiles {
+		req.FileIDs = req.FileIDs[:maxVirtualPlaybackPrefetchFiles]
+	}
+	files := make([]*models.MediaFile, 0, len(req.FileIDs))
+	for _, id := range req.FileIDs {
+		if id <= 0 {
+			continue
+		}
+		file, err := h.loadAuthorizedFile(r, id)
+		if err != nil || file == nil || !isVirtualPlaybackFile(file) {
+			continue
+		}
+		files = append(files, file)
+	}
+	h.PrefetchVirtualPlayback(r.Context(), files, apimw.GetProfileID(r.Context()))
+	w.WriteHeader(http.StatusAccepted)
+}
+
 // VirtualContentFileLookup looks up an existing media file row by its content ID.
 type VirtualContentFileLookup func(ctx context.Context, contentID string) (*models.MediaFile, error)
 
@@ -205,6 +236,7 @@ type PlaybackHandler struct {
 	VirtualPlaybackStreamLister VirtualPlaybackStreamLister
 	VirtualPlaybackStreamSink   VirtualPlaybackStreamSink
 	VirtualFileLookup           VirtualFileLookup
+	VirtualCandidateFileLookup  VirtualCandidateFileLookup
 	VirtualContentFileLookup    VirtualContentFileLookup
 	VirtualEpisodeFileLookup    VirtualEpisodeFileLookup
 	StoreProvider               userstore.UserStoreProvider // optional; enables progress/history persistence

@@ -776,6 +776,16 @@ func TestRouteVideoMetadataGapsDetailV3NamesMissingFields(t *testing.T) {
 	}
 }
 
+func TestSourceDescriptorV3NormalizesCompoundContainerMetadata(t *testing.T) {
+	file := detailedFixtureFileV3()
+	for _, container := range []string{"matroska,webm", "Matroska", "webm"} {
+		file.Container = container
+		if got := SourceDescriptorFromFileV3(file, 0).Container; got != "mkv" {
+			t.Fatalf("container %q normalized to %q, want mkv", container, got)
+		}
+	}
+}
+
 func TestSourceDescriptorV3NormalizesLegacyHEVCMetadata(t *testing.T) {
 	file := detailedFixtureFileV3()
 	file.VideoTracks[0].BitDepth = 0
