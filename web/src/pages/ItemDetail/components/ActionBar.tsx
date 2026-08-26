@@ -549,8 +549,11 @@ export default function ActionBar({
       </div>
 
       {/* ── Stream info controls (second row) ──────────────── */}
+      {/* flex-wrap matters: without it this row's min-content width (two or
+          three nowrap trigger buttons) inflates the auto-sized hero column
+          past narrow viewports, clipping the whole info column. */}
       {hasStreamControls && (
-        <div className="flex min-w-0 items-center gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
           {versions && hasMultipleVersions && selectedVersion && onSelectVersion && (
             <VersionDropdown
               versions={versions}
