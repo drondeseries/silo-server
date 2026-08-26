@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Settings } from "lucide-react";
 import { resolveActiveQualityOptionId } from "../playback-info";
 import type { QualityOption } from "../types";
+import { PlayerMenuSurface } from "./PlayerMenuSurface";
 
 export interface VersionInfo {
   fileId: number;
@@ -113,9 +114,9 @@ export function QualityMenu({
       </button>
 
       {open && (
-        <div
-          role="menu"
+        <PlayerMenuSurface
           className="absolute right-0 bottom-full z-30 mb-2 min-w-[200px] rounded-lg bg-black/90 py-1 shadow-lg backdrop-blur"
+          onClose={() => setOpen(false)}
           onKeyDown={handleMenuKeyDown}
         >
           {error && <div className="px-3 py-1 text-xs text-red-400">{error}</div>}
@@ -197,7 +198,7 @@ export function QualityMenu({
               </button>
             );
           })}
-        </div>
+        </PlayerMenuSurface>
       )}
     </div>
   );
