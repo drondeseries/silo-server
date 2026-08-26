@@ -157,6 +157,28 @@ func ApplyLibraryAccessFilter(keyColumn string, filter AccessFilter, conditions 
 	appendLibraryAccessConditions(keyColumn, filter, conditions, args, argIdx)
 }
 
+// episodeParentSeriesIDExpr resolves an episode row to its parent series for
+// listing queries that do not already project series_id. The subquery is a PK
+// lookup on episodes.content_id.
+func episodeParentSeriesIDExpr(episodeIDExpr string) string {
+	return fmt.Sprintf("(SELECT e_parent.series_id FROM episodes e_parent WHERE e_parent.content_id = %s)", episodeIDExpr)
+}
+
+// appendEpisodeParentLibraryAccess applies the series-level dual-membership
+// predicates that detail and playback already enforce via
+// EnsureAccessible(series_id). Episode file membership (episode_libraries) can
+// diverge from series membership for multi-folder shows; listing without this
+// check surfaces episodes of a globally hidden series as unopenable tiles.
+// Callers that already join episodes or a read model should pass the projected
+// series ID directly to avoid a redundant correlated lookup.
+func appendEpisodeParentLibraryAccess(seriesIDExpr string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	appendLibraryAccessConditions(seriesIDExpr, filter, conditions, args, argIdx)
+}
+
+func appendEpisodeParentLibraryAccessByEpisodeID(episodeIDExpr string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
+	appendEpisodeParentLibraryAccess(episodeParentSeriesIDExpr(episodeIDExpr), filter, conditions, args, argIdx)
+}
+
 // ApplySectionAccessFilter applies non-library access constraints to section queries.
 func ApplySectionAccessFilter(alias string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
 	applyAccessFilter(alias, filter, conditions, args, argIdx)
