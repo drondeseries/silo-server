@@ -504,16 +504,7 @@ func buildLibraryScopeJoin(
 			tableName, keyColumn, itemContentExpr, argIdx,
 		))
 		args = append(args, disabledLibraryIDs)
-	}
-
-	if isEpisodeCatalogScope(mediaScope) {
-		parentAccess := AccessFilter{DisabledLibraryIDs: disabledLibraryIDs}
-		if len(allowedLibraryIDs) > 0 {
-			parentAccess.AllowedLibraryIDs = allowedLibraryIDs
-		}
-		var parentClauses []string
-		appendEpisodeParentLibraryAccessByEpisodeID(itemContentExpr, parentAccess, &parentClauses, &args, &argIdx)
-		clauses = append(clauses, parentClauses...)
+		argIdx++
 	}
 
 	if isEpisodeCatalogScope(mediaScope) {
