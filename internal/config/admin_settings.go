@@ -172,6 +172,9 @@ var adminSettingDefaults = map[string]string{
 	"notifications.apple_push_delivery_enabled":                "false",
 	"notifications.android_push_delivery_enabled":              "false",
 
+	"taskmanager.history_retention_days": "30",
+	"taskmanager.history_keep_per_task":  "1000",
+
 	"opslog.retention_days":           "7",
 	"opslog.cleanup_interval_minutes": "15",
 	"opslog.max_rows":                 "1000000",
@@ -374,6 +377,10 @@ func NormalizeAdminSetting(key, raw string) (string, error) {
 		return normalizeAdminInt(key, value, 1, 25000)
 	case "catalog.search.meilisearch.rebuild_task_queue_depth":
 		return normalizeAdminInt(key, value, 1, 16)
+	case "taskmanager.history_retention_days":
+		return normalizeAdminInt(key, value, 1, 3650)
+	case "taskmanager.history_keep_per_task":
+		return normalizeAdminInt(key, value, 1, math.MaxInt32)
 	case "opslog.retention_days", "opslog.cleanup_interval_minutes":
 		return normalizeAdminInt(key, value, 1, math.MaxInt32)
 	case "opslog.max_rows", "opslog.max_size_mb":

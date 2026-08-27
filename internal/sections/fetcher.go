@@ -111,6 +111,16 @@ func NewFetcher(pool *pgxpool.Pool) *Fetcher {
 	}
 }
 
+// ResolvePlayableTargets resolves profile-aware direct-play targets after
+// section cache lookup. The result stays separate from cached MediaItem
+// pointers so profile-specific playback state cannot enter the shared cache.
+func (f *Fetcher) ResolvePlayableTargets(ctx context.Context, query catalog.PlayableTargetQuery) (map[string]string, error) {
+	if f == nil {
+		return map[string]string{}, nil
+	}
+	return catalog.NewPlayableTargetResolver(f.pool).Resolve(ctx, query)
+}
+
 type editorialCandidateLoader func(context.Context, string, *int, []int, catalog.AccessFilter) ([]string, error)
 
 type editorialCandidateCache struct {
@@ -2324,6 +2334,9 @@ func orderMediaItems(items []*models.MediaItem, orderedIDs []string) []*models.M
 }
 
 func (f *Fetcher) fetchRecentlyAdded(ctx context.Context, s ResolvedSection, libraryID *int, libraryIDs []int, filter catalog.AccessFilter) ([]*models.MediaItem, int, error) {
+	if items, total, handled, err := f.fetchTVRecentlyAdded(ctx, s, libraryID, libraryIDs, filter); handled || err != nil {
+		return items, total, err
+	}
 	query, args := buildRecentlyAddedQuery(s, libraryID, libraryIDs, filter)
 	rows, err := f.pool.Query(ctx, query, args...)
 	if err != nil {
@@ -2335,24 +2348,86 @@ func (f *Fetcher) fetchRecentlyAdded(ctx context.Context, s ResolvedSection, lib
 	return items, len(items), err
 }
 
+func (f *Fetcher) fetchTVRecentlyAdded(
+	ctx context.Context,
+	s ResolvedSection,
+	libraryID *int,
+	libraryIDs []int,
+	filter catalog.AccessFilter,
+) ([]*models.MediaItem, int, bool, error) {
+	if s.DisableTVEventGrouping {
+		return nil, 0, false, nil
+	}
+
+	cfgFilters := recentlyAddedConfigFilters(s.Config)
+	requested := cfgFilters.LibraryIDs()
+	if libraryID != nil {
+		requested = []int{*libraryID}
+	} else if len(requested) == 0 {
+		requested = append([]int(nil), libraryIDs...)
+	}
+	effectiveLibraryIDs, tvScoped, err := catalog.ResolveRecentTVLibraryIDs(
+		ctx,
+		f.pool,
+		requested,
+		cfgFilters.FilterType,
+		filter,
+	)
+	if err != nil || !tvScoped {
+		return nil, 0, tvScoped, err
+	}
+
+	targets, total, _, err := catalog.NewRecentTVRepository(f.pool).List(ctx, catalog.RecentTVQuery{
+		LibraryIDs: effectiveLibraryIDs,
+		Access:     filter,
+		Limit:      s.ItemLimit,
+	})
+	if err != nil {
+		return nil, 0, true, err
+	}
+
+	seriesIDs := make([]string, 0, len(targets))
+	episodeIDs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if target.Type == "episode" {
+			episodeIDs = append(episodeIDs, target.ContentID)
+		} else {
+			seriesIDs = append(seriesIDs, target.ContentID)
+		}
+	}
+
+	seriesItems, err := f.fetchItemsByContentIDs(ctx, seriesIDs, nil, effectiveLibraryIDs, filter)
+	if err != nil {
+		return nil, 0, true, err
+	}
+	episodeItems, _, err := f.fetchEpisodeTargetsByContentIDs(ctx, episodeIDs, nil, effectiveLibraryIDs, filter)
+	if err != nil {
+		return nil, 0, true, err
+	}
+	itemByKey := make(map[string]*models.MediaItem, len(seriesItems)+len(episodeItems))
+	for _, item := range append(seriesItems, episodeItems...) {
+		itemByKey[item.Type+"\x00"+item.ContentID] = item
+	}
+	ordered := make([]*models.MediaItem, 0, len(targets))
+	for _, target := range targets {
+		if item := itemByKey[target.Type+"\x00"+target.ContentID]; item != nil {
+			itemCopy := *item
+			t := target.AddedAt
+			itemCopy.AddedAt = &t
+			itemCopy.PlayContentID = target.PlayContentID
+			ordered = append(ordered, &itemCopy)
+		}
+	}
+	return ordered, total, true, nil
+}
+
 type sectionQuery struct {
 	sql  string
 	args []any
 }
 
 func buildRecentlyAddedQuery(s ResolvedSection, libraryID *int, libraryIDs []int, filter catalog.AccessFilter) (string, []any) {
-	cfgFilters := ParseConfigFilters(s.Config)
-
-	// Backwards compat: support legacy "types" config field
-	var legacyCfg struct {
-		Types []string `json:"types"`
-	}
-	if len(s.Config) > 0 {
-		_ = json.Unmarshal(s.Config, &legacyCfg)
-	}
-	if cfgFilters.FilterType == "" && len(legacyCfg.Types) > 0 {
-		cfgFilters.FilterType = legacyCfg.Types[0]
-	}
+	cfgFilters := recentlyAddedConfigFilters(s.Config)
 
 	if query, ok := buildRecentlyAddedSingleLibraryQuery(s, cfgFilters, libraryID, libraryIDs, filter); ok {
 		return query.sql, query.args
@@ -2383,6 +2458,20 @@ func buildRecentlyAddedQuery(s ResolvedSection, libraryID *int, libraryIDs []int
 	)
 	args = append(args, s.ItemLimit)
 	return query, args
+}
+
+func recentlyAddedConfigFilters(config json.RawMessage) SectionConfigFilters {
+	cfgFilters := ParseConfigFilters(config)
+	var legacyCfg struct {
+		Types []string `json:"types"`
+	}
+	if len(config) > 0 {
+		_ = json.Unmarshal(config, &legacyCfg)
+	}
+	if cfgFilters.FilterType == "" && len(legacyCfg.Types) > 0 {
+		cfgFilters.FilterType = legacyCfg.Types[0]
+	}
+	return cfgFilters
 }
 
 func buildRecentlyAddedSingleLibraryQuery(s ResolvedSection, cfgFilters SectionConfigFilters, libraryID *int, libraryIDs []int, filter catalog.AccessFilter) (sectionQuery, bool) {

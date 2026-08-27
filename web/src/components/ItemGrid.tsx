@@ -161,7 +161,7 @@ export default function ItemGrid(props: ItemGridProps) {
                   );
                 } else {
                   cells.push(
-                    <div key={item.content_id} role="listitem">
+                    <div key={`${item.content_id}-${globalIndex}`} role="listitem">
                       <ItemCard
                         item={item}
                         libraryId={libraryId}

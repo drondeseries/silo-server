@@ -3,7 +3,6 @@ package catalog
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -565,46 +564,6 @@ func (r *SearchIndexEventRepository) UpdateStateAfterSync(ctx context.Context, p
 		return nil
 	}
 	return err
-}
-
-type SearchIndexAdvisoryLock struct {
-	conn *pgxpool.Conn
-	key  int64
-}
-
-func (r *SearchIndexEventRepository) TryAdvisoryLock(ctx context.Context, key int64) (*SearchIndexAdvisoryLock, bool, error) {
-	if r == nil || r.pool == nil {
-		return nil, false, nil
-	}
-	conn, err := r.pool.Acquire(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	var locked bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&locked); err != nil {
-		conn.Release()
-		return nil, false, err
-	}
-	if !locked {
-		conn.Release()
-		return nil, false, nil
-	}
-	return &SearchIndexAdvisoryLock{conn: conn, key: key}, true, nil
-}
-
-func (l *SearchIndexAdvisoryLock) Close(ctx context.Context) error {
-	if l == nil || l.conn == nil {
-		return nil
-	}
-	defer l.conn.Release()
-	var unlocked bool
-	if err := l.conn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, l.key).Scan(&unlocked); err != nil {
-		return err
-	}
-	if !unlocked {
-		return fmt.Errorf("search index advisory lock %d was not held", l.key)
-	}
-	return nil
 }
 
 func isSearchIndexSchemaUnavailable(err error) bool {

@@ -666,6 +666,13 @@ func main() {
 	var restartRequested atomic.Bool
 
 	eventBus := cache.NewEventBus(cfg.Redis.URL)
+	if err := eventBus.Subscribe(appCtx, cache.ChannelCatalog, func(event cache.Event) {
+		if event.Type == cache.EventScanComplete {
+			sections.InvalidateResolvedListCache()
+		}
+	}); err != nil {
+		slog.Warn("subscribe section cache invalidation failed", "error", err)
+	}
 	logStreamHub := logstream.NewHub(nodeID, eventBus)
 	if err := logStreamHub.Start(appCtx); err != nil {
 		log.Fatalf("log stream hub start: %v", err)
@@ -1609,6 +1616,7 @@ func main() {
 				deps.FolderRepo,
 				itemRefreshResolver,
 				libraryIngestExecutor,
+				scanqueue.NewRepository(deps.DB),
 				metadataService,
 				deps.EventBus,
 				deps.RealtimeHub,
@@ -1624,6 +1632,7 @@ func main() {
 				seasonRepo,
 				episodeRepo,
 				libraryIngestExecutor,
+				scanqueue.NewRepository(deps.DB),
 				metadataService,
 				deps.EventBus,
 				deps.RealtimeHub,
@@ -1947,6 +1956,10 @@ func main() {
 		log.Fatalf("seed activitylog defaults: %v", err)
 	}
 
+	if err := taskmanager.SeedHistoryRetentionDefaults(ctx, settingsRepo); err != nil {
+		log.Fatalf("seed task history retention defaults: %v", err)
+	}
+
 	// Seed default page sections for home and existing libraries.
 	sectionRepo := sections.NewRepository(pool)
 	var folders []*models.MediaFolder
@@ -2114,6 +2127,7 @@ func main() {
 		}
 		taskMgr.Register(tasks.NewActivityLogCleanupTask(deps.DB, settingsRepo, activityPM))
 		taskMgr.Register(tasks.NewOperationalLogCleanupTask(deps.DB, settingsRepo, opsPM))
+		taskMgr.Register(tasks.NewTaskHistoryCleanupTask(historyRepo, settingsRepo))
 		var diagnosticsStore diagnostics.ObjectStore
 		if deps.S3Private != nil {
 			diagnosticsStore = diagnostics.NewS3ObjectStore(deps.S3Private)

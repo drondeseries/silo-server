@@ -1101,7 +1101,7 @@ func TestCleanStaleOutputForRestart_SameEncodedRecipeKeepsSegments(t *testing.T)
 
 func TestTranscodeThrottlerIgnoresOutputFromAnEarlierGeneration(t *testing.T) {
 	tempDir := t.TempDir()
-	now := time.Now()
+	now := time.Now().Add(-10 * time.Second)
 	staleTime := now.Add(-time.Minute)
 
 	// A previous copy generation raced hundreds of segments ahead and left its

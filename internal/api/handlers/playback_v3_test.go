@@ -267,11 +267,13 @@ func TestValidateAdvertisedTransformationsV3RejectsOldVideoRecipe(t *testing.T) 
 
 func TestHandleStartPlaybackV3ExplainsOriginalQuality4KPinWhenAlternateExists(t *testing.T) {
 	for _, test := range []struct {
-		name             string
-		includeAlternate bool
-		wantMessage      string
+		name                string
+		alternateResolution string
+		wantMessage         string
 	}{
-		{name: "alternate exists", includeAlternate: true, wantMessage: "compatible lower-resolution version of this title is available"},
+		{name: "lower-resolution alternate exists", alternateResolution: "1080p", wantMessage: "compatible lower-resolution version of this title is available"},
+		{name: "only 4K alternate exists", alternateResolution: "UHD", wantMessage: playback.TerminalMessage4KTranscodeDisabledV3},
+		{name: "only label-only 8K alternate exists", alternateResolution: "8K", wantMessage: playback.TerminalMessage4KTranscodeDisabledV3},
 		{name: "no alternate", wantMessage: playback.TerminalMessage4KTranscodeDisabledV3},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -284,16 +286,22 @@ func TestHandleStartPlaybackV3ExplainsOriginalQuality4KPinWhenAlternateExists(t 
 			source.VideoTracks[0].Bitrate = 32_000
 
 			versions := []*models.MediaFile{source}
-			if test.includeAlternate {
+			if test.alternateResolution != "" {
 				alternateValue := *source
 				alternate := &alternateValue
 				alternate.ID = 84
-				alternate.Resolution = "1080p"
+				alternate.Resolution = test.alternateResolution
 				alternate.Bitrate = 8_000
 				alternate.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
-				alternate.VideoTracks[0].Width = 1920
-				alternate.VideoTracks[0].Height = 1080
-				alternate.VideoTracks[0].Level = 41
+				switch test.alternateResolution {
+				case "1080p":
+					alternate.VideoTracks[0].Width = 1920
+					alternate.VideoTracks[0].Height = 1080
+					alternate.VideoTracks[0].Level = 41
+				case "8K":
+					alternate.VideoTracks[0].Width = 0
+					alternate.VideoTracks[0].Height = 0
+				}
 				alternate.VideoTracks[0].Bitrate = 8_000
 				versions = append(versions, alternate)
 			}
@@ -364,6 +372,159 @@ func TestHandleStartPlaybackV3TriesAlternateAfterHDRTerminal(t *testing.T) {
 	}
 	if response.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
 		t.Fatalf("effective file = %d, want alternate %d", response.PlaybackPlan.EffectiveMediaFileID, alternate.ID)
+	}
+}
+
+func TestHandleStartPlaybackV3TriesLater4KAlternateAfterNon4KTerminal(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.CodecVideo = "hevc"
+	source.Resolution = "2160p"
+	source.Bitrate = 32_000
+	source.VideoTracks[0] = models.VideoTrack{
+		Codec: "hevc", Profile: "main 10", Level: 150, Width: 3840, Height: 2160,
+		FrameRate: "24000/1001", Bitrate: 32_000, BitDepth: 10,
+		VideoRange: "DolbyVision", VideoRangeType: "DOVIWithHDR10", DVProfile: 8, DVBLCompatID: 1,
+	}
+
+	lowerValue := *source
+	lower := &lowerValue
+	lower.ID = 84
+	lower.Resolution = "1080p"
+	lower.Bitrate = 8_000
+	lower.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	lower.VideoTracks[0].Width = 1920
+	lower.VideoTracks[0].Height = 1080
+	lower.VideoTracks[0].Bitrate = 8_000
+
+	playableValue := *source
+	playable := &playableValue
+	playable.ID = 85
+	playable.CodecVideo = "h264"
+	playable.Resolution = "UHD"
+	playable.Bitrate = 12_000
+	playable.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 52, Width: 3840, Height: 2160,
+		FrameRate: "24000/1001", Bitrate: 12_000, BitDepth: 8,
+		VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: source})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, lower, playable},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	start := v3HandlerStartRequest()
+	start.QualityPreference = "auto"
+	start.Capabilities.MaxResolution = "2160p"
+	start.Capabilities.VideoDecode[0].Levels = []int{52}
+	start.Capabilities.VideoDecode[0].MaxWidth = 3840
+	start.Capabilities.VideoDecode[0].MaxHeight = 2160
+	start.Capabilities.VideoDecode[0].MaxBitrateKbps = 50_000
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+		VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+
+	var response playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil || response.PlaybackPlan == nil {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != playable.ID {
+		t.Fatalf("effective file = %d, want later directly playable 4K alternate %d", response.PlaybackPlan.EffectiveMediaFileID, playable.ID)
+	}
+}
+
+func TestHandleReplanPlaybackV3TriesLater4KAlternateAfterNon4KTerminal(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.Resolution = "2160p"
+	source.Bitrate = 32_000
+	source.VideoTracks[0].Level = 52
+	source.VideoTracks[0].Width = 3840
+	source.VideoTracks[0].Height = 2160
+	source.VideoTracks[0].Bitrate = 32_000
+
+	lowerValue := *source
+	lower := &lowerValue
+	lower.ID = 84
+	lower.Resolution = "1080p"
+	lower.Bitrate = 8_000
+	lower.HDR = true
+	lower.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	lower.VideoTracks[0].Width = 1920
+	lower.VideoTracks[0].Height = 1080
+	lower.VideoTracks[0].Bitrate = 8_000
+	lower.VideoTracks[0].VideoRange = "HDR10"
+	lower.VideoTracks[0].VideoRangeType = "HDR10"
+
+	playableValue := *source
+	playable := &playableValue
+	playable.ID = 85
+	playable.CodecVideo = "hevc"
+	playable.Resolution = "UHD"
+	playable.Bitrate = 12_000
+	playable.VideoTracks = []models.VideoTrack{{
+		Codec: "hevc", Profile: "main", Level: 52, Width: 3840, Height: 2160,
+		FrameRate: "24000/1001", Bitrate: 12_000, BitDepth: 8,
+		VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+
+	manager := playback.NewSessionManager(0, 0)
+	files := map[int]*models.MediaFile{source.ID: source, lower.ID: lower, playable.ID: playable}
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, lower, playable},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.Capabilities.MaxResolution = "2160p"
+	startRequest.Capabilities.VideoDecode[0].Levels = []int{52}
+	startRequest.Capabilities.VideoDecode[0].MaxWidth = 3840
+	startRequest.Capabilities.VideoDecode[0].MaxHeight = 2160
+	startRequest.Capabilities.VideoDecode[0].MaxBitrateKbps = 50_000
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+		VideoCodecs: []string{"hevc"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if startRR.Code != http.StatusCreated || json.Unmarshal(startRR.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", startRR.Code, startRR.Body.String())
+	}
+
+	replanCapabilities := startRequest.Capabilities
+	replanCapabilities.CodecsVideo = []string{"hevc"}
+	replanCapabilities.CodecsVideoHardware = []string{"hevc"}
+	replanCapabilities.VideoDecode = []playback.VideoDecodeCapabilityV3{{
+		Codec: "hevc", Profiles: []string{"main"}, Levels: []int{52}, BitDepths: []int{8},
+		MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 50_000, Hardware: true,
+	}}
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	replanned := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "later-4k-replan-0001",
+		FailedPlanID: started.PlaybackPlan.PlanID, PlanAttemptID: "later-4k-plan-0001",
+		PlanAttemptKey: currentKey, AttemptedPlanKeys: []string{currentKey}, AttemptCount: 1,
+		QualityPreference: "auto", SelectedTracks: started.PlaybackPlan.SelectedTracks,
+		Failure:      playback.FailureV3{Classification: "playback_error"},
+		Capabilities: replanCapabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if replanned.Terminal != nil {
+		t.Fatalf("replan terminal = %+v", *replanned.Terminal)
+	}
+	if replanned.PlaybackPlan == nil {
+		t.Fatalf("replan = %#v", replanned)
+	}
+	if replanned.PlaybackPlan.EffectiveMediaFileID != playable.ID {
+		t.Fatalf("effective file = %d, want later directly playable 4K alternate %d", replanned.PlaybackPlan.EffectiveMediaFileID, playable.ID)
 	}
 }
 

@@ -14,6 +14,12 @@ vi.mock("@/components/MediaItemMenu", () => ({
   },
 }));
 
+vi.mock("@/components/CardPlayOverlay", () => ({
+  default: ({ contentId, title }: { contentId: string; title: string }) => (
+    <a href={`/watch/${contentId}`} aria-label={`Play ${title}`} />
+  ),
+}));
+
 vi.mock("@/lib/thumbhash", () => ({
   decodeThumbhash: () => "",
 }));
@@ -221,8 +227,10 @@ describe("ItemCard SortMeta", () => {
       item: {
         ...baseItem,
         content_id: "episode-1",
+        play_content_id: "episode-1",
         type: "episode",
         title: "Long, Long Time",
+        series_id: "series-1",
         series_title: "The Last of Us",
         season_number: 1,
         episode_number: 3,
@@ -230,6 +238,18 @@ describe("ItemCard SortMeta", () => {
     });
 
     expect(markup).toContain("S01E03");
+    expect(markup).toContain('href="/item/series-1"');
+    expect(markup).toContain('href="/item/episode-1"');
+    expect(markup).toContain('href="/watch/episode-1"');
+  });
+
+  it("hides direct play while selection mode is active", () => {
+    const markup = renderCard({
+      selectionMode: true,
+      item: { ...baseItem, play_content_id: "episode-1" },
+    });
+
+    expect(markup).not.toContain('href="/watch/episode-1"');
   });
 
   it("renders a volumes-only manga count chip", () => {

@@ -747,6 +747,7 @@ export type ItemUserData = LeafItemUserData | SeasonUserData;
 
 export interface Season {
   content_id: string;
+  play_content_id?: string;
   season_number: number;
   is_specials: boolean;
   title: string;
@@ -806,8 +807,10 @@ export interface BrowseItemSortMetrics {
 
 export interface BrowseItem {
   content_id: string;
+  play_content_id?: string;
   type: "movie" | "series" | "season" | "episode" | "audiobook" | "ebook" | "manga";
   title: string;
+  series_id?: string;
   series_title?: string;
   season_number?: number | null;
   episode_number?: number | null;
@@ -865,10 +868,9 @@ export interface CatalogResponse extends BrowseResponse {
   title?: string;
   snapshot?: string;
   /**
-   * The order a collection source actually resolved in, after the viewer's
-   * saved override and the collection's configured default were applied.
-   * Absent for non-collection sources and when the collection kept its own
-   * source order.
+   * The order a collection or personal-list source actually resolved in after
+   * saved/default precedence was applied. Absent for other sources and when
+   * the source kept its own order.
    */
   effective_sort?: QuerySort;
 }
@@ -1137,6 +1139,7 @@ export interface ItemExtra {
 
 export interface ItemDetail {
   content_id: string;
+  play_content_id?: string;
   type: "movie" | "series" | "season" | "episode" | "audiobook" | "ebook" | "manga" | "podcast";
   status?: "pending" | "matched" | "unmatched" | "ambiguous";
 
@@ -1384,6 +1387,12 @@ export interface CollectionCapabilitiesResponse {
   collection_default_sort?: boolean;
   collection_sort_preferences?: boolean;
   effective_collection_sort?: boolean;
+  /**
+   * The collection_kind values this server accepts on the sort-preference
+   * endpoints. Absent on servers predating the personal-list kinds, where only
+   * "library" and "user" may be assumed.
+   */
+  sort_preference_kinds?: string[];
 }
 
 export interface QueryRule {
@@ -3866,6 +3875,7 @@ export interface SectionItemUpcomingEvent {
 
 export interface SectionItem {
   content_id: string;
+  play_content_id?: string;
   type: "movie" | "series" | "season" | "episode" | "audiobook" | "ebook";
   title: string;
   series_id?: string;

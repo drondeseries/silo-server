@@ -144,8 +144,9 @@ func (s *DetailService) ProbedDurationsByEpisodeIDs(ctx context.Context, ids []s
 // ItemDetail is the full detail response for a single media item, including
 // metadata, file versions, subtitles, intro/credits markers, and presigned image URLs.
 type ItemDetail struct {
-	ContentID string `json:"content_id"`
-	Type      string `json:"type"`
+	ContentID     string `json:"content_id"`
+	PlayContentID string `json:"play_content_id,omitempty"`
+	Type          string `json:"type"`
 
 	// Metadata (served inline from Postgres).
 	Title         string `json:"title"`

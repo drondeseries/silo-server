@@ -984,12 +984,23 @@ func clientTransformationAvailableV3(request StartRequestV3, name, version strin
 	return false
 }
 
-func is4KSourceV3(file *models.MediaFile, source SourceDescriptorV3) bool {
-	resolution := ""
-	if file != nil {
-		resolution = strings.ToLower(strings.TrimSpace(file.Resolution))
+// Is4KMediaFileV3 reports whether a catalog file is recorded as 4K or higher.
+// Scanners and imports write the resolution label in several spellings, and the
+// stored primary video track can carry dimensions that disagree with that label,
+// so callers use both facts to stay aligned with the planner's 4K policy.
+func Is4KMediaFileV3(file *models.MediaFile) bool {
+	if file == nil {
+		return false
 	}
-	return resolution == "2160p" || resolution == "4k" || resolution == "uhd" || source.Width >= 3840 || source.Height >= 2160
+	labelWidth, labelHeight := dimensionsFromResolutionV3(file.Resolution)
+	if labelWidth >= 3840 || labelHeight >= 2160 {
+		return true
+	}
+	return len(file.VideoTracks) > 0 && (file.VideoTracks[0].Width >= 3840 || file.VideoTracks[0].Height >= 2160)
+}
+
+func is4KSourceV3(file *models.MediaFile, source SourceDescriptorV3) bool {
+	return Is4KMediaFileV3(file) || source.Width >= 3840 || source.Height >= 2160
 }
 
 type QualityResultV3 struct {

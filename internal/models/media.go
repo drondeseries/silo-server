@@ -38,43 +38,28 @@ type MediaFolder struct {
 
 // MediaFile represents a row in the media_files table.
 type MediaFile struct {
-	ID                          int
-	ContentID                   string // Sonyflake ID (nullable until matched)
-	EpisodeID                   string // FK to episodes.content_id (nullable)
-	ExtraID                     string // FK to media_extras.content_id (nullable); set only for local extras files, which keep ContentID/EpisodeID empty
-	SeasonNumber                int    // parsed from filename (nullable)
-	EpisodeNumber               int    // parsed from filename (nullable)
-	MediaFolderID               int
-	CanonicalRootPath           string
-	ObservedRootPath            string
-	ContentGroupKey             string
-	GroupKeyVersion             int
-	BaseTitle                   string
-	BaseYear                    int
-	BaseType                    string
-	IdentityConfidence          string
-	IdentityJSON                []byte
-	FilePath                    string
-	VirtualOwnerInstallationID  int  // owner for zero-storage virtual files; zero for local files
-	VirtualOwnerInstallationSet bool // distinguishes legacy virtual owner 0 from local NULL
-	FileSize                    int64
-	FileModifiedAt              *time.Time
-	// MultiplePPS records whether an H.264 stream redefines the same
-	// pic_parameter_set_id in-band with more than one distinct content. Such
-	// streams cannot be safely stream-copied into an avc1/fMP4 HLS segment.
-	// MultiplePPSScanSize/MultiplePPSScanMtime pin the persisted verdict to the
-	// generation of the file it was computed from; see
-	// MediaFile.PersistedVideoCopyVerdict.
-	MultiplePPS          *bool      `json:"-"`
-	MultiplePPSScanSize  *int64     `json:"-"`
-	MultiplePPSScanMtime *time.Time `json:"-"`
-	FileHash             string     // OSHash (16-char hex)
-	// CopySafetyVerdict persistence: the multi-PPS bitstream scan result
-	// survives restarts, keyed by FileSize at scan time. Kept out of JSON
-	// payloads; validity requires a size match on reuse.
-	CopySafetyMulti              *bool
-	CopySafetyCheckedSize        int64
-	CopySafetyCheckedAt          *time.Time
+	ID                           int
+	ContentID                    string // Sonyflake ID (nullable until matched)
+	EpisodeID                    string // FK to episodes.content_id (nullable)
+	ExtraID                      string // FK to media_extras.content_id (nullable); set only for local extras files, which keep ContentID/EpisodeID empty
+	SeasonNumber                 int    // parsed from filename (nullable)
+	EpisodeNumber                int    // parsed from filename (nullable)
+	MediaFolderID                int
+	CanonicalRootPath            string
+	ObservedRootPath             string
+	ContentGroupKey              string
+	GroupKeyVersion              int
+	BaseTitle                    string
+	BaseYear                     int
+	BaseType                     string
+	IdentityConfidence           string
+	IdentityJSON                 []byte
+	FilePath                     string
+	VirtualOwnerInstallationID   int  // owner for zero-storage virtual files; zero for local files
+	VirtualOwnerInstallationSet  bool // distinguishes legacy virtual owner 0 from local NULL
+	FileSize                     int64
+	FileModifiedAt               *time.Time
+	FileHash                     string // OSHash (16-char hex)
 	CodecVideo                   string // h264, hevc, av1
 	CodecAudio                   string // aac, opus, flac
 	Resolution                   string // 1080p, 2160p
@@ -131,12 +116,24 @@ type MediaFile struct {
 	PresentationPartTotal        int
 	MultiEpisodeStart            int
 	MultiEpisodeEnd              int
-	ProbeSource                  string // arrs, local
-	ProbeUpdatedAt               *time.Time
-	MatchAttemptedAt             *time.Time
-	MissingSince                 *time.Time
-	CreatedAt                    time.Time
-	UpdatedAt                    time.Time
+	// MultiplePPS is the persisted H.264 multi-PPS copy-safety verdict; nil
+	// means the file has never been successfully analyzed. It is trusted only
+	// when MultiplePPSScanSize and MultiplePPSScanMtime still match the file's
+	// current size and mtime, so a rewritten file self-invalidates without any
+	// coordination from the writers that touch media_files.
+	//
+	// json:"-" on all three: MediaFile is not a client-facing shape, and the
+	// runtime copy-safety signal clients do act on lives on VideoTrack.
+	MultiplePPS          *bool      `json:"-"`
+	MultiplePPSScanSize  *int64     `json:"-"`
+	MultiplePPSScanMtime *time.Time `json:"-"`
+	ProbeSource          string     // arrs, local
+	ProbeUpdatedAt       *time.Time
+	MatchAttemptedAt     *time.Time
+	MissingSince         *time.Time
+	FirstSeenScanRunID   string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
 }
 
 // MediaChapter represents a single media chapter derived from embedded file metadata.
@@ -572,6 +569,9 @@ type MediaItem struct {
 	CreatedAt                    time.Time
 	UpdatedAt                    time.Time
 	AddedAt                      *time.Time // populated by browse queries (MIN(mil.first_seen_at))
+	// PlayContentID is transient presentation metadata populated by resolvers
+	// whose displayed item differs from the leaf item that should play.
+	PlayContentID string
 }
 
 // MediaItemAlias is a provider-confirmed searchable title for a media item.

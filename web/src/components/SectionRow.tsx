@@ -113,8 +113,8 @@ export default function SectionRow({ section, libraryId }: SectionRowProps) {
               />
             ));
           })()
-        : section.items.map((item) => (
-            <div key={item.content_id} className={posterWidthClasses} role="listitem">
+        : section.items.map((item, index) => (
+            <div key={`${item.content_id}-${index}`} className={posterWidthClasses} role="listitem">
               <SectionItemCard item={item} libraryId={libraryId} />
             </div>
           ))}

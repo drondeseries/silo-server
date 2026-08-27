@@ -1091,24 +1091,55 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 	})
 	timings.mark("planning")
 	if terminalAllowsAlternateFileV3(result.Terminal) && shouldTryAlternateFileV3(req.QualityPreference) {
-		if alternate, alternateErr := h.findAlternateFile(r.Context(), requestedFile); alternateErr == nil && alternate != nil {
-			effectiveFile = h.ensurePlaybackProbe(r.Context(), alternate)
-			audioIndex = remapAudioIndexV3(requestedFile, effectiveFile, audioIndex)
-			if err := h.remapSubtitleSelectionV3(r.Context(), requestedFile, effectiveFile, &req); err != nil {
-				response, persistErr := h.persistTerminalStartDecisionV3(r.Context(), userID, profileID, req, requestDigests, requestedFile.ID, effectiveFile.ID, playback.NewTerminalResponseV3("subtitle_unavailable_in_version", err.Error(), false))
-				if persistErr != nil {
-					writeStartAttemptPersistenceErrorV3(w, persistErr)
-					return
+		if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile); alternateErr == nil {
+			baseReq := req
+			baseAudioIndex := audioIndex
+			var firstFailureResult playback.PlannerResultV3
+			var firstFailureToneMapErr error
+			var firstFailureFile *models.MediaFile
+			var firstFailureReq playback.StartRequestV3
+			firstFailureAudioIndex := 0
+			for _, alternate := range alternates {
+				candidateFile, err := h.prepareVirtualAlternateFileV3(r, alternate, profileID)
+				if err != nil || candidateFile == nil {
+					continue
 				}
-				writeJSON(w, http.StatusCreated, response)
-				return
+				candidateReq := baseReq
+				candidateAudioIndex := remapAudioIndexV3(requestedFile, candidateFile, baseAudioIndex)
+				var candidateResult playback.PlannerResultV3
+				var candidateToneMapErr error
+				if err := h.remapSubtitleSelectionV3(r.Context(), requestedFile, candidateFile, &candidateReq); err != nil {
+					candidateResult = playback.PlannerResultV3{Terminal: &playback.TerminalV3{Reason: terminalSubtitleUnavailableInVersionV3, Message: err.Error(), Retryable: false}}
+				} else {
+					if err := preflightPlaybackFile(r.Context(), candidateFile, h.MissingMarker, h.EventsHub); err != nil {
+						continue
+					}
+					candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: candidateReq, RequestedFile: requestedFile, EffectiveFile: candidateFile, AudioTrackIndex: candidateAudioIndex, Settings: settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(), AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), candidateFile)})
+				}
+				clampPlannerTargetResolution(&candidateResult, candidateFile)
+				if candidateResult.Terminal == nil {
+					req = candidateReq
+					effectiveFile = candidateFile
+					audioIndex = candidateAudioIndex
+					result = candidateResult
+					toneMapCapabilityErr = candidateToneMapErr
+					break
+				}
+				if firstFailureFile == nil {
+					firstFailureResult = candidateResult
+					firstFailureToneMapErr = candidateToneMapErr
+					firstFailureFile = candidateFile
+					firstFailureReq = candidateReq
+					firstFailureAudioIndex = candidateAudioIndex
+				}
 			}
-			if err := preflightPlaybackFile(r.Context(), effectiveFile, h.MissingMarker, h.EventsHub); err != nil {
-				writePlaybackFilePreflightError(w, err)
-				return
+			if result.Terminal != nil && firstFailureFile != nil {
+				req = firstFailureReq
+				effectiveFile = firstFailureFile
+				audioIndex = firstFailureAudioIndex
+				result = firstFailureResult
+				toneMapCapabilityErr = firstFailureToneMapErr
 			}
-			result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: req, RequestedFile: requestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile)})
-			clampPlannerTargetResolution(&result, effectiveFile)
 		}
 	}
 	result = retryIncompleteToneMapPlanningV3(result, toneMapCapabilityErr)
@@ -3617,27 +3648,62 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if terminalAllowsAlternateFileV3(result.Terminal) && (replanAllowsAlternateFileV3(operation, start.QualityPreference) ||
 		(isVirtualPlaybackFile(requestedFile) && operation == playback.ReplanOperationFailureRecoveryV3)) {
 		if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile); alternateErr == nil {
+			baseStart := start
+			baseEffectiveFile := effectiveFile
+			baseAudioIndex := audioIndex
+			var firstFailureResult playback.PlannerResultV3
+			var firstFailureToneMapErr error
+			var firstFailureFile *models.MediaFile
+			var firstFailureStart playback.StartRequestV3
+			firstFailureAudioIndex := 0
 			for _, alternate := range alternates {
-				alternate = h.ensurePlaybackProbe(r.Context(), alternate)
-				remappedAudio := remapAudioIndexV3(effectiveFile, alternate, audioIndex)
-				if err := h.remapSubtitleSelectionV3(r.Context(), effectiveFile, alternate, &start); err == nil {
-					start.FileID = alternate.ID
-					if err := preflightPlaybackFile(r.Context(), alternate, h.MissingMarker, h.EventsHub); err == nil {
-						effectiveFile = alternate
-						audioIndex = remappedAudio
-						result, toneMapCapabilityErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: start, RequestedFile: plannerRequestedFile, EffectiveFile: effectiveFile, AudioTrackIndex: audioIndex, Settings: h.plannerSettingsV3(r.Context()), Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), effectiveFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile)})
-						clampPlannerTargetResolution(&result, effectiveFile)
-					}
-				} else if start.SubtitleTrackIndex != nil || start.SubtitleTrackID != "" {
-					result = playback.PlannerResultV3{Terminal: &playback.TerminalV3{
-						Reason:    "subtitle_unavailable_in_version",
+				if alternate.ID == baseEffectiveFile.ID {
+					continue
+				}
+				candidateFile, err := h.prepareVirtualAlternateFileV3(r, alternate, record.ProfileID)
+				if err != nil || candidateFile == nil {
+					continue
+				}
+				candidateStart := baseStart
+				candidateAudioIndex := remapAudioIndexV3(baseEffectiveFile, candidateFile, baseAudioIndex)
+				var candidateResult playback.PlannerResultV3
+				var candidateToneMapErr error
+				if err := h.remapSubtitleSelectionV3(r.Context(), baseEffectiveFile, candidateFile, &candidateStart); err != nil {
+					candidateResult = playback.PlannerResultV3{Terminal: &playback.TerminalV3{
+						Reason:    terminalSubtitleUnavailableInVersionV3,
 						Message:   "The selected subtitle track is unavailable in the fallback media version.",
 						Retryable: false,
 					}}
+				} else {
+					candidateStart.FileID = candidateFile.ID
+					if err := preflightPlaybackFile(r.Context(), candidateFile, h.MissingMarker, h.EventsHub); err != nil {
+						continue
+					}
+					candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: candidateStart, RequestedFile: plannerRequestedFile, EffectiveFile: candidateFile, AudioTrackIndex: candidateAudioIndex, Settings: plannerSettings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(), AttemptedKeys: attemptedKeys, AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), candidateFile)})
 				}
-				if result.Terminal == nil {
+				clampPlannerTargetResolution(&candidateResult, candidateFile)
+				if candidateResult.Terminal == nil {
+					start = candidateStart
+					effectiveFile = candidateFile
+					audioIndex = candidateAudioIndex
+					result = candidateResult
+					toneMapCapabilityErr = candidateToneMapErr
 					break
 				}
+				if firstFailureFile == nil {
+					firstFailureResult = candidateResult
+					firstFailureToneMapErr = candidateToneMapErr
+					firstFailureFile = candidateFile
+					firstFailureStart = candidateStart
+					firstFailureAudioIndex = candidateAudioIndex
+				}
+			}
+			if result.Terminal != nil && firstFailureFile != nil {
+				start = firstFailureStart
+				effectiveFile = firstFailureFile
+				audioIndex = firstFailureAudioIndex
+				result = firstFailureResult
+				toneMapCapabilityErr = firstFailureToneMapErr
 			}
 		}
 	}
@@ -4321,6 +4387,7 @@ const (
 	terminalNoAlternateVersionV3            = "no_alternate_version"
 	terminalHDRTranscodeUnsupportedV3       = playback.TerminalHDRTranscodeUnsupportedV3
 	terminalSubtitleConversionUnsupportedV3 = "subtitle_conversion_unsupported"
+	terminalSubtitleUnavailableInVersionV3  = "subtitle_unavailable_in_version"
 )
 
 // terminalAllowsAlternateFileV3 reports whether a refusal is the kind another
@@ -4371,7 +4438,7 @@ func (h *PlaybackHandler) clarifyOriginalQuality4KTerminalV3(ctx context.Context
 	if !alternateFilePinned || terminal == nil || terminal.Reason != terminalNoAlternateVersionV3 || terminal.Message != playback.TerminalMessage4KTranscodeDisabledV3 {
 		return
 	}
-	if alternate, err := h.findAlternateFile(ctx, requestedFile); err == nil && alternate != nil {
+	if alternate, err := h.findAlternateFile(ctx, requestedFile); err == nil && alternate != nil && !playback.Is4KMediaFileV3(alternate) {
 		terminal.Message = "4K transcoding is disabled and quality 'original' pins the 4K version; a compatible lower-resolution version of this title is available."
 	}
 }

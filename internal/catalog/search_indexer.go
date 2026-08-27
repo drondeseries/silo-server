@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/database/pglock"
 	"github.com/Silo-Server/silo-server/internal/embeddingvectors"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -114,7 +115,7 @@ func (i *CatalogSearchIndexer) SyncOutbox(ctx context.Context, progress SearchIn
 	}
 	stats.Configured = true
 
-	lock, locked, err := i.events.TryAdvisoryLock(ctx, searchIndexMaintenanceLockID)
+	lock, locked, err := pglock.TryAcquire(ctx, i.pool, searchIndexMaintenanceLockID)
 	if err != nil {
 		return stats, err
 	}
@@ -125,7 +126,12 @@ func (i *CatalogSearchIndexer) SyncOutbox(ctx context.Context, progress SearchIn
 		reportSearchIndexProgress(progress, 100, "Another catalog search index maintenance task is already running")
 		return stats, nil
 	}
-	defer func() { _ = lock.Close(context.Background()) }()
+	defer func() {
+		if err := lock.Release(ctx); err != nil {
+			slog.WarnContext(ctx, "releasing catalog search index maintenance lock",
+				"component", "catalog", "error", err)
+		}
+	}()
 
 	state, err := i.events.GetState(ctx, SearchProviderMeilisearch)
 	if err != nil {
@@ -247,7 +253,7 @@ func (i *CatalogSearchIndexer) Rebuild(ctx context.Context, progress SearchIndex
 	}
 	stats.Configured = true
 
-	lock, locked, err := i.events.TryAdvisoryLock(ctx, searchIndexMaintenanceLockID)
+	lock, locked, err := pglock.TryAcquire(ctx, i.pool, searchIndexMaintenanceLockID)
 	if err != nil {
 		return stats, err
 	}
@@ -258,7 +264,12 @@ func (i *CatalogSearchIndexer) Rebuild(ctx context.Context, progress SearchIndex
 		reportSearchIndexProgress(progress, 100, "Another catalog search index maintenance task is already running")
 		return stats, nil
 	}
-	defer func() { _ = lock.Close(context.Background()) }()
+	defer func() {
+		if err := lock.Release(ctx); err != nil {
+			slog.WarnContext(ctx, "releasing catalog search index maintenance lock",
+				"component", "catalog", "error", err)
+		}
+	}()
 
 	rebuildEventHighWater, err := i.events.MaxEventID(ctx, SearchProviderMeilisearch)
 	if err != nil {
