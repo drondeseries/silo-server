@@ -1,3 +1,4 @@
+import { memo, useMemo } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import ViewTransitionLink from "@/components/ViewTransitionLink";
 import type { CastMember } from "@/api/types";
@@ -17,15 +18,18 @@ interface CastCarouselProps {
   fullBleed?: boolean;
 }
 
-export default function CastCarousel({ cast, limit = 20, fullBleed = false }: CastCarouselProps) {
+function CastCarousel({ cast, limit = 20, fullBleed = false }: CastCarouselProps) {
   const { emblaRef, canScrollPrev, canScrollNext, scrollPrev, scrollNext } = useCarouselEmbla();
+  const visible = useMemo(
+    () =>
+      cast
+        .slice()
+        .sort((a, b) => a.order - b.order)
+        .slice(0, limit),
+    [cast, limit],
+  );
 
   if (cast.length === 0) return null;
-
-  const visible = cast
-    .slice()
-    .sort((a, b) => a.order - b.order)
-    .slice(0, limit);
 
   return (
     <div className="group/carousel relative">
@@ -84,6 +88,8 @@ export default function CastCarousel({ cast, limit = 20, fullBleed = false }: Ca
     </div>
   );
 }
+
+export default memo(CastCarousel);
 
 function CastCard({ member, href }: { member: CastMember; href: string | null }) {
   const inner = (

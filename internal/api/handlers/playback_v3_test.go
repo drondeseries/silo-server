@@ -1219,6 +1219,45 @@ func TestHandleStartPlaybackV3PersistsAndReplaysTerminalDecision(t *testing.T) {
 	}
 }
 
+func TestHandleStartPlaybackV3DirectPlaysH264ConstrainedBaselineWhenVideoTranscodingDisabled(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.VideoTracks[0].Profile = "Constrained Baseline"
+	manager := playback.NewSessionManager(0, 0)
+	manager.SetLimitProvider(func(context.Context, int) (playback.SessionLimits, error) {
+		return playback.SessionLimits{
+			MaxTranscodes:            0,
+			TranscodingDisabled:      true,
+			AudioTranscodingDisabled: false,
+		}, nil
+	})
+	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: file})
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"transcode_enabled": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	request := v3HandlerStartRequest()
+	request.Capabilities.VideoDecode[0].Profiles = []string{"baseline"}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, request))).WithContext(newAuthorizedPlaybackContext())
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var response playback.DecisionResponseV3
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Outcome != playback.OutcomePlayableV3 || response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("response = %#v, want playable direct plan", response)
+	}
+	if response.PlaybackPlan.Delivery != playback.DeliveryOriginalHTTPV3 || response.PlaybackPlan.DecisionReason != "validated_original_playback" {
+		t.Fatalf("plan = %#v, want validated original playback", response.PlaybackPlan)
+	}
+	sessions := manager.AllSessions()
+	if len(sessions) != 1 || sessions[0].PlayMethod != playback.PlayDirect || sessions[0].TranscodeAudio {
+		t.Fatalf("sessions = %#v, want one direct session without adaptation", sessions)
+	}
+}
+
 func TestHandleStartPlaybackV3RejectsProfileMismatch(t *testing.T) {
 	manager := playback.NewSessionManager(0, 0)
 	handler := NewPlaybackHandler(manager, testPlaybackFileResolver{file: v3HandlerFixtureFile(t)})
@@ -5356,7 +5395,6 @@ func TestTerminalAllowsAlternateFileV3CoversSubtitleForcedRefusals(t *testing.T)
 		t.Fatal("a nil terminal must not trigger an alternate-version retry")
 	}
 }
-
 func TestPlaybackV3ToneMapBudgetsCoverColdNodeWork(t *testing.T) {
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	handler.PlaybackConfig = func() config.PlaybackConfig {

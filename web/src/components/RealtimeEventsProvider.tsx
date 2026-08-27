@@ -35,10 +35,9 @@ import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { usePageActivity } from "@/hooks/usePageActivity";
 import { adminKeys, historyImportKeys, libraryKeys } from "@/hooks/queries/keys";
 import {
-  invalidateMediaSurfaceQueries,
+  scheduleMediaSurfaceInvalidation,
   updateCatalogItemDetail,
 } from "@/hooks/queries/mediaSurfaceRefresh";
-import { bumpHomeRefreshSignal } from "@/pages/homeSurfaceRefresh";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router";
@@ -409,22 +408,46 @@ function handleUserStateEvent(
   }
 
   if (payload.content_id) {
-    updateCatalogItemDetail(queryClient, payload.content_id, (detail) => ({
-      ...detail,
-      user_state: {
-        played: payload.played ?? detail.user_state?.played ?? false,
-        is_favorite: payload.is_favorite ?? detail.user_state?.is_favorite ?? false,
-        in_watchlist: payload.in_watchlist ?? detail.user_state?.in_watchlist ?? false,
-      },
-    }));
+    updateCatalogItemDetail(queryClient, payload.content_id, (detail) => {
+      const played =
+        payload.played ?? detail.user_state?.played ?? detail.user_data?.played ?? false;
+      const isFavorite = payload.is_favorite ?? detail.user_state?.is_favorite ?? false;
+      const inWatchlist = payload.in_watchlist ?? detail.user_state?.in_watchlist ?? false;
+      if (
+        played === (detail.user_data?.played ?? false) &&
+        played === (detail.user_state?.played ?? false) &&
+        isFavorite === (detail.user_state?.is_favorite ?? false) &&
+        inWatchlist === (detail.user_state?.in_watchlist ?? false)
+      ) {
+        return detail;
+      }
+      return {
+        ...detail,
+        user_data:
+          payload.played == null
+            ? detail.user_data
+            : { ...detail.user_data, played: payload.played },
+        user_state: { played, is_favorite: isFavorite, in_watchlist: inWatchlist },
+      };
+    });
   }
 
-  void invalidateMediaSurfaceQueries(
+  // The patch above only carries played/favourite/watchlist, which is the whole
+  // of what a favorite or watchlist event changes. Every other change — progress
+  // above all, which arrives with no state at all — also moves fields the patch
+  // cannot reconstruct (position_seconds, is_in_progress, season counts), so the
+  // detail query still has to be refreshed for those.
+  const detailFullyPatched = payload.change === "favorite" || payload.change === "watchlist";
+  scheduleMediaSurfaceInvalidation(
     queryClient,
-    payload.content_id ? { itemId: payload.content_id } : {},
-  ).then(() => {
-    bumpHomeRefreshSignal(queryClient);
-  });
+    payload.content_id
+      ? {
+          itemId: payload.content_id,
+          skipItemDetail: detailFullyPatched,
+          skipSimilarItems: true,
+        }
+      : { skipSimilarItems: true },
+  );
   void queryClient.invalidateQueries({
     queryKey: adminKeys.stats(),
     refetchType: allowDashboardRefetch ? "active" : "none",

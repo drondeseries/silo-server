@@ -446,29 +446,31 @@ func TestProtocolV3ConformanceMatrixCoversReleaseTrain(t *testing.T) {
 		"concurrent_replan", "mid_seek_replan", "available_qualities",
 		"audio_only_planning", "output_context_invalidation", "legacy_426",
 		"hdr_dv_matrix", "audio_matrix", "subtitle_matrix", "recovery_matrix",
-		"restart_matrix", "capacity_matrix", "route_event_limits",
+		"restart_matrix", "capacity_matrix", "route_event_limits", "profile_compatibility",
 	} {
 		if !categories[required] {
 			t.Errorf("conformance matrix omits %q", required)
 		}
 	}
 	for name, delivery := range map[string]DeliveryV3{
-		"evidence_exact":                  DeliveryTranscodeHLSV3,
-		"evidence_platform_attested":      DeliveryOriginalHTTPV3,
-		"evidence_declared":               DeliveryOriginalHTTPV3,
-		"delivery_original":               DeliveryOriginalHTTPV3,
-		"delivery_progressive":            DeliveryRemuxProgressiveV3,
-		"delivery_hls":                    DeliveryRemuxHLSV3,
-		"delivery_transcode":              DeliveryTranscodeHLSV3,
-		"audio_only_original":             DeliveryOriginalHTTPV3,
-		"hdr10_exact_direct":              DeliveryOriginalHTTPV3,
-		"dolby_vision_8_exact_direct":     DeliveryOriginalHTTPV3,
-		"dolby_vision_7_hdr10_fallback":   DeliveryRemuxProgressiveV3,
-		"truehd_audio_conversion":         DeliveryRemuxProgressiveV3,
-		"truehd_exact_layout_passthrough": DeliveryOriginalHTTPV3,
-		"embedded_pgs_sidecar":            DeliveryOriginalHTTPV3,
-		"embedded_ass_authored_render":    DeliveryOriginalHTTPV3,
-		"embedded_dvd_burn_in":            DeliveryTranscodeHLSV3,
+		"evidence_exact":                    DeliveryTranscodeHLSV3,
+		"evidence_platform_attested":        DeliveryOriginalHTTPV3,
+		"evidence_declared":                 DeliveryOriginalHTTPV3,
+		"delivery_original":                 DeliveryOriginalHTTPV3,
+		"delivery_progressive":              DeliveryRemuxProgressiveV3,
+		"delivery_hls":                      DeliveryRemuxHLSV3,
+		"delivery_transcode":                DeliveryTranscodeHLSV3,
+		"audio_only_original":               DeliveryOriginalHTTPV3,
+		"hdr10_exact_direct":                DeliveryOriginalHTTPV3,
+		"client_managed_hdr_selected_audio": DeliveryOriginalHTTPV3,
+		"dolby_vision_8_exact_direct":       DeliveryOriginalHTTPV3,
+		"dolby_vision_7_hdr10_fallback":     DeliveryRemuxProgressiveV3,
+		"truehd_audio_conversion":           DeliveryRemuxProgressiveV3,
+		"truehd_exact_layout_passthrough":   DeliveryOriginalHTTPV3,
+		"embedded_pgs_sidecar":              DeliveryOriginalHTTPV3,
+		"embedded_ass_authored_render":      DeliveryOriginalHTTPV3,
+		"embedded_dvd_burn_in":              DeliveryTranscodeHLSV3,
+		"h264_constrained_baseline_direct":  DeliveryOriginalHTTPV3,
 	} {
 		value, ok := plannerByName[name]
 		if !ok || value.Expected.Outcome != OutcomePlayableV3 || value.Expected.Delivery != delivery {
@@ -477,6 +479,14 @@ func TestProtocolV3ConformanceMatrixCoversReleaseTrain(t *testing.T) {
 	}
 	if value := plannerByName["available_qualities"]; len(value.Expected.AvailableQualities) < 2 || value.Expected.AvailableQualities[0].Label != QualityOriginalV3 {
 		t.Errorf("available quality fixture = %#v", value.Expected.AvailableQualities)
+	}
+	constrainedBaseline := plannerByName["h264_constrained_baseline_direct"]
+	if constrainedBaseline.Source.VideoProfile != "constrained baseline" ||
+		len(constrainedBaseline.Request.Capabilities.VideoDecode) != 1 ||
+		len(constrainedBaseline.Request.Capabilities.VideoDecode[0].Profiles) != 1 ||
+		constrainedBaseline.Request.Capabilities.VideoDecode[0].Profiles[0] != h264BaselineProfileV3 ||
+		constrainedBaseline.Expected.DecisionReason != "validated_original_playback" {
+		t.Errorf("constrained baseline fixture = %#v", constrainedBaseline)
 	}
 	transformationNamed := func(value PlannerScenarioV3, name string) bool {
 		t.Helper()
@@ -693,6 +703,86 @@ func TestPlanPlaybackV3EvidenceTiersReachTierAppropriateRoutes(t *testing.T) {
 	result = PlanPlaybackV3(PlannerInputV3{Request: declared, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: testTransformationRegistryV3()})
 	if result.Plan == nil || result.Plan.Delivery != DeliveryOriginalHTTPV3 {
 		t.Fatalf("declared tier = %s", ExplainPlannerResultV3(result))
+	}
+}
+
+func TestVideoProfileSupportedV3(t *testing.T) {
+	tests := []struct {
+		name           string
+		codec          string
+		source         string
+		decoderProfile string
+		want           bool
+	}{
+		{name: "constrained baseline is a baseline subset", codec: "h264", source: "constrained baseline", decoderProfile: "baseline", want: true},
+		{name: "case and surrounding whitespace", codec: " H264 ", source: " Constrained Baseline ", decoderProfile: " BASELINE ", want: true},
+		{name: "hyphen variant", codec: "h264", source: "constrained-baseline", decoderProfile: "baseline", want: true},
+		{name: "underscore variant", codec: "h264", source: "constrained_baseline", decoderProfile: "baseline", want: true},
+		{name: "period variant", codec: "h264", source: "constrained.baseline", decoderProfile: "baseline", want: true},
+		{name: "unknown plus qualifier is preserved", codec: "h264", source: "baseline+", decoderProfile: "baseline", want: false},
+		{name: "unknown at-sign separator is preserved", codec: "h264", source: "constrained@baseline", decoderProfile: "baseline", want: false},
+		{name: "direction is not reversed", codec: "h264", source: "baseline", decoderProfile: "constrained baseline", want: false},
+		{name: "main is not baseline", codec: "h264", source: "main", decoderProfile: "baseline", want: false},
+		{name: "high is not baseline", codec: "h264", source: "high", decoderProfile: "baseline", want: false},
+		{name: "main identity", codec: "h264", source: "main", decoderProfile: "MAIN", want: true},
+		{name: "high identity", codec: "h264", source: "high", decoderProfile: "High", want: true},
+		{name: "high 10 identity", codec: "h264", source: "high 10", decoderProfile: "high-10", want: true},
+		{name: "colon variant matches compact spelling", codec: "h264", source: "high 4:2:2", decoderProfile: "high422", want: true},
+		{name: "colon variant matches mixed separators", codec: "h264", source: "high 4:4:4 predictive", decoderProfile: "high-4.4.4-predictive", want: true},
+		{name: "non h264 punctuation remains exact", codec: "hevc", source: "main 10", decoderProfile: "main-10", want: false},
+		{name: "non h264 case and trim remain compatible", codec: "hevc", source: " Main 10 ", decoderProfile: "main 10", want: true},
+		{name: "missing source profile", codec: "h264", source: "", decoderProfile: "baseline", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := videoProfileSupportedV3(test.codec, test.source, []string{test.decoderProfile}); got != test.want {
+				t.Fatalf("videoProfileSupportedV3(%q, %q, [%q]) = %v, want %v", test.codec, test.source, test.decoderProfile, got, test.want)
+			}
+		})
+	}
+}
+
+func TestPlanPlaybackV3DirectPlaysH264ConstrainedBaselineWithoutTranscoding(t *testing.T) {
+	file := &models.MediaFile{
+		ID: 760460, FilePath: "/media/rebel-without-a-pause.mkv", Container: "mkv",
+		CodecVideo: "h264", CodecAudio: "eac3", Resolution: "1080p", Bitrate: 6_642,
+		AudioChannels: 6,
+		VideoTracks: []models.VideoTrack{{
+			Codec: "h264", Profile: "Constrained Baseline", Level: 40,
+			Width: 1920, Height: 1080, FrameRate: "24000/1001", Bitrate: 6_642,
+			BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+		}},
+		AudioTracks: []models.AudioTrack{{Codec: "eac3", Channels: 6, Layout: "5.1", Default: true}},
+	}
+	req := validStartRequestV3()
+	req.FileID = file.ID
+	req.QualityPreference = "auto"
+	req.Capabilities.CodecsVideo = []string{"h264"}
+	req.Capabilities.CodecsVideoHardware = []string{"h264"}
+	req.Capabilities.CodecsAudio = []string{"eac3"}
+	req.Capabilities.Containers = []string{"mkv"}
+	req.Capabilities.MaxResolution = "2160p"
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{
+		Codec: "h264", Profiles: []string{"baseline", "main", "high", "high 10"}, Levels: []int{52},
+		BitDepths: []int{8}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60,
+		MaxBitrateKbps: 20_000, Hardware: true,
+	}}
+
+	result := PlanPlaybackV3(PlannerInputV3{
+		Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0,
+		Settings: PlannerSettingsV3{TranscodeEnabled: false},
+	})
+	if result.Terminal != nil || result.Plan == nil {
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+	if result.Plan.Delivery != DeliveryOriginalHTTPV3 || result.PlayMethod != PlayDirect {
+		t.Fatalf("route = delivery %q method %q, want original_http/direct", result.Plan.Delivery, result.PlayMethod)
+	}
+	if result.Plan.DecisionReason != "validated_original_playback" {
+		t.Fatalf("decision reason = %q", result.Plan.DecisionReason)
+	}
+	if result.TargetVideoCodec != "" || result.TranscodeAudio {
+		t.Fatalf("direct result requested adaptation: video=%q transcode_audio=%v", result.TargetVideoCodec, result.TranscodeAudio)
 	}
 }
 

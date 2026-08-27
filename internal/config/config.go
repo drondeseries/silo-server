@@ -496,7 +496,7 @@ func setDefaults() *configRaw {
 			EnableTVSeriesRootQueue: true,
 		},
 		Playback: PlaybackConfig{
-			FFmpegPath:                   "/usr/lib/jellyfin-ffmpeg/ffmpeg",
+			FFmpegPath:                   "",
 			TranscodeDir:                 DefaultTranscodeDir,
 			HWAccel:                      "auto",
 			SoftwareFallback:             "allow",

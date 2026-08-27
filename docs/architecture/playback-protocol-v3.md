@@ -344,7 +344,7 @@ populating them:
 
 | Field | Match |
 | --- | --- |
-| `profiles` | Case-insensitive string equality against the source profile |
+| `profiles` | Case-insensitive profile identity against the source profile. H.264 ignores presentation separators, and a decoder reporting Baseline also accepts the narrower Constrained Baseline source profile; the reverse is not inferred |
 | `levels` | **At-least**: any listed level ≥ the source level passes |
 | `bit_depths` | Exact integer equality |
 

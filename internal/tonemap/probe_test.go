@@ -30,6 +30,46 @@ func TestHardwareSmokeFilterNVENCPreservesSourceBitDepth(t *testing.T) {
 	}
 }
 
+func TestVideoToolboxSmokeUsesHardwareFramesAndEightBitOutput(t *testing.T) {
+	args := hardwareSmokeArgs("/tmp/probe.hevc", BackendVideoToolbox, "", SourcePQ)
+	joined := strings.Join(args, " ")
+	for _, token := range []string{
+		"-hwaccel videotoolbox",
+		"-hwaccel_output_format videotoolbox_vld",
+		SourceParameters(SourcePQ),
+		"scale_vt=w=iw:h=ih:color_matrix=bt709:color_primaries=bt709:color_transfer=bt709",
+		"hwdownload,format=p010le,format=nv12",
+		"sidedata=mode=delete:type=DOVI_RPU_BUFFER",
+		"-c:v h264_videotoolbox",
+	} {
+		if !strings.Contains(joined, token) {
+			t.Fatalf("VideoToolbox smoke args missing %q: %s", token, joined)
+		}
+	}
+}
+
+func TestVideoToolboxSmokeDeclaresEverySourceSignal(t *testing.T) {
+	for _, kind := range AllSourceKinds() {
+		t.Run(string(kind), func(t *testing.T) {
+			filter := hardwareSmokeFilter(BackendVideoToolbox, kind, decodeProbeFixtureBitDepth)
+			if !strings.HasPrefix(filter, SourceParameters(kind)+",") {
+				t.Fatalf("hardwareSmokeFilter() = %q, want source declaration %q first", filter, SourceParameters(kind))
+			}
+		})
+	}
+}
+
+func TestVideoToolboxListingGateRequiresCompletePipeline(t *testing.T) {
+	filters := []byte("scale_vt hwdownload sidedata")
+	encoders := []byte("h264_videotoolbox")
+	if !hardwareProbeAvailable(BackendVideoToolbox, filters, encoders) {
+		t.Fatal("complete VideoToolbox pipeline was not accepted")
+	}
+	if hardwareProbeAvailable(BackendVideoToolbox, []byte("scale_vt hwdownload"), encoders) {
+		t.Fatal("VideoToolbox pipeline without metadata removal was accepted")
+	}
+}
+
 // TestProbeTotalTimeoutCoversBoundedCommandMatrix verifies the deadline covers every possible probe command.
 func TestProbeTotalTimeoutCoversBoundedCommandMatrix(t *testing.T) {
 	tests := []struct {
@@ -41,6 +81,7 @@ func TestProbeTotalTimeoutCoversBoundedCommandMatrix(t *testing.T) {
 		{name: "software", backend: BackendSoftware, count: 7},
 		{name: "one hardware device", backend: BackendQSV, device: "/dev/dri/renderD128", count: 12},
 		{name: "two hardware devices", backend: BackendVAAPI, device: "/dev/dri/renderD128,/dev/dri/renderD129", count: 17},
+		{name: "VideoToolbox", backend: BackendVideoToolbox, count: 12},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -89,6 +130,99 @@ func TestProbeEmptyCapabilitiesExpire(t *testing.T) {
 	_, _ = probeCached(context.Background(), "/ffmpeg-empty", BackendSoftware, "", runner, func() time.Time { return now })
 	if calls != 4 {
 		t.Fatalf("listing calls = %d, want a fresh probe after expiry", calls)
+	}
+}
+
+func TestProbePartialHardwareCapabilitiesExpire(t *testing.T) {
+	resetProbeCache(t)
+	now := time.Unix(100, 0)
+	hardwareReady := false
+	calls := 0
+	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		calls++
+		if len(args) > 0 && args[len(args)-1] == "-filters" {
+			return []byte(" .S. zscale V->V\n .S. tonemap V->V\n .S. scale_vt V->V\n .S. hwdownload V->V\n .S. sidedata V->V\n"), nil
+		}
+		if len(args) > 0 && args[len(args)-1] == "-encoders" {
+			return []byte("libx264 h264_videotoolbox"), nil
+		}
+		if strings.Contains(strings.Join(args, " "), "-hwaccel videotoolbox") && !hardwareReady {
+			return nil, errors.New("VideoToolbox session temporarily unavailable")
+		}
+		return nil, nil
+	}
+
+	got, err := probeCached(t.Context(), "/ffmpeg-partial", BackendVideoToolbox, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("partial probe error = %v", err)
+	}
+	if len(got) != 1 || !got.Supports(ModeSoftware, SourcePQ) || got.Supports(ModeHardware, SourcePQ) {
+		t.Fatalf("partial probe = %#v, want software only", got)
+	}
+	firstCalls := calls
+	hardwareReady = true
+	got, err = probeCached(t.Context(), "/ffmpeg-partial", BackendVideoToolbox, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("cached partial probe error = %v", err)
+	}
+	if calls != firstCalls || got.Supports(ModeHardware, SourcePQ) {
+		t.Fatalf("partial probe was not cached until expiry: calls = %d, capabilities = %#v", calls, got)
+	}
+
+	now = now.Add(probeNegativeTTL + time.Second)
+	got, err = probeCached(t.Context(), "/ffmpeg-partial", BackendVideoToolbox, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("retried partial probe error = %v", err)
+	}
+	if calls == firstCalls || !got.Supports(ModeHardware, SourcePQ) {
+		t.Fatalf("expired partial probe was not retried: calls = %d, capabilities = %#v", calls, got)
+	}
+}
+
+func TestProbeIncompleteSourceKindCapabilitiesExpire(t *testing.T) {
+	resetProbeCache(t)
+	now := time.Unix(100, 0)
+	allKindsReady := false
+	calls := 0
+	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		calls++
+		if len(args) > 0 && args[len(args)-1] == "-filters" {
+			return []byte(" .S. zscale V->V\n .S. tonemap V->V\n .S. scale_vt V->V\n .S. hwdownload V->V\n .S. sidedata V->V\n"), nil
+		}
+		if len(args) > 0 && args[len(args)-1] == "-encoders" {
+			return []byte("libx264 h264_videotoolbox"), nil
+		}
+		if !allKindsReady && strings.Contains(strings.Join(args, " "), SourceParameters(SourceHLGBT709)) {
+			return nil, errors.New("executor session temporarily unavailable")
+		}
+		return nil, nil
+	}
+
+	got, err := probeCached(t.Context(), "/ffmpeg-subset", BackendVideoToolbox, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("subset probe error = %v", err)
+	}
+	if len(got) != 2 || !got.Supports(ModeSoftware, SourcePQ) || !got.Supports(ModeHardware, SourcePQ) ||
+		got.Supports(ModeSoftware, SourceHLGBT709) || got.Supports(ModeHardware, SourceHLGBT709) {
+		t.Fatalf("subset probe = %#v, want both executors without HLG BT.709", got)
+	}
+	firstCalls := calls
+	allKindsReady = true
+	got, err = probeCached(t.Context(), "/ffmpeg-subset", BackendVideoToolbox, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("cached subset probe error = %v", err)
+	}
+	if calls != firstCalls || got.Supports(ModeSoftware, SourceHLGBT709) || got.Supports(ModeHardware, SourceHLGBT709) {
+		t.Fatalf("subset probe was not cached until expiry: calls = %d, capabilities = %#v", calls, got)
+	}
+
+	now = now.Add(probeNegativeTTL + time.Second)
+	got, err = probeCached(t.Context(), "/ffmpeg-subset", BackendVideoToolbox, "", runner, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("retried subset probe error = %v", err)
+	}
+	if calls == firstCalls || !got.Supports(ModeSoftware, SourceHLGBT709) || !got.Supports(ModeHardware, SourceHLGBT709) {
+		t.Fatalf("expired subset probe was not retried: calls = %d, capabilities = %#v", calls, got)
 	}
 }
 

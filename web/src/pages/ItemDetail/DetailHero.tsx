@@ -118,8 +118,7 @@ export default function DetailHero({
               key={backdropUrl}
               src={backdropUrl}
               alt=""
-              className={`h-full w-full object-cover object-[center_20%] transition-opacity duration-300 will-change-transform ${backdropLoaded ? "opacity-100" : "opacity-0"}`}
-              style={{ animation: "var(--animate-ken-burns-a)" }}
+              className={`h-full w-full object-cover object-[center_20%] transition-opacity duration-300 ${backdropLoaded ? "opacity-100" : "opacity-0"}`}
               onLoad={onBackdropLoad}
             />
           )}

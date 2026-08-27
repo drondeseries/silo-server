@@ -844,6 +844,50 @@ func is4KResolution(res string) bool {
 	return access.CompareQuality(res, "2160p") >= 0
 }
 
+// compatVideoToolboxToneMapBitrateKbps chooses a resolution-aware bitrate for
+// Jellyfin-compatible VideoToolbox tone maps. Those requests intentionally
+// preserve source dimensions, so leaving the bitrate unset would make the
+// encoder use its 1080p fallback even for 4K sources.
+func compatVideoToolboxToneMapBitrateKbps(version catalog.FileVersion, recipe compatToneMapRecipe) int {
+	if recipe.mode != tonemap.ModeHardware || recipe.hwAccel != tonemap.BackendVideoToolbox {
+		return 0
+	}
+
+	height := 0
+	for _, track := range version.VideoTracks {
+		if track.Height > 0 {
+			height = track.Height
+			break
+		}
+	}
+	if height == 0 {
+		resolution := strings.ToLower(strings.TrimSpace(version.Resolution))
+		switch resolution {
+		case "8k":
+			height = 4320
+		case "4k", "uhd":
+			height = 2160
+		default:
+			height, _ = strconv.Atoi(strings.TrimSuffix(resolution, "p"))
+		}
+	}
+
+	switch {
+	case height >= 2160:
+		return 20_000
+	case height >= 1080:
+		return 6_000
+	case height >= 720:
+		return 2_000
+	case height > 0:
+		return 1_500
+	case version.Bitrate > 0:
+		return version.Bitrate
+	default:
+		return 0
+	}
+}
+
 // NewPlaybackHandler creates a playback handler.
 func NewPlaybackHandler(
 	cfg *config.Config,
@@ -1238,6 +1282,10 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		reqBody.ToneMapDVRPUPresent = toneMapRecipe.dvRPUPresent
 		reqBody.HWAccel = toneMapRecipe.hwAccel
 	}
+	autoVideoToolboxBitrate := compatVideoToolboxToneMapBitrateKbps(source.Version, toneMapRecipe)
+	if autoVideoToolboxBitrate > 0 {
+		reqBody.TargetBitrateKbps = autoVideoToolboxBitrate
+	}
 	if source.TranscodeAudio {
 		reqBody.TargetCodecVideo = "copy"
 		reqBody.VideoSampleEntry = playback.VideoSampleEntryForDVCopy(file.PrimaryDVProfile())
@@ -1321,6 +1369,9 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	if retryWithSoftware {
 		reqBody.ToneMapMode = toneMapRecipe.mode
 		reqBody.HWAccel = toneMapRecipe.hwAccel
+		if autoVideoToolboxBitrate > 0 {
+			reqBody.TargetBitrateKbps = 0
+		}
 		nodeResponse, status, cleanupRequired, err = dispatch(reqBody)
 		validationErr = nil
 		if isCompatToneMapExecutionError(err) {
@@ -1414,17 +1465,19 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		CanonicalInputPath:               file.FilePath,
 		VirtualSourceOwnerInstallationID: source.VirtualSourceOwnerInstallationID,
 		SourceVideoCodec:                 reqBody.SourceVideoCodec,
-		SourceAudioChannels:              reqBody.SourceAudioChannels,
 		SourceVideoProfile:               reqBody.SourceVideoProfile,
 		SourceVideoBitDepth:              reqBody.SourceVideoBitDepth,
 		SeekSeconds:                      reqBody.SeekSeconds,
 		StartSegmentNumber:               reqBody.StartSegmentNumber,
 		TargetCodecVideo:                 reqBody.TargetCodecVideo,
 		TargetCodecAudio:                 reqBody.TargetCodecAudio,
-		TargetAudioChannels:              reqBody.TargetAudioChannels,
+		TargetResolution:                 reqBody.TargetResolution,
+		TargetBitrateKbps:                reqBody.TargetBitrateKbps,
 		VideoSampleEntry:                 reqBody.VideoSampleEntry,
 		SegmentDuration:                  reqBody.SegmentDuration,
 		AudioTrackIndex:                  reqBody.AudioTrackIndex,
+		SourceAudioChannels:              reqBody.SourceAudioChannels,
+		TargetAudioChannels:              reqBody.TargetAudioChannels,
 		TotalDuration:                    reqBody.TotalDuration,
 	}
 	if isCompatVirtualSource(source) {

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
@@ -25,11 +26,14 @@ func TestToneMapFFmpegGraphsCoverSupportedExecutors(t *testing.T) {
 		{name: "QSV", mode: tonemap.ModeHardware, hwAccel: "qsv", filter: "tonemap_opencl", sourceKind: tonemap.SourcePQ, want: []string{"-init_hw_device opencl=ocl@va", "tonemap_opencl", "hwmap=derive_device=qsv:mode=read+write", "h264_qsv"}},
 		{name: "VAAPI", mode: tonemap.ModeHardware, hwAccel: "vaapi", filter: "tonemap_vaapi", sourceKind: tonemap.SourceHLG, want: []string{"tonemap_vaapi", "scale_vaapi", "h264_vaapi"}},
 		{name: "NVENC", mode: tonemap.ModeHardware, hwAccel: "nvenc", filter: "tonemap_cuda", sourceKind: tonemap.SourcePQ, want: []string{"color_trc=smpte2084", "tonemap_cuda", "scale_cuda", "h264_nvenc"}},
+		{name: "VideoToolbox", mode: tonemap.ModeHardware, hwAccel: "videotoolbox", filter: "scale_vt", sourceKind: tonemap.SourcePQ, want: []string{"-hwaccel videotoolbox", "-hwaccel_output_format videotoolbox_vld", "scale_vt=w=-2:h=1080", "hwdownload,format=p010le,format=nv12", "h264_videotoolbox"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			args := buildFFmpegArgs(TranscodeOpts{
 				InputPath: "/media/hdr.mkv", OutputDir: t.TempDir(), TargetCodecVideo: "h264", TargetCodecAudio: "aac",
+				FFmpegPath:       videoToolboxTestFFmpegFor(t, tt.hwAccel),
+				SourceVideoCodec: "hevc", SourceVideoProfile: "Main 10", SourceVideoBitDepth: 10,
 				TargetResolution: "1080p", HWAccel: tt.hwAccel, ToneMapPolicy: tonemap.PolicyHardwareThenSoftware,
 				ToneMapMode: tt.mode, ToneMapSourceKind: tt.sourceKind, ToneMapFilter: tt.filter,
 				ToneMapRecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3,
@@ -43,11 +47,79 @@ func TestToneMapFFmpegGraphsCoverSupportedExecutors(t *testing.T) {
 			if tt.mode == tonemap.ModeSoftware && !strings.Contains(joined, "-colorspace bt709") {
 				t.Fatalf("software args omit explicit output matrix: %s", joined)
 			}
-			if tt.mode == tonemap.ModeHardware && strings.Contains(joined, "-colorspace bt709") {
+			if tt.mode == tonemap.ModeHardware && tt.hwAccel != transcodeHWVideoToolbox && strings.Contains(joined, "-colorspace bt709") {
 				t.Fatalf("hardware args request an incompatible software colorspace conversion: %s", joined)
+			}
+			if tt.hwAccel == transcodeHWVideoToolbox && !strings.Contains(joined, "-colorspace bt709") {
+				t.Fatalf("VideoToolbox args omit the required output matrix: %s", joined)
 			}
 			if tt.mode == tonemap.ModeHardware && strings.Contains(joined, "-pix_fmt yuv420p") {
 				t.Fatalf("hardware graph requested a software pixel format conversion: %s", joined)
+			}
+		})
+	}
+}
+
+func TestBuildFFmpegArgs_VideoToolboxToneMapUnprobedSourceUsesSoftwareDecodeUpload(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		codec    string
+		profile  string
+		bitDepth int
+	}{
+		{name: "AV1", codec: "av1", profile: "Main", bitDepth: 10},
+		{name: "HEVC Main 12", codec: "hevc", profile: "Main 12", bitDepth: 12},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			args := buildFFmpegArgs(TranscodeOpts{
+				InputPath: "/media/hdr.mkv", OutputDir: t.TempDir(), TargetCodecVideo: "h264", TargetCodecAudio: "aac",
+				FFmpegPath: videoToolboxTestFFmpeg(t), SourceVideoCodec: tt.codec, SourceVideoProfile: tt.profile, SourceVideoBitDepth: tt.bitDepth,
+				TargetResolution: "1080p", HWAccel: transcodeHWVideoToolbox, ToneMapPolicy: tonemap.PolicyHardwareThenSoftware,
+				ToneMapMode: tonemap.ModeHardware, ToneMapSourceKind: tonemap.SourcePQ, ToneMapFilter: tonemap.HardwareFilterVideoToolbox,
+				ToneMapRecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3,
+			})
+			joined := strings.Join(args, " ")
+			for _, forbidden := range []string{"-hwaccel videotoolbox", "-hwaccel_output_format videotoolbox_vld"} {
+				if strings.Contains(joined, forbidden) {
+					t.Fatalf("unprobed source shape must not use VideoToolbox decoding, found %q: %s", forbidden, joined)
+				}
+			}
+			for _, required := range []string{
+				"-init_hw_device videotoolbox=vt", "-filter_hw_device vt",
+				"setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,format=p010le,hwupload",
+				"scale_vt=w=-2:h=1080", "-c:v h264_videotoolbox",
+			} {
+				if !strings.Contains(joined, required) {
+					t.Fatalf("software-decode VideoToolbox tone map missing %q: %s", required, joined)
+				}
+			}
+		})
+	}
+}
+
+func TestResolveVideoToolboxToneMapDecodeUsesOnlyProbedSourceShape(t *testing.T) {
+	tests := []struct {
+		name     string
+		codec    string
+		profile  string
+		bitDepth int
+		wantCPU  bool
+	}{
+		{name: "HEVC Main 10", codec: "hevc", profile: "Main 10", bitDepth: 10},
+		{name: "HEVC Main 12", codec: "hevc", profile: "Main 12", bitDepth: 12, wantCPU: true},
+		{name: "HEVC range extensions", codec: "hevc", profile: "Rext", bitDepth: 10, wantCPU: true},
+		{name: "HEVC unknown bit depth", codec: "hevc", profile: "Main 10", wantCPU: true},
+		{name: "HEVC mismatched bit depth", codec: "hevc", profile: "Main 10", bitDepth: 12, wantCPU: true},
+		{name: "AV1", codec: "av1", profile: "Main", bitDepth: 10, wantCPU: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := resolveVideoToolboxToneMapDecode(TranscodeOpts{
+				HWAccel: transcodeHWVideoToolbox, ToneMapMode: tonemap.ModeHardware,
+				SourceVideoCodec: tt.codec, SourceVideoProfile: tt.profile, SourceVideoBitDepth: tt.bitDepth,
+			})
+			if opts.SoftwareVideoDecode != tt.wantCPU {
+				t.Fatalf("SoftwareVideoDecode = %v, want %v", opts.SoftwareVideoDecode, tt.wantCPU)
 			}
 		})
 	}
@@ -87,12 +159,14 @@ func TestEveryToneMapSourceKindBuildsEveryExecutorGraph(t *testing.T) {
 		{name: "qsv", mode: tonemap.ModeHardware, hwAccel: "qsv", filter: tonemap.HardwareFilterOpenCL, encoder: "h264_qsv"},
 		{name: "vaapi", mode: tonemap.ModeHardware, hwAccel: "vaapi", filter: tonemap.HardwareFilterVAAPI, encoder: "h264_vaapi"},
 		{name: "nvenc", mode: tonemap.ModeHardware, hwAccel: "nvenc", filter: tonemap.HardwareFilterCUDA, encoder: "h264_nvenc"},
+		{name: "videotoolbox", mode: tonemap.ModeHardware, hwAccel: "videotoolbox", filter: tonemap.HardwareFilterVideoToolbox, encoder: "h264_videotoolbox"},
 	}
 	for _, kind := range tonemap.AllSourceKinds() {
 		for _, executor := range executors {
 			t.Run(string(kind)+"/"+executor.name, func(t *testing.T) {
 				args := buildPrepareFileArgs(TranscodeOpts{
 					InputPath: "/media/source.mkv", SourceVideoBitDepth: 10, TargetCodecVideo: "h264", TargetCodecAudio: "aac",
+					FFmpegPath:       videoToolboxTestFFmpegFor(t, executor.hwAccel),
 					TargetResolution: "720p", ToneMapPolicy: tonemap.PolicyHardwareThenSoftware,
 					ToneMapMode: executor.mode, ToneMapSourceKind: kind, ToneMapFilter: executor.filter,
 					ToneMapRecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3, HWAccel: executor.hwAccel,
@@ -104,7 +178,7 @@ func TestEveryToneMapSourceKindBuildsEveryExecutorGraph(t *testing.T) {
 					}
 				}
 				hasLuminanceToneMap := strings.Contains(joined, "tonemap=hable") || strings.Contains(joined, "tonemap_opencl") || strings.Contains(joined, "tonemap_vaapi") || strings.Contains(joined, "tonemap_cuda")
-				if hasLuminanceToneMap == tonemap.IsSDRSource(kind) {
+				if executor.hwAccel != transcodeHWVideoToolbox && hasLuminanceToneMap == tonemap.IsSDRSource(kind) {
 					t.Fatalf("%s/%s luminance tone-map decision is wrong: %s", kind, executor.name, joined)
 				}
 			})
@@ -123,11 +197,13 @@ func TestHardwareToneMapRemovesMetadataAfterHardwareFormatConversion(t *testing.
 		{name: "QSV", hwAccel: "qsv", filter: tonemap.HardwareFilterOpenCL, before: "hwmap=derive_device=qsv"},
 		{name: "VAAPI", hwAccel: "vaapi", filter: tonemap.HardwareFilterVAAPI, before: "scale_vaapi"},
 		{name: "NVENC", hwAccel: "nvenc", filter: tonemap.HardwareFilterCUDA, before: "scale_cuda"},
+		{name: "VideoToolbox", hwAccel: "videotoolbox", filter: tonemap.HardwareFilterVideoToolbox, before: "scale_vt"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			graph := strings.Join(buildFFmpegArgs(TranscodeOpts{
 				InputPath: "/media/hdr.mkv", OutputDir: t.TempDir(), TargetCodecVideo: "h264", TargetCodecAudio: "aac",
+				FFmpegPath:       videoToolboxTestFFmpegFor(t, tt.hwAccel),
 				TargetResolution: "1080p", HWAccel: tt.hwAccel, ToneMapPolicy: tonemap.PolicyHardwareOnly,
 				ToneMapMode: tonemap.ModeHardware, ToneMapSourceKind: tonemap.SourcePQ, ToneMapFilter: tt.filter,
 				ToneMapRecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3,
@@ -170,6 +246,52 @@ func TestToneMapGraphOrdersTextAndBitmapSubtitles(t *testing.T) {
 	assertTokenOrder(bitmapGraph, "tonemapx=tonemap=bt2390", "overlay=eof_action=pass", "scale=-2:1080")
 }
 
+func TestVideoToolboxToneMapDownloadsBeforeSubtitleComposition(t *testing.T) {
+	base := TranscodeOpts{
+		InputPath: "/media/hdr.mkv", OutputDir: t.TempDir(), SourceVideoBitDepth: 10,
+		FFmpegPath:       videoToolboxTestFFmpeg(t),
+		TargetCodecVideo: "h264", TargetCodecAudio: "aac", TargetResolution: "1080p",
+		HWAccel: transcodeHWVideoToolbox, ToneMapPolicy: tonemap.PolicyHardwareOnly,
+		ToneMapMode: tonemap.ModeHardware, ToneMapSourceKind: tonemap.SourcePQ,
+		ToneMapFilter:        tonemap.HardwareFilterVideoToolbox,
+		ToneMapRecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3,
+		SubtitleBurnIn:       true, SubtitleTrackIndex: 0,
+	}
+	for _, codec := range []string{"subrip", "hdmv_pgs_subtitle"} {
+		t.Run(codec, func(t *testing.T) {
+			opts := base
+			opts.SubtitleCodec = codec
+			graph := strings.Join(buildFFmpegArgs(opts), " ")
+			convert := strings.Index(graph, "scale_vt=w=-2:h=1080")
+			download := strings.Index(graph, "hwdownload,format=p010le,format=nv12")
+			compose := strings.Index(graph, "subtitles=")
+			if codec == "hdmv_pgs_subtitle" {
+				compose = strings.Index(graph, "overlay=eof_action=pass")
+			}
+			metadata := strings.Index(graph, "sidedata=mode=delete")
+			if convert < 0 || download <= convert || compose <= download || metadata <= compose {
+				t.Fatalf("unsafe VideoToolbox subtitle order: %s", graph)
+			}
+			if strings.Contains(graph, "scale=-2:1080") {
+				t.Fatalf("VideoToolbox scaling ran a second time on the CPU: %s", graph)
+			}
+		})
+	}
+}
+
+func TestValidateToneMapOptsAcceptsVideoToolbox(t *testing.T) {
+	err := validateToneMapOpts(TranscodeOpts{
+		TargetCodecVideo: "h264", HWAccel: transcodeHWVideoToolbox,
+		ToneMapPolicy: tonemap.PolicyHardwareOnly, ToneMapMode: tonemap.ModeHardware,
+		ToneMapSourceKind: tonemap.SourcePQ, ToneMapFilter: tonemap.HardwareFilterVideoToolbox,
+		ToneMapRecipeVersion:  TransformationHDRToSDRToneMapRecipeVersionV3,
+		ToneMapSourceRevision: tonemap.SourceRevision{MediaFileID: 1, FileSize: 1, FileModifiedUnixNano: 1, FileHash: "hash", ProbeUpdatedUnixNano: 1, StreamSignature: "stream"},
+	})
+	if err != nil {
+		t.Fatalf("VideoToolbox tone-map recipe rejected: %v", err)
+	}
+}
+
 // TestSDRBaseGraphsBypassLuminanceToneMapping verifies SDR-compatible bases avoid needless luminance mapping.
 func TestSDRBaseGraphsBypassLuminanceToneMapping(t *testing.T) {
 	tests := []struct {
@@ -185,11 +307,13 @@ func TestSDRBaseGraphsBypassLuminanceToneMapping(t *testing.T) {
 		{name: "QSV", mode: tonemap.ModeHardware, hwAccel: "qsv", filter: tonemap.HardwareFilterOpenCL, sourceKind: tonemap.SourceSDRBT709, want: []string{"scale_vaapi=format=nv12", "hwmap=derive_device=qsv"}},
 		{name: "VAAPI", mode: tonemap.ModeHardware, hwAccel: "vaapi", filter: tonemap.HardwareFilterVAAPI, sourceKind: tonemap.SourceSDRBT2020, want: []string{"scale_vaapi=format=nv12", "h264_vaapi"}},
 		{name: "NVENC", mode: tonemap.ModeHardware, hwAccel: "nvenc", filter: tonemap.HardwareFilterCUDA, sourceKind: tonemap.SourceSDRBT2020, want: []string{"hwdownload,format=p010le", "zscale=p=bt709", "hwupload_cuda", "h264_nvenc"}},
+		{name: "VideoToolbox", mode: tonemap.ModeHardware, hwAccel: "videotoolbox", filter: tonemap.HardwareFilterVideoToolbox, sourceKind: tonemap.SourceSDRBT2020, want: []string{"scale_vt", "hwdownload,format=p010le,format=nv12", "h264_videotoolbox"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			args := buildFFmpegArgs(TranscodeOpts{
 				InputPath: "/media/dovi.mkv", OutputDir: t.TempDir(), SourceVideoBitDepth: 10,
+				FFmpegPath:       videoToolboxTestFFmpegFor(t, tt.hwAccel),
 				TargetCodecVideo: "h264", TargetCodecAudio: "aac", TargetResolution: "1080p", HWAccel: tt.hwAccel,
 				ToneMapPolicy: tonemap.PolicyHardwareThenSoftware, ToneMapMode: tt.mode,
 				ToneMapSourceKind: tt.sourceKind, ToneMapFilter: tt.filter, ToneMapRecipeVersion: TransformationHDRToSDRToneMapRecipeVersionV3,
@@ -275,7 +399,7 @@ func TestPrepareSubtitleFilterInputCreatesParserSafeAlias(t *testing.T) {
 	if !strings.Contains(joined, "-i "+inputPath) {
 		t.Fatalf("media input should keep its original path: %s", joined)
 	}
-	if !strings.Contains(joined, "subtitles='"+wantAlias+"':si=2") {
+	if !strings.Contains(joined, "subtitles=filename='"+wantAlias+"':si=2") {
 		t.Fatalf("subtitle filter should use the parser-safe alias: %s", joined)
 	}
 }
@@ -818,7 +942,7 @@ func TestBuildFFmpegArgs_H264High10QSVASSBurnInUsesSoftwareFrames(t *testing.T) 
 	})
 
 	joined := strings.Join(args, " ")
-	want := "-vf format=yuv420p,scale=-2:720,subtitles='/media/high10.mkv':si=0,format=nv12,hwupload,hwmap=derive_device=qsv,format=qsv"
+	want := "-vf format=yuv420p,scale=-2:720,subtitles=filename='/media/high10.mkv':si=0,format=nv12,hwupload,hwmap=derive_device=qsv,format=qsv"
 	if !strings.Contains(joined, want) {
 		t.Fatalf("High 10 ASS burn-in should render on software frames then upload %q: %s", want, joined)
 	}
@@ -1030,7 +1154,7 @@ func TestBuildFFmpegArgs_TextBurnInStillUsesSubtitlesFilter(t *testing.T) {
 	})
 
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "-vf scale=-2:1080,subtitles='/media/movie.mkv':si=1") {
+	if !strings.Contains(joined, "-vf scale=-2:1080,subtitles=filename='/media/movie.mkv':si=1") {
 		t.Fatalf("text burn-in should keep the libass subtitles -vf path: %s", joined)
 	}
 	if strings.Contains(joined, "-filter_complex") {
@@ -1057,7 +1181,7 @@ func TestBuildFFmpegArgs_LegacyBurnInWithoutCodecKeepsTextPath(t *testing.T) {
 	})
 
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "subtitles='/media/movie.mkv':si=0") {
+	if !strings.Contains(joined, "subtitles=filename='/media/movie.mkv':si=0") {
 		t.Fatalf("legacy burn-in without codec should keep the subtitles filter: %s", joined)
 	}
 	if strings.Contains(joined, "-filter_complex") {
@@ -1144,6 +1268,96 @@ func TestResolveEffectiveTranscodeHWAccel(t *testing.T) {
 				t.Fatalf("resolveEffectiveTranscodeHWAccel() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolveEffectiveTranscodeHWAccelVideoToolboxChecksTargetEncoder(t *testing.T) {
+	setupHWAccelTest(t)
+	currentGOOS = "darwin"
+	ffmpeg := writeFakeFFmpeg(t, fakeFFmpegProbe{videotoolbox: true, h264VT: true, smokeOK: true})
+
+	base := TranscodeOpts{
+		FFmpegPath:        ffmpeg.path,
+		HWAccel:           "videotoolbox",
+		SourceVideoCodec:  "h264",
+		TargetBitrateKbps: 2000,
+	}
+
+	h264 := base
+	h264.TargetCodecVideo = "h264"
+	if got := resolveEffectiveTranscodeHWAccel(h264); got != "videotoolbox" {
+		t.Fatalf("H.264 target resolved to %q, want videotoolbox", got)
+	}
+
+	hevc := base
+	hevc.TargetCodecVideo = "hevc"
+	if got := resolveEffectiveTranscodeHWAccel(hevc); got != "none" {
+		t.Fatalf("HEVC target resolved to %q, want software fallback", got)
+	}
+}
+
+func TestNormalizeTranscodeOptsVideoToolboxHonorsCallerDeadline(t *testing.T) {
+	setupHWAccelTest(t)
+	ffmpeg := writeFakeFFmpeg(t, fakeFFmpegProbe{hang: true})
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+	opts := normalizeTranscodeOptsContext(ctx, TranscodeOpts{
+		FFmpegPath:        ffmpeg.path,
+		HWAccel:           transcodeHWVideoToolbox,
+		TargetCodecVideo:  "h264",
+		TargetBitrateKbps: 2000,
+	})
+	if opts.HWAccel != HWAccelNone {
+		t.Fatalf("HWAccel = %q, want software after caller deadline", opts.HWAccel)
+	}
+	if elapsed := time.Since(started); elapsed >= 150*time.Millisecond {
+		t.Fatalf("normalization took %s, want less than the probe command timeout", elapsed)
+	}
+	if ctx.Err() != context.DeadlineExceeded {
+		t.Fatalf("context error = %v, want deadline exceeded", ctx.Err())
+	}
+
+	// Let the bounded shared probe finish before setupHWAccelTest restores its
+	// package globals during cleanup.
+	_ = cachedVideoToolboxProbe(ffmpeg.path)
+}
+
+func TestResolveEffectiveTranscodeHWAccelVideoToolboxUnconstrainedUsesSoftware(t *testing.T) {
+	setupHWAccelTest(t)
+	currentGOOS = "darwin"
+	ffmpeg := writeFakeFFmpeg(t, successfulVideoToolboxProbe())
+
+	unconstrained := TranscodeOpts{
+		FFmpegPath:       ffmpeg.path,
+		HWAccel:          "videotoolbox",
+		SourceVideoCodec: "h264",
+		TargetCodecVideo: "h264",
+	}
+	if got := resolveEffectiveTranscodeHWAccel(unconstrained); got != "none" {
+		t.Fatalf("unconstrained transcode resolved to %q, want software (quality-based CRF)", got)
+	}
+
+	toneMap := unconstrained
+	toneMap.SourceVideoCodec = transcodeCodecHEVC
+	toneMap.SourceVideoProfile = "Main 10"
+	toneMap.SourceVideoBitDepth = 10
+	toneMap.ToneMapMode = tonemap.ModeHardware
+	if got := resolveEffectiveTranscodeHWAccel(toneMap); got != transcodeHWVideoToolbox {
+		t.Fatalf("unconstrained hardware tone map resolved to %q, want VideoToolbox", got)
+	}
+
+	withResolution := unconstrained
+	withResolution.TargetResolution = "720p"
+	if got := resolveEffectiveTranscodeHWAccel(withResolution); got != "videotoolbox" {
+		t.Fatalf("resolution-constrained transcode resolved to %q, want videotoolbox", got)
+	}
+
+	withBitrate := unconstrained
+	withBitrate.TargetBitrateKbps = 2000
+	if got := resolveEffectiveTranscodeHWAccel(withBitrate); got != "videotoolbox" {
+		t.Fatalf("bitrate-constrained transcode resolved to %q, want videotoolbox", got)
 	}
 }
 
@@ -1319,5 +1533,164 @@ func TestAppendAudioArgsBoostsOnlyEncodedSurroundToStereo(t *testing.T) {
 				t.Fatalf("downmix boost present=%t, want %t; args=%s", gotBoost, tt.wantBoost, strings.Join(args, " "))
 			}
 		})
+	}
+}
+
+// videoToolboxTestFFmpeg supplies a fake VideoToolbox-capable ffmpeg so the
+// argument tests validate construction independent of the host OS: the
+// builder's encoder probe must succeed on Linux CI as well as macOS.
+func videoToolboxTestFFmpeg(t *testing.T) string {
+	t.Helper()
+	resetNVENCProbeCacheForTest()
+	t.Cleanup(resetNVENCProbeCacheForTest)
+	return writeFakeFFmpeg(t, successfulVideoToolboxProbe()).path
+}
+
+func videoToolboxTestFFmpegFor(t *testing.T, hwAccel string) string {
+	t.Helper()
+	if hwAccel != transcodeHWVideoToolbox {
+		return ""
+	}
+	return videoToolboxTestFFmpeg(t)
+}
+
+func TestBuildFFmpegArgs_VideoToolboxH264UsesSoftwareFilters(t *testing.T) {
+	args := buildFFmpegArgs(TranscodeOpts{
+		InputPath:         "/media/movie.mkv",
+		OutputDir:         "/tmp/out",
+		SessionID:         "session-vt",
+		FFmpegPath:        videoToolboxTestFFmpeg(t),
+		SourceVideoCodec:  "h264",
+		TargetCodecVideo:  "h264",
+		TargetCodecAudio:  "aac",
+		SegmentDuration:   2,
+		HWAccel:           "videotoolbox",
+		TargetResolution:  "720p",
+		TargetBitrateKbps: 2000,
+	})
+
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-hwaccel videotoolbox") {
+		t.Fatalf("videotoolbox args should enable videotoolbox hwaccel: %s", joined)
+	}
+	if strings.Contains(joined, "-hwaccel_output_format") {
+		t.Fatalf("videotoolbox decode must output software frames: %s", joined)
+	}
+	if !strings.Contains(joined, "-c:v h264_videotoolbox") {
+		t.Fatalf("videotoolbox args should use h264_videotoolbox encoder: %s", joined)
+	}
+	if !strings.Contains(joined, "-pix_fmt yuv420p") {
+		t.Fatalf("videotoolbox h264 should force 8-bit output: %s", joined)
+	}
+	if !strings.Contains(joined, "-vf scale=-2:720") {
+		t.Fatalf("videotoolbox args should use the software scale filter: %s", joined)
+	}
+	if !strings.Contains(joined, "-b:v 2000k -maxrate 2000k -bufsize 4000k") {
+		t.Fatalf("videotoolbox args should include bitrate cap controls: %s", joined)
+	}
+	if !strings.Contains(joined, "-g 60 -keyint_min 60") {
+		t.Fatalf("videotoolbox args should force GOP on segment boundaries: %s", joined)
+	}
+	if strings.Contains(joined, "-preset") {
+		t.Fatalf("videotoolbox encoder does not take x264-style presets: %s", joined)
+	}
+}
+
+func TestBuildFFmpegArgs_VideoToolboxH264UsesPortableDefaultBitrate(t *testing.T) {
+	args := buildFFmpegArgs(TranscodeOpts{
+		InputPath:        "/media/movie.mkv",
+		OutputDir:        "/tmp/out",
+		SessionID:        "session-vt-default-rate",
+		FFmpegPath:       videoToolboxTestFFmpeg(t),
+		SourceVideoCodec: "h264",
+		TargetCodecVideo: "h264",
+		TargetCodecAudio: "aac",
+		SegmentDuration:  2,
+		HWAccel:          "videotoolbox",
+		TargetResolution: "720p",
+	})
+
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-b:v 2000k -maxrate 2000k -bufsize 4000k") {
+		t.Fatalf("uncapped VideoToolbox H.264 should use the portable 720p default bitrate: %s", joined)
+	}
+	if strings.Contains(joined, "-q:v") {
+		t.Fatalf("VideoToolbox must not use Apple-Silicon-only qscale mode: %s", joined)
+	}
+}
+
+func TestBuildFFmpegArgs_VideoToolboxHi10PDecodesInSoftware(t *testing.T) {
+	args := buildFFmpegArgs(TranscodeOpts{
+		InputPath:          "/media/movie.mkv",
+		OutputDir:          "/tmp/out",
+		SessionID:          "session-vt-hi10p",
+		FFmpegPath:         videoToolboxTestFFmpeg(t),
+		SourceVideoCodec:   "h264",
+		SourceVideoProfile: "High 10",
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+		SegmentDuration:    2,
+		HWAccel:            "videotoolbox",
+		TargetBitrateKbps:  2000,
+	})
+
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "-hwaccel videotoolbox") {
+		t.Fatalf("Hi10P source must decode in software (VideoToolbox cannot): %s", joined)
+	}
+	if !strings.Contains(joined, "-c:v h264_videotoolbox") {
+		t.Fatalf("encode should still use the hardware encoder: %s", joined)
+	}
+}
+
+func TestBuildFFmpegArgs_VideoToolboxHEVCKeepsSourceBitDepth(t *testing.T) {
+	args := buildFFmpegArgs(TranscodeOpts{
+		InputPath:        "/media/movie.mkv",
+		OutputDir:        "/tmp/out",
+		SessionID:        "session-vt-hevc",
+		FFmpegPath:       videoToolboxTestFFmpeg(t),
+		SourceVideoCodec: "hevc",
+		TargetCodecVideo: "hevc",
+		TargetCodecAudio: "copy",
+		SegmentDuration:  2,
+		HWAccel:          "videotoolbox",
+		TargetResolution: "1080p",
+	})
+
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-c:v hevc_videotoolbox") {
+		t.Fatalf("videotoolbox args should use hevc_videotoolbox encoder: %s", joined)
+	}
+	if strings.Contains(joined, "-pix_fmt") {
+		t.Fatalf("videotoolbox hevc must not force a pixel format (HDR10 passthrough): %s", joined)
+	}
+	if !strings.Contains(joined, "-b:v 6000k -maxrate 6000k -bufsize 12000k") {
+		t.Fatalf("uncapped videotoolbox hevc should use the portable default bitrate: %s", joined)
+	}
+}
+
+func TestBuildFFmpegArgs_VideoToolboxTextBurnInStaysOnCPUFilters(t *testing.T) {
+	args := buildFFmpegArgs(TranscodeOpts{
+		InputPath:          "/media/movie.mkv",
+		OutputDir:          "/tmp/out",
+		SessionID:          "session-vt-sub",
+		FFmpegPath:         videoToolboxTestFFmpeg(t),
+		SourceVideoCodec:   "h264",
+		TargetCodecVideo:   "h264",
+		TargetCodecAudio:   "aac",
+		SegmentDuration:    2,
+		HWAccel:            "videotoolbox",
+		TargetResolution:   "720p",
+		SubtitleBurnIn:     true,
+		SubtitleTrackIndex: 0,
+		SubtitleCodec:      "subrip",
+	})
+
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "subtitles=") {
+		t.Fatalf("text burn-in should use the subtitles filter: %s", joined)
+	}
+	if strings.Contains(joined, "hwdownload") || strings.Contains(joined, "hwupload") {
+		t.Fatalf("videotoolbox burn-in runs on software frames, no hw round-trip: %s", joined)
 	}
 }

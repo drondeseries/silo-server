@@ -1131,11 +1131,38 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RequireReady {
 		if _, err := session.WaitForManifest(TranscodeStartReadinessTimeout); err != nil {
+			wasRunning := session.IsRunning()
 			_ = session.Close()
-			unlock()
-			slog.ErrorContext(r.Context(), "transcode failed readiness check", "component", "transcodenode", "error", err, "session", req.SessionID, "playback_session_id", req.SessionID)
-			http.Error(w, "transcode did not become ready", http.StatusInternalServerError)
-			return
+			// Mirror the API server's local-transport retry: an early death
+			// under VideoToolbox retries once in software (there is no
+			// alternate render device to move to), so a hardware encoder
+			// session this Mac cannot create does not fail clustered
+			// playback while CPU encoding was available.
+			retryAccel := playback.StartupRetryHWAccel(opts)
+			if wasRunning || retryAccel == opts.HWAccel {
+				unlock()
+				slog.ErrorContext(r.Context(), "transcode failed readiness check", "component", "transcodenode", "error", err, "session", req.SessionID, "playback_session_id", req.SessionID)
+				http.Error(w, "transcode did not become ready", http.StatusInternalServerError)
+				return
+			}
+			slog.WarnContext(r.Context(), "transcode crashed during startup; retrying with software encoding",
+				"component", "transcodenode", "error", err, "session", req.SessionID, "playback_session_id", req.SessionID)
+			retryOpts := opts
+			retryOpts.HWAccel = retryAccel
+			session, err = playback.StartTranscode(context.WithoutCancel(r.Context()), retryOpts)
+			if err != nil {
+				unlock()
+				slog.ErrorContext(r.Context(), "start transcode retry", "component", "transcodenode", "error", err, "session", req.SessionID, "playback_session_id", req.SessionID)
+				http.Error(w, "failed to start transcode", http.StatusInternalServerError)
+				return
+			}
+			if _, retryErr := session.WaitForManifest(TranscodeStartReadinessTimeout); retryErr != nil {
+				_ = session.Close()
+				unlock()
+				slog.ErrorContext(r.Context(), "transcode failed readiness check", "component", "transcodenode", "error", retryErr, "session", req.SessionID, "playback_session_id", req.SessionID)
+				http.Error(w, "transcode did not become ready", http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 
@@ -1400,6 +1427,40 @@ func (s *Server) spawnReconstruct(r *http.Request, sessionID string, requestedSe
 		slog.ErrorContext(r.Context(), "transcode node reconstruct start failed", "component", "transcodenode", "error", err,
 			"session", sessionID, "playback_session_id", sessionID)
 		return nil, err
+	}
+
+	// Readiness is normally the caller's concern, but a VideoToolbox session
+	// can die at encoder init (e.g. a session the hardware cannot create at
+	// these dimensions), and registering the dead session would serve this
+	// media as permanently missing. Mirror handleStart's software retry for
+	// the accel StartupRetryHWAccel would change; other accels keep the
+	// existing register-immediately behavior.
+	if retryAccel := playback.StartupRetryHWAccel(opts); retryAccel != opts.HWAccel {
+		if _, waitErr := session.WaitForManifest(playback.ManifestStartupTimeout); waitErr != nil {
+			if session.IsRunning() {
+				slog.WarnContext(r.Context(), "reconstructed transcode slow to produce a manifest", "component", "transcodenode",
+					"error", waitErr, "session", sessionID, "playback_session_id", sessionID)
+			} else {
+				// Keep the shared output directory: the retry writes into it.
+				_ = session.CloseProcess()
+				slog.WarnContext(r.Context(), "reconstructed transcode crashed during startup; retrying with software encoding",
+					"component", "transcodenode", "error", waitErr, "session", sessionID, "playback_session_id", sessionID)
+				retryOpts := opts
+				retryOpts.HWAccel = retryAccel
+				session, err = playback.StartTranscode(context.WithoutCancel(r.Context()), retryOpts)
+				if err != nil {
+					slog.ErrorContext(r.Context(), "transcode node reconstruct retry failed", "component", "transcodenode", "error", err,
+						"session", sessionID, "playback_session_id", sessionID)
+					return nil, err
+				}
+				if _, retryErr := session.WaitForManifest(playback.ManifestStartupTimeout); retryErr != nil {
+					_ = session.Close()
+					slog.ErrorContext(r.Context(), "reconstructed software retry failed readiness check", "component", "transcodenode", "error", retryErr,
+						"session", sessionID, "playback_session_id", sessionID)
+					return nil, retryErr
+				}
+			}
+		}
 	}
 
 	// Yield to a winner registered by another path; close only the duplicate ffmpeg,

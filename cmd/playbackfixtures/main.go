@@ -528,6 +528,25 @@ func goldenConformanceMatrix() playback.ConformanceMatrixV3 {
 		))
 	}
 
+	constrainedBaselineFile := conformanceFallbackFile()
+	constrainedBaselineFile.Container = containerMKV
+	constrainedBaselineFile.FilePath = "/media/constrained-baseline.mkv"
+	constrainedBaselineFile.VideoTracks[0].Profile = "Constrained Baseline"
+	constrainedBaselineRequest := conformanceStartRequest()
+	constrainedBaselineRequest.PlaybackAttemptID = "attempt-h264-constrained-baseline"
+	constrainedBaselineRequest.QualityPreference = "auto"
+	constrainedBaselineRequest.Capabilities.CodecsVideo = []string{codecH264}
+	constrainedBaselineRequest.Capabilities.CodecsVideoHardware = []string{codecH264}
+	constrainedBaselineRequest.Capabilities.Containers = []string{containerMKV}
+	constrainedBaselineRequest.Capabilities.VideoDecode = []playback.VideoDecodeCapabilityV3{{
+		Codec: codecH264, Profiles: []string{"baseline"}, Levels: []int{52}, BitDepths: []int{8},
+		MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 20_000, Hardware: true,
+	}}
+	planner = append(planner, makePlannerScenario(
+		"h264_constrained_baseline_direct", "profile_compatibility", constrainedBaselineRequest,
+		constrainedBaselineFile, nil, playback.PlannerSettingsV3{TranscodeEnabled: false}, registry,
+	))
+
 	fallbackRequest := conformanceStartRequest()
 	fallbackRequest.Capabilities.VideoEvidence = playback.EvidenceDeclaredV3
 	fallbackRequest.Capabilities.VideoDecode = nil

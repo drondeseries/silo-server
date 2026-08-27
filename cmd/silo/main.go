@@ -397,6 +397,15 @@ func runCompatWebCommand(ctx context.Context, args []string) error {
 	}
 }
 
+// normalizeLoadedConfig repairs derived config values after every load: the
+// DB-seeded default is Jellyfin's Linux-only ffmpeg path, so resolve it
+// through the same discovery the playback pipeline uses. Registered as an
+// OnLoad hook on both config watchers so hot reloads cannot restore the
+// seeded value, and applied to the startup snapshot before the watchers run.
+func normalizeLoadedConfig(cfg *config.Config) {
+	cfg.Playback.FFmpegPath = playback.ResolveFFmpegPath(cfg.Playback.FFmpegPath)
+}
+
 // main starts the Silo server or a requested maintenance command.
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "compat-web" {
@@ -585,6 +594,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("building config: %v", err)
 	}
+	normalizeLoadedConfig(cfg)
 
 	// Step 7: Apply bootstrap overrides
 	cfg.Server.Listen = bc.Listen
@@ -706,6 +716,7 @@ func main() {
 			RedisURL:    bc.RedisURL,
 		}
 		watcher := nodeconfig.NewWatcher(pool, dataCipher, eventBus, bootstrap)
+		watcher.OnLoad(normalizeLoadedConfig)
 		if err := watcher.Start(appCtx); err != nil {
 			slog.Error("config watcher start failed", "error", err)
 			os.Exit(1)
@@ -778,6 +789,7 @@ func main() {
 		JFListen:    bc.JFListen,
 		RedisURL:    bc.RedisURL,
 	})
+	configWatcher.OnLoad(normalizeLoadedConfig)
 	if err := configWatcher.Start(appCtx); err != nil {
 		log.Fatalf("config watcher start: %v", err)
 	}

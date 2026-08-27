@@ -1045,6 +1045,83 @@
     --glass-hover-color: var(--accent);
   }
 
+  /* Detail actions sit directly over large hero artwork. Repainting several
+     live backdrop filters after every button or popover state change blocks
+     scroll compositing on this surface, so retain the glass appearance with
+     an opaque color blend instead of sampling and blurring the backdrop. */
+  .detail-action-bar .glass-subtle {
+    background: color-mix(in srgb, var(--surface) 82%, var(--background));
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  /* The detail overflow menu opens without an entrance transition so it is
+     immediately interactive. Pointer hover is CSS-only. */
+  .detail-overflow-menu {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  /* Rating hover stays entirely in CSS so moving across stars does not
+     schedule React renders or recomposite a live backdrop-filter surface. */
+  .star-rating {
+    contain: layout paint;
+    background: color-mix(in srgb, var(--surface) 82%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border) 30%, transparent);
+    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.05);
+  }
+
+  .star-rating-star {
+    color: color-mix(in srgb, var(--muted-foreground) 50%, transparent);
+  }
+
+  /* The stored rating is the resting state, so it survives a pointer that is
+     inside the pill but not over a star (its padding, the gaps between stars)
+     and it still renders where :has() is unsupported. */
+  .star-rating-star[data-filled="true"] {
+    color: rgb(250 204 21);
+  }
+
+  .star-rating-star[data-filled="true"] svg {
+    fill: currentcolor;
+  }
+
+  /* Hovering a star previews that value instead: clear the stored fill first,
+     then fill up to the hovered position. */
+  .star-rating:has(.star-rating-star:hover) .star-rating-star {
+    color: color-mix(in srgb, var(--muted-foreground) 50%, transparent);
+  }
+
+  .star-rating:has(.star-rating-star:hover) .star-rating-star svg {
+    fill: none;
+  }
+
+  .star-rating:has(.star-rating-star:nth-of-type(1):hover) .star-rating-star:nth-of-type(-n + 1),
+  .star-rating:has(.star-rating-star:nth-of-type(2):hover) .star-rating-star:nth-of-type(-n + 2),
+  .star-rating:has(.star-rating-star:nth-of-type(3):hover) .star-rating-star:nth-of-type(-n + 3),
+  .star-rating:has(.star-rating-star:nth-of-type(4):hover) .star-rating-star:nth-of-type(-n + 4),
+  .star-rating:has(.star-rating-star:nth-of-type(5):hover) .star-rating-star:nth-of-type(-n + 5) {
+    color: rgb(250 204 21);
+  }
+
+  .star-rating:has(.star-rating-star:nth-of-type(1):hover)
+    .star-rating-star:nth-of-type(-n + 1)
+    svg,
+  .star-rating:has(.star-rating-star:nth-of-type(2):hover)
+    .star-rating-star:nth-of-type(-n + 2)
+    svg,
+  .star-rating:has(.star-rating-star:nth-of-type(3):hover)
+    .star-rating-star:nth-of-type(-n + 3)
+    svg,
+  .star-rating:has(.star-rating-star:nth-of-type(4):hover)
+    .star-rating-star:nth-of-type(-n + 4)
+    svg,
+  .star-rating:has(.star-rating-star:nth-of-type(5):hover)
+    .star-rating-star:nth-of-type(-n + 5)
+    svg {
+    fill: currentcolor;
+  }
+
   /* Less-transparent glass for small chips that sit over busy cover art
      (manga count/status pills) so the label stays legible. */
   .glass-chip {

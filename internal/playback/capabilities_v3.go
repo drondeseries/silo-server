@@ -3,6 +3,7 @@ package playback
 import (
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
@@ -111,6 +112,8 @@ func normalizeColorRangeV3(value string) string {
 // transcode.
 const EvidenceInsufficientForDirectV3 = "evidence_insufficient_for_direct"
 
+const h264BaselineProfileV3 = "baseline"
+
 // videoEligibleV3 reports whether the source's video stream is validated for
 // a copy/direct route under the request's video evidence tier. The second
 // result reports that the route was blocked by insufficient evidence for the
@@ -139,7 +142,7 @@ func videoEligibleV3(source SourceDescriptorV3, request StartRequestV3) (bool, b
 			matchedCodec = true
 			skipProfileLevel := request.Capabilities.VideoEvidence == EvidencePlatformAttestedV3 && capability.Hardware
 			if !skipProfileLevel {
-				if len(capability.Profiles) > 0 && (source.VideoProfile == "" || !containsFoldV3(capability.Profiles, source.VideoProfile)) {
+				if len(capability.Profiles) > 0 && !videoProfileSupportedV3(source.VideoCodec, source.VideoProfile, capability.Profiles) {
 					continue
 				}
 				if len(capability.Levels) > 0 && (source.VideoLevel <= 0 || !containsAtLeastV3(capability.Levels, source.VideoLevel)) {
@@ -161,6 +164,46 @@ func videoEligibleV3(source SourceDescriptorV3, request StartRequestV3) (bool, b
 	default:
 		return false, false
 	}
+}
+
+// videoProfileSupportedV3 compares a source profile with the profiles an exact
+// decoder capability reports. Most codecs retain strict case-insensitive
+// equality. H.264 additionally treats Constrained Baseline as a restricted
+// subset of Baseline, so a Baseline decoder validates a Constrained Baseline
+// source; the reverse direction intentionally remains unsupported.
+func videoProfileSupportedV3(codec string, sourceProfile string, decoderProfiles []string) bool {
+	if strings.TrimSpace(sourceProfile) == "" {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(codec), "h264") {
+		return containsFoldV3(decoderProfiles, sourceProfile)
+	}
+
+	source := canonicalH264ProfileV3(sourceProfile)
+	if source == "" {
+		return false
+	}
+	for _, decoderProfile := range decoderProfiles {
+		decoder := canonicalH264ProfileV3(decoderProfile)
+		if decoder == source || source == "constrainedbaseline" && decoder == h264BaselineProfileV3 {
+			return true
+		}
+	}
+	return false
+}
+
+// canonicalH264ProfileV3 removes presentation-only separators while retaining
+// the profile identity. It is deliberately local to H.264 exact-evidence
+// comparison; source descriptors keep the original normalized probe value.
+func canonicalH264ProfileV3(profile string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsSpace(r), r == '-', r == '_', r == '.', r == ':':
+			return -1
+		default:
+			return unicode.ToLower(r)
+		}
+	}, profile)
 }
 
 // routeVideoMetadataCompleteV3 covers the fields every validated route needs.

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -38,8 +39,8 @@ const decodeProbeFixtureBase64 = "AAAAAUABDAH//wIgAAADAJAAAAMAAAMAHpWUCQAAAAFCAQ
 // output. Tests inject it to model individual FFmpeg capabilities and failures.
 type CommandRunner func(context.Context, string, ...string) ([]byte, error)
 
-// probeCacheEntry stores either a permanent positive capability result or a
-// short-lived negative result that is eligible for retry.
+// probeCacheEntry stores either a permanent complete capability result or a
+// short-lived incomplete result that is eligible for retry.
 type probeCacheEntry struct {
 	capabilities Capabilities
 	expiresAt    time.Time
@@ -83,7 +84,7 @@ func probeCached(ctx context.Context, ffmpegPath, hardwareBackend, hardwareDevic
 			return nil, err
 		}
 		entry := probeCacheEntry{capabilities: append(Capabilities(nil), result...)}
-		if len(result) == 0 {
+		if !probeCapabilitiesComplete(result, hardwareBackend) {
 			entry.expiresAt = now().Add(probeNegativeTTL)
 		}
 		probeCache.Lock()
@@ -143,7 +144,7 @@ func probeCacheKey(ffmpegPath, hardwareBackend, hardwareDevice string) string {
 	device := strings.TrimSpace(hardwareDevice)
 	driverIdentities := make([]string, 0)
 	switch backend {
-	case BackendQSV, BackendVAAPI, BackendNVENC:
+	case BackendQSV, BackendVAAPI, BackendNVENC, BackendVideoToolbox:
 		devices := probeDevices(device, backend)
 		driverIdentities = make([]string, 0, len(devices))
 		for _, configuredDevice := range devices {
@@ -153,10 +154,39 @@ func probeCacheKey(ffmpegPath, hardwareBackend, hardwareDevice string) string {
 	return strings.Join([]string{binaryIdentity, backend, device, strings.Join(driverIdentities, ",")}, "\x00")
 }
 
-// probeCacheEntryCurrent reports whether a positive result or unexpired
-// negative result may be reused.
+// probeCacheEntryCurrent reports whether a complete result or unexpired
+// incomplete result may be reused.
 func probeCacheEntryCurrent(entry probeCacheEntry, now time.Time) bool {
-	return len(entry.capabilities) > 0 || now.Before(entry.expiresAt)
+	return entry.expiresAt.IsZero() || now.Before(entry.expiresAt)
+}
+
+// probeCapabilitiesComplete reports whether discovery found a reusable result
+// for every executor class it was asked to inspect. A software capability does
+// not make a missing configured hardware executor permanent: temporary device
+// contention must be retried after the negative-cache interval.
+func probeCapabilitiesComplete(capabilities Capabilities, hardwareBackend string) bool {
+	if !capabilityCoversAllSourceKinds(capabilities, ModeSoftware, BackendSoftware) {
+		return false
+	}
+	backend := strings.ToLower(strings.TrimSpace(hardwareBackend))
+	switch backend {
+	case BackendQSV, BackendVAAPI, BackendNVENC, BackendVideoToolbox:
+		return capabilityCoversAllSourceKinds(capabilities, ModeHardware, backend)
+	default:
+		return true
+	}
+}
+
+func capabilityCoversAllSourceKinds(capabilities Capabilities, mode Mode, backend string) bool {
+	index := slices.IndexFunc(capabilities, func(capability Capability) bool {
+		return capability.Mode == mode && capability.Backend == backend
+	})
+	if index < 0 {
+		return false
+	}
+	return !slices.ContainsFunc(AllSourceKinds(), func(kind SourceKind) bool {
+		return !slices.Contains(capabilities[index].SourceKinds, kind)
+	})
 }
 
 // ProbeTotalTimeout budgets one bounded deadline for every listing and smoke
@@ -165,7 +195,7 @@ func ProbeTotalTimeout(hardwareBackend, hardwareDevice string) time.Duration {
 	commandCount := 2 + len(AllSourceKinds())
 	backend := strings.ToLower(strings.TrimSpace(hardwareBackend))
 	switch backend {
-	case BackendQSV, BackendVAAPI, BackendNVENC:
+	case BackendQSV, BackendVAAPI, BackendNVENC, BackendVideoToolbox:
 		commandCount += len(AllSourceKinds()) * len(probeDevices(hardwareDevice, backend))
 	}
 	return time.Duration(commandCount)*probeCommandTimeout + probeTimeoutSlack
@@ -265,6 +295,9 @@ func probeDevices(value, backend string) []string {
 		if backend == BackendNVENC {
 			return []string{"0"}
 		}
+		if backend == BackendVideoToolbox {
+			return []string{""}
+		}
 		return []string{defaultDRIRenderDevice}
 	}
 	return devices
@@ -292,6 +325,8 @@ func hardwareFilter(backend string) string {
 		return HardwareFilterOpenCL
 	case BackendNVENC:
 		return HardwareFilterCUDA
+	case BackendVideoToolbox:
+		return HardwareFilterVideoToolbox
 	default:
 		return HardwareFilterVAAPI
 	}
@@ -326,6 +361,8 @@ func hardwareProbeAvailable(backend string, filters, encoders []byte) bool {
 		return hasToken(filters, HardwareFilterVAAPI) && hasToken(filters, "scale_vaapi") && hasToken(encoders, "h264_vaapi")
 	case BackendNVENC:
 		return hasToken(filters, HardwareFilterCUDA) && hasToken(filters, "scale_cuda") && hasToken(encoders, "h264_nvenc")
+	case BackendVideoToolbox:
+		return hasToken(filters, HardwareFilterVideoToolbox) && hasToken(filters, "hwdownload") && hasToken(filters, "sidedata") && hasToken(encoders, "h264_videotoolbox")
 	default:
 		return false
 	}
@@ -363,7 +400,7 @@ func softwareSmokeArgs(fixturePath string, kind SourceKind, filterName string) [
 // command for one hardware backend, device, and source kind.
 func hardwareSmokeArgs(fixturePath, backend, hardwareDevice string, kind SourceKind) []string {
 	device := firstDevice(hardwareDevice)
-	if device == "" && backend != BackendNVENC {
+	if device == "" && backend != BackendNVENC && backend != BackendVideoToolbox {
 		device = defaultDRIRenderDevice
 	}
 	base := []string{ffmpegHideBannerArg, ffmpegLogLevelArg, ffmpegErrorLogLevel}
@@ -384,6 +421,8 @@ func hardwareSmokeArgs(fixturePath, backend, hardwareDevice string, kind SourceK
 			cudaDevice = "0"
 		}
 		base = append(base, "-init_hw_device", "cuda=cu:"+cudaDevice, "-filter_hw_device", "cu", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda")
+	case BackendVideoToolbox:
+		base = append(base, "-hwaccel", BackendVideoToolbox, "-hwaccel_output_format", "videotoolbox_vld")
 	}
 	base = append(base,
 		"-f", codecHEVC, "-i", fixturePath,
@@ -396,6 +435,9 @@ func hardwareSmokeArgs(fixturePath, backend, hardwareDevice string, kind SourceK
 // hardwareSmokeFilter builds the backend-specific graph used to validate both
 // HDR and already-SDR Dolby Vision base layers.
 func hardwareSmokeFilter(backend string, kind SourceKind, sourceVideoBitDepth int) string {
+	if backend == BackendVideoToolbox {
+		return SourceParameters(kind) + "," + VideoToolboxFilter("iw", "ih") + "," + VideoToolboxDownloadFilter(sourceVideoBitDepth) + "," + HDRMetadataRemovalFilter()
+	}
 	if backend == BackendNVENC {
 		if IsSDRSource(kind) {
 			return "hwdownload,format=" + NVENCSoftwareFallbackPixelFormat(sourceVideoBitDepth) + "," + SoftwareFilter(kind, "") + ",format=nv12,hwupload_cuda"
@@ -441,6 +483,8 @@ func hardwareEncoder(backend string) string {
 		return "h264_qsv"
 	case BackendVAAPI:
 		return "h264_vaapi"
+	case BackendVideoToolbox:
+		return "h264_videotoolbox"
 	default:
 		return "h264_nvenc"
 	}
