@@ -27,7 +27,11 @@ import { useOptionalAuth } from "@/hooks/useAuth";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { useCatalogItemDetail } from "@/hooks/queries/catalogRead";
-import { useDeleteMediaItem, useRefreshItemMetadata, useWatchedStateMutation } from "@/hooks/queries/items";
+import {
+  useDeleteMediaItem,
+  useRefreshItemMetadata,
+  useWatchedStateMutation,
+} from "@/hooks/queries/items";
 import { type DismissHomeItemVariables, useDismissHomeItem } from "@/hooks/queries/homeDismissals";
 import { useToggleFavorite } from "@/hooks/queries/favorites";
 import { useToggleWatchlist } from "@/hooks/queries/watchlist";

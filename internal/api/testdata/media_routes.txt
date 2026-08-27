@@ -299,6 +299,7 @@ GET /api/v1/markers/items/{id}	non-media
 PUT /api/v1/markers/items/{id}	non-media
 GET /api/v1/metadata/ai/status	non-media
 GET /api/v1/playback/capability	non-media
+POST /api/v1/playback/prefetch	non-media
 POST /api/v1/playback/route-events	non-media
 GET /api/v1/playback/sessions/{session_id}/control/ws	non-media
 POST /api/v1/playback/start	non-media
