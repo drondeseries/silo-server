@@ -447,6 +447,54 @@ func (r *SearchIndexEventRepository) MarkFailed(ctx context.Context, ids []int64
 	return err
 }
 
+// PruneProcessed deletes one bounded batch of processed outbox events older
+// than cutoff and after the caller's keyset cursor. The persisted state
+// watermark is the recovery fence. Dead letters remain observable until a
+// later successful rebuild supersedes them; pending and newer events remain.
+func (r *SearchIndexEventRepository) PruneProcessed(ctx context.Context, provider string, cutoff time.Time, afterID int64, limit int) (deleted, lastID int64, err error) {
+	if r == nil || r.pool == nil || limit <= 0 {
+		return 0, afterID, nil
+	}
+	err = r.pool.QueryRow(ctx, `
+		WITH candidates AS (
+			SELECT events.id
+			FROM catalog_search_index_events AS events
+			JOIN catalog_search_index_state AS state
+			  ON state.provider = events.provider
+			WHERE events.provider = $1
+			  AND events.id <= state.last_processed_event_id
+			  AND events.processed_at < $2
+			  AND events.id > $4
+			  AND (
+			      (events.attempts < $3 AND events.last_error = '')
+			      OR (
+			          events.attempts >= $3
+			          AND events.last_error <> ''
+			          AND state.last_rebuild_at IS NOT NULL
+			          AND state.last_rebuild_at >= events.processed_at
+			      )
+			  )
+			ORDER BY events.id
+			LIMIT $5
+			FOR UPDATE OF events SKIP LOCKED
+		), deleted AS (
+			DELETE FROM catalog_search_index_events AS events
+			USING candidates
+			WHERE events.id = candidates.id
+			RETURNING events.id
+		)
+		SELECT COUNT(*), COALESCE(MAX(id), $4)
+		FROM deleted
+	`, provider, cutoff, searchIndexEventMaxAttempts, afterID, limit).Scan(&deleted, &lastID)
+	if isSearchIndexSchemaUnavailable(err) {
+		return 0, afterID, nil
+	}
+	if err != nil {
+		return 0, afterID, err
+	}
+	return deleted, lastID, nil
+}
+
 func (r *SearchIndexEventRepository) GetState(ctx context.Context, provider string) (SearchIndexState, error) {
 	state := SearchIndexState{Provider: provider}
 	if r == nil || r.pool == nil {
