@@ -391,4 +391,41 @@ describe("MovieContent", () => {
       canEditMarkers: true,
     });
   });
+
+  it("does not pass playHref or restartHref when the movie has no versions or play targets", () => {
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent
+          item={makeMovieItem({
+            versions: [],
+            playback_variants: [],
+            play_content_id: undefined,
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      playHref: undefined,
+      restartHref: undefined,
+    });
+  });
+
+  it("passes playHref when the movie has a play target but no local versions", () => {
+    renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/item/movie-1"]}>
+        <MovieContent
+          item={makeMovieItem({
+            versions: [],
+            playback_variants: [],
+            play_content_id: "virtual-target-1",
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(mocks.capturedActionBarProps.value).toMatchObject({
+      playHref: "/watch/movie-1",
+    });
+  });
 });

@@ -4,7 +4,9 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -370,5 +372,109 @@ func TestStartLocalPlaybackTransportPreservesEpisodeURIOverSeriesCatalogFile(t *
 
 	if requestedTargetURI != "virtual://series/tt11198330/3/2" {
 		t.Fatalf("VirtualMediaResolver received %q, want virtual://series/tt11198330/3/2", requestedTargetURI)
+	}
+}
+
+func TestResolveVirtualPlaybackSourceKeepsUnprobedPinnedFallbackWhenOthersFail(t *testing.T) {
+	pinnedStream := VirtualPlaybackStream{URI: "virtual://movie/1?result=pinned", Resolution: "1080p", CodecVideo: "h264"}
+	alternateStream := VirtualPlaybackStream{URI: "virtual://movie/1?result=alt", Resolution: "1080p", CodecVideo: "h264"}
+
+	h := &PlaybackHandler{
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{pinnedStream, alternateStream}, nil
+		}),
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
+			if path == pinnedStream.URI {
+				return "http://localhost:8080/pinned.mp4", nil
+			}
+			return "", context.DeadlineExceeded
+		}),
+		VirtualPlaybackSourceProber: func(ctx context.Context, streamURL string, transient *models.MediaFile) (*models.MediaFile, error) {
+			// Probing fails for the pinned stream.
+			return nil, context.DeadlineExceeded
+		},
+	}
+
+	stickyKey := "movie-1"
+	h.pinVirtualSticky(stickyKey, pinnedStream.URI)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := &models.MediaFile{ID: 10, ContentID: "movie-1", FilePath: "virtual://movie/1"}
+
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource returned error %v, want fallback to resolved pinned candidate", err)
+	}
+	if resolved.URI != pinnedStream.URI || resolved.URL != "http://localhost:8080/pinned.mp4" {
+		t.Fatalf("resolved source = %#v, want pinned stream fallback", resolved)
+	}
+}
+
+func TestFallbackResolveStaleVirtualSourceRespectsMaxFailoverLimit(t *testing.T) {
+	resolveAttempts := 0
+	streams := make([]VirtualPlaybackStream, 0, 15)
+	for i := 1; i <= 15; i++ {
+		streams = append(streams, VirtualPlaybackStream{
+			URI:        "virtual://movie/1?result=" + string(rune('a'+i)),
+			Resolution: "1080p",
+		})
+	}
+
+	h := &PlaybackHandler{
+		PlaybackConfig: func() config.PlaybackConfig {
+			return config.PlaybackConfig{
+				MaxVirtualFailoverAttempts: 3,
+			}
+		},
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]VirtualPlaybackStream, error) {
+			return streams, nil
+		}),
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
+			resolveAttempts++
+			return "", context.DeadlineExceeded
+		}),
+	}
+
+	file := &models.MediaFile{ID: 10, ContentID: "movie-1", FilePath: "virtual://movie/1?result=dead"}
+	result := h.fallbackResolveStaleVirtualSource(context.Background(), file, 1, "profile-1")
+	if result != nil {
+		t.Fatalf("result = %#v, want nil after all attempts fail", result)
+	}
+	if resolveAttempts != 3 {
+		t.Fatalf("resolve attempts = %d, want exactly max attempts (3)", resolveAttempts)
+	}
+}
+
+func TestMaybeTriggerSubtitleSearchDeduplicatesTransientFilesDistinctly(t *testing.T) {
+	searchedContent := make(chan string, 2)
+	h := &PlaybackHandler{
+		SubtitleSearchInFlight: &sync.Map{},
+		VirtualSubtitleSearcher: func(ctx context.Context, contentID, imdbID, title string, year, season, episode, mediaFileID int, subtitleLanguages []string) {
+			searchedContent <- contentID
+		},
+	}
+
+	fileA := &models.MediaFile{ID: 0, ContentID: "movie-a"}
+	candA := VirtualPlaybackStream{URI: "virtual://movie/a?res=1", SubtitleLanguages: []string{"eng"}}
+
+	fileB := &models.MediaFile{ID: 0, ContentID: "movie-b"}
+	candB := VirtualPlaybackStream{URI: "virtual://movie/b?res=1", SubtitleLanguages: []string{"eng"}}
+
+	// Both files are transient with ID 0. They must both trigger search because candidate URIs differ.
+	h.maybeTriggerSubtitleSearch(context.Background(), fileA, candA)
+	h.maybeTriggerSubtitleSearch(context.Background(), fileB, candB)
+
+	var seen []string
+	for i := 0; i < 2; i++ {
+		select {
+		case id := <-searchedContent:
+			seen = append(seen, id)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for search %d; seen = %v", i+1, seen)
+		}
+	}
+
+	if len(seen) != 2 {
+		t.Fatalf("expected 2 distinct searches, got %d (%v)", len(seen), seen)
 	}
 }
