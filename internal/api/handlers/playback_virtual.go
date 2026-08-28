@@ -464,6 +464,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				// start re-ranks candidates instead of retrying a dead URI.
 				h.unpinVirtualSticky(stickyKey, candidate.URI)
 			}
+			if firstResolved == nil && result != nil {
+				firstResolved = result
+			}
 			slog.WarnContext(r.Context(), "virtual playback candidate failed",
 				"component", "api", "candidate_uri", candidate.URI, "candidate_index", i,
 				"file_id", file.ID, "content_id", file.ContentID, "error", err)
@@ -693,9 +696,15 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 	// Guard against cross-identity candidates: only consider streams that
 	// share the same scheme, host, path, and profile as the original file.
 	streams = filterVirtualPlaybackStreams(file, streams)
+	maxAttempts := h.maxVirtualFailoverAttempts(ctx)
+	attempts := 0
 	for _, stream := range streams {
 		if stream.URI == "" || stream.URI == file.FilePath {
 			continue
+		}
+		attempts++
+		if attempts > maxAttempts {
+			break
 		}
 		resolved, err := h.resolveVirtualCandidateSource(ctx, file, stream, userID, profileID)
 		if err == nil {
@@ -935,13 +944,17 @@ func (h *PlaybackHandler) maybeTriggerSubtitleSearch(
 	if len(file.SubtitleTracks) > 0 || len(file.ExternalSubtitles) > 0 {
 		return
 	}
+	searchKey := any(file.ID)
+	if file.ID <= 0 {
+		searchKey = "virtual:" + file.ContentID + ":" + cand.URI
+	}
 	// Dedupe: one in-flight search per file. Rapid replays or multiple
 	// candidates resolving the same file must not hammer subtitle providers.
-	if _, loaded := h.SubtitleSearchInFlight.LoadOrStore(file.ID, struct{}{}); loaded {
+	if _, loaded := h.SubtitleSearchInFlight.LoadOrStore(searchKey, struct{}{}); loaded {
 		return
 	}
 	go func() {
-		defer h.SubtitleSearchInFlight.Delete(file.ID)
+		defer h.SubtitleSearchInFlight.Delete(searchKey)
 		h.VirtualSubtitleSearcher(
 			context.Background(),
 			file.ContentID,
