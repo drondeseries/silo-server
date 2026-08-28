@@ -170,27 +170,44 @@ func (h *PlaybackHandler) resolveAndProbeVirtualSource(ctx context.Context, file
 		return resolvedCompatVirtualSource{file: file}, nil
 	}
 
-	candidates := []VirtualPlaybackStream{{
-		URI:                 file.FilePath,
-		Resolution:          file.Resolution,
-		CodecVideo:          file.CodecVideo,
-		CodecAudio:          file.CodecAudio,
-		Container:           file.Container,
-		HDR:                 mediaFileHDRString(file),
-		FileSize:            file.FileSize,
-		Bitrate:             file.Bitrate,
-		OwnerInstallationID: file.VirtualOwnerInstallationID,
-	}}
 	parsed, _ := url.Parse(file.FilePath)
-	if parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) == "" && h.VirtualPlaybackStreamLister != nil {
+	hasResult := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) != ""
+
+	candidates := []VirtualPlaybackStream(nil)
+	if hasResult {
+		candidates = []VirtualPlaybackStream{{
+			URI:                 file.FilePath,
+			Resolution:          file.Resolution,
+			CodecVideo:          file.CodecVideo,
+			CodecAudio:          file.CodecAudio,
+			Container:           file.Container,
+			HDR:                 mediaFileHDRString(file),
+			FileSize:            file.FileSize,
+			Bitrate:             file.Bitrate,
+			OwnerInstallationID: file.VirtualOwnerInstallationID,
+		}}
+	} else if h.VirtualPlaybackStreamLister != nil {
 		listCtx, cancel := context.WithTimeout(ctx, compatVirtualListTimeout)
 		streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(listCtx, file.FilePath, userID, profileID, file.VirtualOwnerInstallationID)
 		cancel()
-		if err == nil {
-			if filtered := filterCompatVirtualCandidates(file.FilePath, streams); len(filtered) > 0 {
-				candidates = filtered
-			}
+		if err != nil {
+			return resolvedCompatVirtualSource{}, fmt.Errorf("list virtual playback streams: %w", err)
 		}
+		if filtered := filterCompatVirtualCandidates(file.FilePath, streams); len(filtered) > 0 {
+			candidates = filtered
+		}
+	} else {
+		candidates = []VirtualPlaybackStream{{
+			URI:                 file.FilePath,
+			Resolution:          file.Resolution,
+			CodecVideo:          file.CodecVideo,
+			CodecAudio:          file.CodecAudio,
+			Container:           file.Container,
+			HDR:                 mediaFileHDRString(file),
+			FileSize:            file.FileSize,
+			Bitrate:             file.Bitrate,
+			OwnerInstallationID: file.VirtualOwnerInstallationID,
+		}}
 	}
 	if len(candidates) > compatVirtualMaxProbeAttempts {
 		candidates = candidates[:compatVirtualMaxProbeAttempts]

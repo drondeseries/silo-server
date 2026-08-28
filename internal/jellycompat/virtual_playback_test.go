@@ -2,9 +2,13 @@ package jellycompat
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -123,21 +127,49 @@ type recordingCompatRelay struct {
 	proxiedURL      string
 	proxiedInsecure string
 	body            string
+	proxyErr        error
+	lastRange       string
+	registerCalls   int
 }
 
-func (r *recordingCompatRelay) Proxy(w http.ResponseWriter, _ *http.Request, source string) error {
+func (r *recordingCompatRelay) Proxy(w http.ResponseWriter, req *http.Request, source string) error {
 	r.proxiedURL = source
+	if req != nil {
+		r.lastRange = req.Header.Get("Range")
+	}
+	if r.proxyErr != nil {
+		return r.proxyErr
+	}
+	if r.lastRange != "" {
+		w.Header().Set("Content-Range", "bytes 0-5/19")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, r.body[:6])
+		return nil
+	}
 	_, _ = io.WriteString(w, r.body)
 	return nil
 }
 
-func (r *recordingCompatRelay) ProxyInsecure(w http.ResponseWriter, _ *http.Request, source string) error {
+func (r *recordingCompatRelay) ProxyInsecure(w http.ResponseWriter, req *http.Request, source string) error {
 	r.proxiedInsecure = source
+	if req != nil {
+		r.lastRange = req.Header.Get("Range")
+	}
+	if r.proxyErr != nil {
+		return r.proxyErr
+	}
+	if r.lastRange != "" {
+		w.Header().Set("Content-Range", "bytes 0-5/19")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, r.body[:6])
+		return nil
+	}
 	_, _ = io.WriteString(w, r.body)
 	return nil
 }
 
 func (r *recordingCompatRelay) Register(context.Context, string) (string, func(), error) {
+	r.registerCalls++
 	return "http://127.0.0.1/relay", func() {}, nil
 }
 
@@ -378,4 +410,631 @@ func TestCompatVirtualDVProfileRobustExtraction(t *testing.T) {
 			t.Errorf("compatVirtualDVProfile(%q) = %d, want %d", tc.raw, gotProf, tc.wantProfile)
 		}
 	}
+}
+
+// TestHandlePlaybackInfoThenStreamServesVirtualSource is the end-to-end
+// Plezy-shaped flow that regressed: PlaybackInfo negotiates a virtual item and
+// the client immediately streams it with Static=true + api_key + MediaSourceId
+// and no PlaySessionId. It covers real router authentication (PlaybackSessionAuth),
+// probed metadata persistence, transport lifecycle tracking, and Range streaming.
+func TestHandlePlaybackInfoThenStreamServesVirtualSource(t *testing.T) {
+	codec := NewResourceIDCodec()
+	contentID := "ep-1"
+	placeholderURI := "virtual://series/tt0813715/1/1"
+	boundURI := placeholderURI + "?result=stable"
+	version := catalog.FileVersion{FileID: 42, FilePath: placeholderURI, Container: "virtual", Duration: 3197}
+
+	store := NewPlaybackSessionStore(time.Hour, time.Now)
+	sessionStore := NewSessionStore(time.Hour, nil)
+	const compatToken = "plezy-compat-token"
+	sessionStore.Put(Session{
+		Token:                compatToken,
+		StreamAppUserID:      1,
+		ProfileID:            "profile-1",
+		StreamAppTokenExpiry: time.Now().Add(time.Hour),
+	})
+
+	relay := &recordingCompatRelay{body: "virtual media bytes"}
+	mgr := &virtualBindingSessionManager{
+		testCompatSessionManager: &testCompatSessionManager{sessions: make(map[string]*playback.Session)},
+	}
+	handler := &PlaybackHandler{
+		codec:          codec,
+		content:        &stubContentService{detail: &upstreamItemDetail{ContentID: contentID, Type: "episode", Versions: []catalog.FileVersion{version}}},
+		fileResolver:   testCompatFileResolver{file: &models.MediaFile{ID: 42, FilePath: placeholderURI, Container: "virtual", VirtualOwnerInstallationID: 5}},
+		playbackStore:  store,
+		deviceProfiles: NewDeviceProfileStore(time.Hour, nil),
+		sessionMgr:     mgr,
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{{
+				URI: boundURI, Resolution: "1080p", CodecVideo: "h264", CodecAudio: "dts",
+				Container: "mkv", Bitrate: 6205, OwnerInstallationID: 5,
+			}}, nil
+		}),
+		VirtualMediaResolver: VirtualMediaResolverFunc(func(_ context.Context, uri string, owner, user int, profile string) (string, error) {
+			if uri != boundURI || owner != 5 || user != 1 || profile != "profile-1" {
+				t.Fatalf("resolver identity uri=%q owner=%d user=%d profile=%q", uri, owner, user, profile)
+			}
+			return "https://provider.example/stream", nil
+		}),
+		RemoteStreamRelay: relay,
+	}
+	encodedID := codec.EncodeStringID(EncodedIDItem, contentID)
+	sourceID := codec.EncodeIntID(EncodedIDMediaSource, 42)
+
+	// Construct router pipeline with real PlaybackSessionAuth middleware
+	authMiddleware := PlaybackSessionAuth(sessionStore, store, nil)
+	mux := chi.NewRouter()
+	mux.Use(authMiddleware)
+	mux.Post("/Items/{id}/PlaybackInfo", handler.HandlePlaybackInfo)
+	mux.Get("/Videos/{id}/stream", handler.HandleVideoStream)
+
+	// Step 1: PlaybackInfo with MediaBrowser authorization header
+	infoReq := httptest.NewRequest(http.MethodPost, "/Items/"+encodedID+"/PlaybackInfo?MediaSourceId="+sourceID, strings.NewReader("{}"))
+	infoReq.Header.Set("Authorization", `MediaBrowser Token="`+compatToken+`", Client="Plezy", Version="1.0"`)
+	infoRec := httptest.NewRecorder()
+	mux.ServeHTTP(infoRec, infoReq)
+	if infoRec.Code != http.StatusOK {
+		t.Fatalf("PlaybackInfo status = %d, body=%s", infoRec.Code, infoRec.Body.String())
+	}
+
+	// Verify the negotiated session carries the probed virtual metadata and pinned URI
+	sess, _, ok := store.FindByRoute(compatToken, encodedID)
+	if !ok {
+		t.Fatalf("negotiated session not found by route")
+	}
+	if len(sess.MediaSources) != 1 {
+		t.Fatalf("negotiated media sources = %d, want 1", len(sess.MediaSources))
+	}
+	bound := sess.MediaSources[0]
+	if bound.VirtualSourceURI != boundURI || bound.VirtualSourceOwnerInstallationID != 5 {
+		t.Fatalf("negotiated virtual binding = %q owner %d, want %q owner 5", bound.VirtualSourceURI, bound.VirtualSourceOwnerInstallationID, boundURI)
+	}
+	if bound.Version.Container != "mkv" || bound.Version.CodecVideo != "h264" || bound.Version.CodecAudio != "dts" {
+		t.Fatalf("negotiated version metadata = %+v, want probed mkv/h264/dts", bound.Version)
+	}
+
+	// Step 2: Stream request using Plezy's exact shape (Static=true + api_key + MediaSourceId and Range header, no PlaySessionId)
+	streamReq := httptest.NewRequest(http.MethodGet, "/Videos/"+encodedID+"/stream?Static=true&api_key="+compatToken+"&DeviceId=shield-1&Container=mkv&MediaSourceId="+url.QueryEscape(sourceID), nil)
+	streamReq.Header.Set("Range", "bytes=0-5")
+	streamRec := httptest.NewRecorder()
+	mux.ServeHTTP(streamRec, streamReq)
+
+	if streamRec.Code != http.StatusPartialContent {
+		t.Fatalf("stream status = %d, body=%s", streamRec.Code, streamRec.Body.String())
+	}
+	if got := streamRec.Body.String(); got != "virtua" {
+		t.Fatalf("stream body = %q, want partial relayed bytes 'virtua'", got)
+	}
+	if relay.proxiedURL != "https://provider.example/stream" {
+		t.Fatalf("relayed URL = %q", relay.proxiedURL)
+	}
+	if len(mgr.beginTransportCalls) == 0 {
+		t.Fatal("BeginTransport was not called for virtual stream")
+	}
+	if len(mgr.endTransportCalls) == 0 {
+		t.Fatal("EndTransport was not called for virtual stream")
+	}
+}
+
+type mapCompatFileResolver map[int]*models.MediaFile
+
+func (m mapCompatFileResolver) GetByID(_ context.Context, id int) (*models.MediaFile, error) {
+	if f, ok := m[id]; ok {
+		return f, nil
+	}
+	return nil, errors.New("file not found")
+}
+
+func TestHandlePlaybackInfoMultiVersionVirtualFailure(t *testing.T) {
+	codec := NewResourceIDCodec()
+	contentID := "item-multi"
+	localVer := catalog.FileVersion{FileID: 10, FilePath: "/media/movie.mkv", Container: "mkv", Duration: 3600}
+	brokenVirtualVer := catalog.FileVersion{FileID: 20, FilePath: "virtual://series/broken/1/1", Container: "virtual", Duration: 3600}
+
+	store := NewPlaybackSessionStore(time.Hour, time.Now)
+	files := mapCompatFileResolver{
+		10: &models.MediaFile{ID: 10, FilePath: "/media/movie.mkv", Container: "mkv"},
+		20: &models.MediaFile{ID: 20, FilePath: "virtual://series/broken/1/1", Container: "virtual", VirtualOwnerInstallationID: 5},
+	}
+	handler := &PlaybackHandler{
+		codec:          codec,
+		content:        &stubContentService{detail: &upstreamItemDetail{ContentID: contentID, Type: "movie", Versions: []catalog.FileVersion{localVer, brokenVirtualVer}}},
+		fileResolver:   files,
+		playbackStore:  store,
+		deviceProfiles: NewDeviceProfileStore(time.Hour, nil),
+		sessionMgr:     &virtualBindingSessionManager{testCompatSessionManager: &testCompatSessionManager{sessions: make(map[string]*playback.Session)}},
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return nil, errors.New("provider down")
+		}),
+	}
+	encodedID := codec.EncodeStringID(EncodedIDItem, contentID)
+	localSourceID := codec.EncodeIntID(EncodedIDMediaSource, 10)
+	virtualSourceID := codec.EncodeIntID(EncodedIDMediaSource, 20)
+
+	serveInfo := func(mediaSourceID string) *httptest.ResponseRecorder {
+		target := "/Items/" + encodedID + "/PlaybackInfo"
+		if mediaSourceID != "" {
+			target += "?MediaSourceId=" + mediaSourceID
+		}
+		req := httptest.NewRequest(http.MethodPost, target, strings.NewReader("{}"))
+		routeCtx := chi.NewRouteContext()
+		routeCtx.URLParams.Add("id", encodedID)
+		ctx := context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx)
+		ctx = context.WithValue(ctx, compatSessionKey, &Session{Token: "token-1", StreamAppUserID: 1, ProfileID: "profile-1"})
+		req = req.WithContext(ctx)
+		rec := httptest.NewRecorder()
+		handler.HandlePlaybackInfo(rec, req)
+		return rec
+	}
+
+	// 1. Selecting the local version succeeds despite the broken virtual version
+	recLocal := serveInfo(localSourceID)
+	if recLocal.Code != http.StatusOK {
+		t.Fatalf("local selection status = %d, body = %s", recLocal.Code, recLocal.Body.String())
+	}
+
+	// 2. Unselected listing (MediaSourceId="") returns the working local version, skipping the broken virtual version
+	recAll := serveInfo("")
+	if recAll.Code != http.StatusOK {
+		t.Fatalf("unselected listing status = %d, body = %s", recAll.Code, recAll.Body.String())
+	}
+	sess, _, ok := store.FindByRoute("token-1", encodedID)
+	if !ok {
+		t.Fatalf("session not found")
+	}
+	if len(sess.MediaSources) != 1 || sess.MediaSources[0].FileID != 10 {
+		t.Fatalf("expected 1 working media source (FileID 10), got %+v", sess.MediaSources)
+	}
+
+	// 3. Specifically selecting the broken virtual version returns 503 PlaybackUnavailable
+	recVirtual := serveInfo(virtualSourceID)
+	if recVirtual.Code != http.StatusServiceUnavailable {
+		t.Fatalf("broken virtual selection status = %d, want 503; body = %s", recVirtual.Code, recVirtual.Body.String())
+	}
+}
+
+func TestHandleVideoStreamVirtualRelayFailureReturns502(t *testing.T) {
+	codec := NewResourceIDCodec()
+	contentID := "ep-fail"
+	placeholderURI := "virtual://series/tt0813715/1/1"
+	boundURI := placeholderURI + "?result=stable"
+	version := catalog.FileVersion{FileID: 42, FilePath: boundURI, Container: "mkv", Duration: 3197}
+
+	store := NewPlaybackSessionStore(time.Hour, time.Now)
+	relay := &recordingCompatRelay{proxyErr: errors.New("upstream connection reset")}
+	mgr := &virtualBindingSessionManager{testCompatSessionManager: &testCompatSessionManager{sessions: make(map[string]*playback.Session)}}
+	handler := &PlaybackHandler{
+		codec:          codec,
+		content:        &stubContentService{detail: &upstreamItemDetail{ContentID: contentID, Type: "episode", Versions: []catalog.FileVersion{version}}},
+		fileResolver:   testCompatFileResolver{file: &models.MediaFile{ID: 42, FilePath: placeholderURI, Container: "mkv", VirtualOwnerInstallationID: 5}},
+		playbackStore:  store,
+		deviceProfiles: NewDeviceProfileStore(time.Hour, nil),
+		sessionMgr:     mgr,
+		VirtualMediaResolver: VirtualMediaResolverFunc(func(_ context.Context, _ string, _, _ int, _ string) (string, error) {
+			return "https://provider.example/stream", nil
+		}),
+		RemoteStreamRelay: relay,
+	}
+	encodedID := codec.EncodeStringID(EncodedIDItem, contentID)
+	sourceID := codec.EncodeIntID(EncodedIDMediaSource, 42)
+
+	store.Put(PlaybackSession{
+		ID:          "play-fail",
+		CompatToken: "token-1",
+		ItemID:      contentID,
+		RouteItemID: encodedID,
+		MediaSources: []PlaybackMediaSource{{
+			ID:                               sourceID,
+			FileID:                           42,
+			Version:                          version,
+			SupportsDirectPlay:               true,
+			VirtualSourceURI:                 boundURI,
+			VirtualSourceOwnerInstallationID: 5,
+		}},
+	})
+
+	streamRec := serveStreamWithSession(handler, encodedID, "Static=true&MediaSourceId="+url.QueryEscape(sourceID), "token-1")
+	if streamRec.Code != http.StatusBadGateway {
+		t.Fatalf("stream failure code = %d, want 502; body = %s", streamRec.Code, streamRec.Body.String())
+	}
+	if len(mgr.stopCalls) == 0 {
+		t.Fatal("expected teardown/stop on failed virtual stream")
+	}
+}
+
+func TestHandlePlaybackInfoAllVirtualSourcesFailReturns503(t *testing.T) {
+	codec := NewResourceIDCodec()
+	contentID := "item-all-fail"
+	brokenVirtualVer := catalog.FileVersion{FileID: 20, FilePath: "virtual://series/broken/1/1", Container: "virtual", Duration: 3600}
+
+	store := NewPlaybackSessionStore(time.Hour, time.Now)
+	files := mapCompatFileResolver{
+		20: &models.MediaFile{ID: 20, FilePath: "virtual://series/broken/1/1", Container: "virtual", VirtualOwnerInstallationID: 5},
+	}
+	handler := &PlaybackHandler{
+		codec:          codec,
+		content:        &stubContentService{detail: &upstreamItemDetail{ContentID: contentID, Type: "movie", Versions: []catalog.FileVersion{brokenVirtualVer}}},
+		fileResolver:   files,
+		playbackStore:  store,
+		deviceProfiles: NewDeviceProfileStore(time.Hour, nil),
+		sessionMgr:     &virtualBindingSessionManager{testCompatSessionManager: &testCompatSessionManager{sessions: make(map[string]*playback.Session)}},
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return nil, errors.New("all providers down")
+		}),
+	}
+	encodedID := codec.EncodeStringID(EncodedIDItem, contentID)
+
+	req := httptest.NewRequest(http.MethodPost, "/Items/"+encodedID+"/PlaybackInfo", strings.NewReader("{}"))
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", encodedID)
+	ctx := context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx)
+	ctx = context.WithValue(ctx, compatSessionKey, &Session{Token: "token-1", StreamAppUserID: 1, ProfileID: "profile-1"})
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+	handler.HandlePlaybackInfo(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 PlaybackUnavailable; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleVideoStreamStaticVirtualFailureReturns503(t *testing.T) {
+	codec := NewResourceIDCodec()
+	contentID := "item-static-fail"
+	placeholderURI := "virtual://series/broken/1/1"
+	brokenVirtualVer := catalog.FileVersion{FileID: 20, FilePath: placeholderURI, Container: "virtual", Duration: 3600}
+
+	store := NewPlaybackSessionStore(time.Hour, time.Now)
+	files := mapCompatFileResolver{
+		20: &models.MediaFile{ID: 20, FilePath: placeholderURI, Container: "virtual", VirtualOwnerInstallationID: 5},
+	}
+	handler := &PlaybackHandler{
+		codec:          codec,
+		content:        &stubContentService{detail: &upstreamItemDetail{ContentID: contentID, Type: "movie", Versions: []catalog.FileVersion{brokenVirtualVer}}},
+		fileResolver:   files,
+		playbackStore:  store,
+		deviceProfiles: NewDeviceProfileStore(time.Hour, nil),
+		sessionMgr:     &virtualBindingSessionManager{testCompatSessionManager: &testCompatSessionManager{sessions: make(map[string]*playback.Session)}},
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return nil, errors.New("provider down")
+		}),
+	}
+	encodedID := codec.EncodeStringID(EncodedIDItem, contentID)
+	sourceID := codec.EncodeIntID(EncodedIDMediaSource, 20)
+
+	streamRec := serveStreamWithSession(handler, encodedID, "Static=true&MediaSourceId="+url.QueryEscape(sourceID), "token-1")
+	if streamRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 PlaybackUnavailable; body = %s", streamRec.Code, streamRec.Body.String())
+	}
+}
+
+func writeFastCompatTestFFmpeg(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-ffmpeg-fast.sh")
+	script := "#!/bin/sh\n" +
+		"case \"$2\" in\n" +
+		"  -bsfs) exit 0;;\n" +
+		"  -encoders) printf ' A....D aac AAC\\n'; exit 0;;\n" +
+		"esac\n" +
+		"case \" $* \" in\n" +
+		"  *\" -f lavfi \"*) exit 0;;\n" +
+		"esac\n" +
+		"printf 'fake mp4 remux stream bytes'\n" +
+		"sleep 1\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	return path
+}
+
+func TestHandleVideoStreamVirtualRemuxRegistersInput(t *testing.T) {
+	codec := NewResourceIDCodec()
+	contentID := "ep-remux"
+	placeholderURI := "virtual://series/tt0813715/1/1"
+	boundURI := placeholderURI + "?result=stable"
+	version := catalog.FileVersion{
+		FileID: 42, FilePath: boundURI, Container: "mkv", Duration: 3197,
+		VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}},
+		AudioTracks: []models.AudioTrack{{Codec: "mp3", Channels: 2, Default: true}},
+	}
+
+	ffmpegPath := writeFastCompatTestFFmpeg(t)
+	store := NewPlaybackSessionStore(time.Hour, time.Now)
+	relay := &recordingCompatRelay{}
+	mgr := &virtualBindingSessionManager{testCompatSessionManager: &testCompatSessionManager{sessions: make(map[string]*playback.Session)}}
+	handler := &PlaybackHandler{
+		codec:          codec,
+		content:        &stubContentService{detail: &upstreamItemDetail{ContentID: contentID, Type: "episode", Versions: []catalog.FileVersion{version}}},
+		fileResolver:   testCompatFileResolver{file: &models.MediaFile{ID: 42, FilePath: placeholderURI, Container: "mkv", VirtualOwnerInstallationID: 5}},
+		playbackStore:  store,
+		deviceProfiles: NewDeviceProfileStore(time.Hour, nil),
+		sessionMgr:     mgr,
+		FFmpegPath:     ffmpegPath,
+		VirtualMediaResolver: VirtualMediaResolverFunc(func(_ context.Context, _ string, _, _ int, _ string) (string, error) {
+			return "https://provider.example/stream", nil
+		}),
+		RemoteStreamRelay: relay,
+	}
+	encodedID := codec.EncodeStringID(EncodedIDItem, contentID)
+	sourceID := codec.EncodeIntID(EncodedIDMediaSource, 42)
+
+	store.Put(PlaybackSession{
+		ID:          "play-remux",
+		CompatToken: "token-1",
+		ItemID:      contentID,
+		RouteItemID: encodedID,
+		MediaSources: []PlaybackMediaSource{{
+			ID:                               sourceID,
+			FileID:                           42,
+			Version:                          version,
+			SupportsDirectPlay:               false,
+			SupportsDirectStream:             true,
+			TranscodeAudio:                   true,
+			VirtualSourceURI:                 boundURI,
+			VirtualSourceOwnerInstallationID: 5,
+		}},
+	})
+
+	// Client requests remux (Static is false/omitted)
+	streamRec := serveStreamWithSession(handler, encodedID, "MediaSourceId="+url.QueryEscape(sourceID), "token-1")
+	if streamRec.Code != http.StatusOK {
+		t.Fatalf("stream status = %d, body = %s, want 200", streamRec.Code, streamRec.Body.String())
+	}
+	if got := streamRec.Header().Get("Content-Type"); got != "video/mp4" {
+		t.Fatalf("Content-Type = %q, want video/mp4", got)
+	}
+	if got := streamRec.Body.String(); !strings.Contains(got, "fake mp4 remux stream bytes") {
+		t.Fatalf("stream body = %q, want remux stream bytes", got)
+	}
+	if relay.registerCalls != 1 {
+		t.Fatalf("expected registerVirtualInput to call relay.Register once, got %d", relay.registerCalls)
+	}
+	if len(mgr.beginTransportCalls) == 0 {
+		t.Fatal("BeginTransport was not called for virtual remux")
+	}
+	if len(mgr.endTransportCalls) == 0 {
+		t.Fatal("EndTransport was not called for virtual remux")
+	}
+}
+
+func writeIncompatibleCompatAudioRecipeFFmpeg(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-ffmpeg-incompatible.sh")
+	script := "#!/bin/sh\n" +
+		"case \"$2\" in\n" +
+		"  -bsfs) exit 0;;\n" +
+		"  -encoders) printf ' A....D aac AAC\\n'; exit 0;;\n" +
+		"esac\n" +
+		"case \" $* \" in\n" +
+		"  *\" -f lavfi \"*) exit 1;;\n" +
+		"esac\n" +
+		"printf 'fake mp4 remux stream bytes'\n" +
+		"sleep 1\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ffmpeg: %v", err)
+	}
+	return path
+}
+
+func TestHandleVideoStreamVirtualRemuxGuardsAudioDownmixCapability(t *testing.T) {
+	codec := NewResourceIDCodec()
+	contentID := "ep-downmix-fail"
+	placeholderURI := "virtual://series/tt0813715/1/1"
+	boundURI := placeholderURI + "?result=stable"
+	version := catalog.FileVersion{
+		FileID: 42, FilePath: boundURI, Container: "mkv", Duration: 3197,
+		VideoTracks: []models.VideoTrack{{Codec: "h264", Width: 1920, Height: 1080}},
+		AudioTracks: []models.AudioTrack{{Codec: "dts", Channels: 6, Default: true}},
+	}
+
+	// Fake ffmpeg without required audio_to_aac capability
+	ffmpegPath := writeIncompatibleCompatAudioRecipeFFmpeg(t)
+	store := NewPlaybackSessionStore(time.Hour, time.Now)
+	relay := &recordingCompatRelay{}
+	mgr := &virtualBindingSessionManager{testCompatSessionManager: &testCompatSessionManager{sessions: make(map[string]*playback.Session)}}
+	handler := &PlaybackHandler{
+		codec:          codec,
+		content:        &stubContentService{detail: &upstreamItemDetail{ContentID: contentID, Type: "episode", Versions: []catalog.FileVersion{version}}},
+		fileResolver:   testCompatFileResolver{file: &models.MediaFile{ID: 42, FilePath: placeholderURI, Container: "mkv", VirtualOwnerInstallationID: 5}},
+		playbackStore:  store,
+		deviceProfiles: NewDeviceProfileStore(time.Hour, nil),
+		sessionMgr:     mgr,
+		FFmpegPath:     ffmpegPath,
+		VirtualMediaResolver: VirtualMediaResolverFunc(func(_ context.Context, _ string, _, _ int, _ string) (string, error) {
+			return "https://provider.example/stream", nil
+		}),
+		RemoteStreamRelay: relay,
+	}
+	encodedID := codec.EncodeStringID(EncodedIDItem, contentID)
+	sourceID := codec.EncodeIntID(EncodedIDMediaSource, 42)
+
+	store.Put(PlaybackSession{
+		ID:          "play-downmix",
+		CompatToken: "token-1",
+		ItemID:      contentID,
+		RouteItemID: encodedID,
+		MediaSources: []PlaybackMediaSource{{
+			ID:                               sourceID,
+			FileID:                           42,
+			Version:                          version,
+			SupportsDirectPlay:               false,
+			SupportsDirectStream:             true,
+			TranscodeAudio:                   true,
+			VirtualSourceURI:                 boundURI,
+			VirtualSourceOwnerInstallationID: 5,
+		}},
+	})
+
+	// Audio-v2 route for surround remux
+	target := "/Videos/" + encodedID + "/audio-v2/stream?MediaSourceId=" + url.QueryEscape(sourceID)
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", encodedID)
+	ctx := context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx)
+	ctx = context.WithValue(ctx, compatSessionKey, &Session{Token: "token-1", StreamAppUserID: 1, ProfileID: "profile-1"})
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	handler.HandleAudioV2VideoStream(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 TranscodeUnavailable; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "TranscodeUnavailable") {
+		t.Fatalf("body = %s, want TranscodeUnavailable error", rec.Body.String())
+	}
+	if len(mgr.stopCalls) == 0 {
+		t.Fatal("expected session teardown on audio capability failure")
+	}
+}
+
+func TestHandleVideoStreamFallbackVirtualBindingPersistsAndBindsUpstream(t *testing.T) {
+	codec := NewResourceIDCodec()
+	contentID := "ep-fallback-bind"
+	placeholderURI := "virtual://series/tt0813715/1/1"
+	boundURI := placeholderURI + "?result=stable"
+	version := catalog.FileVersion{FileID: 42, FilePath: placeholderURI, Container: "virtual", Duration: 3197}
+
+	store := NewPlaybackSessionStore(time.Hour, time.Now)
+	relay := &recordingCompatRelay{body: "virtual media bytes"}
+	mgr := &virtualBindingSessionManager{testCompatSessionManager: &testCompatSessionManager{sessions: make(map[string]*playback.Session)}}
+	listerCalls := 0
+	handler := &PlaybackHandler{
+		codec:          codec,
+		content:        &stubContentService{detail: &upstreamItemDetail{ContentID: contentID, Type: "episode", Versions: []catalog.FileVersion{version}}},
+		fileResolver:   testCompatFileResolver{file: &models.MediaFile{ID: 42, FilePath: placeholderURI, Container: "virtual", VirtualOwnerInstallationID: 5}},
+		playbackStore:  store,
+		deviceProfiles: NewDeviceProfileStore(time.Hour, nil),
+		sessionMgr:     mgr,
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			listerCalls++
+			return []VirtualPlaybackStream{{
+				URI: boundURI, Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac",
+				Container: "mkv", Bitrate: 6205, OwnerInstallationID: 5,
+			}}, nil
+		}),
+		VirtualMediaResolver: VirtualMediaResolverFunc(func(_ context.Context, uri string, owner, user int, profile string) (string, error) {
+			if uri != boundURI || owner != 5 {
+				t.Fatalf("unexpected resolver args uri=%q owner=%d", uri, owner)
+			}
+			return "https://provider.example/stream", nil
+		}),
+		RemoteStreamRelay: relay,
+	}
+	encodedID := codec.EncodeStringID(EncodedIDItem, contentID)
+	sourceID := codec.EncodeIntID(EncodedIDMediaSource, 42)
+
+	// Existing session without VirtualSourceURI (legacy/unbound negotiation)
+	store.Put(PlaybackSession{
+		ID:          "play-fallback",
+		CompatToken: "token-1",
+		ItemID:      contentID,
+		RouteItemID: encodedID,
+		MediaSources: []PlaybackMediaSource{{
+			ID:                               sourceID,
+			FileID:                           42,
+			Version:                          version,
+			SupportsDirectPlay:               true,
+			VirtualSourceURI:                 "", // Intentionally empty to trigger fallback repair
+			VirtualSourceOwnerInstallationID: 0,
+		}},
+	})
+
+	// First stream request repairs binding and starts upstream playback
+	streamRec1 := serveStreamWithSession(handler, encodedID, "PlaySessionId=play-fallback&MediaSourceId="+url.QueryEscape(sourceID), "token-1")
+	if streamRec1.Code != http.StatusOK {
+		t.Fatalf("first stream status = %d, body = %s, want 200", streamRec1.Code, streamRec1.Body.String())
+	}
+	if listerCalls != 1 {
+		t.Fatalf("expected 1 lister call, got %d", listerCalls)
+	}
+	if mgr.boundURI != boundURI || mgr.boundOwner != 5 {
+		t.Fatalf("upstream session bound source = %q owner %d, want %q owner 5", mgr.boundURI, mgr.boundOwner, boundURI)
+	}
+
+	// Verify session was persisted with the repaired virtual binding
+	persisted, ok := store.Get("play-fallback")
+	if !ok || len(persisted.MediaSources) != 1 {
+		t.Fatalf("persisted session missing or invalid: %+v", persisted)
+	}
+	if persisted.MediaSources[0].VirtualSourceURI != boundURI || persisted.MediaSources[0].VirtualSourceOwnerInstallationID != 5 {
+		t.Fatalf("persisted virtual binding = %q owner %d, want %q owner 5", persisted.MediaSources[0].VirtualSourceURI, persisted.MediaSources[0].VirtualSourceOwnerInstallationID, boundURI)
+	}
+
+	// Second stream request (e.g. range / seek) reuses the persisted binding without re-listing
+	streamRec2 := serveStreamWithSession(handler, encodedID, "PlaySessionId=play-fallback&MediaSourceId="+url.QueryEscape(sourceID), "token-1")
+	if streamRec2.Code != http.StatusOK {
+		t.Fatalf("second stream status = %d, body = %s, want 200", streamRec2.Code, streamRec2.Body.String())
+	}
+	if listerCalls != 1 {
+		t.Fatalf("expected listerCalls to remain 1 on replay, got %d", listerCalls)
+	}
+}
+
+func TestHandleVideoStreamFallbackVirtualResolutionFailureReturns502(t *testing.T) {
+	codec := NewResourceIDCodec()
+	contentID := "ep-fallback-err"
+	placeholderURI := "virtual://series/tt0813715/1/1"
+	version := catalog.FileVersion{FileID: 42, FilePath: placeholderURI, Container: "virtual", Duration: 3197}
+
+	store := NewPlaybackSessionStore(time.Hour, time.Now)
+	mgr := &virtualBindingSessionManager{testCompatSessionManager: &testCompatSessionManager{sessions: make(map[string]*playback.Session)}}
+	handler := &PlaybackHandler{
+		codec:          codec,
+		content:        &stubContentService{detail: &upstreamItemDetail{ContentID: contentID, Type: "episode", Versions: []catalog.FileVersion{version}}},
+		fileResolver:   testCompatFileResolver{file: &models.MediaFile{ID: 42, FilePath: placeholderURI, Container: "virtual", VirtualOwnerInstallationID: 5}},
+		playbackStore:  store,
+		deviceProfiles: NewDeviceProfileStore(time.Hour, nil),
+		sessionMgr:     mgr,
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(context.Context, string, int, string, int) ([]VirtualPlaybackStream, error) {
+			return nil, errors.New("upstream provider failure")
+		}),
+		RemoteStreamRelay: &recordingCompatRelay{},
+	}
+	encodedID := codec.EncodeStringID(EncodedIDItem, contentID)
+	sourceID := codec.EncodeIntID(EncodedIDMediaSource, 42)
+
+	store.Put(PlaybackSession{
+		ID:          "play-fallback-err",
+		CompatToken: "token-1",
+		ItemID:      contentID,
+		RouteItemID: encodedID,
+		MediaSources: []PlaybackMediaSource{{
+			ID:                               sourceID,
+			FileID:                           42,
+			Version:                          version,
+			SupportsDirectPlay:               true,
+			VirtualSourceURI:                 "",
+			VirtualSourceOwnerInstallationID: 0,
+		}},
+	})
+
+	streamRec := serveStreamWithSession(handler, encodedID, "PlaySessionId=play-fallback-err&MediaSourceId="+url.QueryEscape(sourceID), "token-1")
+	if streamRec.Code != http.StatusBadGateway {
+		t.Fatalf("stream status = %d, want 502 Bad Gateway; body = %s", streamRec.Code, streamRec.Body.String())
+	}
+	if len(mgr.beginTransportCalls) != 0 {
+		t.Fatal("transport was started unexpectedly on failed fallback resolution")
+	}
+}
+
+// serveStreamWithSession issues a GET /Videos/{id}/stream with the chi "id" route
+// param and an injected compat session carrying the given token, bypassing
+// middleware auth for focused handler tests.
+func serveStreamWithSession(handler *PlaybackHandler, encodedID, rawQuery, token string) *httptest.ResponseRecorder {
+	target := "/Videos/" + encodedID + "/stream"
+	if rawQuery != "" {
+		target += "?" + rawQuery
+	}
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", encodedID)
+	ctx := context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx)
+	ctx = context.WithValue(ctx, compatSessionKey, &Session{Token: token, StreamAppUserID: 1, ProfileID: "profile-1"})
+	req = req.WithContext(ctx)
+
+	rec := httptest.NewRecorder()
+	handler.HandleVideoStream(rec, req)
+	return rec
 }

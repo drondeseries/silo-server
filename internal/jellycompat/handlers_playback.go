@@ -1704,8 +1704,8 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 	if req.MediaSourceID != "" {
 		matched := false
 		for _, version := range detail.Versions {
-			candidate := h.buildPlaybackSource(routeItemID, playSessionID, version, profile, req, allow4KTranscode)
-			if mediaSourceIDsEqual(candidate.ID, req.MediaSourceID) {
+			candidateID := h.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
+			if mediaSourceIDsEqual(candidateID, req.MediaSourceID) {
 				matched = true
 				break
 			}
@@ -1719,12 +1719,32 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 			req.MediaSourceID = ""
 		}
 	}
+	hadVirtualPrepErr := false
 	for _, version := range detail.Versions {
-		source := h.buildPlaybackSource(routeItemID, playSessionID, version, profile, req, allow4KTranscode)
-		if req.MediaSourceID != "" && !mediaSourceIDsEqual(source.ID, req.MediaSourceID) {
+		sourceID := h.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
+		if req.MediaSourceID != "" && !mediaSourceIDsEqual(sourceID, req.MediaSourceID) {
 			continue
 		}
-		if source.SupportsTranscoding && !source.TranscodeAudio && compatVersionRequiresToneMap(version) {
+
+		prepared := version
+		virtualURI := ""
+		virtualOwnerID := 0
+		if isCompatVirtualPath(version.FilePath) || strings.EqualFold(strings.TrimSpace(version.Container), "virtual") {
+			var prepErr error
+			prepared, virtualURI, virtualOwnerID, prepErr = h.prepareVirtualPlaybackVersion(r.Context(), session, version)
+			if prepErr != nil {
+				hadVirtualPrepErr = true
+				if req.MediaSourceID != "" {
+					writeError(w, http.StatusServiceUnavailable, "PlaybackUnavailable", "Failed to resolve virtual playback source")
+					return
+				}
+				slog.WarnContext(r.Context(), "jellycompat virtual playback version preparation failed", "component", "jellycompat",
+					"file_id", version.FileID, "error", prepErr)
+				continue
+			}
+		}
+		source := h.buildPlaybackSourceWithVirtual(routeItemID, playSessionID, prepared, profile, req, allow4KTranscode, virtualURI, virtualOwnerID)
+		if source.SupportsTranscoding && !source.TranscodeAudio && compatVersionRequiresToneMap(prepared) {
 			if !toneMapPolicyLoaded {
 				var policyErr error
 				toneMapPolicy, policyErr = h.toneMapPolicyResult(r.Context())
@@ -1817,6 +1837,10 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 	}
 
 	if len(sourceDTOs) == 0 {
+		if hadVirtualPrepErr {
+			writeError(w, http.StatusServiceUnavailable, "PlaybackUnavailable", "Failed to resolve virtual playback source")
+			return
+		}
 		writeError(w, http.StatusNotFound, "NotFound", "Media source not found")
 		return
 	}
@@ -1891,6 +1915,25 @@ func (h *PlaybackHandler) buildPlaybackSource(
 	req playbackInfoRequest,
 	allow4KTranscode bool,
 ) PlaybackMediaSource {
+	return h.buildPlaybackSourceWithVirtual(routeItemID, playSessionID, version, profile, req, allow4KTranscode, "", 0)
+}
+
+// buildPlaybackSourceWithVirtual is buildPlaybackSource plus the provider-neutral
+// virtual binding resolved (and probed) during PlaybackInfo. virtualURI carries
+// the pinned candidate URI (e.g. "...&result=stable") and ownerID the owning
+// plugin installation so the stream handler can resolve just-in-time instead of
+// re-listing candidates. A virtual source is always served through the relay —
+// never by opening the raw path — so its advertised capabilities must permit
+// direct streaming regardless of local file availability.
+func (h *PlaybackHandler) buildPlaybackSourceWithVirtual(
+	routeItemID, playSessionID string,
+	version catalog.FileVersion,
+	profile DeviceProfile,
+	req playbackInfoRequest,
+	allow4KTranscode bool,
+	virtualURI string,
+	virtualOwnerID int,
+) PlaybackMediaSource {
 	sourceID := h.codec.EncodeIntID(EncodedIDMediaSource, int64(version.FileID))
 	enableDirectPlay := boolDefault(req.EnableDirectPlay, true)
 	enableDirectStream := boolDefault(req.EnableDirectStream, true)
@@ -1923,17 +1966,19 @@ func (h *PlaybackHandler) buildPlaybackSource(
 	}
 
 	return PlaybackMediaSource{
-		ID:                         sourceID,
-		FileID:                     version.FileID,
-		Version:                    version,
-		SupportsDirectPlay:         supportsDirectPlay,
-		SupportsDirectStream:       supportsDirectStream,
-		SupportsTranscoding:        supportsTranscoding,
-		TranscodeAudio:             transcodeAudio,
-		DefaultAudioStreamIndex:    audioIndex,
-		SelectedAudioStreamIndex:   selectedAudioIndex,
-		DefaultSubtitleStreamIndex: subtitleIndex,
-		ETag:                       mediaSourceETag(version),
+		ID:                               sourceID,
+		FileID:                           version.FileID,
+		Version:                          version,
+		SupportsDirectPlay:               supportsDirectPlay,
+		SupportsDirectStream:             supportsDirectStream,
+		SupportsTranscoding:              supportsTranscoding,
+		TranscodeAudio:                   transcodeAudio,
+		DefaultAudioStreamIndex:          audioIndex,
+		SelectedAudioStreamIndex:         selectedAudioIndex,
+		DefaultSubtitleStreamIndex:       subtitleIndex,
+		ETag:                             mediaSourceETag(version),
+		VirtualSourceURI:                 virtualURI,
+		VirtualSourceOwnerInstallationID: virtualOwnerID,
 	}
 }
 
