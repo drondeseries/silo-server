@@ -80,6 +80,7 @@ function TrailerCard({ video, onPlay }: { video: ItemVideo; onPlay: () => void }
           alt={label}
           className="h-full w-full object-cover transition-transform duration-300 group-hover/trailer:scale-105"
           loading="lazy"
+          decoding="async"
         />
         <div className="absolute inset-0 flex items-center justify-center bg-black/0 transition-colors duration-200 group-hover/trailer:bg-black/30">
           <span className="flex h-11 w-11 items-center justify-center rounded-full bg-black/60 opacity-0 backdrop-blur-sm transition-opacity duration-200 group-hover/trailer:opacity-100 group-focus-visible/trailer:opacity-100">

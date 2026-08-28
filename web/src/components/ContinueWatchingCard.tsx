@@ -242,6 +242,7 @@ export default function ContinueWatchingCard(props: ContinueWatchingCardProps) {
                 alt={heading}
                 className="h-full w-full object-cover transition-transform duration-300 group-hover/media:scale-105"
                 loading="lazy"
+                decoding="async"
               />
             ) : (
               <div className="text-muted-foreground bg-surface flex h-full w-full items-center justify-center text-sm">

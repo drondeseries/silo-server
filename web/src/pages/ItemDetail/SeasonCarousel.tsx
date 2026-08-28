@@ -72,6 +72,7 @@ export default function SeasonCarousel({ seasons }: SeasonCarouselProps) {
                             alt={getSeasonDisplayTitle(season)}
                             className="h-full w-full object-cover transition-transform duration-300 group-hover/season:scale-105"
                             loading="lazy"
+                            decoding="async"
                           />
                         ) : (
                           <div className="text-muted-foreground bg-surface flex h-full items-center justify-center p-4 text-center text-sm font-medium">

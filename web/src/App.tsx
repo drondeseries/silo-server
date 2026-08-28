@@ -1,4 +1,12 @@
-import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   createBrowserRouter,
   createRoutesFromElements,
@@ -162,7 +170,10 @@ const HOT_ROUTE_CHUNKS: readonly RouteChunkImport[] = [
  */
 function useScrollRestoration() {
   const { pathname } = useLocation();
-  useEffect(() => {
+  // Layout effect, not effect: after paint the browser has already shown one
+  // frame of the new route at the old route's scroll offset, which reads as
+  // a jump to the top rather than an arrival at it.
+  useLayoutEffect(() => {
     window.scrollTo(0, 0);
   }, [pathname]);
 }

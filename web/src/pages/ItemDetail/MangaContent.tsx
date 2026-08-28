@@ -159,6 +159,7 @@ function MangaRow({
             src={chapter.poster_url}
             alt=""
             loading="lazy"
+            decoding="async"
             className="h-12 w-8 flex-shrink-0 rounded object-cover"
           />
         ) : (

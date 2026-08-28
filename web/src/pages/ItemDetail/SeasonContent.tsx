@@ -3,7 +3,7 @@ import { Link, useNavigate } from "react-router";
 import type { ItemDetail } from "@/api/types";
 import { useItemEpisodes } from "@/hooks/queries/episodes";
 import { prefetchVirtualPlayback } from "@/hooks/queries/catalogRead";
-import { useRefreshItemMetadata, useWatchedStateMutation } from "@/hooks/queries/items";
+import { useRefreshItemMetadata } from "@/hooks/queries/items";
 import { useAmbientColor } from "@/hooks/useAmbientColor";
 import { useAuth } from "@/hooks/useAuth";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
@@ -15,11 +15,10 @@ import EditMetadataDialog from "@/components/EditMetadataDialog";
 import PageBack from "@/components/PageBack";
 import DetailHero from "./DetailHero";
 import MetadataBadges from "./components/MetadataBadges";
-import ActionBar from "./components/ActionBar";
+import WatchedActionBar from "./components/WatchedActionBar";
 import DetailBreadcrumb from "./components/DetailBreadcrumb";
 import SeasonEpisodeGrid from "./components/SeasonEpisodeGrid";
 import type { EpisodeNavigationState } from "./itemDetailLayout";
-import { getWatchedActionLabel } from "./watchedState";
 import { canCurateMetadata as canCurateMetadataForUser } from "@/lib/permissions";
 
 function seasonLabel(seasonNumber: number, title?: string) {
@@ -38,7 +37,6 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
   const { profile: currentProfile } = useCurrentProfile();
   const canCurateMetadata = canCurateMetadataForUser(user, currentProfile);
   const [editOpen, setEditOpen] = useState(false);
-  const watchedMutation = useWatchedStateMutation(item);
   const refreshMetadataMutation = useRefreshItemMetadata();
 
   const {
@@ -120,13 +118,11 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
         overviewTranslating={overviewTranslating}
         onTranslateOverview={onTranslateOverview}
         actions={
-          <ActionBar
+          <WatchedActionBar
+            item={item}
             contentId={item.content_id}
             playHref={firstEpisode ? `/watch/${firstEpisode.content_id}` : undefined}
             playLabel="Play First Episode"
-            watchedLabel={getWatchedActionLabel(item)}
-            onToggleWatched={() => watchedMutation.mutate(!(item.user_data?.played ?? false))}
-            isUpdatingWatched={watchedMutation.isPending}
             onRefresh={
               canCurateMetadata
                 ? (mode) =>

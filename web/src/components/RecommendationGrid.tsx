@@ -28,6 +28,8 @@ function RecommendationItemCard({ itemId }: RecommendationItemCardProps) {
               <img
                 src={item.poster_url}
                 alt={item.title}
+                loading="lazy"
+                decoding="async"
                 className="h-full w-full object-cover transition-transform group-hover:scale-105"
               />
             ) : (
