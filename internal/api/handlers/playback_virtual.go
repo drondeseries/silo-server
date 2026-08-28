@@ -20,7 +20,6 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/models"
-	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"golang.org/x/text/language"
 )
@@ -200,22 +199,6 @@ func bestResultCacheKey(contentID, neutralURI string, ownerInstallationID int) s
 
 type VirtualPlaybackResolver interface {
 	ResolveVirtualPlayback(ctx context.Context, virtualPath string, userID int, profileID string, ownerInstallationID int) (string, error)
-}
-
-type virtualPlaybackSessionFileResolver interface {
-	VirtualPlaybackSessionFile(*models.MediaFile, *playback.Session) *models.MediaFile
-}
-
-func virtualPlaybackSessionFile(file *models.MediaFile, session *playback.Session) *models.MediaFile {
-	if file == nil || session == nil || session.VirtualSourceURI == "" {
-		return file
-	}
-	copy := *file
-	copy.FilePath = session.VirtualSourceURI
-	if session.VirtualSourceOwnerInstallationID > 0 {
-		copy.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
-	}
-	return &copy
 }
 
 type VirtualPlaybackResolverFunc func(context.Context, string, int, string, int) (string, error)
@@ -761,52 +744,6 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	return &resolved, nil
 }
 
-func (h *PlaybackHandler) probeVirtualSessionFile(ctx context.Context, file *models.MediaFile, session *playback.Session) (*models.MediaFile, string, error) {
-	file = virtualPlaybackSessionFile(file, session)
-	if !isVirtualPlaybackFile(file) {
-		return file, "", nil
-	}
-	if h.VirtualMediaResolver == nil || h.VirtualPlaybackSourceProber == nil {
-		return file, "", errors.New("virtual playback probing is not configured")
-	}
-	resolved, err := resolveVirtualMediaPath(
-		ctx, h.VirtualMediaResolver, file.FilePath, file.VirtualOwnerInstallationID,
-		session.UserID, session.ProfileID,
-	)
-	if err != nil {
-		return file, "", err
-	}
-	probed, err := h.VirtualPlaybackSourceProber(ctx, resolved, file)
-	if err != nil {
-		return file, "", err
-	}
-	return probed, resolved, nil
-}
-
-func virtualPlaybackAlternatives(
-	ctx context.Context,
-	lister VirtualPlaybackStreamLister,
-	file *models.MediaFile,
-	userID int,
-	profileID string,
-) []VirtualPlaybackStream {
-	if lister == nil || file == nil {
-		return nil
-	}
-	listCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	defer cancel()
-	streams, err := lister.ListVirtualPlaybackStreams(
-		listCtx, file.FilePath, userID, profileID, file.VirtualOwnerInstallationID,
-	)
-	if err != nil {
-		return nil
-	}
-	if len(streams) > maxVirtualPlaybackStreams {
-		streams = streams[:maxVirtualPlaybackStreams]
-	}
-	return filterVirtualPlaybackStreams(file, streams)
-}
-
 func filterVirtualPlaybackStreams(file *models.MediaFile, streams []VirtualPlaybackStream) []VirtualPlaybackStream {
 	if file == nil {
 		return nil
@@ -905,28 +842,6 @@ func virtualPlaybackNeutralKey(virtualPath string) string {
 	q.Del("result")
 	parsed.RawQuery = q.Encode()
 	return parsed.String()
-}
-
-func isHLSVirtualStreamURL(streamURL string) bool {
-	u, err := url.Parse(streamURL)
-	if err != nil {
-		return strings.Contains(strings.ToLower(streamURL), ".m3u8")
-	}
-	return strings.Contains(strings.ToLower(u.Path), ".m3u8") || strings.Contains(strings.ToLower(u.RawQuery), ".m3u8")
-}
-
-// hasReliableCodecs returns true when the candidate carries explicit codec
-// metadata (parsed from provider information, not just a filename guess).
-// HLS streams with known codecs can skip ffprobe entirely.
-func (s VirtualPlaybackStream) hasReliableCodecs() bool {
-	if s.CodecVideo != "" && s.Resolution != "" {
-		return true
-	}
-	// Audio-only streams with a declared codec can also skip probing.
-	if s.CodecAudio != "" && s.Resolution == "" {
-		return true
-	}
-	return false
 }
 
 // maybeTriggerSubtitleSearch kicks off a background subtitle search when a

@@ -61,7 +61,7 @@ func TestCopySeekAnchorRetrySkipsWhenContextDone(t *testing.T) {
 	}
 
 	if attempts != 1 {
-		t.Fatalf("attempts = %d, want 1 when context is already cancelled", attempts)
+		t.Fatalf("attempts = %d, want 1 when context is already canceled", attempts)
 	}
 }
 

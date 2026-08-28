@@ -224,12 +224,9 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			proxy := &httputil.ReverseProxy{
-				Director: func(req *http.Request) {
-					req.URL.Scheme = targetURL.Scheme
-					req.URL.Host = targetURL.Host
-					req.URL.Path = targetURL.Path
-					req.URL.RawQuery = targetURL.RawQuery
-					req.Host = targetURL.Host
+				Rewrite: func(pr *httputil.ProxyRequest) {
+					pr.SetURL(targetURL)
+					pr.Out.Host = targetURL.Host
 				},
 			}
 			proxy.ServeHTTP(w, r)

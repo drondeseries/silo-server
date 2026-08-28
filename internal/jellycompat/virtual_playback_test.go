@@ -427,12 +427,14 @@ func TestHandlePlaybackInfoThenStreamServesVirtualSource(t *testing.T) {
 	store := NewPlaybackSessionStore(time.Hour, time.Now)
 	sessionStore := NewSessionStore(time.Hour, nil)
 	const compatToken = "plezy-compat-token"
-	sessionStore.Put(Session{
+	if err := sessionStore.Put(Session{
 		Token:                compatToken,
 		StreamAppUserID:      1,
 		ProfileID:            "profile-1",
 		StreamAppTokenExpiry: time.Now().Add(time.Hour),
-	})
+	}); err != nil {
+		t.Fatalf("sessionStore.Put failed: %v", err)
+	}
 
 	relay := &recordingCompatRelay{body: "virtual media bytes"}
 	mgr := &virtualBindingSessionManager{

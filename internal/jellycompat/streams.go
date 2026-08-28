@@ -516,7 +516,7 @@ func (h *PlaybackHandler) HandleDownload(w http.ResponseWriter, r *http.Request)
 		playSessionID := firstNonEmpty(r.URL.Query().Get("PlaySessionId"), r.URL.Query().Get("playSessionId"))
 		mediaSourceID := firstNonEmpty(r.URL.Query().Get("MediaSourceId"), r.URL.Query().Get("mediaSourceId"))
 		boundSource := h.boundVirtualDownloadSource(session, playSessionID, version.FileID, mediaSourceID)
-		source := PlaybackMediaSource{}
+		var source PlaybackMediaSource
 		if boundSource != nil {
 			source = *boundSource
 		} else {

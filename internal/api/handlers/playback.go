@@ -583,15 +583,6 @@ func (h *PlaybackHandler) signStreamClaims(claims streamtoken.Claims) string {
 	return token
 }
 
-// streamCardFromQuery verifies the stream token in the request's ?st= parameter
-// and returns the decoded reconstruction recipe, or nil when the token is
-// absent, invalid/expired, or bound to a different session. A live session needs
-// no token (the result is simply nil); the recipe is consumed only on
-// reconstruct.
-func (h *PlaybackHandler) streamCardFromQuery(r *http.Request, sessionID string) *playback.RecipeCard {
-	return streamCardFromToken(r.URL.Query().Get(streamTokenParam), sessionID, h.JWTSecret)
-}
-
 // loadTranscodeServeSession resolves the playback Session for the transcode
 // manifest/segment serve routes while keeping stream-token verification off the
 // hot path. A V3 session that negotiated header-authenticated media requires a

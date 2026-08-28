@@ -2707,10 +2707,6 @@ func IsHardwareTranscode(hwAccel string) bool {
 	}
 }
 
-func isHardwareTranscode(hwAccel string) bool {
-	return IsHardwareTranscode(hwAccel)
-}
-
 // Opts returns the TranscodeOpts used to create this session (for testing).
 func (s *TranscodeSession) Opts() TranscodeOpts {
 	s.mu.Lock()

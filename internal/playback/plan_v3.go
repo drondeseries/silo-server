@@ -220,7 +220,7 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 	// container list but AVPlayer cannot play raw Matroska over HTTP progressive.
 	// Detect and correct this before containerOK is evaluated so the planner
 	// selects a remux route instead of returning an unplayable direct stream.
-	// The quirk is recorded on base below, after base is initialised.
+	// The quirk is recorded on base below, after base is initialized.
 	mkvQuirk, mkvQuirkFired := appleAVPlayerMKVContainerFallback(source, input.Request)
 	effectiveContainers := input.Request.Capabilities.Containers
 	if mkvQuirkFired {

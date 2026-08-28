@@ -210,14 +210,15 @@ func TestVirtualDVMetadataRobustProfileExtraction(t *testing.T) {
 }
 
 func TestMaxVirtualFailoverAttemptsConfigurable(t *testing.T) {
+	ctx := context.Background()
 	// Nil / default
 	var h *PlaybackHandler
-	if got := h.maxVirtualFailoverAttempts(nil); got != 5 {
+	if got := h.maxVirtualFailoverAttempts(ctx); got != 5 {
 		t.Fatalf("nil handler max attempts = %d, want 5", got)
 	}
 
 	h = &PlaybackHandler{}
-	if got := h.maxVirtualFailoverAttempts(nil); got != 5 {
+	if got := h.maxVirtualFailoverAttempts(ctx); got != 5 {
 		t.Fatalf("empty handler max attempts = %d, want 5", got)
 	}
 
@@ -227,7 +228,7 @@ func TestMaxVirtualFailoverAttemptsConfigurable(t *testing.T) {
 			return config.PlaybackConfig{MaxVirtualFailoverAttempts: 12}
 		},
 	}
-	if got := h.maxVirtualFailoverAttempts(nil); got != 12 {
+	if got := h.maxVirtualFailoverAttempts(ctx); got != 12 {
 		t.Fatalf("config max attempts = %d, want 12", got)
 	}
 
@@ -242,7 +243,7 @@ func TestMaxVirtualFailoverAttemptsConfigurable(t *testing.T) {
 			return config.PlaybackConfig{MaxVirtualFailoverAttempts: 12}
 		},
 	}
-	if got := h.maxVirtualFailoverAttempts(nil); got != 8 {
+	if got := h.maxVirtualFailoverAttempts(ctx); got != 8 {
 		t.Fatalf("dynamic settings max attempts = %d, want 8", got)
 	}
 }

@@ -1735,6 +1735,7 @@ func (h *PlaybackHandler) HandleCapabilitiesFull(w http.ResponseWriter, r *http.
 	}
 	if profile.HasData() {
 		h.deviceProfiles.Put(session.Token, profile)
+		h.persistDeviceProfileFromHandshake(r, session, profile)
 	}
 
 	w.WriteHeader(http.StatusNoContent)

@@ -44,15 +44,6 @@ func (h *PlaybackHandler) startLocalPlaybackTransport(ctx context.Context, opts 
 	return h.startLocalPlaybackTransportOnce(ctx, opts)
 }
 
-func (h *PlaybackHandler) softwareFallbackAllowed(ctx context.Context) bool {
-	if h.SettingsRepo != nil {
-		if value, err := h.SettingsRepo.Get(ctx, "playback.software_fallback"); err == nil && strings.EqualFold(strings.TrimSpace(value), "gpu_only") {
-			return false
-		}
-	}
-	return !strings.EqualFold(strings.TrimSpace(h.playbackConfig().SoftwareFallback), "gpu_only")
-}
-
 func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
 	if !strings.HasPrefix(strings.ToLower(opts.InputPath), virtualPlaybackPrefix) {
 		session, startErr := playback.StartTranscode(context.WithoutCancel(ctx), opts)
@@ -183,16 +174,6 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		lastErr = errors.New("virtual transcode provider returned no usable stream")
 	}
 	return nil, lastErr
-}
-
-func (h *PlaybackHandler) resolveVirtualInput(ctx context.Context, file *models.MediaFile, userID int, profileID string, forceRefresh bool) (string, func(), error) {
-	if file == nil || !isVirtualPlaybackFile(file) {
-		return "", nil, errors.New("virtual media file is required")
-	}
-	return h.resolveVirtualInputURI(
-		ctx, file.FilePath, file.VirtualOwnerInstallationID,
-		userID, profileID, forceRefresh,
-	)
 }
 
 func (h *PlaybackHandler) resolveVirtualInputURI(

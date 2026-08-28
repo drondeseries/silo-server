@@ -1070,7 +1070,7 @@ func TestRemoteTranscodeStartTimeoutCoversColdProbePreflightAndReadiness(t *test
 	if got := handler.remoteTranscodeStartTimeout(request, (24 * time.Hour).Milliseconds()); got != maxWant {
 		t.Fatalf("bounded remote transcode start timeout = %v, want %v", got, maxWant)
 	}
-	fallbackWant := compatRemoteNodeProbeFallbackTimeout + playback.ManifestStartupTimeout + tonemap.SourcePreflightTimeout(100) + transcodenode.TranscodeStartReadinessTimeout
+	fallbackWant := handler.toneMapCapabilityTimeout() + playback.ManifestStartupTimeout + tonemap.SourcePreflightTimeout(100) + transcodenode.TranscodeStartReadinessTimeout
 	if got := handler.remoteTranscodeStartTimeout(request, 0); got != fallbackWant {
 		t.Fatalf("missing-budget remote transcode start timeout = %v, want %v", got, fallbackWant)
 	}
