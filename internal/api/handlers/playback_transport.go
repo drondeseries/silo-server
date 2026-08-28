@@ -103,8 +103,13 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 	opts.CanonicalInputPath = canonicalPath
 	opts.VirtualSourceOwnerInstallationID = ownerInstallationID
 	opts.RefreshInput = func(refreshCtx context.Context) (string, func(), error) {
+		// A restart renews the exact candidate pinned to this session, never a
+		// provider-neural re-selection: re-resolving through the neutral path
+		// can silently swap to a differently-ranked candidate mid-stream. The
+		// canonical path still carries the ?result= identity the session bound
+		// to during planning.
 		return h.resolveVirtualInputURI(
-			refreshCtx, neutralPath, ownerInstallationID,
+			refreshCtx, canonicalPath, ownerInstallationID,
 			userID, profileID, true,
 		)
 	}

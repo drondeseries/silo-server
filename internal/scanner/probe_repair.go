@@ -14,6 +14,15 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+// isVirtualMediaFile reports whether a row is a plugin-provided virtual source
+// (virtual:// URI, container "virtual"). Such rows are read through their
+// resolved provider URL by the virtual playback pipeline, never through the
+// virtual:// path as a local file.
+func isVirtualMediaFile(file *models.MediaFile) bool {
+	return file != nil &&
+		(strings.HasPrefix(file.FilePath, "virtual://") || strings.EqualFold(file.Container, "virtual"))
+}
+
 // NeedsCriticalProbeRepair reports whether playback-critical probe metadata is
 // missing and the file should be reprobed before making playback decisions.
 func NeedsCriticalProbeRepair(file *models.MediaFile) bool {
@@ -26,6 +35,14 @@ func NeedsCriticalProbeRepair(file *models.MediaFile) bool {
 	// them, so requiring probe metadata re-ran ffprobe on every detail/watch
 	// load and never converged.
 	if file.BaseType == "ebook" {
+		return false
+	}
+	// Virtual rows (virtual:// URIs, container "virtual") are probed by the
+	// virtual playback pipeline with the provider's resolved URL, never by
+	// local ffprobe: the virtual:// URI is not a readable file. Requiring
+	// repair here re-ran a doomed local ffprobe on every replay/replan and
+	// logged "ffprobe failed for virtual://..." each time without converging.
+	if isVirtualMediaFile(file) {
 		return false
 	}
 	if file.HasLegacyAttachedPictureVideo() {
@@ -469,6 +486,12 @@ func (e *PlaybackProbeEnsurer) ensureCriticalProbe(ctx context.Context, file *mo
 // media_files row, and only then runs the bitstream scan — so a restart no
 // longer re-reads the opening seconds of every browsed H.264 file.
 func (e *PlaybackProbeEnsurer) ensureCopySafety(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error) {
+	// Virtual rows are scanned by the virtual pipeline (ProbeVirtualSource)
+	// against the resolved provider URL, never against the local virtual://
+	// URI. A scan here would exec ffmpeg on an unreadable path.
+	if isVirtualMediaFile(file) {
+		return file, nil
+	}
 	if !needsCopySafetyProbe(file) || strings.TrimSpace(e.ffmpegPath) == "" {
 		return file, nil
 	}

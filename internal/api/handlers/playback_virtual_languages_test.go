@@ -25,7 +25,7 @@ func TestVisibleVirtualPlaybackStreamsHidesAlternatesOnlyWhenMarked(t *testing.T
 	}
 }
 
-func TestMergeVirtualCandidateLanguagesSynthesizesAudioAndSubtitles(t *testing.T) {
+func TestMergeVirtualCandidateLanguagesSynthesizesAudioTracksOnly(t *testing.T) {
 	probed := &models.MediaFile{
 		VideoTracks:    []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}},
 		SubtitleTracks: []models.SubtitleTrack{{Index: 0, Language: "eng", Codec: "subrip"}},
@@ -51,24 +51,14 @@ func TestMergeVirtualCandidateLanguagesSynthesizesAudioAndSubtitles(t *testing.T
 		t.Error("first synthesized audio track should be marked default")
 	}
 
-	if len(probed.SubtitleTracks) != 2 {
-		t.Fatalf("subtitle tracks: got %d, want 2", len(probed.SubtitleTracks))
+	// Subtitle tracks must NOT be synthesized from candidate metadata because
+	// they carry invalid stream ordinals (0:s:N) that fail during extraction.
+	// Only probed embedded subtitles should remain.
+	if len(probed.SubtitleTracks) != 1 {
+		t.Fatalf("subtitle tracks: got %d, want 1 (probed only)", len(probed.SubtitleTracks))
 	}
-	if got := probed.SubtitleTracks[1].Language; got != "ger" {
-		t.Errorf("subtitle[1].language: got %q, want ger", got)
-	}
-	if got := probed.SubtitleTracks[1].Index; got != 1 {
-		t.Errorf("subtitle[1].index: got %d, want 1", got)
-	}
-	// The pre-existing probed "eng" subtitle must not be duplicated.
-	seenEng := 0
-	for _, st := range probed.SubtitleTracks {
-		if st.Language == "eng" {
-			seenEng++
-		}
-	}
-	if seenEng != 1 {
-		t.Errorf("eng subtitle duplicated: got %d entries, want 1", seenEng)
+	if got := probed.SubtitleTracks[0].Language; got != "eng" {
+		t.Errorf("subtitle[0].language: got %q, want eng", got)
 	}
 }
 
@@ -171,17 +161,9 @@ func TestMergeVirtualCandidateLanguagesSkipsReleaseMarkers(t *testing.T) {
 		t.Errorf("audio tracks: got %d, want 2 (ITA, ENG)", len(probed.AudioTracks))
 	}
 
-	gotSubs := make([]string, 0, len(probed.SubtitleTracks))
-	for _, st := range probed.SubtitleTracks {
-		gotSubs = append(gotSubs, st.Language)
-	}
-	if len(probed.SubtitleTracks) != 2 {
-		t.Errorf("subtitle tracks: got %v, want [eng ger]", gotSubs)
-	}
-	for _, got := range gotSubs {
-		if got == "MULTI" {
-			t.Errorf("release marker MULTI leaked into subtitle tracks: %v", gotSubs)
-		}
+	// Subtitles are never synthesized from release markers or candidate metadata.
+	if len(probed.SubtitleTracks) != 0 {
+		t.Errorf("subtitle tracks: got %d, want 0", len(probed.SubtitleTracks))
 	}
 }
 

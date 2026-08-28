@@ -323,6 +323,15 @@ func (h *StreamHandler) HandleSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bind to the session's planned virtual URI when available: the catalog
+	// row's path is mutable (candidate rotation, stale pin removal), but the
+	// session captured the exact URI that was resolved and probed during
+	// planning. Extracting from a different row would silently switch the
+	// source under an in-flight play.
+	if session.VirtualSourceURI != "" && isVirtualPlaybackFile(file) {
+		file.FilePath = session.VirtualSourceURI
+	}
+
 	// trackIndex is a combined ordinal, resolved through the same three
 	// consecutive ranges playback.BuildSubtitleInventoryV3 assigns them from:
 	// externals, then embedded container tracks, then downloaded ones. The

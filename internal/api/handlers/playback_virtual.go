@@ -1202,13 +1202,21 @@ func virtualDVLabel(isDV bool, profile int) string {
 	return "Profile " + strconv.Itoa(profile)
 }
 
-// mergeVirtualCandidateLanguages appends provider-declared audio/subtitle
-// languages as tracks when the probed inventory does not already carry them.
-// Candidate language lists come from the release metadata (e.g. ITA-ENG in a
-// release name), not from ffprobe, so tracks synthesized here are never
-// authoritative — a later probe fills real codec/channel evidence on top.
-// Release-group markers that are not real languages (e.g. MULTI, DUAL) are
-// skipped so a bogus track never appears in the player's picker.
+// mergeVirtualCandidateLanguages appends provider-declared audio languages as
+// tracks when the probed inventory does not already carry them. Candidate
+// language lists come from the release metadata (e.g. ITA-ENG in a release
+// name), not from ffprobe, so tracks synthesized here are never authoritative —
+// a later probe fills real codec/channel evidence on top. Release-group markers
+// that are not real languages (e.g. MULTI, DUAL) are skipped so a bogus track
+// never appears in the player's picker.
+//
+// Provider-declared subtitle languages are deliberately NOT synthesized into
+// embedded tracks here: a synthesized SubtitleTrack carries a stream ordinal
+// that no real subtitle stream backs, and the extractor maps it straight to
+// ffmpeg's `0:s:N` specifier. That produced phantom subtitle selections that
+// always failed at FFmpeg ("Stream map '' matches no streams"). Real embedded
+// subtitle inventory comes only from the probe; provider subtitle hints stay on
+// the candidate stream for the picker and drive the background subtitle search.
 func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualPlaybackStream) {
 	if probed == nil {
 		return
@@ -1238,27 +1246,6 @@ func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualP
 				Language: lang,
 				Codec:    audioCodec,
 				Channels: channels,
-			})
-		}
-	}
-	if len(candidate.SubtitleLanguages) > 0 {
-		existing := make(map[string]bool, len(probed.SubtitleTracks))
-		for _, t := range probed.SubtitleTracks {
-			if lang := strings.TrimSpace(t.Language); lang != "" {
-				existing[strings.ToLower(lang)] = true
-			}
-		}
-		for _, lang := range candidate.SubtitleLanguages {
-			lang = strings.TrimSpace(lang)
-			if lang == "" || !isRealVirtualLanguageTag(lang) || existing[strings.ToLower(lang)] {
-				continue
-			}
-			existing[strings.ToLower(lang)] = true
-			probed.SubtitleTracks = append(probed.SubtitleTracks, models.SubtitleTrack{
-				Index:    len(probed.SubtitleTracks),
-				Language: lang,
-				Codec:    "srt",
-				Title:    lang,
 			})
 		}
 	}
