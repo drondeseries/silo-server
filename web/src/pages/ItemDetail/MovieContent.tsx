@@ -176,7 +176,7 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
   const isPlayable =
     (item.versions?.length ?? 0) > 0 ||
     (item.playback_variants?.length ?? 0) > 0 ||
-    Boolean(item.content_id);
+    Boolean(item.play_content_id);
   const primaryAction = resolveLeafPrimaryAction(item, "Play");
   const restartHref =
     primaryAction.label === "Resume" && isPlayable
