@@ -5889,3 +5889,372 @@ func writePlaybackTestFFmpegFailingForInputPattern(t *testing.T, failPattern str
 	}
 	return path
 }
+
+func TestHandleStartPlaybackV3SkipsUnresolvableVirtualAlternateForLaterWorkingAlternate(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 100
+	source.CodecVideo = "hevc"
+	source.Resolution = "2160p"
+	source.FilePath = "virtual://movie/source-4k"
+	source.VirtualOwnerInstallationID = 5
+	source.VideoTracks[0] = models.VideoTrack{
+		Codec: "hevc", Profile: "main 10", Level: 150, Width: 3840, Height: 2160,
+		BitDepth: 10, VideoRange: "HDR10", VideoRangeType: "HDR10",
+	}
+
+	altBroken := *source
+	altBroken.ID = 101
+	altBroken.Resolution = "1080p"
+	altBroken.FilePath = "virtual://movie/alt-broken-1080p"
+	altBroken.VirtualOwnerInstallationID = 5
+	altBroken.HDR = false
+	altBroken.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 40, Width: 1920, Height: 1080,
+		BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+
+	altGood := *source
+	altGood.ID = 102
+	altGood.Resolution = "1080p"
+	altGood.FilePath = "virtual://movie/alt-good-1080p"
+	altGood.VirtualOwnerInstallationID = 5
+	altGood.HDR = false
+	altGood.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 40, Width: 1920, Height: 1080,
+		BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+
+	files := map[int]*models.MediaFile{source.ID: source, altBroken.ID: &altBroken, altGood.ID: &altGood}
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, &altBroken, &altGood},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+
+	// Resolver fails for altBroken (101), succeeds for altGood (102)
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		if strings.Contains(path, "alt-broken") {
+			return "", errors.New("provider stream offline")
+		}
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	start := v3HandlerStartRequest()
+	start.FileID = source.ID
+	start.QualityPreference = "auto"
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+		VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+
+	var response playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil || response.PlaybackPlan == nil {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != altGood.ID {
+		t.Fatalf("effective file = %d, want working virtual alternate %d", response.PlaybackPlan.EffectiveMediaFileID, altGood.ID)
+	}
+	if response.PlaybackPlan.RequestedMediaFileID != source.ID {
+		t.Fatalf("requested file = %d, want original source %d", response.PlaybackPlan.RequestedMediaFileID, source.ID)
+	}
+}
+
+func TestHandleStartPlaybackV3TriesLaterVirtual4KAlternateAfterVirtualNon4KTerminal(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 200
+	source.CodecVideo = "hevc"
+	source.Resolution = "2160p"
+	source.Bitrate = 32_000
+	source.FilePath = "virtual://movie/source-hdr-4k"
+	source.VirtualOwnerInstallationID = 5
+	source.VideoTracks[0] = models.VideoTrack{
+		Codec: "hevc", Profile: "main 10", Level: 150, Width: 3840, Height: 2160,
+		FrameRate: "24000/1001", Bitrate: 32_000, BitDepth: 10,
+		VideoRange: "DolbyVision", VideoRangeType: "DOVIWithHDR10", DVProfile: 8, DVBLCompatID: 1,
+	}
+
+	lowerValue := *source
+	lower := &lowerValue
+	lower.ID = 201
+	lower.Resolution = "1080p"
+	lower.Bitrate = 8_000
+	lower.FilePath = "virtual://movie/lower-1080p"
+	lower.VirtualOwnerInstallationID = 5
+	lower.VideoTracks = append([]models.VideoTrack(nil), source.VideoTracks...)
+	lower.VideoTracks[0].Width = 1920
+	lower.VideoTracks[0].Height = 1080
+	lower.VideoTracks[0].Bitrate = 8_000
+
+	playableValue := *source
+	playable := &playableValue
+	playable.ID = 202
+	playable.CodecVideo = "h264"
+	playable.Resolution = "UHD"
+	playable.Bitrate = 12_000
+	playable.FilePath = "virtual://movie/playable-uhd"
+	playable.VirtualOwnerInstallationID = 5
+	playable.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 52, Width: 3840, Height: 2160,
+		FrameRate: "24000/1001", Bitrate: 12_000, BitDepth: 8,
+		VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+
+	files := map[int]*models.MediaFile{source.ID: source, lower.ID: lower, playable.ID: playable}
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, lower, playable},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	start := v3HandlerStartRequest()
+	start.FileID = source.ID
+	start.QualityPreference = "auto"
+	start.Capabilities.MaxResolution = "2160p"
+	start.Capabilities.VideoDecode[0].Levels = []int{52}
+	start.Capabilities.VideoDecode[0].MaxWidth = 3840
+	start.Capabilities.VideoDecode[0].MaxHeight = 2160
+	start.Capabilities.VideoDecode[0].MaxBitrateKbps = 50_000
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+		VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+
+	var response playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil || response.PlaybackPlan == nil {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != playable.ID {
+		t.Fatalf("effective file = %d, want later directly playable virtual 4K alternate %d", response.PlaybackPlan.EffectiveMediaFileID, playable.ID)
+	}
+	if response.PlaybackPlan.RequestedMediaFileID != source.ID {
+		t.Fatalf("requested file = %d, want original requested ID %d", response.PlaybackPlan.RequestedMediaFileID, source.ID)
+	}
+}
+
+func TestHandleReplanPlaybackV3ExhaustivelyTriesVirtualAlternatesOnFailureRecovery(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 300
+	source.Resolution = "2160p"
+	source.Bitrate = 32_000
+	source.FilePath = "virtual://movie/replan-source-300"
+	source.VirtualOwnerInstallationID = 5
+	source.VideoTracks[0].Level = 52
+	source.VideoTracks[0].Width = 3840
+	source.VideoTracks[0].Height = 2160
+	source.VideoTracks[0].Bitrate = 32_000
+
+	altFailValue := *source
+	altFail := &altFailValue
+	altFail.ID = 301
+	altFail.Resolution = "1080p"
+	altFail.FilePath = "virtual://movie/replan-alt-broken-301"
+	altFail.VirtualOwnerInstallationID = 5
+
+	altWorkValue := *source
+	altWork := &altWorkValue
+	altWork.ID = 302
+	altWork.CodecVideo = "hevc"
+	altWork.Resolution = "UHD"
+	altWork.Bitrate = 12_000
+	altWork.FilePath = "virtual://movie/replan-alt-working-302"
+	altWork.VirtualOwnerInstallationID = 5
+	altWork.VideoTracks = []models.VideoTrack{{
+		Codec: "hevc", Profile: "main", Level: 52, Width: 3840, Height: 2160,
+		FrameRate: "24000/1001", Bitrate: 12_000, BitDepth: 8,
+		VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+
+	manager := playback.NewSessionManager(0, 0)
+	files := map[int]*models.MediaFile{source.ID: source, altFail.ID: altFail, altWork.ID: altWork}
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, altFail, altWork},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		if strings.Contains(path, "replan-alt-broken") {
+			return "", errors.New("resolution failed for broken candidate")
+		}
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = source.ID
+	startRequest.Capabilities.MaxResolution = "2160p"
+	startRequest.Capabilities.VideoDecode[0].Levels = []int{52}
+	startRequest.Capabilities.VideoDecode[0].MaxWidth = 3840
+	startRequest.Capabilities.VideoDecode[0].MaxHeight = 2160
+	startRequest.Capabilities.VideoDecode[0].MaxBitrateKbps = 50_000
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+		VideoCodecs: []string{"hevc"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	startRR := httptest.NewRecorder()
+	handler.HandleStartPlayback(startRR, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, startRequest))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if startRR.Code != http.StatusCreated || json.Unmarshal(startRR.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start status=%d body=%s", startRR.Code, startRR.Body.String())
+	}
+
+	replanCapabilities := startRequest.Capabilities
+	replanCapabilities.CodecsVideo = []string{"hevc"}
+	replanCapabilities.CodecsVideoHardware = []string{"hevc"}
+	replanCapabilities.VideoDecode = []playback.VideoDecodeCapabilityV3{{
+		Codec: "hevc", Profiles: []string{"main"}, Levels: []int{52}, BitDepths: []int{8},
+		MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 50_000, Hardware: true,
+	}}
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	replanned := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, Operation: playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID: startRequest.PlaybackAttemptID, ReplanRequestID: "virtual-replan-0001",
+		FailedPlanID: started.PlaybackPlan.PlanID, PlanAttemptID: "virtual-plan-0001",
+		PlanAttemptKey: currentKey, AttemptedPlanKeys: []string{currentKey}, AttemptCount: 1,
+		QualityPreference: "auto", SelectedTracks: started.PlaybackPlan.SelectedTracks,
+		Failure:      playback.FailureV3{Classification: "playback_error"},
+		Capabilities: replanCapabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if replanned.Terminal != nil {
+		t.Fatalf("replan terminal = %+v", *replanned.Terminal)
+	}
+	if replanned.PlaybackPlan == nil {
+		t.Fatalf("replan = %#v", replanned)
+	}
+	if replanned.PlaybackPlan.EffectiveMediaFileID != altWork.ID {
+		t.Fatalf("effective file = %d, want working virtual alternate %d", replanned.PlaybackPlan.EffectiveMediaFileID, altWork.ID)
+	}
+	if replanned.PlaybackPlan.RequestedMediaFileID != source.ID {
+		t.Fatalf("requested file = %d, want original source %d", replanned.PlaybackPlan.RequestedMediaFileID, source.ID)
+	}
+}
+
+func TestPrepareVirtualAlternateFileV3BindsOwnerInstallationAndResolvedURI(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	resolvedOwner := 42
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://relay.local/stream?resolved=true", nil
+	})
+	handler.EpisodeLookup = testEpisodeLookup{
+		episode: &models.Episode{ContentID: "ep-101", Runtime: 45},
+	}
+
+	virtualFile := &models.MediaFile{
+		ID:                         99,
+		EpisodeID:                  "ep-101",
+		FilePath:                   "virtual://series/s1e1?profile=default",
+		VirtualOwnerInstallationID: resolvedOwner,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil).WithContext(newAuthorizedPlaybackContext())
+	prepared, err := handler.prepareVirtualAlternateFileV3(req, virtualFile, "profile-test-1")
+	if err != nil {
+		t.Fatalf("prepareVirtualAlternateFileV3 failed: %v", err)
+	}
+	if prepared.ID != virtualFile.ID {
+		t.Fatalf("prepared ID = %d, want %d", prepared.ID, virtualFile.ID)
+	}
+	if prepared.FilePath != virtualFile.FilePath {
+		t.Fatalf("prepared FilePath = %q, want %q", prepared.FilePath, virtualFile.FilePath)
+	}
+	if prepared.VirtualOwnerInstallationID != resolvedOwner {
+		t.Fatalf("prepared VirtualOwnerInstallationID = %d, want %d", prepared.VirtualOwnerInstallationID, resolvedOwner)
+	}
+	if prepared.Duration != 45*60 {
+		t.Fatalf("prepared Duration = %d, want %d (45 mins in seconds)", prepared.Duration, 45*60)
+	}
+}
+
+func TestHandleStartPlaybackV3SubtitleRemapFailurePreservesOriginalSelectionForLaterAlternate(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 400
+	source.CodecVideo = "hevc"
+	source.Resolution = "2160p"
+	source.FilePath = "virtual://movie/source-400"
+	source.VirtualOwnerInstallationID = 5
+	source.VideoTracks[0] = models.VideoTrack{
+		Codec: "hevc", Profile: "main 10", Level: 150, Width: 3840, Height: 2160,
+		FrameRate: "24000/1001", Bitrate: 32_000, BitDepth: 10,
+		VideoRange: "DolbyVision", VideoRangeType: "DOVIWithHDR10", DVProfile: 8, DVBLCompatID: 1,
+	}
+	source.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Language: "eng", Title: "English", Codec: "subrip"},
+	}
+
+	altNoSubs := *source
+	altNoSubs.ID = 401
+	altNoSubs.Resolution = "1080p"
+	altNoSubs.FilePath = "virtual://movie/alt-no-subs-401"
+	altNoSubs.VirtualOwnerInstallationID = 5
+	altNoSubs.SubtitleTracks = nil
+	altNoSubs.HDR = false
+	altNoSubs.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 40, Width: 1920, Height: 1080,
+		BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+
+	altWithSubs := *source
+	altWithSubs.ID = 402
+	altWithSubs.Resolution = "1080p"
+	altWithSubs.FilePath = "virtual://movie/alt-with-subs-402"
+	altWithSubs.VirtualOwnerInstallationID = 5
+	altWithSubs.SubtitleTracks = []models.SubtitleTrack{
+		{Index: 0, Language: "eng", Title: "English", Codec: "subrip"},
+	}
+	altWithSubs.HDR = false
+	altWithSubs.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 40, Width: 1920, Height: 1080,
+		BitDepth: 8, VideoRange: "SDR", VideoRangeType: "SDR",
+	}}
+
+	files := map[int]*models.MediaFile{source.ID: source, altNoSubs.ID: &altNoSubs, altWithSubs.ID: &altWithSubs}
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, &altNoSubs, &altWithSubs},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	subIndex := 0
+	start := v3HandlerStartRequest()
+	start.FileID = source.ID
+	start.QualityPreference = "auto"
+	start.SubtitleTrackIndex = &subIndex
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"},
+		VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+
+	var response playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &response) != nil || response.PlaybackPlan == nil {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != altWithSubs.ID {
+		t.Fatalf("effective file = %d, want alternate with subtitles %d", response.PlaybackPlan.EffectiveMediaFileID, altWithSubs.ID)
+	}
+	if response.PlaybackPlan.RequestedMediaFileID != source.ID {
+		t.Fatalf("requested file = %d, want original source %d", response.PlaybackPlan.RequestedMediaFileID, source.ID)
+	}
+}

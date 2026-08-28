@@ -1101,8 +1101,9 @@ func TestCleanStaleOutputForRestart_SameEncodedRecipeKeepsSegments(t *testing.T)
 
 func TestTranscodeThrottlerIgnoresOutputFromAnEarlierGeneration(t *testing.T) {
 	tempDir := t.TempDir()
-	now := time.Now().Add(-10 * time.Second)
+	now := time.Now()
 	staleTime := now.Add(-time.Minute)
+	currentTime := now.Add(time.Minute)
 
 	// A previous copy generation raced hundreds of segments ahead and left its
 	// manifest behind; the current process has produced nothing yet.
@@ -1148,6 +1149,9 @@ func TestTranscodeThrottlerIgnoresOutputFromAnEarlierGeneration(t *testing.T) {
 
 	// Once this generation writes its own manifest, throttling works normally.
 	writeManifestRange(t, tempDir, 225, 293, ".ts")
+	if err := os.Chtimes(filepath.Join(tempDir, "stream.m3u8"), currentTime, currentTime); err != nil {
+		t.Fatalf("chtimes current manifest: %v", err)
+	}
 	throttler.CheckOnce()
 	if !throttler.paused {
 		t.Fatal("expected throttler to pause on this generation's own produced head")
