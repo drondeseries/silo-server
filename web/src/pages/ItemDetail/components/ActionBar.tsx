@@ -721,6 +721,9 @@ export default function ActionBar({
                   )}
                 </>
               )}
+            </div>,
+            document.body,
+          )}
         {showPlayChoiceDialog && (
           <Dialog open={playChoiceOpen} onOpenChange={setPlayChoiceOpen}>
             <DialogContent className="max-w-xs gap-3 p-5">

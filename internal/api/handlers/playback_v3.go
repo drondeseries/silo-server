@@ -3656,7 +3656,6 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			var firstFailureToneMapErr error
 			var firstFailureFile *models.MediaFile
 			var firstFailureStart playback.StartRequestV3
-			firstFailureAudioIndex := 0
 			for _, alternate := range alternates {
 				if alternate.ID == baseEffectiveFile.ID {
 					continue
@@ -3686,7 +3685,6 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				if candidateResult.Terminal == nil {
 					start = candidateStart
 					effectiveFile = candidateFile
-					audioIndex = candidateAudioIndex
 					result = candidateResult
 					toneMapCapabilityErr = candidateToneMapErr
 					break
@@ -3696,13 +3694,11 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 					firstFailureToneMapErr = candidateToneMapErr
 					firstFailureFile = candidateFile
 					firstFailureStart = candidateStart
-					firstFailureAudioIndex = candidateAudioIndex
 				}
 			}
 			if result.Terminal != nil && firstFailureFile != nil {
 				start = firstFailureStart
 				effectiveFile = firstFailureFile
-				audioIndex = firstFailureAudioIndex
 				result = firstFailureResult
 				toneMapCapabilityErr = firstFailureToneMapErr
 			}
