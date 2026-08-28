@@ -10,6 +10,9 @@ import MediaItemMenu from "@/components/MediaItemMenu";
 import type { EpisodeNavigationState } from "../itemDetailLayout";
 import { useCarouselEmbla } from "@/hooks/useCarouselEmbla";
 import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
+import { useDwellPrefetch } from "@/hooks/useDwellPrefetch";
+import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
+import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 
 interface EpisodeCarouselProps {
   episodes: EpisodeListItem[];
@@ -26,6 +29,7 @@ export default function EpisodeCarousel({
     (episode) => episode.episode_number === currentEpisodeNumber,
   );
   const prefetchEpisodeDetail = usePrefetchCatalogItemDetail();
+  const { quickActionMode } = useOverlayPrefs();
   const { emblaApi, emblaRef, canScrollPrev, canScrollNext, scrollPrev, scrollNext } =
     useCarouselEmbla({
       options: {
@@ -61,6 +65,7 @@ export default function EpisodeCarousel({
                 ep={ep}
                 isCurrent={ep.episode_number === currentEpisodeNumber}
                 episodeLinkState={episodeLinkState}
+                quickActionMode={quickActionMode}
                 onPrefetch={() => prefetchEpisodeDetail(ep.content_id)}
               />
             ))}
@@ -86,14 +91,17 @@ function EpisodeCarouselCard({
   ep,
   isCurrent,
   episodeLinkState,
+  quickActionMode,
   onPrefetch,
 }: {
   ep: EpisodeListItem;
   isCurrent: boolean;
   episodeLinkState?: EpisodeNavigationState;
+  quickActionMode: CardQuickActionMode;
   onPrefetch: () => void;
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
+  const prefetchHandlers = useDwellPrefetch(onPrefetch);
   const thumbhashUrl = ep.still_thumbhash ? decodeThumbhash(ep.still_thumbhash) : "";
   const episodeTitle = ep.title || `Episode ${ep.episode_number}`;
   const progress =
@@ -114,9 +122,7 @@ function EpisodeCarouselCard({
       <div
         ref={cardRef}
         className="media-card-longpress group/card w-[240px]"
-        onMouseEnter={onPrefetch}
-        onFocus={onPrefetch}
-        onTouchStart={onPrefetch}
+        {...prefetchHandlers}
       >
         <div className="relative">
           <Link
@@ -177,6 +183,7 @@ function EpisodeCarouselCard({
             showCollectionActions={false}
             showWatchedShortcut
             hasPartialProgress={progress != null}
+            quickActionMode={quickActionMode}
             longPressRef={cardRef}
             itemTitle={episodeTitle}
           />

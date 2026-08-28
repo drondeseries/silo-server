@@ -29,11 +29,17 @@ import {
   type RealtimeConnectionState,
   type RealtimeEventsContextValue,
 } from "@/components/realtimeEventsContext";
-import { invalidateCatalogState } from "@/components/realtimeCatalogInvalidation";
+import {
+  createCatalogInvalidationScheduler,
+  invalidateCatalogState,
+  scheduleProgressHomeRefresh,
+  userStateChangeAffectsSectionMembership,
+} from "@/components/realtimeCatalogInvalidation";
+import { bumpHomeRefreshSignal } from "@/pages/homeSurfaceRefresh";
 import { useAuth } from "@/hooks/useAuth";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
 import { usePageActivity } from "@/hooks/usePageActivity";
-import { adminKeys, historyImportKeys, libraryKeys } from "@/hooks/queries/keys";
+import { adminKeys, historyImportKeys, libraryKeys, sectionKeys } from "@/hooks/queries/keys";
 import {
   scheduleMediaSurfaceInvalidation,
   updateCatalogItemDetail,
@@ -63,7 +69,6 @@ const CATALOG_ITEM_CHANGED_EVENTS = new Set([
   "library.item_added",
   "metadata.updated",
 ]);
-const SCOPED_CATALOG_LIBRARY_EVENTS = new Set(["catalog.library.changed", "library.changed"]);
 const DASHBOARD_QUERY_KEYS = [
   adminKeys.stats(),
   adminKeys.sessions(),
@@ -275,6 +280,14 @@ function catalogEventLibraryID(data: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function catalogEventContentID(data: unknown) {
+  if (!data || typeof data !== "object" || !("content_id" in data)) {
+    return undefined;
+  }
+  const value = (data as { content_id?: unknown }).content_id;
+  return typeof value === "string" && value ? value : undefined;
+}
+
 function handleJobSideEffects(
   queryClient: QueryClient,
   job: AdminJob,
@@ -448,6 +461,18 @@ function handleUserStateEvent(
         }
       : { skipSimilarItems: true },
   );
+  // Resetting home's load queue re-runs every section fetch. Membership
+  // changes do it immediately; progress ticks coalesce into one trailing
+  // refresh per window so an open home still catches another client's
+  // playback without a per-tick storm. Mark the home sections stale before
+  // an immediate reset because the surface invalidation above is debounced.
+  if (userStateChangeAffectsSectionMembership(payload.change)) {
+    void queryClient
+      .invalidateQueries({ queryKey: sectionKeys.home(), refetchType: "none" })
+      .then(() => bumpHomeRefreshSignal(queryClient));
+  } else {
+    scheduleProgressHomeRefresh(queryClient);
+  }
   void queryClient.invalidateQueries({
     queryKey: adminKeys.stats(),
     refetchType: allowDashboardRefetch ? "active" : "none",
@@ -464,6 +489,10 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
   const isDashboardRoute = location.pathname === "/admin" || location.pathname === "/admin/";
   const allowDashboardRealtimeUpdates = !isDashboardRoute || pageActivity.canPollDashboard;
   const [connectionState, setConnectionState] = useState<RealtimeConnectionState>("connecting");
+  const catalogInvalidation = useMemo(
+    () => createCatalogInvalidationScheduler(queryClient),
+    [queryClient],
+  );
   const reconnectTimerRef = useRef<number | undefined>(undefined);
   const profileRebindAttemptsRef = useRef(0);
   const nextReconnectDelayRef = useRef<number | null>(null);
@@ -482,6 +511,8 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
   activeProfileIDRef.current = profile?.id;
   canApplyRealtimeUpdatesRef.current = pageActivity.canApplyRealtimeUpdates;
   allowDashboardRealtimeUpdatesRef.current = allowDashboardRealtimeUpdates;
+
+  useEffect(() => () => catalogInvalidation.cancel(), [catalogInvalidation]);
 
   const settleWaiterRef = useRef<(job: AdminJob) => void>(() => {});
   settleWaiterRef.current = (job: AdminJob) => {
@@ -662,28 +693,15 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     switch (message.channel) {
       case "catalog":
         {
-          const eventLibraryID = catalogEventLibraryID(message.data);
-          if (CATALOG_ITEM_CHANGED_EVENTS.has(message.event)) {
-            invalidateCatalogState(queryClient, {
-              itemId:
-                typeof message.data === "object" && message.data && "content_id" in message.data
-                  ? (message.data as { content_id?: string }).content_id
-                  : undefined,
-              libraryId: eventLibraryID,
-              allowDashboardRefetch: allowDashboardRealtimeUpdatesRef.current,
-              includeLibraryLists: false,
-            });
-          } else if (SCOPED_CATALOG_LIBRARY_EVENTS.has(message.event) && eventLibraryID) {
-            invalidateCatalogState(queryClient, {
-              libraryId: eventLibraryID,
-              allowDashboardRefetch: allowDashboardRealtimeUpdatesRef.current,
-            });
-          } else {
-            invalidateCatalogState(queryClient, {
-              libraryId: eventLibraryID,
-              allowDashboardRefetch: allowDashboardRealtimeUpdatesRef.current,
-            });
-          }
+          const isItemChange = CATALOG_ITEM_CHANGED_EVENTS.has(message.event);
+          catalogInvalidation.schedule({
+            itemId: isItemChange ? catalogEventContentID(message.data) : undefined,
+            libraryId: catalogEventLibraryID(message.data),
+            allowDashboardRefetch: allowDashboardRealtimeUpdatesRef.current,
+            // An item changing inside a library does not change the set of
+            // libraries, so the admin library lists stay untouched.
+            includeLibraryLists: !isItemChange,
+          });
         }
         break;
       case "jobs":

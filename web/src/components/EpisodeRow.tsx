@@ -61,6 +61,7 @@ export default function EpisodeRow({ episode, rating, watched, progress }: Episo
             data={overlayDataFromEpisodeListItem(episode)}
             prefs={overlayPrefs}
             variant="wide"
+            hasProgressBar={hasProgress}
           />
         )}
         {hasProgress && (

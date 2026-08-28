@@ -22,10 +22,6 @@ vi.mock("@/components/overlays/CardOverlays", () => ({
   default: () => null,
 }));
 
-vi.mock("@/hooks/useOverlayPrefs", () => ({
-  useOverlayPrefs: () => ({ prefs: null }),
-}));
-
 describe("SectionItemCard", () => {
   it("encodes item links while preserving library context", () => {
     const markup = renderToStaticMarkup(

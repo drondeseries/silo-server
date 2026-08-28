@@ -194,7 +194,7 @@ export default function SeriesContent({ item }: { item: ItemDetail & { type: "se
         }
       />
 
-      <div className="page-shell space-y-12 py-10 sm:space-y-14">
+      <div className="page-shell detail-supporting-content space-y-12 py-10 sm:space-y-14">
         {seasonsLoading ? (
           <SeasonCarouselSkeleton />
         ) : singleSeason ? (

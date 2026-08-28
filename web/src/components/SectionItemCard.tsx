@@ -4,8 +4,8 @@ import ViewTransitionLink from "@/components/ViewTransitionLink";
 import MediaItemMenu from "@/components/MediaItemMenu";
 import CardOverlays from "@/components/overlays/CardOverlays";
 import { decodeThumbhash } from "@/lib/thumbhash";
-import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
-import { overlayDataFromSectionItem } from "@/lib/overlays";
+import { overlayDataFromSectionItem, type CardOverlayPrefs } from "@/lib/overlays";
+import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 import { buildEpisodeCardLabels } from "@/lib/episodeCardLabels";
 import {
   formatUpcomingDate,
@@ -22,13 +22,19 @@ import CardPlayOverlay from "@/components/CardPlayOverlay";
 interface SectionItemCardProps {
   item: SectionItem;
   libraryId?: number;
+  overlayPrefs?: CardOverlayPrefs | null;
+  quickActionMode?: CardQuickActionMode;
 }
 
-export default function SectionItemCard({ item, libraryId }: SectionItemCardProps) {
+export default function SectionItemCard({
+  item,
+  libraryId,
+  overlayPrefs = null,
+  quickActionMode = "none",
+}: SectionItemCardProps) {
   const { loaded, onLoad } = useImageLoaded(item.poster_url);
   const thumbhashUrl = item.poster_thumbhash ? decodeThumbhash(item.poster_thumbhash) : "";
   const itemHref = buildItemHref({ contentId: item.content_id, libraryId });
-  const { prefs: overlayPrefs } = useOverlayPrefs();
   const upcomingEvent = item.upcoming_event;
   const subtitle = upcomingEvent ? formatUpcomingSubtitle(upcomingEvent) : "";
   const airDateLabel = upcomingEvent ? formatUpcomingDate(upcomingEvent.air_date) : "";
@@ -114,6 +120,7 @@ export default function SectionItemCard({ item, libraryId }: SectionItemCardProp
           libraryId={libraryId}
           userState={item.user_state}
           variant="poster"
+          quickActionMode={quickActionMode}
           longPressRef={cardRef}
           itemTitle={displayTitle}
         />

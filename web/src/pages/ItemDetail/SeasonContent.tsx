@@ -145,7 +145,7 @@ export default function SeasonContent({ item }: { item: ItemDetail & { type: "se
         }
       />
 
-      <div className="page-shell py-8 sm:py-10">
+      <div className="page-shell detail-supporting-content py-8 sm:py-10">
         <div className="mb-5 flex items-center justify-between gap-3">
           <h2 className="text-xl font-semibold tracking-tight">Episodes</h2>
           <span className="text-muted-foreground text-sm">

@@ -679,10 +679,11 @@ export function ServerStorageStep() {
         <div className="flex items-center justify-between">
           <div>
             <p className="text-muted-foreground text-[11px] font-semibold tracking-[0.1em] uppercase">
-              Image caching
+              S3 Image Caching
             </p>
             <p className="text-muted-foreground/70 mt-0.5 text-xs">
-              Store artwork in public asset storage instead of proxying external URLs.
+              Copies posters and backdrops from metadata providers into your public S3 bucket
+              instead of proxying external URLs.
             </p>
           </div>
           <Switch

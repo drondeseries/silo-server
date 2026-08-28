@@ -15,6 +15,7 @@ import { buildItemHref, buildMediaPlayHref, isVideoWatchHref } from "@/lib/media
 import { useUICustomization } from "@/hooks/useUICustomization";
 import { carouselCardWidthClasses } from "@/lib/uiCustomization";
 import CardPlayOverlay from "@/components/CardPlayOverlay";
+import type { CardQuickActionMode } from "@/lib/cardQuickActions";
 
 type ContinueWatchingCardProps = (
   | {
@@ -29,6 +30,7 @@ type ContinueWatchingCardProps = (
     }
 ) & {
   overlayPrefs?: CardOverlayPrefs | null;
+  quickActionMode?: CardQuickActionMode;
   libraryId?: number;
   variant?: "wide" | "poster";
 };
@@ -114,6 +116,8 @@ export default function ContinueWatchingCard(props: ContinueWatchingCardProps) {
   const progressPercent =
     card.durationSeconds > 0 ? (card.positionSeconds / card.durationSeconds) * 100 : 0;
   const hasPartialProgress = progressPercent > 0 && progressPercent < 100;
+  // Drives both the bar itself and the overlay row's clearance above it.
+  const showProgressBar = !isNextUp && progressPercent > 0;
   const hasEpisodeMeta = card.seasonNumber != null && card.episodeNumber != null;
   // A manga chapter is an ebook item that carries its owning series; the card
   // presents the series (heading, links) since the chapter's own item detail
@@ -250,15 +254,17 @@ export default function ContinueWatchingCard(props: ContinueWatchingCardProps) {
                 data={overlayDataFromSectionItem(props.sectionItem)}
                 prefs={props.overlayPrefs}
                 variant={variant}
+                hasProgressBar={showProgressBar}
               />
             )}
 
             {/* Hover dim behind the play button */}
             <div className="media-card-hover-dim absolute inset-0 bg-black/0 transition-colors duration-150" />
 
-            {/* Progress bar */}
-            {!isNextUp && progressPercent > 0 && (
-              <div className="bg-background/40 absolute inset-x-0 bottom-0 h-[3px]">
+            {/* Progress bar — inset pill so a full bar doesn't read as a
+                stray edge along the artwork */}
+            {showProgressBar && (
+              <div className="absolute inset-x-2.5 bottom-2 h-[3px] overflow-hidden rounded-full bg-black/40">
                 <div
                   className="h-full transition-all duration-300"
                   style={{
@@ -311,6 +317,7 @@ export default function ContinueWatchingCard(props: ContinueWatchingCardProps) {
           showFavoriteShortcut={false}
           dismissAction={dismissAction}
           hasPartialProgress={hasPartialProgress}
+          quickActionMode={props.quickActionMode ?? "none"}
           longPressRef={cardRef}
           itemTitle={heading}
         />

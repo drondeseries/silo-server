@@ -513,10 +513,6 @@ export default function SettingsLayout() {
     [canManageProfiles],
   );
 
-  const flatItems = useMemo(
-    () => visibleSections.flatMap((section) => section.items),
-    [visibleSections],
-  );
   const filteredSections = useMemo(
     () => filterSettingsSearchGroups(visibleSections, settingsSearch),
     [settingsSearch, visibleSections],
@@ -551,7 +547,6 @@ export default function SettingsLayout() {
                 value={settingsSearch}
                 onChange={setSettingsSearch}
                 resultCount={filteredSettingsCount}
-                totalCount={flatItems.length}
                 className="w-full sm:max-w-sm"
                 shortcutMediaQuery={activeSegment ? "(min-width: 64rem)" : undefined}
               />
@@ -616,7 +611,6 @@ export default function SettingsLayout() {
                 value={settingsSearch}
                 onChange={setSettingsSearch}
                 resultCount={filteredSettingsCount}
-                totalCount={flatItems.length}
                 className="w-full sm:max-w-sm lg:w-[26rem] lg:max-w-none"
                 showShortcutHint
               />
