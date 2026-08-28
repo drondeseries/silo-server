@@ -1,5 +1,4 @@
 import { useEffect, useRef } from "react";
-import { Link } from "react-router";
 import { Play, ChevronLeft, ChevronRight } from "lucide-react";
 import type { EpisodeListItem } from "@/api/types";
 import { WatchedCheckIndicator } from "@/components/CardWatchedBadge";
@@ -7,6 +6,7 @@ import { toEpisodeUserState } from "@/components/episodeUserState";
 import { decodeThumbhash } from "@/lib/thumbhash";
 import { cn } from "@/lib/utils";
 import MediaItemMenu from "@/components/MediaItemMenu";
+import ViewTransitionLink from "@/components/ViewTransitionLink";
 import type { EpisodeNavigationState } from "../itemDetailLayout";
 import { useCarouselEmbla } from "@/hooks/useCarouselEmbla";
 import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
@@ -125,7 +125,7 @@ function EpisodeCarouselCard({
         {...prefetchHandlers}
       >
         <div className="relative">
-          <Link
+          <ViewTransitionLink
             to={`/item/${ep.content_id}`}
             state={episodeLinkState}
             aria-current={isCurrent ? "page" : undefined}
@@ -175,7 +175,7 @@ function EpisodeCarouselCard({
                 </div>
               )}
             </div>
-          </Link>
+          </ViewTransitionLink>
           <MediaItemMenu
             contentId={ep.content_id}
             mediaType="episode"
@@ -189,7 +189,7 @@ function EpisodeCarouselCard({
             itemTitle={episodeTitle}
           />
         </div>
-        <Link
+        <ViewTransitionLink
           to={`/item/${ep.content_id}`}
           state={episodeLinkState}
           aria-current={isCurrent ? "page" : undefined}
@@ -206,7 +206,7 @@ function EpisodeCarouselCard({
             {episodeTitle}
           </p>
           {ep.runtime > 0 && <p className="text-muted-foreground/70 text-xs">{ep.runtime}m</p>}
-        </Link>
+        </ViewTransitionLink>
       </div>
     </li>
   );

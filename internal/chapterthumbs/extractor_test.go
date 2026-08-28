@@ -250,7 +250,7 @@ func TestExtractFramePassesCallerContextToHWAccelResolution(t *testing.T) {
 		InputPath:  "/media/movie.mkv",
 		FFmpegPath: "/test/ffmpeg",
 		HWAccel:    "auto",
-		resolveHWAccel: func(gotCtx context.Context, hwAccel, ffmpegPath string) string {
+		resolveHWAccel: func(gotCtx context.Context, hwAccel, ffmpegPath, _ string) string {
 			called = true
 			if gotCtx != ctx {
 				t.Fatal("hardware probe did not receive the extraction context")

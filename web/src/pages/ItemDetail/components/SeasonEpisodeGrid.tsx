@@ -1,11 +1,11 @@
 import { useRef } from "react";
-import { Link } from "react-router";
 import { Play } from "lucide-react";
 import type { EpisodeListItem } from "@/api/types";
 import { WatchedCheckIndicator } from "@/components/CardWatchedBadge";
 import { toEpisodeUserState } from "@/components/episodeUserState";
 import MediaItemMenu from "@/components/MediaItemMenu";
 import CardOverlays from "@/components/overlays/CardOverlays";
+import ViewTransitionLink from "@/components/ViewTransitionLink";
 import { useOverlayPrefs } from "@/hooks/useOverlayPrefs";
 import { usePrefetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useDwellPrefetch } from "@/hooks/useDwellPrefetch";
@@ -98,7 +98,11 @@ function SeasonEpisodeCard({
   return (
     <div ref={cardRef} className="group/card media-card media-card-longpress" {...prefetchHandlers}>
       <div className="relative">
-        <Link to={`/item/${episode.content_id}`} state={episodeLinkState} className="group block">
+        <ViewTransitionLink
+          to={`/item/${episode.content_id}`}
+          state={episodeLinkState}
+          className="group block"
+        >
           <div className="media-card-image relative aspect-video">
             {episode.still_url ? (
               <img
@@ -140,7 +144,7 @@ function SeasonEpisodeCard({
               </div>
             )}
           </div>
-        </Link>
+        </ViewTransitionLink>
         <MediaItemMenu
           contentId={episode.content_id}
           mediaType="episode"
@@ -154,7 +158,11 @@ function SeasonEpisodeCard({
           itemTitle={episodeTitle}
         />
       </div>
-      <Link to={`/item/${episode.content_id}`} state={episodeLinkState} className="block">
+      <ViewTransitionLink
+        to={`/item/${episode.content_id}`}
+        state={episodeLinkState}
+        className="block"
+      >
         <div className="text-muted-foreground mt-2 flex items-center gap-2 text-xs">
           <span>Episode {episode.episode_number}</span>
           {episode.user_data?.played && <WatchedCheckIndicator className="ml-auto" />}
@@ -179,7 +187,7 @@ function SeasonEpisodeCard({
             </p>
           )}
         </div>
-      </Link>
+      </ViewTransitionLink>
     </div>
   );
 }

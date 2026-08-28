@@ -479,7 +479,8 @@ func sourceConversionPreflightArgs(request SourcePreflightRequest, position floa
 			if device == "" {
 				device = defaultDRIRenderDevice
 			}
-			args = append(args, "-init_hw_device", qsvVAAPIInitDevice(device), "-init_hw_device", "qsv=qs@va", "-init_hw_device", "opencl=ocl@va", "-filter_hw_device", "va")
+			args = append(args, QSVInitDeviceArgs(device)...)
+			args = append(args, "-init_hw_device", "opencl=ocl@va", "-filter_hw_device", "va")
 			if !request.SoftwareVideoDecode {
 				args = append(args, "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi")
 			}
@@ -487,7 +488,8 @@ func sourceConversionPreflightArgs(request SourcePreflightRequest, position floa
 			if device == "" {
 				device = defaultDRIRenderDevice
 			}
-			args = append(args, "-init_hw_device", "vaapi=va:"+device, "-filter_hw_device", "va")
+			args = append(args, VAAPIInitDeviceArgs("va", device)...)
+			args = append(args, "-filter_hw_device", "va")
 			if !request.SoftwareVideoDecode {
 				args = append(args, "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi")
 			}

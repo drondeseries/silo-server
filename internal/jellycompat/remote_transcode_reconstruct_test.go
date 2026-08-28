@@ -1063,8 +1063,11 @@ func TestRemoteTranscodeStartTimeoutCoversColdProbePreflightAndReadiness(t *test
 	if got := handler.remoteTranscodeStartTimeout(request, (137 * time.Second).Milliseconds()); got != want {
 		t.Fatalf("remote transcode start timeout = %v, want %v", got, want)
 	}
-	maxWant := 5*time.Minute + playback.ManifestStartupTimeout + tonemap.SourcePreflightTimeout(100) + transcodenode.TranscodeStartReadinessTimeout
-	if got := handler.remoteTranscodeStartTimeout(request, (10 * time.Minute).Milliseconds()); got != maxWant {
+	// Still bounded — the advertisement comes off the wire from a worker — but
+	// at the ceiling the probe formula produces, not a round number a real
+	// nine-device node already exceeds.
+	maxWant := playback.MaxCapabilityRequestTimeout() + playback.ManifestStartupTimeout + tonemap.SourcePreflightTimeout(100) + transcodenode.TranscodeStartReadinessTimeout
+	if got := handler.remoteTranscodeStartTimeout(request, (24 * time.Hour).Milliseconds()); got != maxWant {
 		t.Fatalf("bounded remote transcode start timeout = %v, want %v", got, maxWant)
 	}
 	fallbackWant := compatRemoteNodeProbeFallbackTimeout + playback.ManifestStartupTimeout + tonemap.SourcePreflightTimeout(100) + transcodenode.TranscodeStartReadinessTimeout

@@ -116,12 +116,18 @@ type Service struct {
 
 	// hwMu guards the resolved-accelerator memo below. Resolving "auto" execs
 	// an FFmpeg capability probe and logs the verdict, so the result is cached
-	// against the configured value that produced it and recomputed only when
-	// that value actually changes.
-	hwMu            sync.Mutex
-	hwResolved      bool
-	hwResolvedFrom  string
-	resolvedHWAccel string
+	// against the configured values that produced it and recomputed only when
+	// they actually change.
+	//
+	// Both values, not just the backend: the walk is over the configured device
+	// set, so a device edit changes which backends have candidates to verify and
+	// therefore what "auto" resolves to. Keying on the backend alone would hold
+	// a verdict taken against the old device list.
+	hwMu             sync.Mutex
+	hwResolved       bool
+	hwResolvedFrom   string
+	hwResolvedDevice string
+	resolvedHWAccel  string
 
 	notifyNormal        chan struct{}
 	notifyPriority      chan struct{}
@@ -694,9 +700,12 @@ func (s *Service) resolveHWConfig(ctx context.Context) (string, string) {
 
 	s.hwMu.Lock()
 	defer s.hwMu.Unlock()
-	if !s.hwResolved || s.hwResolvedFrom != configuredAccel {
-		s.resolvedHWAccel = playback.ResolveHWAccelWithFFmpeg(configuredAccel, s.ffmpegPath)
+	if !s.hwResolved || s.hwResolvedFrom != configuredAccel || s.hwResolvedDevice != configuredDevice {
+		// The device set is an input to the walk, not just to execution: it is
+		// what decides which backends have candidates to probe.
+		s.resolvedHWAccel = playback.ResolveHWAccelWithFFmpeg(configuredAccel, s.ffmpegPath, configuredDevice)
 		s.hwResolvedFrom = configuredAccel
+		s.hwResolvedDevice = configuredDevice
 		s.hwResolved = true
 	}
 	// The configured device value passes through raw: ExtractFrame resolves it

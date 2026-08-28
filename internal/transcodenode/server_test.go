@@ -380,9 +380,14 @@ func TestHandleHWCapabilitiesReturnsServiceUnavailableWhenDeadlineExpires(t *tes
 }
 
 func TestToneMapCapabilityResolveTimeoutCoversConfiguredProbeBudget(t *testing.T) {
+	// The endpoint budget is both halves — the hardware walk and the tone-map
+	// matrix — because the endpoint runs both.
 	got := toneMapCapabilityResolveTimeout(tonemap.BackendQSV, "/dev/dri/renderD128")
-	if want := tonemap.ProbeEndpointTimeout(tonemap.BackendQSV, "/dev/dri/renderD128"); got != want {
+	if want := playback.CapabilityEndpointTimeout(tonemap.BackendQSV, "/dev/dri/renderD128"); got != want {
 		t.Fatalf("capability resolve timeout = %v, want endpoint budget %v", got, want)
+	}
+	if tone := tonemap.ProbeEndpointTimeout(tonemap.BackendQSV, "/dev/dri/renderD128"); got <= tone {
+		t.Fatalf("capability resolve timeout = %v, want more than the tone-map half alone (%v)", got, tone)
 	}
 }
 
@@ -405,7 +410,7 @@ func TestHandleHWCapabilitiesAdvertisesEffectiveProbeRequestTimeout(t *testing.T
 	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	want := float64(tonemap.ProbeRequestTimeout(playback.HWAccelNone, "").Milliseconds())
+	want := float64(playback.CapabilityRequestTimeout(playback.HWAccelNone, "").Milliseconds())
 	if got := response["probe_request_timeout_ms"]; got != want {
 		t.Fatalf("probe request timeout = %v, want %.0fms", got, want)
 	}

@@ -242,6 +242,30 @@
   }
 }
 
+/* Directional page motion for nested navigation. `--nav-slide-shift` is the
+   distance the OUTGOING page travels; the incoming page always enters from the
+   opposite side, so one pair of keyframes covers both directions.            */
+@keyframes nav-slide-out {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(var(--nav-slide-shift));
+  }
+}
+@keyframes nav-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(calc(-1 * var(--nav-slide-shift)));
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
 /* ================================================================
    VIEW TRANSITIONS — Page navigation animations
    ================================================================
@@ -249,6 +273,31 @@
    route changes. The browser captures old/new page snapshots
    and animates between them.
    ================================================================ */
+
+/* The sidebar collapse (`.sidebar-surface`) is a live CSS transition running
+   across the same navigation. The root snapshot would freeze the old 260px
+   sidebar and cross-fade it over that motion, so inside the sidebar shell the
+   root group is held still and `main-content` carries the whole transition; the
+   rail, the impersonation banner, and the mobile header keep animating in the
+   live document.
+
+   Scoped to `html[data-app-shell]`, which `Layout` sets while it is mounted,
+   because `main-content` is named in `Layout` and nowhere else. Un-naming the
+   root outright would leave the routes that render outside it — /watch,
+   /reader/*, /admin/*, /login — with no captured element at all, so their
+   navigations would have nothing to animate rather than one thing too many. */
+html[data-app-shell]::view-transition-old(root),
+html[data-app-shell]::view-transition-new(root) {
+  animation: none;
+}
+
+/* main-content's own box moves with the rail (`lg:ml-[260px]` to `lg:ml-16`),
+   so the captured group has to travel on the rail's clock rather than the UA's
+   250ms default, or the two edges separate near the end of the collapse.     */
+::view-transition-group(main-content) {
+  animation-duration: var(--duration-sidebar-collapse);
+  animation-timing-function: var(--ease-sidebar-collapse);
+}
 
 ::view-transition-old(main-content) {
   animation: 200ms cubic-bezier(0, 0, 0.2, 1) both fade-out;
@@ -258,9 +307,35 @@
   animation: 300ms cubic-bezier(0, 0, 0.2, 1) both slide-up;
 }
 
+/* Nested detail navigation moves sideways instead, on the sidebar's own tokens,
+   so following a breadcrumb up reads as the reverse of the push that made it.
+   Navigations whose direction is unknowable — a POP whose entry predates this
+   page load, an external pushState — leave the attribute off and fall through
+   to the neutral rules above. Both halves share one duration and easing: the
+   pseudo-elements default to `mix-blend-mode: plus-lighter`, which only
+   cross-fades cleanly while the two opacities sum to 1.                       */
+html[data-navigation-direction="forward"] {
+  --nav-slide-shift: -24px;
+}
+html[data-navigation-direction="back"] {
+  --nav-slide-shift: 24px;
+}
+html[data-navigation-direction]::view-transition-old(main-content) {
+  animation: var(--duration-sidebar-collapse) var(--ease-sidebar-collapse) both nav-slide-out;
+}
+html[data-navigation-direction]::view-transition-new(main-content) {
+  animation: var(--duration-sidebar-collapse) var(--ease-sidebar-collapse) both nav-slide-in;
+}
+
 @media (prefers-reduced-motion: reduce) {
+  /* The directional selectors carry their own specificity — (0,1,2) against the
+     bare pseudo-elements' (0,0,1) — so they have to be suppressed by name here
+     or they would keep animating for someone who asked for no motion.        */
   ::view-transition-old(main-content),
-  ::view-transition-new(main-content) {
+  ::view-transition-new(main-content),
+  ::view-transition-group(main-content),
+  html[data-navigation-direction]::view-transition-old(main-content),
+  html[data-navigation-direction]::view-transition-new(main-content) {
     animation: none;
   }
   :root {

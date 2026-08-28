@@ -78,7 +78,6 @@ type v3NodeCapabilityCache struct {
 	toneMapCapabilities tonemap.Capabilities
 	err                 error
 	expiresAt           time.Time
-	probeRequestTimeout time.Duration
 }
 
 type preparedTransportV3 struct {
@@ -271,11 +270,11 @@ func (h *PlaybackHandler) transformationRegistryV3(ctx context.Context) *playbac
 func (h *PlaybackHandler) localToneMapCapabilitiesV3(ctx context.Context) (tonemap.Capabilities, error) {
 	cfg := h.playbackConfig()
 	ffmpegPath := playback.ResolveFFmpegPath(cfg.FFmpegPath)
-	resolved := playback.ResolveHWAccelWithFFmpegContext(ctx, cfg.HWAccel, cfg.FFmpegPath)
+	hwDevice := strings.TrimSpace(cfg.HWDevice)
+	resolved := playback.ResolveHWAccelWithFFmpegContext(ctx, cfg.HWAccel, cfg.FFmpegPath, hwDevice)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	hwDevice := strings.TrimSpace(cfg.HWDevice)
 	probe := tonemap.Probe
 	if h.v3ToneMapProbe != nil {
 		probe = h.v3ToneMapProbe
@@ -292,17 +291,84 @@ func (h *PlaybackHandler) localToneMapCapabilitiesForTransportV3(ctx context.Con
 
 func (h *PlaybackHandler) localToneMapProbeTimeoutV3() time.Duration {
 	cfg := h.playbackConfig()
-	return tonemap.ProbeEndpointTimeout(cfg.HWAccel, cfg.HWDevice)
+	// The whole read, not its tone-map half: localToneMapCapabilitiesV3 resolves
+	// the backend first, and on Linux that is a full hardware walk whose cost
+	// scales with the configured device set.
+	return playback.CapabilityEndpointTimeout(cfg.HWAccel, cfg.HWDevice)
 }
 
+// remoteToneMapProbeTimeoutV3 returns how long to allow one capability read of
+// a node, from the budget that node last advertised.
+//
+// The budget is kept apart from the inventory because it describes the node
+// rather than its hardware, and the two are invalidated for different reasons.
+// An acceleration change makes the inventory wrong and the matrix cold — which
+// is exactly when the next read is slowest — while how long that node takes to
+// answer has not changed. Storing them together meant an invalidation dropped
+// the budget with the inventory and the refresh it triggered fell back to two
+// minutes, short of the ~136 seconds a two-device node legitimately asks for,
+// so protocol-v3 planning lost its inventory precisely after an invalidation.
 func (h *PlaybackHandler) remoteToneMapProbeTimeoutV3(nodeURL string) time.Duration {
+	nodeURL = nodepool.NormalizeNodeURL(nodeURL)
 	h.v3NodeCapabilitiesMu.Lock()
-	entry := h.v3NodeCapabilities[nodeURL]
+	budget := h.v3NodeProbeBudgets[nodeURL]
 	h.v3NodeCapabilitiesMu.Unlock()
-	if entry.probeRequestTimeout > 0 {
-		return entry.probeRequestTimeout
+	// Never less than what this node currently describes, whatever was learned
+	// from it before.
+	//
+	// A learned budget is kept across invalidations on purpose — an invalidation
+	// is the moment the next read is coldest and slowest, so dropping the budget
+	// with the inventory would fall back to a figure short of what the node
+	// needs. But a per-node policy edit invalidates through the same path, and
+	// widening hw_device_override is precisely a change that makes the learned
+	// number too small: the node reloads, walks four devices instead of one, and
+	// gets canceled at the one-device deadline. Nothing recovers from that on its
+	// own, because a budget is only ever learned from a read that completes.
+	if cold := h.coldNodeProbeTimeoutV3(nodeURL); cold > budget {
+		return cold
 	}
-	return remoteNodeProbeFallbackTimeout
+	return budget
+}
+
+// coldNodeProbeTimeoutV3 prices one capability read of a node this process has
+// not read successfully yet, from that node rather than from a cluster-wide
+// guess. Without a pooled record — a planner that cannot look nodes up, or a
+// URL that is no longer in the pool — the cluster's own policy is the closest
+// description available.
+func (h *PlaybackHandler) coldNodeProbeTimeoutV3(nodeURL string) time.Duration {
+	cfg := h.playbackConfig()
+	var node *nodepool.Node
+	if lookup, ok := h.NodePlanner.(transcodeNodeLookupV3); ok {
+		if found, ok := lookup.TranscodeNodeByURL(nodeURL); ok {
+			node = found
+		}
+	}
+	return playback.ColdCapabilityRequestTimeout(
+		node.StoredCapabilities(),
+		node.EffectiveHWAccel(cfg.HWAccel),
+		node.EffectiveHWDevice(cfg.HWDevice),
+		remoteNodeProbeFallbackTimeout,
+	)
+}
+
+// transcodeNodeLookupV3 resolves the pooled record behind a transcode node URL,
+// which carries that node's stored capability report and its acceleration
+// override. Optional, like the planner itself: without it this path falls back
+// to the cluster-wide setting. *nodepool.Planner implements it.
+type transcodeNodeLookupV3 interface {
+	TranscodeNodeByURL(nodeURL string) (*nodepool.Node, bool)
+}
+
+// rememberNodeProbeBudgetV3 records what a node says its capability read costs.
+// Callers must hold v3NodeCapabilitiesMu.
+func (h *PlaybackHandler) rememberNodeProbeBudgetLockedV3(nodeURL string, budget time.Duration) {
+	if budget <= 0 {
+		return
+	}
+	if h.v3NodeProbeBudgets == nil {
+		h.v3NodeProbeBudgets = make(map[string]time.Duration)
+	}
+	h.v3NodeProbeBudgets[nodeURL] = budget
 }
 
 func (h *PlaybackHandler) toneMapPlanningTimeoutV3(localFallbackAllowed bool) time.Duration {
@@ -340,6 +406,10 @@ func (h *PlaybackHandler) lookupRemoteTransformationsV3(ctx context.Context, nod
 // lookupRemoteCapabilitiesV3 fetches and jointly caches a node's transformation
 // and tone-map inventory, optionally reusing short-lived fetch failures.
 func (h *PlaybackHandler) lookupRemoteCapabilitiesV3(ctx context.Context, nodeURL string, honorCachedFailure bool) (v3NodeCapabilityCache, error) {
+	// Canonical here and in RefreshNodeCapabilitiesV3, which are the two ways
+	// into these maps; everything below is reached from one of them and so is
+	// already keyed the same way.
+	nodeURL = nodepool.NormalizeNodeURL(nodeURL)
 	now := time.Now()
 	h.v3NodeCapabilitiesMu.Lock()
 	entry, ok := h.v3NodeCapabilities[nodeURL]
@@ -361,20 +431,53 @@ func (h *PlaybackHandler) lookupRemoteCapabilitiesV3(ctx context.Context, nodeUR
 		return entry, nil
 	}
 
-	requestCtx, cancel := context.WithTimeout(ctx, h.remoteToneMapProbeTimeoutV3(nodeURL))
-	defer cancel()
-	info, err := fetchRemoteTranscodeCapabilities(requestCtx, nodeURL, h.JWTSecret)
-	completedAt := time.Now()
+	// An invalidation landing mid-fetch means the report this probe is about to
+	// return describes the node as it was, not as it is — and this caller is
+	// about to select transformations and a tone-map executor from it. Re-probe
+	// rather than plan on it.
+	//
+	// Bounded at two attempts, and the second result is used even if it is
+	// overtaken too. Failing the request instead would be worse than a slightly
+	// stale inventory: most hash changes are not "the hardware went away" — a
+	// driver update, a new identity field, a raised probe budget all move it —
+	// so refusing would reject playback that the report in hand describes
+	// perfectly well, and on a single-transcode-node deployment there is nothing
+	// to fall back to. A node changing faster than two probes can read it is a
+	// different problem, and one this path cannot fix by failing.
+	var (
+		info        playback.HWAccelInfo
+		err         error
+		completedAt time.Time
+		overtaken   bool
+	)
+	for attempt := range v3CapabilityFetchAttempts {
+		// Snapshot the invalidation count before probing: anything this fetch
+		// learns describes the node as it was when the request left.
+		invalidations := h.nodeCapabilityInvalidationsV3(nodeURL)
+		requestCtx, cancel := context.WithTimeout(ctx, h.remoteToneMapProbeTimeoutV3(nodeURL))
+		info, err = fetchRemoteTranscodeCapabilities(requestCtx, nodeURL, h.JWTSecret)
+		cancel()
+		completedAt = time.Now()
+		overtaken = h.nodeCapabilityInvalidationsV3(nodeURL) != invalidations
+		if !overtaken || attempt+1 == v3CapabilityFetchAttempts {
+			break
+		}
+	}
+
 	if err != nil {
 		h.v3NodeCapabilitiesMu.Lock()
 		if h.v3NodeCapabilities == nil {
 			h.v3NodeCapabilities = make(map[string]v3NodeCapabilityCache)
 		}
+		if overtaken {
+			h.v3NodeCapabilitiesMu.Unlock()
+			return v3NodeCapabilityCache{}, err
+		}
 		if current, currentOK := h.v3NodeCapabilities[nodeURL]; currentOK && current.err == nil && completedAt.Before(current.expiresAt) {
 			h.v3NodeCapabilitiesMu.Unlock()
 			return current, nil
 		}
-		h.v3NodeCapabilities[nodeURL] = v3NodeCapabilityCache{err: err, expiresAt: completedAt.Add(v3NodeCapabilityErrorTTL), probeRequestTimeout: entry.probeRequestTimeout}
+		h.v3NodeCapabilities[nodeURL] = v3NodeCapabilityCache{err: err, expiresAt: completedAt.Add(v3NodeCapabilityErrorTTL)}
 		h.v3NodeCapabilitiesMu.Unlock()
 		return v3NodeCapabilityCache{}, err
 	}
@@ -382,9 +485,20 @@ func (h *PlaybackHandler) lookupRemoteCapabilitiesV3(ctx context.Context, nodeUR
 		transformations:     append([]playback.TransformationV3(nil), info.Transformations...),
 		toneMapCapabilities: append(tonemap.Capabilities(nil), info.ToneMapCapabilities...),
 		expiresAt:           completedAt.Add(v3NodeCapabilityTTL),
-		probeRequestTimeout: playback.NormalizeProbeRequestTimeout(info.ProbeRequestTimeoutMillis, remoteNodeProbeFallbackTimeout),
 	}
 	h.v3NodeCapabilitiesMu.Lock()
+	// Recorded even when the entry below is discarded as overtaken: what the
+	// node says its read costs is true regardless of whether this particular
+	// answer is still current.
+	h.rememberNodeProbeBudgetLockedV3(nodeURL,
+		playback.NormalizeProbeRequestTimeout(info.ProbeRequestTimeoutMillis, remoteNodeProbeFallbackTimeout))
+	if overtaken {
+		// Still overtaken after the retry. Hand the result to this caller, which
+		// has nothing better, but leave the cache empty so the next lookup
+		// re-probes instead of serving it for a full TTL to everyone else.
+		h.v3NodeCapabilitiesMu.Unlock()
+		return entry, nil
+	}
 	if h.v3NodeCapabilities == nil {
 		h.v3NodeCapabilities = make(map[string]v3NodeCapabilityCache)
 	}
@@ -393,19 +507,97 @@ func (h *PlaybackHandler) lookupRemoteCapabilitiesV3(ctx context.Context, nodeUR
 	return entry, nil
 }
 
+// v3CapabilityFetchAttempts is how many times one lookup will re-probe a node
+// whose capabilities changed while it was being read.
+const v3CapabilityFetchAttempts = 2
+
+func (h *PlaybackHandler) nodeCapabilityInvalidationsV3(nodeURL string) uint64 {
+	h.v3NodeCapabilitiesMu.Lock()
+	defer h.v3NodeCapabilitiesMu.Unlock()
+	return h.v3NodeCapabilityInvalidations[nodeURL]
+}
+
+// RefreshNodeCapabilitiesV3 discards one node's cached capability inventory and
+// re-probes it in the background. It exists for the node health sweep, which
+// learns from a node's advertised capability hash that its hardware changed
+// long before this cache's freshness window would expire — and a cache that
+// outlives the hardware it describes plans transcodes onto a GPU that is gone.
+func (h *PlaybackHandler) RefreshNodeCapabilitiesV3(nodeURL string) {
+	if h == nil || nodeURL == "" {
+		return
+	}
+	// Every map here is keyed by the node's canonical address. This entry point
+	// is reached from the admin route with the URL exactly as the row stores it,
+	// which may carry a trailing slash the pools have already dropped — and then
+	// the entry this deletes is not the entry planning reads, so a node keeps
+	// serving the backend it was just moved off until the old key expires.
+	nodeURL = nodepool.NormalizeNodeURL(nodeURL)
+	h.v3NodeCapabilitiesMu.Lock()
+	delete(h.v3NodeCapabilities, nodeURL)
+	if h.v3NodeCapabilityInvalidations == nil {
+		h.v3NodeCapabilityInvalidations = make(map[string]uint64)
+	}
+	// Bumping the count is what makes the delete stick. A refresh already in
+	// flight fetched this node before its hardware changed, so it must neither
+	// re-install its answer over this delete nor be mistaken for the re-probe
+	// this invalidation is owed.
+	h.v3NodeCapabilityInvalidations[nodeURL]++
+	claimed := h.claimCapabilityRefreshLockedV3(nodeURL)
+	h.v3NodeCapabilitiesMu.Unlock()
+	if claimed {
+		h.runCapabilityRefreshV3(nodeURL)
+	}
+}
+
 func (h *PlaybackHandler) refreshRemoteCapabilitiesV3(nodeURL string) {
 	if h == nil || nodeURL == "" {
 		return
 	}
-	if _, loaded := h.v3NodeCapabilityRefresh.LoadOrStore(nodeURL, struct{}{}); loaded {
-		return
+	h.v3NodeCapabilitiesMu.Lock()
+	claimed := h.claimCapabilityRefreshLockedV3(nodeURL)
+	h.v3NodeCapabilitiesMu.Unlock()
+	if claimed {
+		h.runCapabilityRefreshV3(nodeURL)
 	}
+}
+
+// claimCapabilityRefreshLockedV3 takes the node's single background-refresh
+// slot. The caller must hold v3NodeCapabilitiesMu: taking the slot under the
+// same lock as the invalidation counter is what guarantees that an invalidation
+// either starts a refresh or is seen by the one already running.
+func (h *PlaybackHandler) claimCapabilityRefreshLockedV3(nodeURL string) bool {
+	if _, inFlight := h.v3NodeCapabilityRefresh[nodeURL]; inFlight {
+		return false
+	}
+	if h.v3NodeCapabilityRefresh == nil {
+		h.v3NodeCapabilityRefresh = make(map[string]struct{})
+	}
+	h.v3NodeCapabilityRefresh[nodeURL] = struct{}{}
+	return true
+}
+
+// runCapabilityRefreshV3 probes one node in the background until its result is
+// current: a probe that an invalidation overtook was discarded, so it repeats
+// rather than leave the cache empty until the next viewer pays for a probe.
+func (h *PlaybackHandler) runCapabilityRefreshV3(nodeURL string) {
 	go func() {
-		defer h.v3NodeCapabilityRefresh.Delete(nodeURL)
-		ctx, cancel := context.WithTimeout(context.Background(), h.remoteToneMapProbeTimeoutV3(nodeURL))
-		defer cancel()
-		if _, err := h.lookupRemoteCapabilitiesV3(ctx, nodeURL, false); err != nil {
-			slog.Debug("protocol v3 background node capability refresh failed", "component", "api", "node", logredact.SanitizeURL(nodeURL), "error", err)
+		for {
+			invalidations := h.nodeCapabilityInvalidationsV3(nodeURL)
+			ctx, cancel := context.WithTimeout(context.Background(), h.remoteToneMapProbeTimeoutV3(nodeURL))
+			_, err := h.lookupRemoteCapabilitiesV3(ctx, nodeURL, false)
+			cancel()
+			if err != nil {
+				slog.Debug("protocol v3 background node capability refresh failed", "component", "api", "node", logredact.SanitizeURL(nodeURL), "error", err)
+			}
+			h.v3NodeCapabilitiesMu.Lock()
+			current := h.v3NodeCapabilityInvalidations[nodeURL] == invalidations
+			if current {
+				delete(h.v3NodeCapabilityRefresh, nodeURL)
+			}
+			h.v3NodeCapabilitiesMu.Unlock()
+			if current {
+				return
+			}
 		}
 	}()
 }
@@ -2030,12 +2222,135 @@ func shouldUsePooledPlaybackNodeV3(file *models.MediaFile) bool {
 // bytes are either the source file or a single remux pipe — so the planner is
 // asked for a proxy alone, exactly as the Jellyfin-compat transport does.
 //
-// A nil node (no planner, no signing secret, or no eligible proxy) means the
-// API server serves the stream itself, which is both the single-node case and
-// the correct degradation when every proxy is unhealthy or at capacity. The one
-// exception is a remux that must run ffmpeg: that is transcode work, so it
-// honors the same local-fallback gate as the HLS routes rather than quietly
-// spawning an encoder on an API-only node.
+// The proxy serves from the grant alone, so the grant has to carry everything
+// the API-local path would have read from the session and the file record — the
+// media path it opens, and the source facts (Dolby Vision profile, audio-only)
+// its remux needs. Omitting either would not fail loudly: the proxy would serve
+// a subtly different stream than the plan promised.
+//
+// The bool reports whether the returned URL is actually a proxy URL, so the
+// caller can release the planner reservation when it is not. A grant that
+// cannot be written is not fatal: this attempt simply stays on the API origin,
+// which is exactly the behavior of a header-authenticated attempt that
+// negotiated no origins at all. The third value is the grant this write
+// displaced, for the caller's rollback.
+func (h *PlaybackHandler) identityGrantStreamURLV3(ctx context.Context, s *playback.Session, file *models.MediaFile, proxyNode *nodepool.Node) (string, bool, *playback.RecipeCard) {
+	if proxyNode == nil || file == nil || s == nil {
+		return h.playbackStreamURL(s), false, nil
+	}
+	card := identityRecipeCard(s)
+	card.InputPath = file.FilePath
+	card.DVProfile = file.PrimaryDVProfile()
+	card.AudioOnly = file.IsAudioOnly()
+	prior, stored := h.putProxyGrantV3(ctx, s.ID, card)
+	if !stored {
+		return h.playbackStreamURL(s), false, nil
+	}
+	return strings.TrimRight(proxyNode.ClientURL(), "/") + "/stream/v3/" + s.ID, true, prior
+}
+
+// putProxyGrantV3 stores the recipe a designated proxy origin serves this
+// session from, reporting whether the grant is actually retrievable. A replan
+// overwrites the previous grant under the same session id, so the grant it
+// displaces is returned for the caller to thread into its rollback: a
+// replacement that fails to commit restores the old plan, and that plan's
+// already-published proxy URL is only serviceable while its grant exists.
+//
+// The overwrite is deliberately not staged behind the commit. Between this Put
+// and the transport commit the previously published client URL resolves the new
+// recipe — same session, same user, same media authority, bounded by the replan
+// window — which is the accepted cost of keeping one grant per session.
+//
+// A disabled store is a negative answer rather than a silent success: it
+// accepts writes it cannot retrieve (the Redis-less integrated box), and
+// publishing a proxy URL against one would hand the client a route that 404s.
+func (h *PlaybackHandler) putProxyGrantV3(ctx context.Context, sessionID string, card playback.RecipeCard) (*playback.RecipeCard, bool) {
+	if h.ProxyGrantStore == nil || !h.ProxyGrantStore.Enabled() || sessionID == "" {
+		return nil, false
+	}
+	prior, hadPrior := h.ProxyGrantStore.Get(ctx, sessionID)
+	if !hadPrior {
+		prior = nil
+	}
+	if err := h.ProxyGrantStore.Put(ctx, sessionID, card); err != nil {
+		slog.WarnContext(ctx, "protocol v3 proxy egress grant write failed; serving from the API origin",
+			"component", "api", "playback_session_id", sessionID, "error", err)
+		return nil, false
+	}
+	return prior, true
+}
+
+// restoreProxyGrantV3 undoes a replan's grant overwrite. A session that was
+// already egressing from a proxy keeps serving its restored plan, so its grant
+// has to come back rather than be revoked; a session that had none is revoked
+// as before, because a grant for a transport that never committed would point a
+// proxy at work that no longer exists.
+func (h *PlaybackHandler) restoreProxyGrantV3(ctx context.Context, sessionID string, prior *playback.RecipeCard) {
+	if h == nil || h.ProxyGrantStore == nil || sessionID == "" {
+		return
+	}
+	if prior == nil {
+		h.deleteProxyGrantV3(ctx, sessionID)
+		return
+	}
+	if err := h.ProxyGrantStore.Put(context.WithoutCancel(ctx), sessionID, *prior); err != nil {
+		slog.WarnContext(ctx, "failed to restore the previous proxy egress grant",
+			"component", "api", "playback_session_id", sessionID, "error", err)
+	}
+}
+
+// deleteProxyGrantV3 revokes a session's proxy egress authority. It runs
+// wherever the session ends or its transport fails to commit: a grant that
+// outlived its session would let a proxy keep serving bytes for playback the
+// server considers over.
+func (h *PlaybackHandler) deleteProxyGrantV3(ctx context.Context, sessionID string) {
+	if h == nil || h.ProxyGrantStore == nil || sessionID == "" {
+		return
+	}
+	if err := h.ProxyGrantStore.Delete(context.WithoutCancel(ctx), sessionID); err != nil {
+		slog.WarnContext(ctx, "failed to revoke proxy egress grant",
+			"component", "api", "playback_session_id", sessionID, "error", err)
+	}
+}
+
+// putNodeRecipeV3 hands the transcode node the recipe it rebuilds this job from
+// after a restart, keyed by the transport id the node serves it under (which is
+// the id in every relayed node URL, not the playback session id).
+//
+// It exists because a header-authenticated attempt publishes no stream token, so
+// neither the client nor this server's relay has a recipe to forward when the
+// node comes back empty — the node would 404 until the client replanned. A node
+// dying mid-stream is a normal event, so tokenless playback recovers from it the
+// way a legacy token attempt already does.
+//
+// Best effort, exactly like the jellycompat handoff: the write is bounded and a
+// failure only forfeits restart resilience for this session, never the start.
+func (h *PlaybackHandler) putNodeRecipeV3(ctx context.Context, transportID string, card playback.RecipeCard) {
+	if h == nil || h.NodeRecipeStore == nil || transportID == "" {
+		return
+	}
+	putCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nodeRecipeWriteTimeoutV3)
+	defer cancel()
+	if err := h.NodeRecipeStore.Put(putCtx, transportID, card); err != nil {
+		slog.WarnContext(ctx, "persist node transcode recipe failed; this session cannot survive a node restart",
+			"component", "api", "playback_session_id", card.SessionID, "transport", transportID,
+			"node", card.TranscodeNodeURL, "error", err)
+	}
+}
+
+// deleteNodeRecipeV3 drops a transport's stored recipe so a buffered or retrying
+// request cannot resurrect a transcode the server has replaced or ended. The
+// store's TTL is only the backstop for the paths that never run (a crashed API
+// process); every deliberate teardown deletes here.
+func (h *PlaybackHandler) deleteNodeRecipeV3(ctx context.Context, transportID string) {
+	if h == nil || h.NodeRecipeStore == nil || transportID == "" {
+		return
+	}
+	if err := h.NodeRecipeStore.Delete(context.WithoutCancel(ctx), transportID); err != nil {
+		slog.WarnContext(ctx, "failed to drop the node transcode recipe",
+			"component", "api", "transport", transportID, "error", err)
+	}
+}
 // planIdentityProxyV3 selects the proxy node that will serve a direct-play or
 // progressive-remux session. These deliveries need no transcode node — the
 // bytes are either the source file or a single remux pipe — so the planner is
@@ -2270,7 +2585,7 @@ func (h *PlaybackHandler) identityStreamURLV3(s *playback.Session, file *models.
 	if token == "" {
 		return h.playbackStreamURL(s), false
 	}
-	base := strings.TrimRight(proxyNode.URL, "/")
+	base := strings.TrimRight(proxyNode.ClientURL(), "/")
 	if s.PlayMethod == playback.PlayRemux {
 		if claims.PlayMethod == streamtoken.PlayMethodAudioDownmixRemux {
 			return base + "/stream/remux/audio-v2/" + token, true
@@ -2709,7 +3024,10 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 	}
 	sourceMetadata := sourceExecutionMetadataV3(file, result)
 	sourceProfile, sourceBitDepth := sourceVideoTranscodeFactsV3(file, result)
-	hwAccel := h.playbackConfig().HWAccel
+	// The node's own override wins over this host's cluster-wide setting; every
+	// other node gets the cluster value verbatim, "auto" included, so the node
+	// still resolves it against live hardware at session start.
+	hwAccel := node.EffectiveHWAccel(h.playbackConfig().HWAccel)
 	toneMapFilter := ""
 	if result.ToneMapMode != "" {
 		capabilities, err := h.remoteToneMapCapabilitiesV3(r.Context(), node.URL, false)
@@ -2887,7 +3205,7 @@ func (h *PlaybackHandler) grantManifestURLV3(ctx context.Context, card playback.
 	if !stored {
 		return localURL, false, nil
 	}
-	return strings.TrimRight(proxyNode.URL, "/") + "/stream/v3/" + card.SessionID + "/master.m3u8", true, prior
+	return strings.TrimRight(proxyNode.ClientURL(), "/") + "/stream/v3/" + card.SessionID + "/master.m3u8", true, prior
 }
 
 // sourceExecutionMetadataV3 freezes the source facts used by a remote executor.
@@ -4622,10 +4940,18 @@ func (h *PlaybackHandler) enqueueRouteEventV3(event playback.RouteEventRecordV3)
 	}
 	h.v3EventOnce.Do(func() {
 		h.v3EventQueue = make(chan playback.RouteEventRecordV3, 512)
+		// The store is captured with the queue rather than read per event. The
+		// goroutine below outlives the request that started it, so re-reading
+		// the field would be an unsynchronized read of handler state — harmless
+		// in production, where the router wires PlanStoreV3 once before serving,
+		// and a real data race against any caller that replaces it afterwards.
+		// Capturing also matches what the queue is: work batched for the store
+		// that existed when it was created.
+		store := h.PlanStoreV3
 		go func() {
 			for value := range h.v3EventQueue {
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				if err := h.PlanStoreV3.RecordRouteEvent(ctx, value); err != nil {
+				if err := store.RecordRouteEvent(ctx, value); err != nil {
 					slog.Warn("playback route event write failed", "error", err, "event", value.Event)
 				}
 				cancel()
@@ -5269,81 +5595,6 @@ func videoSampleEntryForPlanV3(plan *playback.PlanV3) string {
 		return playback.VideoSampleEntryDVH1
 	}
 	return ""
-}
-
-func (h *PlaybackHandler) putProxyGrantV3(ctx context.Context, sessionID string, card playback.RecipeCard) (*playback.RecipeCard, bool) {
-	if h.ProxyGrantStore == nil || !h.ProxyGrantStore.Enabled() || sessionID == "" {
-		return nil, false
-	}
-	prior, hadPrior := h.ProxyGrantStore.Get(ctx, sessionID)
-	if !hadPrior {
-		prior = nil
-	}
-	if err := h.ProxyGrantStore.Put(ctx, sessionID, card); err != nil {
-		slog.WarnContext(ctx, "protocol v3 proxy egress grant write failed; serving from the API origin",
-			"component", "api", "playback_session_id", sessionID, "error", err)
-		return nil, false
-	}
-	return prior, true
-}
-
-func (h *PlaybackHandler) identityGrantStreamURLV3(ctx context.Context, s *playback.Session, file *models.MediaFile, proxyNode *nodepool.Node) (string, bool, *playback.RecipeCard) {
-	if proxyNode == nil || file == nil || s == nil {
-		return h.playbackStreamURL(s), false, nil
-	}
-	card := identityRecipeCard(s)
-	card.InputPath = file.FilePath
-	card.DVProfile = file.PrimaryDVProfile()
-	card.AudioOnly = file.IsAudioOnly()
-	prior, stored := h.putProxyGrantV3(ctx, s.ID, card)
-	if !stored {
-		return h.playbackStreamURL(s), false, nil
-	}
-	return strings.TrimRight(proxyNode.URL, "/") + "/stream/v3/" + s.ID, true, prior
-}
-
-// restoreProxyGrantV3 undoes a replan's grant overwrite. A session that was
-// already egressing from a proxy keeps serving its restored plan, so its grant
-// has to come back rather than be revoked; a session that had none is revoked
-// as before, because a grant for a transport that never committed would point a
-// proxy at work that no longer exists.
-func (h *PlaybackHandler) restoreProxyGrantV3(ctx context.Context, sessionID string, prior *playback.RecipeCard) {
-	if h == nil || h.ProxyGrantStore == nil || sessionID == "" {
-		return
-	}
-	if prior == nil {
-		h.deleteProxyGrantV3(ctx, sessionID)
-		return
-	}
-	if err := h.ProxyGrantStore.Put(context.WithoutCancel(ctx), sessionID, *prior); err != nil {
-		slog.WarnContext(ctx, "failed to restore the previous proxy egress grant",
-			"component", "api", "playback_session_id", sessionID, "error", err)
-	}
-}
-
-// putNodeRecipeV3 hands the transcode node the recipe it rebuilds this job from
-// after a restart, keyed by the transport id the node serves it under (which is
-// the id in every relayed node URL, not the playback session id).
-//
-// It exists because a header-authenticated attempt publishes no stream token, so
-// neither the client nor this server's relay has a recipe to forward when the
-// node comes back empty — the node would 404 until the client replanned. A node
-// dying mid-stream is a normal event, so tokenless playback recovers from it the
-// way a legacy token attempt already does.
-//
-// Best effort, exactly like the jellycompat handoff: the write is bounded and a
-// failure only forfeits restart resilience for this session, never the start.
-func (h *PlaybackHandler) putNodeRecipeV3(ctx context.Context, transportID string, card playback.RecipeCard) {
-	if h == nil || h.NodeRecipeStore == nil || transportID == "" {
-		return
-	}
-	putCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nodeRecipeWriteTimeoutV3)
-	defer cancel()
-	if err := h.NodeRecipeStore.Put(putCtx, transportID, card); err != nil {
-		slog.WarnContext(ctx, "persist node transcode recipe failed; this session cannot survive a node restart",
-			"component", "api", "playback_session_id", card.SessionID, "transport", transportID,
-			"node", card.TranscodeNodeURL, "error", err)
-	}
 }
 
 // sessionProxyReservationReleaserV3 gives back only the proxy half of a node

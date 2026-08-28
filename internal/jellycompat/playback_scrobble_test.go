@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -671,6 +672,10 @@ func TestPositionlessLateStopPreservesAndDeliversPendingFallback(t *testing.T) {
 	scrobbler := &channelCompatWatchScrobbler{stopEvents: make(chan watchsync.ScrobbleEvent, 1)}
 	h.WatchScrobbler = scrobbler
 	h.terminalFallbackDelay = time.Hour
+	// Receiving the scrobble event is not enough to read the store on: the
+	// release that sets TerminalFallbackSent runs after the dispatch returns.
+	releases := make(chan struct{}, 2)
+	h.playbackStore = &terminalReleaseObservingStore{CompatPlaybackStore: store, releases: releases}
 	store.Put(PlaybackSession{
 		ID:                       "play-1",
 		CompatToken:              "token-1",
@@ -711,6 +716,11 @@ func TestPositionlessLateStopPreservesAndDeliversPendingFallback(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for preserved terminal fallback")
 	}
+	select {
+	case <-releases:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for fallback delivery lease release")
+	}
 	terminal, ok = store.GetFinalizable("play-1", "token-1")
 	if !ok || !terminal.TerminalFallbackSent || terminal.TerminalAuthoritative {
 		t.Fatalf("delivered fallback state = ok=%v session=%+v", ok, terminal)
@@ -749,9 +759,8 @@ func TestStoppedScrobbleQueueFailureRetainsAndRetriesTerminalEvent(t *testing.T)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for terminal queue retry")
 	}
-	if _, ok := handler.playbackStore.GetFinalizable("play-1", "token-1"); ok {
-		t.Fatal("authoritative terminal event remained after successful retry")
-	}
+	awaitTerminalCompleted(t, handler.playbackStore, "play-1", "token-1",
+		"authoritative terminal event remained after successful retry")
 }
 
 func TestStoppedScrobbleRestagesAfterTerminalPersistenceFailure(t *testing.T) {
@@ -795,9 +804,8 @@ func TestStoppedScrobbleRestagesAfterTerminalPersistenceFailure(t *testing.T) {
 	if calls := flakyStore.calls(); calls < 2 {
 		t.Fatalf("stage calls = %d, want persistence retry", calls)
 	}
-	if _, ok := flakyStore.GetFinalizable("play-1", "token-1"); ok {
-		t.Fatal("restaged authoritative event remained after delivery")
-	}
+	awaitTerminalCompleted(t, flakyStore, "play-1", "token-1",
+		"restaged authoritative event remained after delivery")
 }
 
 func TestStoppedScrobblePreservesExplicitZeroPosition(t *testing.T) {
@@ -853,9 +861,7 @@ func TestTerminalScrobbleRecoveryDeliversPersistedEventAfterRestart(t *testing.T
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for recovered terminal event")
 	}
-	if _, ok := store.GetFinalizable("play-1", "token-1"); ok {
-		t.Fatal("recovered authoritative event remained pending")
-	}
+	awaitTerminalCompleted(t, store, "play-1", "token-1", "recovered authoritative event remained pending")
 }
 
 func TestTerminalScrobbleRecoveryWaitsForConfirmedProviderStop(t *testing.T) {
@@ -1177,4 +1183,30 @@ func TestTeardownStillCleansLocalPlaybackAfterAnotherCallerClaimsStop(t *testing
 	if len(scrobbler.calls) != 0 {
 		t.Fatalf("losing teardown emitted provider event: %+v", scrobbler.calls)
 	}
+}
+
+// awaitTerminalCompleted waits for the delivery path to retire a terminal event.
+//
+// The mirror of awaitTerminalFallbackSent, and racy for the same reason:
+// CompleteTerminal runs after the dispatch that puts the event on the scrobbler
+// channel, so a test that reads the store the instant it receives can see the
+// entry still present. Waiting for its absence removes the ordering dependence.
+func awaitTerminalCompleted(t *testing.T, store terminalFinalizableStore, id, token, message string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := store.GetFinalizable(id, token); !ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(message)
+		}
+		runtime.Gosched()
+	}
+}
+
+// terminalFinalizableStore is the one method these waits need, so they work on
+// the concrete store and on the handler's interface field alike.
+type terminalFinalizableStore interface {
+	GetFinalizable(id, compatToken string) (*PlaybackSession, bool)
 }

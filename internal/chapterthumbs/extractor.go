@@ -27,7 +27,7 @@ type FrameExtractOptions struct {
 	RunFunc              func(ctx context.Context, ffmpegPath string, args []string) ([]byte, error)
 
 	softwareToneMapResolver *softwareToneMapFilterResolver
-	resolveHWAccel          func(ctx context.Context, hwAccel, ffmpegPath string) string
+	resolveHWAccel          func(ctx context.Context, hwAccel, ffmpegPath, hwDevice string) string
 }
 
 const (
@@ -189,7 +189,7 @@ func ExtractFrame(ctx context.Context, opts FrameExtractOptions) ([]byte, string
 		softwareToneMapResolver: softwareToneMapResolver,
 	}
 
-	resolvedAccel := resolveHWAccel(ctx, opts.HWAccel, ffmpegPath)
+	resolvedAccel := resolveHWAccel(ctx, opts.HWAccel, ffmpegPath, opts.HWDevice)
 	if supportsHardwareFrameExtract(resolvedAccel) {
 		softwareToneMapFilter := ""
 		if resolvedAccel == hwAccelVideoToolbox && opts.ToneMap {
@@ -419,9 +419,8 @@ func buildFrameExtractArgs(
 		if hwDevice == "" {
 			return nil, fmt.Errorf("qsv requires a render device")
 		}
+		args = append(args, tonemap.QSVInitDeviceArgs(hwDevice)...)
 		args = append(args,
-			"-init_hw_device", fmt.Sprintf("vaapi=va:%s,driver=iHD,kernel_driver=i915,vendor_id=0x8086", hwDevice),
-			"-init_hw_device", "qsv=qs@va",
 			"-filter_hw_device", "va",
 			"-hwaccel", "vaapi",
 			"-hwaccel_output_format", "vaapi",
@@ -430,8 +429,8 @@ func buildFrameExtractArgs(
 		if hwDevice == "" {
 			return nil, fmt.Errorf("vaapi requires a render device")
 		}
+		args = append(args, tonemap.VAAPIInitDeviceArgs("hw", hwDevice)...)
 		args = append(args,
-			"-init_hw_device", fmt.Sprintf("vaapi=hw:%s", hwDevice),
 			"-filter_hw_device", "hw",
 			"-hwaccel", "vaapi",
 			"-hwaccel_output_format", "vaapi",

@@ -711,6 +711,25 @@ func qsvVAAPIInitDevice(device string) string {
 	return "vaapi=va:" + device + ",driver=iHD,kernel_driver=i915,vendor_id=0x8086"
 }
 
+// initHWDeviceFlag is FFmpeg's hardware-device declaration flag, shared by
+// every init chain built here.
+const initHWDeviceFlag = "-init_hw_device"
+
+// QSVInitDeviceArgs declares the Intel VAAPI display and derives the QSV
+// device from it. Every QSV command line in the server — transcode, encoder
+// warmup, capability probes, tone-map smoke tests, chapter thumbnails — must
+// initialize hardware through this chain, so a driver constraint is fixed in
+// one place.
+func QSVInitDeviceArgs(device string) []string {
+	return []string{initHWDeviceFlag, qsvVAAPIInitDevice(device), initHWDeviceFlag, "qsv=qs@va"}
+}
+
+// VAAPIInitDeviceArgs declares one VAAPI device under the alias the caller's
+// filter graph and encoder reference.
+func VAAPIInitDeviceArgs(alias, device string) []string {
+	return []string{initHWDeviceFlag, "vaapi=" + alias + ":" + device}
+}
+
 // HDRMetadataRemovalFilter removes side data that would otherwise incorrectly
 // label the converted SDR frames as HDR or Dolby Vision.
 func HDRMetadataRemovalFilter() string {

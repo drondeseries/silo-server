@@ -302,3 +302,28 @@ func TestHandleReplanPlaybackV3PinsAttemptStickyFeatures(t *testing.T) {
 		t.Fatalf("durable client features = %v, the software-decode opt-in was dropped", record.NormalizedRequest.ClientFeatures)
 	}
 }
+
+// Every client-facing proxy URL builder joins onto the proxy's ClientURL —
+// the public URL when one is set — while the backend URL stays what the
+// server and the stream-token tnode claim dial. A split-network proxy
+// registered by its private address must never leak that address to a player.
+func TestProxyURLBuildersUseThePublicURLWhenSet(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.JWTSecret = "test-stream-signing-secret"
+	file := v3HandlerFixtureFile(t)
+	public := "https://cdn.example.com"
+	proxy := &nodepool.Node{URL: "http://10.0.0.9:8083", PublicURL: &public}
+
+	session := &playback.Session{ID: "session-public", UserID: 7, ProfileID: "profile-1", MediaFileID: file.ID, PlayMethod: playback.PlayDirect}
+	if got, servedByProxy := handler.identityStreamURLV3(session, file, proxy); !servedByProxy || !strings.HasPrefix(got, public+"/stream/direct/") {
+		t.Fatalf("identity URL = %q (proxy %v), want the public origin", got, servedByProxy)
+	}
+
+	card := playback.NewRecipeCard(session.UserID, session.ProfileID, file.ID, "", playback.TranscodeOpts{SessionID: session.ID, InputPath: file.FilePath})
+	if got := handler.buildProxyManifestURL(card, proxy, false); !strings.HasPrefix(got, public+"/stream/transcode/") {
+		t.Fatalf("manifest URL = %q, want the public origin", got)
+	}
+	if strings.Contains(handler.buildProxyManifestURL(card, proxy, false), "10.0.0.9") {
+		t.Fatalf("manifest URL leaked the backend address")
+	}
+}

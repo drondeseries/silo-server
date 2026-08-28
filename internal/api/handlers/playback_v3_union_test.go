@@ -782,9 +782,9 @@ func TestLookupRemoteCapabilitiesV3PreservesConcurrentFreshSuccessOnRefetchFailu
 	handler.JWTSecret = "test-secret"
 	handler.v3NodeCapabilities = make(map[string]v3NodeCapabilityCache)
 	handler.v3NodeCapabilities[remote.URL] = v3NodeCapabilityCache{
-		expiresAt:           time.Now().Add(-time.Second),
-		probeRequestTimeout: time.Second,
+		expiresAt: time.Now().Add(-time.Second),
 	}
+	handler.v3NodeProbeBudgets = map[string]time.Duration{remote.URL: time.Second}
 	type lookupResult struct {
 		entry v3NodeCapabilityCache
 		err   error

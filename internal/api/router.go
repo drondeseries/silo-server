@@ -49,6 +49,7 @@ import (
 	metatrakt "github.com/Silo-Server/silo-server/internal/metadata/trakt"
 	metadatatranslation "github.com/Silo-Server/silo-server/internal/metadata/translation"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/nodemetrics"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
 	"github.com/Silo-Server/silo-server/internal/notifications"
 	"github.com/Silo-Server/silo-server/internal/onboarding"
@@ -68,6 +69,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/secret"
 	"github.com/Silo-Server/silo-server/internal/sections"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
+	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 	subtitleai "github.com/Silo-Server/silo-server/internal/subtitles/ai"
 	"github.com/Silo-Server/silo-server/internal/subtitles/opensubtitles"
@@ -100,67 +102,77 @@ type Dependencies struct {
 	DB                           *pgxpool.Pool
 	SecretCipher                 *secret.Cipher // at-rest credential cipher (required when DB is set)
 	FrontendFS                   fs.FS
-	S3Public                     *s3client.Client                 // public assets bucket client (may be nil)
-	S3Private                    *s3client.Client                 // private internal bucket client (may be nil)
-	S3UserDB                     *s3client.Client                 // user-db bucket client (may be nil)
-	BrandingService              *branding.Service                // white-label branding (nil when DB unavailable)
-	FolderRepo                   *catalog.FolderRepository        // media folder repository (may be nil)
-	FileRepo                     *scanner.FileRepository          // media file repository (may be nil)
-	Scanner                      *scanner.Scanner                 // scanner instance (may be nil)
-	LibraryIngester              *libraryingest.Executor          // shared library ingest executor (may be nil)
-	ProbeEnsurer                 handlers.PlaybackProbeEnsurer    // on-demand probe repair for playback/detail (may be nil)
-	UserStoreProvider            userstore.UserStoreProvider      // user store provider (may be nil)
-	SessionMgr                   *playback.SessionManager         // playback session manager (may be nil)
-	SkippedRootRepo              *metadata.SkippedRootRepository  // skipped root repository (may be nil)
-	StaleIDRepo                  *metadata.StaleMediaIDRepository // stale media ID repository (may be nil)
-	MovieMatchQueueRepo          *metadata.MovieMatchQueueRepository
-	SeriesRootMatchQueueRepo     *metadata.SeriesRootMatchQueueRepository
-	Refresher                    handlers.AdminMetadataRefresher // metadata refresher (may be nil)
-	NodeRepo                     *nodepool.Repository            // stream node repository (may be nil)
-	ProxyPool                    *nodepool.ProxyPool             // proxy node pool (may be nil)
-	TranscodePool                *nodepool.TranscodePool         // transcode node pool (may be nil)
-	NodePlanner                  *nodepool.Planner               // group/cap-aware node selection (may be nil)
-	SessionSyncer                handlers.PlaybackSessionSyncer  // optional; immediate playback session sync trigger
-	EventBus                     cache.EventBus
-	AdminStatsProvider           handlers.AdminStatsSource
-	Recommender                  recommendations.Recommender // nil when disabled
-	RecWorker                    *recommendations.Worker     // nil when disabled
-	CatalogSearchVectorizer      catalog.CatalogSearchQueryVectorizer
-	RatingsRepo                  *catalog.RatingsRepo
-	PersonRepo                   *catalog.PersonRepository
-	PersonRefreshQueue           handlers.PersonRefreshQueue
-	PersonRefresher              handlers.PersonRefresher
-	RateLimitMW                  *ratelimit.Middleware
-	ClientIPResolver             *clientip.Resolver
-	NodeID                       string
-	LogStreamHub                 *logstream.Hub
-	RealtimeHub                  *notifications.Hub
-	Notifications                *notifications.System // user-facing release notifications (may be nil)
-	PolicySystem                 *policy.System        // policy engine lifecycle (may be nil)
-	EventsHub                    *evt.Hub
-	ScanRegistry                 *evt.ScanRegistry
-	LibraryScanQueue             *scanqueue.Service
-	ActivityLogWriter            activitylog.Writer
-	ActivityLogRepo              *activitylog.Repo
-	OpsLogRepo                   *opslog.Repo
-	FFmpegLogSink                playback.FFmpegLogSink
-	RedisClient                  *redis.Client              // for session listing (may be nil)
-	TaskManager                  *taskmanager.TaskManager   // task manager (may be nil)
-	ArtifactManager              *downloads.ArtifactManager // download prepare-to-file pipeline (may be nil)
-	AdminJobCancelRegistry       *adminjob.CancelRegistry
-	IntroRepository              *intromarkers.Repository
-	IntroAnalyzer                *intromarkers.Analyzer
-	MarkerRegistry               *markers.Registry
-	MarkerResolver               markers.ExternalIDResolver
-	MarkerProviderConfig         *markers.ProviderConfigStore
-	MarkerContributionStore      *markers.ContributionStore
-	MarkerContributionService    *markers.ContributionService
-	WatchProviderService         handlers.WatchProviderService
-	WatchCompletionObserver      watchstate.CompletionObserver
-	PluginService                *plugins.Service
-	PluginHTTPProxy              *plugins.HTTPProxy
-	PluginUserConfig             *plugins.UserConfigStore
-	AuthProviders                []auth.RegisteredProvider
+	S3Public                     *s3client.Client              // public assets bucket client (may be nil)
+	S3Private                    *s3client.Client              // private internal bucket client (may be nil)
+	S3UserDB                     *s3client.Client              // user-db bucket client (may be nil)
+	BrandingService              *branding.Service             // white-label branding (nil when DB unavailable)
+	FolderRepo                   *catalog.FolderRepository     // media folder repository (may be nil)
+	FileRepo                     *scanner.FileRepository       // media file repository (may be nil)
+	Scanner                      *scanner.Scanner              // scanner instance (may be nil)
+	LibraryIngester              *libraryingest.Executor       // shared library ingest executor (may be nil)
+	ProbeEnsurer                 handlers.PlaybackProbeEnsurer // on-demand probe repair for playback/detail (may be nil)
+	UserStoreProvider            userstore.UserStoreProvider   // user store provider (may be nil)
+	SessionMgr                   *playback.SessionManager      // playback session manager (may be nil)
+	StreamTelemetry              *streamtelemetry.Registry     // local observation-only stream telemetry (may be nil)
+	// StreamTelemetryViewCache serves the merged global view with bounded
+	// staleness so the admin parity endpoint never rebuilds it per request.
+	StreamTelemetryViewCache *streamtelemetry.ViewCache
+	SkippedRootRepo          *metadata.SkippedRootRepository  // skipped root repository (may be nil)
+	StaleIDRepo              *metadata.StaleMediaIDRepository // stale media ID repository (may be nil)
+	MovieMatchQueueRepo      *metadata.MovieMatchQueueRepository
+	SeriesRootMatchQueueRepo *metadata.SeriesRootMatchQueueRepository
+	Refresher                handlers.AdminMetadataRefresher // metadata refresher (may be nil)
+	NodeRepo                 *nodepool.Repository            // stream node repository (may be nil)
+	ProxyPool                *nodepool.ProxyPool             // proxy node pool (may be nil)
+	TranscodePool            *nodepool.TranscodePool         // transcode node pool (may be nil)
+	NodePlanner              *nodepool.Planner               // group/cap-aware node selection (may be nil)
+	NodeHealthChecker        *nodepool.HealthChecker         // periodic node health/capability sweep (may be nil)
+	// NodeCapabilityInvalidator drops one node's cached capability inventory
+	// outside the playback handler — the prepared-download preparer holds its
+	// own. nil where downloads are not wired; set before NewRouter runs.
+	NodeCapabilityInvalidator func(nodeURL string)
+	ResourceSampler           *nodemetrics.Sampler           // this host's own resource sampler (may be nil)
+	SessionSyncer             handlers.PlaybackSessionSyncer // optional; immediate playback session sync trigger
+	EventBus                  cache.EventBus
+	AdminStatsProvider        handlers.AdminStatsSource
+	Recommender               recommendations.Recommender // nil when disabled
+	RecWorker                 *recommendations.Worker     // nil when disabled
+	CatalogSearchVectorizer   catalog.CatalogSearchQueryVectorizer
+	RatingsRepo               *catalog.RatingsRepo
+	PersonRepo                *catalog.PersonRepository
+	PersonRefreshQueue        handlers.PersonRefreshQueue
+	PersonRefresher           handlers.PersonRefresher
+	RateLimitMW               *ratelimit.Middleware
+	ClientIPResolver          *clientip.Resolver
+	NodeID                    string
+	LogStreamHub              *logstream.Hub
+	RealtimeHub               *notifications.Hub
+	Notifications             *notifications.System // user-facing release notifications (may be nil)
+	PolicySystem              *policy.System        // policy engine lifecycle (may be nil)
+	EventsHub                 *evt.Hub
+	ScanRegistry              *evt.ScanRegistry
+	LibraryScanQueue          *scanqueue.Service
+	ActivityLogWriter         activitylog.Writer
+	ActivityLogRepo           *activitylog.Repo
+	OpsLogRepo                *opslog.Repo
+	FFmpegLogSink             playback.FFmpegLogSink
+	RedisClient               *redis.Client              // for session listing (may be nil)
+	TaskManager               *taskmanager.TaskManager   // task manager (may be nil)
+	ArtifactManager           *downloads.ArtifactManager // download prepare-to-file pipeline (may be nil)
+	AdminJobCancelRegistry    *adminjob.CancelRegistry
+	IntroRepository           *intromarkers.Repository
+	IntroAnalyzer             *intromarkers.Analyzer
+	MarkerRegistry            *markers.Registry
+	MarkerResolver            markers.ExternalIDResolver
+	MarkerProviderConfig      *markers.ProviderConfigStore
+	MarkerContributionStore   *markers.ContributionStore
+	MarkerContributionService *markers.ContributionService
+	WatchProviderService      handlers.WatchProviderService
+	WatchCompletionObserver   watchstate.CompletionObserver
+	PluginService             *plugins.Service
+	PluginHTTPProxy           *plugins.HTTPProxy
+	PluginUserConfig          *plugins.UserConfigStore
+	AuthProviders             []auth.RegisteredProvider
 	// PublicURL is the externally-reachable origin (scheme + host) for this
 	// silo instance. Used to build redirect_uri values handed to OAuth
 	// IdPs. Empty disables the /oauth/{install_id}/{init,callback} routes.
@@ -218,6 +230,24 @@ func (d *Dependencies) CurrentConfig() *config.Config {
 // NewRouter creates a chi.Router with all middleware and routes mounted
 // under /api/v1/. ABS-compat routes (/abs/*, /login, /socket.io/*) are
 // mounted at the root level when deps.ABSHandler is non-nil.
+// invalidateNodeCapabilities drops every cached view of one node's hardware.
+//
+// There is more than one: protocol-v3 planning holds an inventory, and prepared
+// downloads hold their own with its own TTL. A policy edit or a capability hash
+// change invalidates the node itself, not one reader of it, so anything that
+// caches the answer has to be told — otherwise a QSV-to-NVENC edit keeps
+// selecting the node for a tone-map executor it no longer has, and the
+// reconfigured worker rejects the recipe or the download falls back locally for
+// no reason.
+func (deps Dependencies) invalidateNodeCapabilities(playbackHandler *handlers.PlaybackHandler) func(nodeURL string) {
+	return func(nodeURL string) {
+		playbackHandler.RefreshNodeCapabilitiesV3(nodeURL)
+		if deps.NodeCapabilityInvalidator != nil {
+			deps.NodeCapabilityInvalidator(nodeURL)
+		}
+	}
+}
+
 func NewRouter(deps Dependencies) chi.Router {
 	r := chi.NewRouter()
 
@@ -1353,6 +1383,10 @@ func NewRouter(deps Dependencies) chi.Router {
 			playbackHandler.SetProfileRefreshRequester(deps.RecWorker)
 		}
 		playbackHandler.StartCapabilityWarmupV3(deps.AppContext)
+		// The health sweep sees a node's capability hash change long before this
+		// cache would expire, so let it invalidate directly. Wired here rather
+		// than at checker construction because the handler does not exist yet.
+		deps.NodeHealthChecker.SetCapabilitiesChangedCallback(deps.invalidateNodeCapabilities(playbackHandler))
 
 		realtimeHub := deps.PlaybackRealtimeHub
 		if realtimeHub == nil {
@@ -3431,6 +3465,23 @@ func NewRouter(deps Dependencies) chi.Router {
 									jwtSecret = deps.Config.Auth.JWTSecret
 								}
 								nodeHandler := handlers.NewNodeHandler(deps.NodeRepo, deps.ProxyPool, deps.TranscodePool, deps.NodeRepo, deps.EventBus, deps.RedisClient, jwtSecret)
+								// A re-probe stores the node's new inventory through the
+								// sweep's own refresh, so the drift and persist rules have
+								// one implementation. Without a health checker the node
+								// still re-probes and the row catches up on a later sweep.
+								if deps.NodeHealthChecker != nil {
+									nodeHandler.SetCapabilityRefresher(deps.NodeHealthChecker)
+								}
+								// An acceleration override change makes this
+								// server's cached view of the node wrong the
+								// moment it lands; the same invalidation the
+								// health sweep uses drops it.
+								nodeHandler.SetCapabilityInvalidator(deps.invalidateNodeCapabilities(playbackHandler))
+								// A node with no override of its own runs the
+								// cluster's acceleration policy, and how many
+								// devices that names is what decides how long its
+								// re-probe may take.
+								nodeHandler.SetClusterPlaybackPolicy(playbackHandler.PlaybackConfig)
 								r.Route("/nodes", func(r chi.Router) {
 									r.Get("/", nodeHandler.HandleListNodes)
 									r.Post("/", nodeHandler.HandleCreateNode)
@@ -3439,6 +3490,7 @@ func NewRouter(deps Dependencies) chi.Router {
 									r.Post("/{id}/check", nodeHandler.HandleCheckNode)
 									r.Post("/force-reload", nodeHandler.HandleForceReloadNodes)
 									r.Post("/{id}/force-reload", nodeHandler.HandleForceReloadNode)
+									r.Post("/{id}/reprobe", nodeHandler.HandleReprobeNode)
 								})
 								// Live node sessions (reads from Redis)
 								// Note: /admin/sessions is already used for playback sessions from PostgreSQL.
@@ -3448,15 +3500,29 @@ func NewRouter(deps Dependencies) chi.Router {
 							// System inspection.
 							{
 								sysJWTSecret := ""
-								sysFFmpegPath := ""
 								if deps.Config != nil {
 									sysJWTSecret = deps.Config.Auth.JWTSecret
-									sysFFmpegPath = deps.Config.Playback.FFmpegPath
 								}
-								systemHandler := handlers.NewSystemHandler(deps.TranscodePool, sysJWTSecret, sysFFmpegPath)
+								// Read per request, not captured: playback
+								// settings hot reload, and a probe against the
+								// values this process started with would show an
+								// operator a result for the configuration they
+								// just replaced.
+								systemHandler := handlers.NewSystemHandler(deps.TranscodePool, sysJWTSecret,
+									func() (string, string, string) {
+										cfg := deps.CurrentConfig()
+										if cfg == nil {
+											return "", "", ""
+										}
+										return cfg.Playback.FFmpegPath, cfg.Playback.HWAccel, cfg.Playback.HWDevice
+									})
+								if deps.ResourceSampler != nil {
+									systemHandler.SetResourceSampler(deps.ResourceSampler)
+								}
 								r.Route("/system", func(r chi.Router) {
 									r.Get("/build", systemHandler.HandleBuildInfo)
 									r.Get("/hw-accel", systemHandler.HandleHWAccel)
+									r.Get("/resources", systemHandler.HandleSystemResources)
 								})
 							}
 

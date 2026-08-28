@@ -28,6 +28,7 @@ import { queryClient } from "@/lib/query-client";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
 import { useIsActingAdmin } from "@/hooks/useIsActingAdmin";
+import { useNavigationDirection } from "@/hooks/useNavigationDirection";
 import { ThemeProvider } from "@/hooks/useTheme";
 import { DateTimeFormatProvider, useDateTimeFormat } from "@/hooks/useDateTimeFormat";
 import { CustomThemeProvider } from "@/contexts/CustomThemeProvider";
@@ -200,6 +201,17 @@ function RouteAnnouncer() {
 
 function ScrollRestorationManager() {
   useScrollRestoration();
+  return null;
+}
+
+/**
+ * Tracks history provenance and the direction the page is moving in. A leaf
+ * rather than a call inside `AppShell`: the hook reads the location, and
+ * subscribing `AppShell` to it would re-render the whole provider stack on
+ * every navigation.
+ */
+function NavigationDirectionManager() {
+  useNavigationDirection();
   return null;
 }
 
@@ -760,6 +772,7 @@ function AppShell() {
                         <RouteChunkPrewarmer />
                         <RealtimeEventChannels />
                         <ScrollRestorationManager />
+                        <NavigationDirectionManager />
                         <RouteAnnouncer />
                         <QueryCacheManager />
                         <AppChrome />

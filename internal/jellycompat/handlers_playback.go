@@ -145,6 +145,24 @@ type compatTranscodeNodeHealth interface {
 	TranscodeNodeHealthy(nodeURL string) bool
 }
 
+// compatTranscodeNodeLookup resolves the pooled record behind a transcode node
+// URL, which carries that node's own acceleration override. Optional, like the
+// enumerators above: without it dispatch falls back to the cluster-wide
+// acceleration setting. *nodepool.Planner implements it.
+type compatTranscodeNodeLookup interface {
+	TranscodeNodeByURL(nodeURL string) (*nodepool.Node, bool)
+}
+
+// compatProxyNodeLookup resolves the pooled record behind a proxy node URL, so
+// capability-budget pricing can read a proxy's stored report and overrides —
+// the transcode lookup above answers nothing for a proxy URL, and pricing
+// proxies from the cluster policy alone undersizes a sweep whose slowest
+// member is a cold proxy. Optional for the same reason. *nodepool.Planner
+// implements it.
+type compatProxyNodeLookup interface {
+	ProxyNodeByURL(nodeURL string) (*nodepool.Node, bool)
+}
+
 // transcodeStreamDetailsSetter is implemented by the native SessionManager.
 // Optional (like sessionStarterContext) so lightweight test fakes don't have
 // to; without it the session keeps transport-level defaults only.
@@ -459,13 +477,13 @@ func resolveCompatToneMapRecipeWithPolicy(file *models.MediaFile, capabilities t
 
 // localToneMapCapabilities probes the API host's live FFmpeg backend and device.
 func (h *PlaybackHandler) localToneMapCapabilities(ctx context.Context) (tonemap.Capabilities, error) {
-	backend := playback.ResolveHWAccelWithFFmpegContext(ctx, h.HWAccel, h.FFmpegPath)
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
 	hwDevice := ""
 	if h.cfg != nil {
 		hwDevice = h.cfg.Playback.HWDevice
+	}
+	backend := playback.ResolveHWAccelWithFFmpegContext(ctx, h.HWAccel, h.FFmpegPath, hwDevice)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	probe := tonemap.Probe
 	if h.compatToneMapProbe != nil {
@@ -581,8 +599,65 @@ func compatSupportsAudioBoost(transformations []playback.TransformationV3) bool 
 	return false
 }
 
+// toneMapCapabilityTimeout bounds one capability sweep. Every caller wraps a
+// single deadline around concurrent per-node fetches (plus the local probe),
+// so the budget has to cover the slowest node in the fan-out, not a typical
+// one: each pooled node is priced the way the v3 and download paths price a
+// cold read — ColdCapabilityRequestTimeout over its stored report and its
+// effective override — and the sweep takes the maximum, with the fixed
+// fallback as the floor for the local probe and for nodes this process cannot
+// resolve. Without the derivation, a node with enough configured devices to
+// out-price two minutes was canceled while still inside its own advertised
+// probe budget, and HDR or audio-boost planning excluded it for no fault.
 func (h *PlaybackHandler) toneMapCapabilityTimeout() time.Duration {
-	return compatRemoteNodeProbeFallbackTimeout
+	hwDevice := ""
+	if h.cfg != nil {
+		hwDevice = h.cfg.Playback.HWDevice
+	}
+	// The local probe runs under the same deadline, priced by the cluster
+	// policy; this is also the whole answer when no pool is reachable.
+	budget := playback.ColdCapabilityRequestTimeout(nil, h.HWAccel, hwDevice, compatRemoteNodeProbeFallbackTimeout)
+
+	// A URL its lookup cannot resolve — a record that left the pool, or a
+	// planner without the lookup at all — prices as a nil node: cluster policy
+	// over the fallback, which is the pre-derivation behavior.
+	price := func(node *nodepool.Node) {
+		cold := playback.ColdCapabilityRequestTimeout(
+			node.StoredCapabilities(),
+			node.EffectiveHWAccel(h.HWAccel),
+			node.EffectiveHWDevice(hwDevice),
+			compatRemoteNodeProbeFallbackTimeout,
+		)
+		if cold > budget {
+			budget = cold
+		}
+	}
+	if enumerator, ok := h.NodePlanner.(compatTranscodeNodeEnumerator); ok {
+		lookup, canLookup := h.NodePlanner.(compatTranscodeNodeLookup)
+		for _, nodeURL := range enumerator.TranscodeNodeURLs() {
+			var node *nodepool.Node
+			if canLookup {
+				node, _ = lookup.TranscodeNodeByURL(nodeURL)
+			}
+			price(node)
+		}
+	}
+	// Proxy nodes answer the audio-boost recipe sweep under this same
+	// deadline, resolved through their own pool: the transcode lookup answers
+	// nothing for a proxy URL, and a cold proxy whose report or override
+	// out-prices the fallback would otherwise be canceled inside its own
+	// budget and dropped from planning.
+	if enumerator, ok := h.NodePlanner.(compatProxyNodeEnumerator); ok {
+		lookup, canLookup := h.NodePlanner.(compatProxyNodeLookup)
+		for _, nodeURL := range enumerator.ProxyNodeURLs() {
+			var node *nodepool.Node
+			if canLookup {
+				node, _ = lookup.ProxyNodeByURL(nodeURL)
+			}
+			price(node)
+		}
+	}
+	return budget
 }
 
 func (h *PlaybackHandler) remoteTranscodeStartTimeout(request transcodenode.TranscodeStartRequest, nodeProbeTimeoutMillis int64) time.Duration {
@@ -1072,19 +1147,20 @@ func (h *PlaybackHandler) buildProxyRedirectURL(
 
 	switch method {
 	case string(playback.PlayDirect):
-		return proxyNode.URL + "/stream/direct/" + token, nil
+		return nodepool.NodeEndpoint(proxyNode.ClientURL(), "/stream/direct/"+token), nil
 	case string(playback.PlayRemux):
 		remuxPath := "/stream/remux/"
 		if claims.PlayMethod == streamtoken.PlayMethodAudioDownmixRemux {
 			remuxPath = "/stream/remux/audio-v2/"
 		}
-		redirectURL := proxyNode.URL + remuxPath + token
+		redirectURL := nodepool.NodeEndpoint(proxyNode.ClientURL(), remuxPath+token)
 		if seekSeconds > 0 {
 			redirectURL += "?seek=" + strconv.FormatFloat(seekSeconds, 'f', -1, 64)
 		}
 		return redirectURL, nil
 	case string(playback.PlayTranscode):
-		return proxyNode.URL + "/stream/transcode/" + token + "/master.m3u8?" + playback.SourceTimelineQueryParam + "=1", nil
+		return nodepool.NodeEndpoint(proxyNode.ClientURL(),
+			"/stream/transcode/"+token+"/master.m3u8?"+playback.SourceTimelineQueryParam+"=1"), nil
 	default:
 		return "", fmt.Errorf("unsupported proxy method %q", method)
 	}
@@ -1109,6 +1185,26 @@ func clampSeekSeconds(seekSeconds float64, sources []PlaybackMediaSource) float6
 		return maxDuration
 	}
 	return seekSeconds
+}
+
+// remoteDispatchHWAccel picks the acceleration backend to name in a start
+// request to one node: that node's own hw_accel_override when it carries one,
+// and otherwise the cluster-wide setting this host runs under. A node under an
+// override resolves to its own answer regardless, so naming it keeps the
+// request and what runs in agreement. The cluster value passes through
+// untouched otherwise — "auto" included, because the node honors a named
+// backend verbatim and must be left to resolve it against live hardware. This
+// mirrors the v1 dispatch path in internal/api/handlers/playback_v3.go.
+func (h *PlaybackHandler) remoteDispatchHWAccel(nodeURL string) string {
+	lookup, ok := h.NodePlanner.(compatTranscodeNodeLookup)
+	if !ok {
+		return h.HWAccel
+	}
+	node, found := lookup.TranscodeNodeByURL(nodeURL)
+	if !found {
+		return h.HWAccel
+	}
+	return node.EffectiveHWAccel(h.HWAccel)
 }
 
 // startRemoteTranscode submits a frozen compatibility recipe to a selected node.
@@ -1256,7 +1352,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		TargetCodecVideo:    compatTargetVideoCodec,
 		TargetCodecAudio:    compatTargetAudioCodec,
 		SegmentDuration:     segmentDuration,
-		HWAccel:             h.HWAccel,
+		HWAccel:             h.remoteDispatchHWAccel(transcodeNodeURL),
 		AudioTrackIndex:     compatAudioTrackIndexOrDefault(source),
 		SourceAudioChannels: compatSourceAudioChannels(source),
 		TotalDuration:       float64(source.Version.Duration),
@@ -1298,7 +1394,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		}
 		requestCtx, cancel := context.WithTimeout(ctx, h.remoteTranscodeStartTimeout(request, nodeProbeTimeoutMillis))
 		defer cancel()
-		httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, transcodeNodeURL+"/transcode/start", strings.NewReader(string(body)))
+		httpReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, nodepool.NodeEndpoint(transcodeNodeURL, "/transcode/start"), strings.NewReader(string(body)))
 		if err != nil {
 			return transcodenode.TranscodeStartResponse{}, 0, false, fmt.Errorf("build transcode request: %w", logredact.SanitizeURLError(err))
 		}

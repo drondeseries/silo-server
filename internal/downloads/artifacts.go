@@ -503,7 +503,7 @@ func (m *ArtifactManager) localToneMapCapabilities(ctx context.Context) (tonemap
 	if cfg == nil {
 		return nil, nil
 	}
-	backend := playback.ResolveHWAccelWithFFmpegContext(ctx, cfg.Playback.HWAccel, cfg.Playback.FFmpegPath)
+	backend := playback.ResolveHWAccelWithFFmpegContext(ctx, cfg.Playback.HWAccel, cfg.Playback.FFmpegPath, cfg.Playback.HWDevice)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

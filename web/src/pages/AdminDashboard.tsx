@@ -4,6 +4,7 @@ import { Link, useNavigate } from "react-router";
 import { AdminSessionActions } from "@/components/AdminSessionActions";
 import { useEventChannel } from "@/components/realtimeEventsContext";
 import { fetchAdminStats, useAdminStats, useAdminSessions } from "@/hooks/queries/admin/stats";
+import { useSystemResources } from "@/hooks/queries/admin/system";
 import { useAdminUsers } from "@/hooks/queries/admin/users";
 import {
   useAdminLibraries,
@@ -56,6 +57,8 @@ import {
   classifyActivityMethod,
   getSessionClientLabel,
 } from "@/pages/adminActivityPresentation";
+import type { ResourceMetric } from "@/pages/adminNodesPresentation";
+import { describeResourceSample } from "@/pages/adminNodesPresentation";
 
 const REFRESH_SPINNER_MIN_VISIBLE_MS = 1_000;
 const DASHBOARD_AUTO_REFRESH_MS = 60_000;
@@ -272,6 +275,8 @@ export default function AdminDashboard() {
         error={statsQuery.error}
       />
 
+      <ServerResourcesCard canPoll={pageActivity.canPollDashboard} />
+
       {statsQuery.data?.watch_provider_activity && (
         <TraktActivityCard activity={statsQuery.data.watch_provider_activity} />
       )}
@@ -385,6 +390,73 @@ function StatsRow({
   );
 }
 
+/**
+ * The API host's own CPU/RAM/disk/GPU, which no other dashboard panel covers:
+ * every stat card above describes the library, and the Nodes page describes the
+ * workers. In integrated mode this host is also the transcoder.
+ */
+function ServerResourcesCard({ canPoll }: { canPoll: boolean }) {
+  const resourcesQuery = useSystemResources(canPoll);
+
+  // A server predating the endpoint 404s. There is nothing to say about it, and
+  // an error box on the dashboard would be about our request, not the server.
+  if (resourcesQuery.isError) {
+    return null;
+  }
+
+  const sample = describeResourceSample(resourcesQuery.data);
+  const sampledLabel =
+    sample.kind === "sampled" && sample.sampledAt ? getTimeAgo(sample.sampledAt) : null;
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-3">
+        <CardTitle className="text-sm font-bold">Server resources</CardTitle>
+        {sampledLabel && (
+          <span className="text-muted-foreground text-[11px]">Sampled {sampledLabel}</span>
+        )}
+      </CardHeader>
+      <CardContent>
+        {/* No body yet — still fetching, or paused with the tab in the
+            background. Either way the host has not said it cannot be sampled,
+            so the skeleton is the honest state rather than the empty copy. */}
+        {resourcesQuery.data === undefined ? (
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <Skeleton key={i} className="h-[76px] rounded-lg" />
+            ))}
+          </div>
+        ) : sample.kind === "unavailable" ? (
+          <div className="text-muted-foreground py-4 text-center text-sm">{sample.title}</div>
+        ) : (
+          <div className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+            <ResourceMetricBox metric={sample.cpu} />
+            <ResourceMetricBox metric={sample.memory} />
+            <ResourceMetricBox metric={sample.disk} />
+            {sample.gpu ? (
+              <ResourceMetricBox metric={sample.gpu} />
+            ) : (
+              <ResourceMetricBox metric={sample.network} />
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function ResourceMetricBox({ metric }: { metric: ResourceMetric }) {
+  return (
+    <MetricBox
+      label={metric.label}
+      value={metric.value}
+      detail={metric.detail}
+      title={metric.title}
+      valueClassName={cn(metric.muted && "text-muted-foreground", metric.warning && "text-warning")}
+    />
+  );
+}
+
 function TraktActivityCard({ activity }: { activity: WatchProviderActivity }) {
   const hasActivity =
     activity.trakt_connected_profiles > 0 ||
@@ -411,22 +483,22 @@ function TraktActivityCard({ activity }: { activity: WatchProviderActivity }) {
       </CardHeader>
       <CardContent>
         <div className="grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
-          <TraktMetric
+          <MetricBox
             label="Connected"
             value={activity.trakt_connected_profiles.toLocaleString()}
             detail={`${activity.trakt_enabled_profiles.toLocaleString()} enabled`}
           />
-          <TraktMetric
+          <MetricBox
             label="Last sync"
             value={lastSync}
             detail={`${activity.sync_runs_24h.toLocaleString()} runs in 24h`}
           />
-          <TraktMetric
+          <MetricBox
             label="Imported"
             value={activity.imported_watched_24h.toLocaleString()}
             detail={`${activity.imported_progress_24h.toLocaleString()} progress updates`}
           />
-          <TraktMetric
+          <MetricBox
             label="Exported"
             value={activity.exported_watched_24h.toLocaleString()}
             detail={`${activity.pending_exports.toLocaleString()} pending`}
@@ -463,11 +535,24 @@ function TraktActivityCard({ activity }: { activity: WatchProviderActivity }) {
   );
 }
 
-function TraktMetric({ label, value, detail }: { label: string; value: string; detail: string }) {
+/** Label / big value / small detail box, shared by the metric cards above. */
+function MetricBox({
+  label,
+  value,
+  detail,
+  title,
+  valueClassName,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+  title?: string;
+  valueClassName?: string;
+}) {
   return (
-    <div className="border-border/60 rounded-lg border p-3">
+    <div className="border-border/60 rounded-lg border p-3" title={title}>
       <div className="text-muted-foreground text-xs">{label}</div>
-      <div className="mt-1 text-xl font-bold tracking-tight">{value}</div>
+      <div className={cn("mt-1 text-xl font-bold tracking-tight", valueClassName)}>{value}</div>
       <div className="text-muted-foreground mt-0.5 text-xs">{detail}</div>
     </div>
   );

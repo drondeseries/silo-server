@@ -169,6 +169,9 @@ const (
 	transcodeResolution720p  = "720p"
 	transcodeResolution1080p = "1080p"
 	transcodeResolution2160p = "2160p"
+	// vaapiHWDeviceAlias names the VAAPI device every non-QSV hardware command
+	// line declares; filter graphs and probes reference it by this alias.
+	vaapiHWDeviceAlias = "hw"
 )
 
 // TranscodeSession manages a running ffmpeg HLS transcode process.
@@ -200,10 +203,11 @@ type TranscodeSession struct {
 	// directory) and describes media this process has not produced yet.
 	generationStartedAt time.Time
 	inputCleanupOnce    sync.Once
-	// reserveHWDeviceOnRestart is true when StartTranscode selected and reserved
-	// one device from a multi-device QSV/VAAPI setting. Each replacement ffmpeg
-	// process reacquires that same concrete device.
-	reserveHWDeviceOnRestart bool
+	// hwWorkloadDevice is the device this session's GPU workload is counted
+	// against, or empty when it holds none. Each replacement ffmpeg process
+	// reacquires this same device rather than re-running selection, so a restart
+	// keeps its GPU affinity and stays visible in per-device reporting.
+	hwWorkloadDevice string
 }
 
 // SetRestartHook registers a callback fired after every successful Restart.
@@ -315,11 +319,11 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 	if err := validateToneMapOpts(opts); err != nil {
 		return nil, err
 	}
-	configuredHWDevices := ParseHWDeviceSet(opts.HWDevice)
-	reserveHWDeviceOnRestart := configuredHWDevices.Multi() && hwAccelBalancesRenderDevices(opts.HWAccel)
 	// Resolve a multi-device hw_device list to one concrete GPU. Restarts reuse
 	// the selected device, but each ffmpeg process owns its own reservation.
-	hwDevice, releaseHWDevice := acquireHWDevice(opts.HWDevice, opts.HWAccel, opts.AvoidHWDevice)
+	// hwWorkloadDevice is whatever the allocator counted this workload under, so
+	// the rule for which workloads are counted lives in one place.
+	hwDevice, hwWorkloadDevice, releaseHWDevice := acquireHWDevice(opts.HWDevice, opts.HWAccel, opts.AvoidHWDevice)
 	opts.HWDevice = hwDevice
 	opts.AvoidHWDevice = ""
 	if err := validateToneMapSource(ctx, opts); err != nil {
@@ -342,14 +346,14 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 	// transcode process outlives a disconnected manifest request.
 	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	s := &TranscodeSession{
-		cancel:                   cancel,
-		opts:                     opts,
-		outputDir:                opts.OutputDir,
-		running:                  true,
-		done:                     make(chan struct{}),
-		stderr:                   newBoundedTailBuffer(stderrTailMaxBytes),
-		lastRequestedSegment:     opts.StartSegmentNumber,
-		reserveHWDeviceOnRestart: reserveHWDeviceOnRestart,
+		cancel:               cancel,
+		opts:                 opts,
+		outputDir:            opts.OutputDir,
+		running:              true,
+		done:                 make(chan struct{}),
+		stderr:               newBoundedTailBuffer(stderrTailMaxBytes),
+		lastRequestedSegment: opts.StartSegmentNumber,
+		hwWorkloadDevice:     hwWorkloadDevice,
 	}
 
 	args := buildFFmpegArgs(opts)
@@ -592,7 +596,7 @@ func ResolveToneMapExecutor(ctx context.Context, opts TranscodeOpts) (TranscodeO
 		opts.ToneMapSourceRevision.IsZero() {
 		return opts, fmt.Errorf("incomplete tone-map recipe")
 	}
-	backend := ResolveHWAccelWithFFmpegContext(ctx, opts.HWAccel, opts.FFmpegPath)
+	backend := ResolveHWAccelWithFFmpegContext(ctx, opts.HWAccel, opts.FFmpegPath, opts.HWDevice)
 	capabilities, err := tonemap.Probe(ctx, ResolveFFmpegPath(opts.FFmpegPath), backend, opts.HWDevice)
 	if err != nil {
 		return opts, fmt.Errorf("%w: probe tone-map executor: %w", ErrToneMapExecutorUnavailable, err)
@@ -824,7 +828,10 @@ func resolveEffectiveTranscodeHWAccelContext(ctx context.Context, opts Transcode
 	if opts.ToneMapHDRToSDR && opts.SubtitleBurnIn {
 		return "none"
 	}
-	hwAccel := ResolveHWAccelWithFFmpegContext(ctx, opts.HWAccel, opts.FFmpegPath)
+	// The device goes with the backend: resolution probes it, so a host whose
+	// first render node belongs to another vendor is not verified on hardware
+	// the transcode will never open.
+	hwAccel := ResolveHWAccelWithFFmpegContext(ctx, opts.HWAccel, opts.FFmpegPath, opts.HWDevice)
 	if hwAccel == "" {
 		return ""
 	}
@@ -973,10 +980,7 @@ func appendHWAccelArgs(args []string, opts TranscodeOpts) []string {
 			hwDevice = "/dev/dri/renderD128" // last-resort fallback
 		}
 		// VAAPI→QSV hardware pipeline: derive QSV from VAAPI device.
-		args = append(args,
-			"-init_hw_device", qsvVAAPIInitDevice(hwDevice),
-			"-init_hw_device", "qsv=qs@va",
-		)
+		args = append(args, tonemap.QSVInitDeviceArgs(hwDevice)...)
 		if opts.ToneMapMode == tonemap.ModeHardware && opts.ToneMapFilter == tonemap.HardwareFilterOpenCL {
 			args = append(args, "-init_hw_device", "opencl=ocl@va")
 		}
@@ -990,10 +994,8 @@ func appendHWAccelArgs(args []string, opts TranscodeOpts) []string {
 		if vaapiDevice == "" {
 			vaapiDevice = "/dev/dri/renderD128" // last-resort fallback
 		}
-		args = append(args,
-			"-init_hw_device", fmt.Sprintf("vaapi=hw:%s", vaapiDevice),
-			"-filter_hw_device", "hw",
-		)
+		args = append(args, tonemap.VAAPIInitDeviceArgs(vaapiHWDeviceAlias, vaapiDevice)...)
+		args = append(args, "-filter_hw_device", vaapiHWDeviceAlias)
 		if !opts.SoftwareVideoDecode {
 			args = append(args, "-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi")
 		}
@@ -1023,10 +1025,6 @@ func appendHWAccelArgs(args []string, opts TranscodeOpts) []string {
 		}
 	}
 	return args
-}
-
-func qsvVAAPIInitDevice(device string) string {
-	return fmt.Sprintf("vaapi=va:%s,driver=iHD,kernel_driver=i915,vendor_id=0x8086", device)
 }
 
 // videoPreset returns an encoder-compatible preset. CPU encoders use a faster
@@ -2929,7 +2927,7 @@ func (s *TranscodeSession) restart(
 		s.opts.InputPath = refreshedPath
 		s.opts.InputCleanup = refreshedCleanup
 	}
-	reserveHWDevice := s.reserveHWDeviceOnRestart
+	hwWorkloadDevice := s.hwWorkloadDevice
 	s.mu.Unlock()
 
 	previousOpts := opts
@@ -2986,8 +2984,8 @@ func (s *TranscodeSession) restart(
 	// this session on the same concrete GPU while accounting for the replacement
 	// process as a new active workload.
 	releaseHWDevice := func() {}
-	if reserveHWDevice {
-		releaseHWDevice = reserveConcreteHWDevice(opts.HWDevice)
+	if hwWorkloadDevice != "" {
+		releaseHWDevice = reserveConcreteHWDevice(hwWorkloadDevice)
 	}
 
 	// As in StartTranscode, stamp the generation before the process can write.

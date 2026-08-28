@@ -161,6 +161,7 @@ PATCH /api/v1/admin/subtitles/{id}/	non-media
 GET /api/v1/admin/subtitles/{id}/download	non-media
 GET /api/v1/admin/system/build	non-media
 GET /api/v1/admin/system/hw-accel	non-media
+GET /api/v1/admin/system/resources	non-media
 GET /api/v1/admin/unmatched	non-media
 GET /api/v1/admin/users	non-media
 POST /api/v1/admin/users	non-media

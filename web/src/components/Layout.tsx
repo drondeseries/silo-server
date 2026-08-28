@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useState } from "react";
-import { Link, useLocation, useNavigate } from "react-router";
+import { Link, useLocation } from "react-router";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { Menu, Search } from "lucide-react";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -29,6 +29,7 @@ import {
   type SidebarItemNavigationRequest,
 } from "@/components/sidebarItemNavigation";
 import { useSidebarItemDetailsGate } from "@/hooks/useSidebarItemDetailsGate";
+import { useViewTransitionNavigate } from "@/hooks/useViewTransition";
 import { catalogKeys } from "@/hooks/queries/keys";
 import { fetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
 
@@ -38,7 +39,7 @@ interface LayoutProps {
 
 export default function Layout({ children }: LayoutProps) {
   const location = useLocation();
-  const navigate = useNavigate();
+  const navigate = useViewTransitionNavigate();
   const queryClient = useQueryClient();
   const [mobileOpen, setMobileOpen] = useState(false);
   // Tracks whether the mobile header should slide off-screen on scroll.
@@ -103,7 +104,6 @@ export default function Layout({ children }: LayoutProps) {
       navigate(request.href, {
         replace: request.replace,
         state: request.state,
-        viewTransition: true,
       });
       return true;
     },
@@ -172,6 +172,12 @@ export default function Layout({ children }: LayoutProps) {
   // a frame late and it would trail the sidebar by ~23px at peak velocity.
   useLayoutEffect(() => {
     const root = document.documentElement;
+    // Marks that this shell is mounted, and with it the only element named
+    // `main-content`. app.css holds the root view-transition group still while
+    // it is set, so the frozen sidebar snapshot cannot cross-fade over the live
+    // collapse — and the routes rendered outside this shell keep the default
+    // root transition, which is the only thing they have to animate.
+    root.dataset.appShell = "true";
     if (targetDetailImmersion) {
       root.dataset.sidebarCollapsed = "true";
     } else {
@@ -183,6 +189,7 @@ export default function Layout({ children }: LayoutProps) {
       delete root.dataset.sidebarVisualCollapsed;
     }
     return () => {
+      delete root.dataset.appShell;
       delete root.dataset.sidebarCollapsed;
       delete root.dataset.sidebarVisualCollapsed;
     };

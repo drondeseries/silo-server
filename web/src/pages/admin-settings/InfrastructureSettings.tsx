@@ -24,7 +24,7 @@ import { useCheckAdminSettingsConnection } from "@/hooks/queries/admin/settings"
 import { useRestartKeys, type RestartKeyMatcher } from "@/hooks/useRestartKeys";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 
-import { FieldGroup, RestartAllProvider } from "./FieldGroup";
+import { FieldGroup } from "./FieldGroup";
 import { SaveBar } from "./SaveBar";
 import { SettingField } from "./SettingField";
 import { USER_DATABASE_BACKEND_OPTIONS } from "./databaseSettingOptions";
@@ -104,6 +104,15 @@ function countDirty(form: SettingsForm, keys: string[]): number {
   return keys.filter((key) => form.isDirty(key)).length;
 }
 
+// Whether a group may claim "changes apply after a restart" for all of its
+// fields at once. Computed from the server's restart registry rather than
+// asserted, so converting one key to hot-reload silently demotes its group to
+// per-field chips instead of leaving a false blanket claim — the Logs group
+// below is exactly that case today.
+function allRestart(restartKeys: RestartKeyMatcher, keys: string[]): boolean {
+  return keys.every((key) => restartKeys.has(key));
+}
+
 /**
  * Shared credential-draft helpers for every secret on the page. Every editor
  * is frozen while a save is in flight so a late keystroke cannot ride along
@@ -159,7 +168,7 @@ function RedisGroup({
   }
 
   return (
-    <FieldGroup label="Redis">
+    <FieldGroup label="Redis" restartAll={allRestart(restartKeys, REDIS_KEYS)}>
       <SettingField
         label="Use Redis"
         type="toggle"
@@ -218,6 +227,7 @@ function S3Group({
   secrets,
   scope,
   label,
+  description,
   checkKind,
 }: {
   form: SettingsForm;
@@ -225,6 +235,7 @@ function S3Group({
   secrets: SecretEditors;
   scope: "public" | "private";
   label: string;
+  description: string;
   checkKind: "s3_public" | "s3_private";
 }) {
   const checkConnection = useCheckAdminSettingsConnection();
@@ -269,7 +280,7 @@ function S3Group({
   }
 
   return (
-    <FieldGroup label={label}>
+    <FieldGroup label={label} description={description} restartAll={allRestart(restartKeys, keys)}>
       <SettingField
         label="Endpoint"
         hint="https://s3.us-east-1.amazonaws.com"
@@ -441,7 +452,7 @@ function DatabaseGroup({
   const changed = countDirty(form, DATABASE_KEYS);
 
   return (
-    <FieldGroup label="Database">
+    <FieldGroup label="Database" restartAll={allRestart(restartKeys, DATABASE_KEYS)}>
       <AdvancedSection id="infrastructure.database" count={sqlite ? 4 : 2} forceOpen={changed > 0}>
         <SettingField
           label="Maximum Postgres connections"
@@ -904,34 +915,31 @@ export default function InfrastructureSettings() {
 
   return (
     <div className="flex h-full flex-col">
-      <SettingsPageHeader title="Storage & Database" className="mb-2" />
-      <p className="text-muted-foreground mb-6 text-sm">
-        Changes on this page apply after a restart.
-      </p>
+      <SettingsPageHeader title="Storage & Database" className="mb-8" />
 
-      <RestartAllProvider>
-        <div className="flex-1 space-y-5">
-          <RedisGroup form={form} restartKeys={restartKeys} secrets={secrets} />
-          <S3Group
-            form={form}
-            restartKeys={restartKeys}
-            secrets={secrets}
-            scope="public"
-            label="Public storage"
-            checkKind="s3_public"
-          />
-          <S3Group
-            form={form}
-            restartKeys={restartKeys}
-            secrets={secrets}
-            scope="private"
-            label="Private storage"
-            checkKind="s3_private"
-          />
-          <DatabaseGroup form={form} restartKeys={restartKeys} />
-          <LogsGroup form={form} restartKeys={restartKeys} />
-        </div>
-      </RestartAllProvider>
+      <div className="flex-1 space-y-5">
+        <RedisGroup form={form} restartKeys={restartKeys} secrets={secrets} />
+        <S3Group
+          form={form}
+          restartKeys={restartKeys}
+          secrets={secrets}
+          scope="public"
+          label="Public storage"
+          description="Files clients download directly: cached artwork, uploaded posters, and branding images."
+          checkKind="s3_public"
+        />
+        <S3Group
+          form={form}
+          restartKeys={restartKeys}
+          secrets={secrets}
+          scope="private"
+          label="Private storage"
+          description="Files only the server reads: profile avatars, diagnostics bundles, and catalog seed artifacts."
+          checkKind="s3_private"
+        />
+        <DatabaseGroup form={form} restartKeys={restartKeys} />
+        <LogsGroup form={form} restartKeys={restartKeys} />
+      </div>
 
       <div className="flex-1 space-y-5">
         <VirtualLibraryGroup />

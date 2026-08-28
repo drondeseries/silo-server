@@ -6,38 +6,14 @@ import type { HWAccelInfo } from "@/hooks/queries/admin/system";
 // toggles, with no selection meaning "auto" (server picks the first
 // available device). The setting is cluster-wide, so rows carry per-node
 // presence info when transcode nodes report their inventories.
+//
+// Parsing and toggling that list is the same problem as editing one node's
+// hw_device_override, so both live in @/lib/hwDevices and are re-exported here
+// for the callers (and tests) that already know them by these names.
 
-export function parseHWDeviceList(value: string | undefined): string[] {
-  if (!value) return [];
-  return value
-    .split(",")
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0);
-}
+import { parseHWDeviceList, toggleHWDevice } from "@/lib/hwDevices";
 
-/**
- * Toggles one device in the stored list, preserving the order devices are
- * detected in so the stored value stays stable regardless of click order.
- */
-export function toggleHWDevice(
-  value: string | undefined,
-  device: string,
-  detectedOrder: string[],
-): string {
-  const selected = new Set(parseHWDeviceList(value));
-  if (selected.has(device)) {
-    selected.delete(device);
-  } else {
-    selected.add(device);
-  }
-  const ordered = detectedOrder.filter((path) => selected.has(path));
-  // Preserve selected devices the current detection pass doesn't list (e.g.
-  // a temporarily unplugged GPU) rather than silently dropping them.
-  for (const path of selected) {
-    if (!detectedOrder.includes(path)) ordered.push(path);
-  }
-  return ordered.join(",");
-}
+export { parseHWDeviceList, toggleHWDevice };
 
 export interface HWDeviceRow {
   path: string;

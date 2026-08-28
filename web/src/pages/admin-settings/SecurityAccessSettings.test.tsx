@@ -68,7 +68,7 @@ const SERVER_CONFIG: RateLimitConfig = {
   redis_available: true,
 };
 
-const REDIS_HINT = /Configure Redis under Infrastructure first/;
+const REDIS_HINT = /Configure Redis under Storage & Database first/;
 
 async function openBackendSelect() {
   await userEvent.click(screen.getByRole("button", { name: /Advanced/i }));
@@ -223,7 +223,7 @@ describe("SecurityAccessSettings", () => {
     expect(screen.queryByText(REDIS_HINT)).not.toBeInTheDocument();
   });
 
-  it("disables the Redis backend and points at Infrastructure when Redis is unconfigured", async () => {
+  it("disables the Redis backend and points at Storage & Database when Redis is unconfigured", async () => {
     rateLimitConfigMock.mockReturnValue({
       data: { ...SERVER_CONFIG, redis_available: false },
       isLoading: false,

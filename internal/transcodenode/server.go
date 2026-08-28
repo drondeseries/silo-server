@@ -17,12 +17,14 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/Silo-Server/silo-server/internal/chapterthumbs"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/downloadprepare"
 	"github.com/Silo-Server/silo-server/internal/nodeconfig"
+	"github.com/Silo-Server/silo-server/internal/nodemetrics"
 	"github.com/Silo-Server/silo-server/internal/nodesessions"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
@@ -116,6 +118,22 @@ func ValidateAudioRecipeAttestation(req TranscodeStartRequest, response Transcod
 type HealthResponse struct {
 	Status     string `json:"status"`
 	ActiveJobs int32  `json:"active_jobs"`
+	// CapabilitiesHash identifies this node's last computed hardware capability
+	// snapshot. It is read from the stored snapshot only — health must stay a
+	// cheap liveness answer, so it never triggers a probe — and is empty until
+	// the first background snapshot completes.
+	CapabilitiesHash string `json:"capabilities_hash,omitempty"`
+	// System and GPU are this node's last resource sample. Like the hash above
+	// they are read from a snapshot the sampler already published, never
+	// measured on the request: health is what the cluster routes on, so it must
+	// answer at the same speed whether or not a mount is hung or a GPU query is
+	// wedged. Both are omitted on a host that cannot be sampled.
+	//
+	// This route takes no credential, so the sample is path-free: disk entries
+	// carry their role and their fill, never where they are mounted. See
+	// nodemetrics.Snapshot.RedactPaths.
+	System *nodemetrics.SystemStats `json:"system,omitempty"`
+	GPU    []nodemetrics.GPUStats   `json:"gpu,omitempty"`
 }
 
 // sessionIdleTTL is how long a job may go without a manifest or segment
@@ -193,6 +211,49 @@ type Server struct {
 	// recipeStore is the control-plane recipe store consulted when a forwarded
 	// token carries no recipe (the jellycompat node hop). Nil disables that path.
 	recipeStore recipeStore
+
+	// capabilityHash is the last computed capability snapshot's hash, published
+	// by /health without probing. Nil until the first snapshot or capability
+	// request completes.
+	capabilityHash atomic.Pointer[string]
+
+	// metrics samples host and GPU resources in the background. Nil until
+	// StartMetricsSampler runs, which leaves health exactly as it was before.
+	metrics *nodemetrics.Sampler
+
+	// gpu keeps a capability re-probe's smoke encode and real transcodes off
+	// the encoder at the same time; see gpuGate.
+	gpu gpuGate
+
+	// capabilityBuildAdmitted, when set, is called once a capability build has
+	// claimed the GPU work slot and is about to wait for the build lock. It is
+	// the seam a test uses to observe that ordering rather than sleeping on it;
+	// production leaves it nil.
+	capabilityBuildAdmitted func()
+
+	// capabilityBuildMu serializes capability assemblies with each other.
+	//
+	// The gpuGate covers transcodes and downloads, not other capability
+	// builders, and the probe caches no longer coalesce a re-probe with work
+	// already in flight — bumping the invalidation generation is what makes the
+	// re-probe honest. Those two together would otherwise let the scheduled
+	// snapshot (or an authenticated /hw-capabilities request) run its smoke
+	// matrix beside the operator's, which on session-limited hardware is
+	// exactly the collision that publishes a false regression.
+	capabilityBuildMu sync.Mutex
+}
+
+// storedCapabilityHash returns the last published capability hash, or empty
+// when none has been computed yet.
+func (s *Server) storedCapabilityHash() string {
+	if hash := s.capabilityHash.Load(); hash != nil {
+		return *hash
+	}
+	return ""
+}
+
+func (s *Server) storeCapabilityHash(hash string) {
+	s.capabilityHash.Store(&hash)
 }
 
 func (s *Server) resolveToneMapRecipe(ctx context.Context, opts *playback.TranscodeOpts) error {
@@ -318,7 +379,7 @@ func NewServer(watcher *nodeconfig.Watcher, tracker *nodesessions.Tracker) *Serv
 }
 
 // StartOrphanSweeper runs the age-guarded orphan-transcode sweep immediately and
-// then hourly until ctx is cancelled. It never blocks (a slow network-filesystem
+// then hourly until ctx is canceled. It never blocks (a slow network-filesystem
 // delete runs in its own goroutine), so it is safe to call before the node binds
 // its listener. This is the node's only filesystem-level reclaimer of dirs left
 // behind by a session that was dropped without its output dir being removed — the
@@ -340,21 +401,37 @@ func (s *Server) StartOrphanSweeper(ctx context.Context) {
 }
 
 // StartHardwareEncoderWarmup primes the configured hardware encoder behind
-// node startup. It is best effort and never delays the health listener.
-func (s *Server) StartHardwareEncoderWarmup(ctx context.Context) {
+// node startup. It is best effort and never delays the health listener. The
+// returned channel closes once warmup has settled (including when there was
+// nothing to warm), so work that wants a primed encoder — the first capability
+// snapshot — can wait for it instead of racing it.
+func (s *Server) StartHardwareEncoderWarmup(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
 	if s == nil || s.watcher == nil || ctx == nil {
-		return
+		close(done)
+		return done
 	}
 	cfg := s.watcher.Config()
 	if cfg == nil {
-		return
+		close(done)
+		return done
 	}
 	playbackCfg := cfg.Playback
+	// Claimed here, before the goroutine exists. Warmup is a real smoke encode
+	// and the listener opens while it may still be running, so an admin re-probe
+	// arriving in a node's first seconds must not see an idle gate — and a claim
+	// taken inside the goroutine leaves exactly that window, since the scheduler
+	// makes no promise about when it runs. Held rather than requested: warmup is
+	// already committed by the time it could be refused.
+	s.gpu.holdWork()
 	go func() {
+		defer close(done)
+		defer s.gpu.endWork()
 		if err := playback.WarmHardwareEncoder(ctx, playbackCfg.FFmpegPath, playbackCfg.HWAccel, playbackCfg.HWDevice); err != nil {
 			slog.DebugContext(ctx, "transcode node hardware encoder warmup failed", "component", "transcodenode", "error", err)
 		}
 	}()
+	return done
 }
 
 // activeSessionIDs snapshots the ids of currently registered jobs so the orphan
@@ -497,8 +574,7 @@ func (s *Server) reapSession(sessionID string, session *playback.TranscodeSessio
 	delete(s.lastAccess, sessionID)
 	s.mu.Unlock()
 
-	s.activeJobs.Add(-1)
-	if err := session.Close(); err != nil {
+	if err := s.closeSessionOffGPU(session); err != nil {
 		slog.Error("close idle transcode session", "component", "transcodenode", "error", err, "session", sessionID, "playback_session_id", sessionID)
 	}
 	if s.tracker != nil {
@@ -506,6 +582,30 @@ func (s *Server) reapSession(sessionID string, session *playback.TranscodeSessio
 	}
 	slog.Info("transcode node reaped idle session", "component", "transcodenode",
 		"session", sessionID, "playback_session_id", sessionID, "idle_ms", time.Since(last).Milliseconds())
+}
+
+// closeSessionOffGPU retires one session: it drops the node's job count and
+// closes the encoder, with the GPU gate holding the session as work for the
+// whole teardown.
+//
+// The two counters have to overlap here, the same way the gate and activeJobs
+// overlap when a session starts. Close waits for ffmpeg to exit, so the encoder
+// keeps its GPU session for the length of the call, while activeJobs has to drop
+// first for a stop to be reflected immediately. Without the hold, that live
+// encoder is counted by nothing and a re-probe admitted in the gap smoke-encodes
+// beside it.
+func (s *Server) closeSessionOffGPU(session *playback.TranscodeSession) error {
+	return s.retireGPUSession(session.Close)
+}
+
+// retireGPUSession drops the node's job count and runs one session's teardown
+// with the gate holding it as work throughout. The hold discipline is the same
+// whatever the teardown is, which is why it is separate from what it closes.
+func (s *Server) retireGPUSession(close func() error) error {
+	s.gpu.holdWork()
+	defer s.gpu.endWork()
+	s.activeJobs.Add(-1)
+	return close()
 }
 
 // recipeStore reads a remote transcode's reconstruction recipe written by central
@@ -552,6 +652,10 @@ func (s *Server) Handler() http.Handler {
 	s.startIdleReaper()
 	r := chi.NewRouter()
 	r.Get("/api/v1/health", s.handleHealth)
+	// Unauthenticated, matching the API listener's own /metrics posture: a
+	// scrape target that needs a credential is a scrape target that goes
+	// unmonitored, and the exposure is host resource counters, not media.
+	r.Method(http.MethodGet, "/metrics", promhttp.Handler())
 
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireBearer)
@@ -566,6 +670,8 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/transcode/{session_id}/master.m3u8", observeNode(s.telemetry, http.MethodGet, "/transcode/{session_id}/master.m3u8", s.handleManifest))
 		r.Get("/transcode/{session_id}/segment/{name}", observeNode(s.telemetry, http.MethodGet, "/transcode/{session_id}/segment/{name}", s.handleSegment))
 		r.Post("/admin/force-reload", s.handleForceReload)
+		r.Post("/admin/reload-config", s.handleReloadConfig)
+		r.Post("/admin/reprobe-capabilities", s.handleReprobeCapabilities)
 		r.Get("/status", s.handleStatus)
 	})
 	return r
@@ -614,6 +720,16 @@ func (s *Server) handleDownloadPrepare(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Claimed only once this request is committed to producing something: a
+	// prepared download encodes on the GPU like any transcode, and the tone-map
+	// recipe resolution just below runs ffmpeg probes on it too. Serving an
+	// artifact that already exists touches neither, so a re-probe must not
+	// refuse it.
+	if !s.gpu.beginWork() {
+		http.Error(w, "node is re-probing its hardware; retry shortly", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.gpu.endWork()
 	if req.ToneMapRequested() {
 		if err := s.resolveToneMapRecipe(r.Context(), &opts); err != nil {
 			writeToneMapRecipeError(w, err)
@@ -738,7 +854,7 @@ func resolveToneMapRecipe(ctx context.Context, opts *playback.TranscodeOpts) err
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	resolveCtx, cancel := context.WithTimeout(ctx, tonemap.ProbeEndpointTimeout(opts.HWAccel, opts.HWDevice))
+	resolveCtx, cancel := context.WithTimeout(ctx, playback.CapabilityEndpointTimeout(opts.HWAccel, opts.HWDevice))
 	defer cancel()
 	if err := resolveCtx.Err(); err != nil {
 		return err
@@ -886,15 +1002,80 @@ func (s *Server) trackDownloadPrepare(ctx context.Context, info nodesessions.Ses
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	snapshot := s.metrics.Snapshot().RedactPaths()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(HealthResponse{
-		Status:     "ok",
-		ActiveJobs: s.activeJobs.Load(),
+		Status:           "ok",
+		ActiveJobs:       s.activeJobs.Load(),
+		CapabilitiesHash: s.storedCapabilityHash(),
+		System:           snapshot.System,
+		GPU:              snapshot.GPU,
 	})
 }
 
-// handleHWCapabilities reports live smoke-tested node capabilities.
-func (s *Server) handleHWCapabilities(w http.ResponseWriter, r *http.Request) {
+// StartMetricsSampler begins background resource sampling until ctx is
+// canceled, and publishes the readings on /health, /status and /metrics.
+//
+// The scratch dir is the only mount a transcode node samples: it is the volume
+// that silently kills transcodes when it fills, and it is the one path the node
+// is guaranteed to be able to see. Media roots are the API host's to report,
+// because path visibility varies per node and a node cannot tell "root I cannot
+// see" from "root that does not exist".
+func (s *Server) StartMetricsSampler(ctx context.Context) {
+	if s == nil || ctx == nil {
+		return
+	}
+	s.metrics = nodemetrics.NewSampler(nodemetrics.Options{
+		// Fixed for this process: a node writes every session under the
+		// directory it resolved at startup, so a later config edit does not move
+		// the volume this one is filling.
+		ScratchDir:       func() string { return s.transcodeDir },
+		DeviceSessions:   playback.HWDeviceLoadSnapshot,
+		DeviceIdentities: playback.SamplerDeviceIdentities,
+	})
+	s.metrics.Start(ctx)
+}
+
+// buildCapabilitySnapshot runs the node's full capability detection: hardware
+// walk, tone-map probe, and transformation registry, hashed into one identity.
+// It is the single assembly used by both the capability endpoint and the
+// background snapshot, so the hash a health response advertises always
+// describes the payload the endpoint would serve.
+//
+// The probes behind it are individually cached, so repeating this is cheap once
+// the first pass has run.
+// ErrCapabilityBuildBusy reports that a capability snapshot was not attempted
+// because a re-probe holds the encoder. The previously published hash stands.
+var ErrCapabilityBuildBusy = errors.New("capability build refused while the node is re-probing")
+
+func (s *Server) buildCapabilitySnapshot(ctx context.Context) (playback.HWAccelInfo, error) {
+	// A snapshot runs ffmpeg on the GPU whenever the probe caches are cold, so
+	// it registers as GPU work. That is what stops a manual re-probe from
+	// claiming an apparently idle encoder and running its own smoke matrix
+	// beside this one.
+	//
+	// It deliberately does *not* refuse while transcodes are running. A node
+	// under sustained load would then never refresh its inventory, and its
+	// advertised hash would go stale indefinitely — a worse failure than the
+	// cold-start contention this would avoid, which a positive probe result
+	// caches away after the first success and which the next snapshot corrects.
+	if !s.gpu.beginWork() {
+		return playback.HWAccelInfo{}, ErrCapabilityBuildBusy
+	}
+	defer s.gpu.endWork()
+	if s.capabilityBuildAdmitted != nil {
+		s.capabilityBuildAdmitted()
+	}
+	s.capabilityBuildMu.Lock()
+	defer s.capabilityBuildMu.Unlock()
+	return s.buildCapabilitySnapshotLocked(ctx)
+}
+
+// buildCapabilitySnapshotLocked is buildCapabilitySnapshot's body. Callers must
+// hold capabilityBuildMu; the re-probe takes it itself so its cache
+// invalidation and its rebuild are one step no other builder can interleave
+// with.
+func (s *Server) buildCapabilitySnapshotLocked(ctx context.Context) (playback.HWAccelInfo, error) {
 	ffmpegPath := ""
 	configuredHWAccel := playback.HWAccelNone
 	hwDevice := ""
@@ -903,29 +1084,101 @@ func (s *Server) handleHWCapabilities(w http.ResponseWriter, r *http.Request) {
 		configuredHWAccel = cfg.Playback.HWAccel
 		hwDevice = cfg.Playback.HWDevice
 	}
-	resolveCtx, cancel := context.WithTimeout(r.Context(), toneMapCapabilityResolveTimeout(configuredHWAccel, hwDevice))
+	resolveCtx, cancel := context.WithTimeout(ctx, toneMapCapabilityResolveTimeout(configuredHWAccel, hwDevice))
 	defer cancel()
-	hwAccel := playback.ResolveHWAccelWithFFmpegContext(resolveCtx, configuredHWAccel, ffmpegPath)
-	info := playback.DetectHWAccelWithFFmpegContext(resolveCtx, ffmpegPath)
-	info.ProbeRequestTimeoutMillis = tonemap.ProbeRequestTimeout(configuredHWAccel, hwDevice).Milliseconds()
-	capabilities, err := tonemap.Probe(resolveCtx, playback.ResolveFFmpegPath(ffmpegPath), hwAccel, hwDevice)
+	// One detection walk answers both questions: Resolved honors the configured
+	// backend's pass-through contract, and DetectedBackends explains it.
+	//
+	// A walk that ran out of budget is refused rather than published: it marks
+	// unprobed backends Verified=false, which is byte-identical to a real
+	// hardware failure, so hashing it would make the API persist a capability
+	// regression for hardware that is fine.
+	info, err := playback.DetectHWAccelWithFFmpegContextResult(resolveCtx, configuredHWAccel, ffmpegPath, hwDevice)
 	if err != nil {
-		http.Error(w, "capability probe unavailable", http.StatusServiceUnavailable)
-		return
+		return playback.HWAccelInfo{}, err
+	}
+	info.ProbeRequestTimeoutMillis = playback.CapabilityRequestTimeout(configuredHWAccel, hwDevice).Milliseconds()
+	capabilities, err := tonemap.Probe(resolveCtx, playback.ResolveFFmpegPath(ffmpegPath), info.Resolved, hwDevice)
+	if err != nil {
+		return playback.HWAccelInfo{}, err
 	}
 	info.ToneMapCapabilities = capabilities
 	registry, err := playback.ProbeTransformationRegistryWithToneMapV3Result(resolveCtx, ffmpegPath, info.ToneMapCapabilities)
 	if err != nil {
+		return playback.HWAccelInfo{}, err
+	}
+	info.Transformations = registry.Advertised()
+	info.CapabilityHash = playback.ComputeCapabilityHash(info)
+	return info, nil
+}
+
+// handleHWCapabilities reports live smoke-tested node capabilities.
+func (s *Server) handleHWCapabilities(w http.ResponseWriter, r *http.Request) {
+	info, err := s.buildCapabilitySnapshot(r.Context())
+	if err != nil {
 		http.Error(w, "capability probe unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	info.Transformations = registry.Advertised()
+	// A served report is as authoritative as a scheduled snapshot, so health
+	// starts advertising this hash immediately rather than at the next tick.
+	s.storeCapabilityHash(info.CapabilityHash)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(info)
 }
 
+// capabilitySnapshotInterval is how often the node recomputes its capability
+// snapshot. The probes behind it are cached, so this mostly re-reads sysfs and
+// re-hashes; it exists to notice hardware or ffmpeg changing underneath a
+// long-running node without waiting for a restart.
+const capabilitySnapshotInterval = 15 * time.Minute
+
+// StartCapabilitySnapshots keeps the capability hash published by /health
+// current, in the background, until ctx is canceled. ready gates the first
+// snapshot so it observes a primed encoder rather than racing warmup; a nil
+// channel means snapshot immediately.
+func (s *Server) StartCapabilitySnapshots(ctx context.Context, ready <-chan struct{}) {
+	if s == nil || ctx == nil {
+		return
+	}
+	go func() {
+		if ready != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ready:
+			}
+		}
+		s.refreshCapabilitySnapshot(ctx)
+		ticker := time.NewTicker(capabilitySnapshotInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.refreshCapabilitySnapshot(ctx)
+			}
+		}
+	}()
+}
+
+func (s *Server) refreshCapabilitySnapshot(ctx context.Context) {
+	info, err := s.buildCapabilitySnapshot(ctx)
+	if err != nil {
+		// Keep the previous hash: a failed probe is not evidence the hardware
+		// changed, and clearing it would look like a downgrade to the API.
+		slog.DebugContext(ctx, "transcode node capability snapshot failed", "component", "transcodenode", "error", err)
+		return
+	}
+	if previous := s.storedCapabilityHash(); previous != "" && previous != info.CapabilityHash {
+		slog.InfoContext(ctx, "transcode node capabilities changed", "component", "transcodenode",
+			"previous_hash", previous, "hash", info.CapabilityHash, "resolved", info.Resolved)
+	}
+	s.storeCapabilityHash(info.CapabilityHash)
+}
+
 func toneMapCapabilityResolveTimeout(hardwareBackend, hardwareDevice string) time.Duration {
-	return tonemap.ProbeEndpointTimeout(hardwareBackend, hardwareDevice)
+	return playback.CapabilityEndpointTimeout(hardwareBackend, hardwareDevice)
 }
 
 func (s *Server) handleChapterThumbnailExtract(w http.ResponseWriter, r *http.Request) {
@@ -947,6 +1200,16 @@ func (s *Server) handleChapterThumbnailExtract(w http.ResponseWriter, r *http.Re
 		writeChapterThumbnailError(w, http.StatusServiceUnavailable, "node_unavailable", "node not configured")
 		return
 	}
+	// A QSV or VAAPI extraction reserves a render device and runs ffmpeg on it,
+	// so it takes the same exclusion a transcode does. Without this the route
+	// leaves the gate looking idle — it never touches activeJobs either — and a
+	// re-probe could smoke-encode beside a live extraction.
+	if !s.gpu.beginWork() {
+		writeChapterThumbnailError(w, http.StatusServiceUnavailable, "node_unavailable",
+			"node is re-probing its hardware; retry shortly")
+		return
+	}
+	defer s.gpu.endWork()
 	frame, reason, err := chapterthumbs.ExtractFrame(r.Context(), chapterthumbs.FrameExtractOptions{
 		InputPath:            req.InputPath,
 		SeekSeconds:          req.SeekSeconds,
@@ -1016,6 +1279,15 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "node not configured", http.StatusServiceUnavailable)
 		return
 	}
+	// Held from here until the handler returns, by which point activeJobs
+	// covers the session. Without the overlap a re-probe could start in the gap
+	// between admitting this transcode and it becoming visible as an active
+	// job, and its smoke encode would then race a live encoder session.
+	if !s.gpu.beginWork() {
+		http.Error(w, "node is re-probing its hardware; retry shortly", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.gpu.endWork()
 	outputDir := s.sessionOutputDir(req.SessionID)
 
 	opts := playback.TranscodeOpts{
@@ -1095,8 +1367,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		delete(s.sessions, req.SessionID)
 		delete(s.lastAccess, req.SessionID)
 		s.mu.Unlock()
-		s.activeJobs.Add(-1)
-		_ = old.Close()
+		_ = s.closeSessionOffGPU(old)
 		// Move the old segment directory aside and delete it in the
 		// background: removing a long session's segments can take seconds
 		// on slow disks, and the playback start that triggered this switch
@@ -1355,6 +1626,15 @@ func (s *Server) spawnReconstruct(r *http.Request, sessionID string, requestedSe
 	if cfg == nil {
 		return nil, nil
 	}
+	// A reconstruct spawns ffmpeg on the GPU exactly as a fresh start does, so
+	// it takes the same exclusion against a running capability re-probe. Held
+	// until this call returns, by which point activeJobs covers the session.
+	if !s.gpu.beginWork() {
+		slog.InfoContext(r.Context(), "transcode node reconstruct deferred while re-probing hardware",
+			"component", "transcodenode", "session", sessionID)
+		return nil, nil
+	}
+	defer s.gpu.endWork()
 	outputDir := s.sessionOutputDir(sessionID)
 	opts := card.TranscodeOpts(outputDir, cfg.Playback.FFmpegPath, s.ffmpegSink)
 	opts.SessionID = sessionID
@@ -1540,9 +1820,8 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	delete(s.sessions, sessionID)
 	delete(s.lastAccess, sessionID)
 	s.mu.Unlock()
-	s.activeJobs.Add(-1)
 
-	if err := session.Close(); err != nil {
+	if err := s.closeSessionOffGPU(session); err != nil {
 		slog.ErrorContext(r.Context(), "close transcode session", "component", "transcodenode", "error", err, "session", sessionID, "playback_session_id", sessionID)
 	}
 
@@ -1751,6 +2030,29 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, segPath)
 }
 
+// handleReloadConfig re-reads this node's configuration and nothing else.
+//
+// It exists because /admin/force-reload is destructive: it tears down every
+// live playback session so a configuration change cannot leave a running ffmpeg
+// on stale settings. That is the right answer when an operator asks for it
+// explicitly, and the wrong one for the control plane's own housekeeping — the
+// API nudges a node after its acceleration overrides change, and a policy edit
+// that says it applies to new transcodes must not interrupt the ones already
+// playing. Sessions keep the settings they started with, which is exactly what
+// the override documentation promises.
+func (s *Server) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
+	// The same lock the destructive route takes, so a start cannot be admitted
+	// against a config this reload is in the middle of replacing.
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	if err := s.watcher.ForceReload(r.Context()); err != nil {
+		http.Error(w, "reload failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	slog.InfoContext(r.Context(), "transcode node configuration reloaded", "component", "transcodenode")
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleForceReload(w http.ResponseWriter, r *http.Request) {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
@@ -1781,9 +2083,8 @@ func (s *Server) handleForceReload(w http.ResponseWriter, r *http.Request) {
 		delete(s.sessions, victim.id)
 		delete(s.lastAccess, victim.id)
 		s.mu.Unlock()
-		s.activeJobs.Add(-1)
 
-		victim.session.Close()
+		_ = s.closeSessionOffGPU(victim.session)
 		if err := os.RemoveAll(s.sessionOutputDir(victim.id)); err != nil {
 			slog.WarnContext(r.Context(), "remove transcode session directory during reload", "component", "transcodenode", "session", victim.id, "error", err)
 		}
@@ -1818,15 +2119,20 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
+	snapshot := s.metrics.Snapshot()
 	w.Header().Set("Content-Type", "application/json")
 	type statusResponse struct {
-		Status     string   `json:"status"`
-		ActiveJobs int32    `json:"active_jobs"`
-		Sessions   []string `json:"sessions"`
+		Status     string                   `json:"status"`
+		ActiveJobs int32                    `json:"active_jobs"`
+		Sessions   []string                 `json:"sessions"`
+		System     *nodemetrics.SystemStats `json:"system,omitempty"`
+		GPU        []nodemetrics.GPUStats   `json:"gpu,omitempty"`
 	}
 	json.NewEncoder(w).Encode(statusResponse{
 		Status:     "ok",
 		ActiveJobs: s.activeJobs.Load(),
 		Sessions:   sessionIDs,
+		System:     snapshot.System,
+		GPU:        snapshot.GPU,
 	})
 }

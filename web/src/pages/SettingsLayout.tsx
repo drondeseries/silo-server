@@ -527,7 +527,7 @@ export default function SettingsLayout() {
         {activeSegment ? (
           <>
             <div className="hidden lg:block">
-              <PageBack to="/" preferHistory={false} floating />
+              <PageBack to="/" up floating />
             </div>
             <Link
               to="/settings"
@@ -599,7 +599,7 @@ export default function SettingsLayout() {
           </>
         ) : (
           <>
-            <PageBack to="/" preferHistory={false} floating />
+            <PageBack to="/" up floating />
             <div className="page-header mt-10 mb-6 gap-5 sm:mt-12 sm:mb-8">
               <div className="min-w-0 space-y-3">
                 <h1 className="page-title text-[clamp(2rem,4vw,3rem)]">Settings</h1>

@@ -214,14 +214,15 @@ export const ADMIN_SETTINGS_GROUPS: AdminSettingsSearchGroup[] = [
       {
         id: "library",
         label: "Library & Metadata",
-        description: "Artwork caching, scanning, intro and credits markers, and catalog search.",
-        groups: ["Metadata", "Scanning", "Intro and credits markers", "Search"],
+        description: "Artwork storage, scanning, intro and credits markers, and catalog search.",
+        groups: ["Artwork", "Scanning", "Intro and credits markers", "Search"],
         keywords: [
           "scanner workers",
           "matcher",
           "batch size",
           "artwork",
           "posters",
+          "image caching",
           "cache images",
           "object storage",
           "intro",
@@ -235,8 +236,8 @@ export const ADMIN_SETTINGS_GROUPS: AdminSettingsSearchGroup[] = [
           "metadata",
         ],
         settings: settingIndex(
-          "Metadata",
-          "S3 image caching",
+          "Artwork",
+          "Store artwork in your bucket",
           "Scanning",
           "Scanner workers",
           "Matcher workers",

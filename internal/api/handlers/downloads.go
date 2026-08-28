@@ -630,7 +630,10 @@ func (h *DownloadHandler) redirectToProxy(w http.ResponseWriter, r *http.Request
 		releaseReservation()
 		return false, fmt.Errorf("sign proxy download token: %w", err)
 	}
-	location := strings.TrimRight(plan.ProxyNode.URL, "/") + "/downloads/file/" + url.PathEscape(token)
+	// The location is what the client downloads from, so it uses the proxy's
+	// client-facing URL; the cache key below stays on the canonical backend
+	// URL, which is the node's identity everywhere else.
+	location := strings.TrimRight(plan.ProxyNode.ClientURL(), "/") + "/downloads/file/" + url.PathEscape(token)
 	targetKey := target.Path
 	if target.OriginArtifactID != "" {
 		targetKey = target.OriginNodeURL + "\x00" + target.OriginArtifactID

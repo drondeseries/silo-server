@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderToStaticMarkup } from "react-dom/server";
+import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import PlaybackSettings from "./PlaybackSettings";
@@ -414,5 +415,59 @@ describe("PlaybackSettings chapter thumbnail execution", () => {
     const container = parse(renderToStaticMarkup(<PlaybackSettings />));
 
     expect(container.textContent).not.toContain("No transcode nodes are connected");
+  });
+});
+
+describe("PlaybackSettings divergent node inventories", () => {
+  // The device picker lives behind the advanced disclosure this page grew.
+  beforeEach(expandAdvanced);
+
+  it("points at the per-node overrides on the Nodes page", () => {
+    useHWAccelDetectionMock.mockReturnValue({
+      data: {
+        resolved: "qsv",
+        render_device_details: [{ path: "/dev/dri/renderD128", description: "Intel GPU" }],
+        nodes: [
+          { node_url: "http://node-a", render_devices: ["/dev/dri/renderD128"] },
+          { node_url: "http://node-b", render_devices: ["/dev/dri/renderD129"] },
+        ],
+      },
+      isLoading: false,
+    });
+    useSettingsFormMock.mockReturnValue(makeForm({ "playback.hw_accel": "qsv" }));
+
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <PlaybackSettings />
+      </MemoryRouter>,
+    );
+
+    expect(markup).toContain("Nodes report different devices");
+    expect(markup).toContain("set per-node overrides on the");
+    expect(markup).toContain('href="/admin/nodes"');
+  });
+
+  it("stays quiet while every node reports the same devices", () => {
+    useHWAccelDetectionMock.mockReturnValue({
+      data: {
+        resolved: "qsv",
+        render_device_details: [{ path: "/dev/dri/renderD128", description: "Intel GPU" }],
+        nodes: [
+          { node_url: "http://node-a", render_devices: ["/dev/dri/renderD128"] },
+          { node_url: "http://node-b", render_devices: ["/dev/dri/renderD128"] },
+        ],
+      },
+      isLoading: false,
+    });
+    useSettingsFormMock.mockReturnValue(makeForm({ "playback.hw_accel": "qsv" }));
+
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <PlaybackSettings />
+      </MemoryRouter>,
+    );
+
+    expect(markup).not.toContain("set per-node overrides on the");
+    expect(markup).not.toContain('href="/admin/nodes"');
   });
 });

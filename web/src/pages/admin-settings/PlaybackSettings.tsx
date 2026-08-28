@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { Link } from "react-router";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 import { useRestartKeys } from "@/hooks/useRestartKeys";
 import { useHWAccelDetection, type HWAccelInfo } from "@/hooks/queries/admin/system";
@@ -200,7 +201,15 @@ export default function PlaybackSettings() {
                 </SettingsSubheading>
                 {inventoriesDiverge && (
                   <p className="pb-2 text-xs text-amber-500">
-                    Nodes report different devices. Only paths on every node are safe to select.
+                    Nodes report different devices. Only paths on every node are safe to select —
+                    for the rest, set per-node overrides on the{" "}
+                    <Link
+                      to="/admin/nodes"
+                      className="font-medium underline-offset-2 hover:underline"
+                    >
+                      Nodes page
+                    </Link>
+                    .
                   </p>
                 )}
                 {/* One shared row shell per device, so these switches land on the

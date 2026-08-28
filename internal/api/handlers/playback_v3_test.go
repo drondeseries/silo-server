@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -5401,11 +5402,15 @@ func TestPlaybackV3ToneMapBudgetsCoverColdNodeWork(t *testing.T) {
 		return config.PlaybackConfig{HWAccel: tonemap.BackendQSV, HWDevice: "/dev/dri/renderD128"}
 	}
 
-	if got, want := handler.localToneMapProbeTimeoutV3(), tonemap.ProbeEndpointTimeout(tonemap.BackendQSV, "/dev/dri/renderD128"); got != want {
+	if got, want := handler.localToneMapProbeTimeoutV3(), playback.CapabilityEndpointTimeout(tonemap.BackendQSV, "/dev/dri/renderD128"); got != want {
 		t.Fatalf("local tone-map probe timeout = %s, want %s", got, want)
 	}
-	if got, want := handler.remoteToneMapProbeTimeoutV3("https://unknown.example"), remoteNodeProbeFallbackTimeout; got != want {
-		t.Fatalf("remote tone-map probe timeout = %s, want %s", got, want)
+	// A node this handler cannot resolve is priced at the cluster's own policy,
+	// which is what such a node runs unless it carries an override — closer than
+	// a flat guess, and the flat fallback is reserved for having no policy either.
+	coldUnknown := playback.CapabilityRequestTimeout(tonemap.BackendQSV, "/dev/dri/renderD128")
+	if got := handler.remoteToneMapProbeTimeoutV3("https://unknown.example"); got != coldUnknown {
+		t.Fatalf("remote tone-map probe timeout = %s, want %s", got, coldUnknown)
 	}
 	if got := handler.toneMapPlanningTimeoutV3(true); got != v3NodeCapabilityPlanTimeout {
 		t.Fatalf("planning timeout with local fallback = %s, want %s", got, v3NodeCapabilityPlanTimeout)
@@ -5420,7 +5425,7 @@ func TestPlaybackV3ToneMapBudgetsCoverColdNodeWork(t *testing.T) {
 		RequireReady:             true,
 		HWAccel:                  tonemap.BackendQSV,
 	}
-	want := remoteNodeProbeFallbackTimeout + playback.ManifestStartupTimeout +
+	want := coldUnknown + playback.ManifestStartupTimeout +
 		tonemap.SourcePreflightTimeout(100) + transcodenode.TranscodeStartReadinessTimeout
 	if got := handler.remotePlaybackTransportTimeout("https://unknown.example", request); got != want {
 		t.Fatalf("remote tone-map start timeout = %s, want %s", got, want)
@@ -5459,6 +5464,62 @@ func TestLookupRemoteCapabilitiesStartsCacheTTLAfterRequestCompletes(t *testing.
 	}
 }
 
+// waitForCachedNodeCapabilitiesV3 returns the first successful cache entry the
+// background refresh installs for nodeURL.
+func waitForCachedNodeCapabilitiesV3(t *testing.T, handler *PlaybackHandler, nodeURL string) v3NodeCapabilityCache {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		handler.v3NodeCapabilitiesMu.Lock()
+		entry, ok := handler.v3NodeCapabilities[nodeURL]
+		handler.v3NodeCapabilitiesMu.Unlock()
+		if ok && entry.err == nil {
+			return entry
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("no node capability report was cached before the deadline")
+	return v3NodeCapabilityCache{}
+}
+
+// A report fetched before the health sweep reported the node's hardware changed
+// must not be installed after the invalidation that change fired, and the
+// invalidation still owes a re-probe: a cache that outlives the hardware it
+// describes plans transcodes onto a GPU that is gone.
+func TestRefreshNodeCapabilitiesDropsReportFetchedBeforeInvalidation(t *testing.T) {
+	var requests atomic.Int64
+	firstRequest := make(chan struct{})
+	release := make(chan struct{})
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		transformation := "post_change"
+		if requests.Add(1) == 1 {
+			close(firstRequest)
+			<-release
+			transformation = "pre_change"
+		}
+		_ = json.NewEncoder(w).Encode(playback.HWAccelInfo{
+			Transformations: []playback.TransformationV3{{Name: transformation}},
+		})
+	}))
+	defer remote.Close()
+
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.refreshRemoteCapabilitiesV3(remote.URL)
+	<-firstRequest
+
+	// The sweep's callback lands while the earlier probe is still outstanding.
+	handler.RefreshNodeCapabilitiesV3(remote.URL)
+	close(release)
+
+	entry := waitForCachedNodeCapabilitiesV3(t, handler, remote.URL)
+	if len(entry.transformations) != 1 || entry.transformations[0].Name != "post_change" {
+		t.Fatalf("cached transformations = %v, want the report fetched after the invalidation", entry.transformations)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("node was probed %d time(s), want the invalidation's own re-probe and no more", got)
+	}
+}
+
 func TestRemoteToneMapProbeTimeoutUsesTargetNodeBudget(t *testing.T) {
 	probeTimeoutMillis := int64(137000)
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -5467,11 +5528,17 @@ func TestRemoteToneMapProbeTimeoutUsesTargetNodeBudget(t *testing.T) {
 	defer remote.Close()
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	handler.PlaybackConfig = func() config.PlaybackConfig {
-		return config.PlaybackConfig{HWAccel: tonemap.BackendQSV, HWDevice: "/central/device/one,/central/device/two"}
+		return config.PlaybackConfig{HWAccel: tonemap.BackendQSV, HWDevice: "/central/device/one"}
 	}
 
 	if _, err := handler.lookupRemoteCapabilitiesV3(context.Background(), remote.URL, false); err != nil {
 		t.Fatal(err)
+	}
+	// The node's own figure is what this path exists to use. It has to exceed
+	// what the cluster setting prices, or the floor below it would be answering
+	// and this would pass without the target node being consulted at all.
+	if cluster := playback.CapabilityRequestTimeout(tonemap.BackendQSV, "/central/device/one"); cluster >= 137*time.Second {
+		t.Fatalf("fixture is inert: the cluster price %s must stay under the node's 137s", cluster)
 	}
 	if got, want := handler.remoteToneMapProbeTimeoutV3(remote.URL), 137*time.Second; got != want {
 		t.Fatalf("remote probe timeout = %s, want target node budget %s", got, want)
@@ -5484,11 +5551,14 @@ func TestRemoteToneMapProbeTimeoutUsesTargetNodeBudget(t *testing.T) {
 	handler.v3NodeCapabilitiesMu.Lock()
 	delete(handler.v3NodeCapabilities, remote.URL)
 	handler.v3NodeCapabilitiesMu.Unlock()
-	probeTimeoutMillis = (10 * time.Minute).Milliseconds()
+	probeTimeoutMillis = (24 * time.Hour).Milliseconds()
 	if _, err := handler.lookupRemoteCapabilitiesV3(context.Background(), remote.URL, false); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := handler.remoteToneMapProbeTimeoutV3(remote.URL), 5*time.Minute; got != want {
+	// Still bounded — the value comes off the wire from a worker — but at the
+	// ceiling the probe formula produces rather than a round number that a real
+	// nine-device node already exceeds.
+	if got, want := handler.remoteToneMapProbeTimeoutV3(remote.URL), playback.MaxCapabilityRequestTimeout(); got != want {
 		t.Fatalf("bounded remote probe timeout = %s, want %s", got, want)
 	}
 }
@@ -6256,5 +6326,152 @@ func TestHandleStartPlaybackV3SubtitleRemapFailurePreservesOriginalSelectionForL
 	}
 	if response.PlaybackPlan.RequestedMediaFileID != source.ID {
 		t.Fatalf("requested file = %d, want original source %d", response.PlaybackPlan.RequestedMediaFileID, source.ID)
+	}
+}
+
+// v3NodeLookupPlanner plans nothing and only resolves nodes by URL, which is all
+// a cold probe budget needs from a planner.
+type v3NodeLookupPlanner struct {
+	node *nodepool.Node
+}
+
+func (p *v3NodeLookupPlanner) PlanSession(string, string, bool, int) nodepool.Plan {
+	return nodepool.Plan{}
+}
+
+func (p *v3NodeLookupPlanner) TranscodeNodeByURL(nodeURL string) (*nodepool.Node, bool) {
+	if p.node == nil || p.node.URL != nodeURL {
+		return nil, false
+	}
+	return p.node, true
+}
+
+// The first read of a node after an API restart is also its most expensive: no
+// probe cache on the node survives, so the whole matrix runs. The flat fallback
+// is shorter than a two-device node legitimately takes, and paying it would
+// cancel exactly the multi-GPU nodes this path exists to plan onto — so the
+// durable report the node last advertised is what prices it.
+func TestPlaybackV3ColdNodeProbeBudgetComesFromTheStoredReport(t *testing.T) {
+	const nodeURL = "https://gpu-1.example"
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{HWAccel: tonemap.BackendQSV, HWDevice: "/dev/dri/renderD128"}
+	}
+	handler.NodePlanner = &v3NodeLookupPlanner{node: &nodepool.Node{
+		ID: 1, URL: nodeURL,
+		Capabilities: json.RawMessage(`{"resolved":"qsv","probe_request_timeout_ms":163000}`),
+	}}
+
+	if got, want := handler.remoteToneMapProbeTimeoutV3(nodeURL), 163*time.Second; got != want {
+		t.Fatalf("cold probe timeout = %s, want the node's advertised %s", got, want)
+	}
+	if remoteNodeProbeFallbackTimeout >= 163*time.Second {
+		t.Fatal("fixture is inert: the advertised budget must exceed the flat fallback")
+	}
+}
+
+// A node registered since the last capability fetch has no stored report to read
+// a budget from, but it does have its own acceleration override — and that is
+// what decides how long its walk takes.
+func TestPlaybackV3ColdNodeProbeBudgetFollowsTheOverrideWithoutAReport(t *testing.T) {
+	const nodeURL = "https://gpu-2.example"
+	devices := "/dev/dri/renderD128,/dev/dri/renderD129,/dev/dri/renderD130"
+	backend := tonemap.BackendQSV
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{HWAccel: tonemap.BackendQSV, HWDevice: "/dev/dri/renderD128"}
+	}
+	handler.NodePlanner = &v3NodeLookupPlanner{node: &nodepool.Node{
+		ID: 2, URL: nodeURL, HWAccelOverride: &backend, HWDeviceOverride: &devices,
+	}}
+
+	want := playback.CapabilityRequestTimeout(backend, devices)
+	if got := handler.remoteToneMapProbeTimeoutV3(nodeURL); got != want {
+		t.Fatalf("cold probe timeout = %s, want the override's %s", got, want)
+	}
+	if cluster := playback.CapabilityRequestTimeout(tonemap.BackendQSV, "/dev/dri/renderD128"); want <= cluster {
+		t.Fatalf("fixture is inert: the override budget %s must exceed the cluster's %s", want, cluster)
+	}
+}
+
+// A per-node policy edit invalidates the inventory through the same path a
+// hardware change does, and the learned budget deliberately survives that. But
+// widening hw_device_override is exactly the change that makes the learned
+// number too small: the node reloads, walks four devices instead of one, and is
+// canceled at the one-device deadline on every retry — with no way back, since a
+// budget is only learned from a read that completes.
+func TestPlaybackV3RepricesALearnedBudgetAfterTheDeviceSetGrows(t *testing.T) {
+	const nodeURL = "https://gpu-3.example"
+	devices := "/dev/dri/renderD128,/dev/dri/renderD129,/dev/dri/renderD130,/dev/dri/renderD131"
+	backend := tonemap.BackendQSV
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{HWAccel: tonemap.BackendQSV, HWDevice: "/dev/dri/renderD128"}
+	}
+	handler.NodePlanner = &v3NodeLookupPlanner{node: &nodepool.Node{
+		ID: 3, URL: nodeURL, HWAccelOverride: &backend, HWDeviceOverride: &devices,
+	}}
+	// Learned while the node was still on the cluster's single device.
+	learned := playback.CapabilityRequestTimeout(backend, "/dev/dri/renderD128")
+	handler.v3NodeCapabilitiesMu.Lock()
+	handler.rememberNodeProbeBudgetLockedV3(nodeURL, learned)
+	handler.v3NodeCapabilitiesMu.Unlock()
+
+	handler.RefreshNodeCapabilitiesV3(nodeURL)
+
+	want := playback.CapabilityRequestTimeout(backend, devices)
+	if got := handler.remoteToneMapProbeTimeoutV3(nodeURL); got != want {
+		t.Fatalf("probe timeout after the override grew = %s, want the four-device %s", got, want)
+	}
+	if want <= learned {
+		t.Fatalf("fixture is inert: the four-device budget %s must exceed the learned %s", want, learned)
+	}
+}
+
+// The reverse must still hold: a node whose own measurement exceeds what this
+// replica can price keeps its measurement, which is the whole reason the learned
+// budget survives an invalidation.
+func TestPlaybackV3KeepsALearnedBudgetLargerThanThePolicyPrice(t *testing.T) {
+	const nodeURL = "https://gpu-4.example"
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{HWAccel: tonemap.BackendQSV, HWDevice: "/dev/dri/renderD128"}
+	}
+	handler.NodePlanner = &v3NodeLookupPlanner{node: &nodepool.Node{ID: 4, URL: nodeURL}}
+	learned := playback.MaxCapabilityRequestTimeout()
+	handler.v3NodeCapabilitiesMu.Lock()
+	handler.rememberNodeProbeBudgetLockedV3(nodeURL, learned)
+	handler.v3NodeCapabilitiesMu.Unlock()
+
+	if got := handler.remoteToneMapProbeTimeoutV3(nodeURL); got != learned {
+		t.Fatalf("probe timeout = %s, want the node's own larger measurement %s", got, learned)
+	}
+}
+
+// The admin route invalidates with the URL exactly as the row stores it, which
+// may carry a trailing slash the pools have already dropped. Keyed verbatim, the
+// entry this deletes is not the entry planning reads, so the node keeps serving
+// the backend it was just moved off until the old key expires.
+func TestRefreshNodeCapabilitiesV3NormalizesTheCacheKey(t *testing.T) {
+	const nodeURL = "https://gpu-5.example"
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.v3NodeCapabilitiesMu.Lock()
+	if handler.v3NodeCapabilities == nil {
+		handler.v3NodeCapabilities = map[string]v3NodeCapabilityCache{}
+	}
+	handler.v3NodeCapabilities[nodeURL] = v3NodeCapabilityCache{expiresAt: time.Now().Add(time.Hour)}
+	handler.v3NodeCapabilitiesMu.Unlock()
+
+	handler.RefreshNodeCapabilitiesV3(nodeURL + "/")
+
+	handler.v3NodeCapabilitiesMu.Lock()
+	_, present := handler.v3NodeCapabilities[nodeURL]
+	invalidations := handler.v3NodeCapabilityInvalidations[nodeURL]
+	handler.v3NodeCapabilitiesMu.Unlock()
+	if present {
+		t.Fatal("the canonical entry survived an invalidation made with a trailing slash")
+	}
+	if invalidations == 0 {
+		t.Fatal("the invalidation was counted under a different key than planning reads")
 	}
 }

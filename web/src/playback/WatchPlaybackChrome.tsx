@@ -13,7 +13,7 @@ import {
 import { flushSync } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Pause, PictureInPicture2, Play, SkipBack, SkipForward, Tv, X } from "lucide-react";
-import { useLocation, useNavigate } from "react-router";
+import { useLocation } from "react-router";
 import type { WatchDetail } from "@/api/types";
 import { getAccessToken, getOrCreateDeviceId, getProfileToken } from "@/api/client";
 import { Button } from "@/components/ui/button";
@@ -33,6 +33,7 @@ import { applyPlaybackProgressToCache } from "@/hooks/queries/playbackProgressCa
 import { invalidatePlaybackSurfaceQueries } from "@/hooks/queries/playbackSurfaceRefresh";
 import { useAuth } from "@/hooks/useAuth";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
+import { useViewTransitionNavigate } from "@/hooks/useViewTransition";
 import { PlayerConfigProvider, type PlayerConfig } from "@/player/context/PlayerConfigContext";
 import type {
   EpisodeRef,
@@ -170,7 +171,7 @@ function PlaybackPreparingScreen() {
 }
 
 export function WatchPlaybackProvider({ children }: { children: ReactNode }) {
-  const navigate = useNavigate();
+  const navigate = useViewTransitionNavigate();
   const [state, dispatch] = useReducer(watchPlaybackReducer, undefined, createEmptyPlaybackState);
   const stateRef = useRef(state);
   const suppressNextPictureInPictureExitRef = useRef<string | null>(null);
@@ -233,7 +234,6 @@ export function WatchPlaybackProvider({ children }: { children: ReactNode }) {
 
         navigate(buildWatchHref(request), {
           state: buildWatchLocationState(request),
-          viewTransition: true,
         });
       };
 
@@ -309,7 +309,6 @@ export function WatchPlaybackProvider({ children }: { children: ReactNode }) {
     navigate(buildWatchHref(request), {
       replace: true,
       state: buildWatchLocationState(request),
-      viewTransition: true,
     });
   }, [navigate]);
 
@@ -415,7 +414,7 @@ export function WatchPlaybackHost() {
   } = controller;
   const queryClient = useQueryClient();
   const location = useLocation();
-  const navigate = useNavigate();
+  const navigate = useViewTransitionNavigate();
   const { user } = useAuth();
   const { profile: currentProfile } = useCurrentProfile();
   const canEditMarkers = canEditMarkersForUser(user, currentProfile);
@@ -526,7 +525,7 @@ export function WatchPlaybackHost() {
     const prefetchAndNavigate = async () => {
       if (request.returnHref) {
         clearPendingReturnNavigation(request.requestKey);
-        navigate(returnHref, { replace: true });
+        navigate(returnHref, { up: true, replace: true });
         return;
       }
 
@@ -541,7 +540,7 @@ export function WatchPlaybackHost() {
 
       if (!cancelled) {
         clearPendingReturnNavigation(request.requestKey);
-        navigate(fallbackItemHref, { replace: true });
+        navigate(fallbackItemHref, { up: true, replace: true });
       }
     };
 
@@ -606,9 +605,11 @@ export function WatchPlaybackHost() {
       if (activeRequest) {
         if (exitState?.destinationHref) {
           exitPlayback({ destinationHref: exitState.destinationHref });
+          // Leaving playback is backward motion, but `replace` still stands:
+          // the watch entry must not survive for Forward to walk back into.
           navigate(exitState.destinationHref, {
+            up: true,
             replace: true,
-            viewTransition: true,
           });
           return;
         }
@@ -616,8 +617,8 @@ export function WatchPlaybackHost() {
         if (activeRequest.roomId && activeRequest.roomToken) {
           exitPlayback();
           navigate(`/rooms/${activeRequest.roomId}?room_token=${activeRequest.roomToken}`, {
+            up: true,
             replace: true,
-            viewTransition: true,
             state: {
               suppressAutoStartSelection: {
                 contentId: activeRequest.contentId,
@@ -631,8 +632,8 @@ export function WatchPlaybackHost() {
 
         exitPlayback();
         navigate(buildPlaybackReturnHref(activeRequest), {
+          up: true,
           replace: true,
-          viewTransition: true,
         });
         return;
       }
@@ -656,8 +657,8 @@ export function WatchPlaybackHost() {
         minimizePlayback();
       });
       navigate(returnHref, {
+        up: true,
         replace: true,
-        viewTransition: true,
       });
     },
     [activeRequest, applyExitStateToCache, minimizePlayback, navigate, state.mode],
@@ -669,7 +670,6 @@ export function WatchPlaybackHost() {
       if (activeRequest.roomId && activeRequest.roomToken) {
         navigate(`/rooms/${activeRequest.roomId}?room_token=${activeRequest.roomToken}`, {
           replace: true,
-          viewTransition: true,
         });
         return;
       }
@@ -739,8 +739,8 @@ export function WatchPlaybackHost() {
       if (activeRequest?.roomId && activeRequest.roomToken) {
         stopPlayback();
         navigate(`/rooms/${activeRequest.roomId}?room_token=${activeRequest.roomToken}`, {
+          up: true,
           replace: true,
-          viewTransition: true,
         });
         return;
       }
@@ -774,7 +774,7 @@ export function WatchPlaybackHost() {
       if (!activeItem?.series_id) {
         if (activeRequest) {
           stopPlayback();
-          navigate(buildWatchItemHref(activeRequest));
+          navigate(buildWatchItemHref(activeRequest), { up: true });
         }
         return;
       }
@@ -799,7 +799,7 @@ export function WatchPlaybackHost() {
   const handlePostRollClose = useCallback(() => {
     if (activeRequest) {
       stopPlayback();
-      navigate(buildWatchItemHref(activeRequest));
+      navigate(buildWatchItemHref(activeRequest), { up: true });
     }
   }, [activeRequest, stopPlayback, navigate]);
 

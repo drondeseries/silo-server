@@ -27,8 +27,15 @@ vi.mock("@/hooks/useSettingsForm", async (importOriginal) => {
   };
 });
 
+// Mirrors the server registry's restart prefixes: every s3/redis/database/
+// userdb key restarts; nothing else on this page does. Tests that need a
+// different registry override the mock.
+const restartKeysMock = vi.fn(() => ({
+  has: (key: string) => /^(s3|redis|database|userdb)\./.test(key),
+}));
+
 vi.mock("@/hooks/useRestartKeys", () => ({
-  useRestartKeys: () => new Set<string>(["redis.url"]),
+  useRestartKeys: () => restartKeysMock(),
 }));
 
 vi.mock("@/hooks/queries/admin/settings", () => ({
@@ -110,16 +117,53 @@ describe("InfrastructureSettings", () => {
     expect(screen.queryByText("No public bucket set")).not.toBeInTheDocument();
   });
 
-  it("states the restart requirement once for the whole page instead of repeating it per group", () => {
+  it("claims a restart only for the groups whose settings actually need one", () => {
     mockForm();
 
     render(<InfrastructureSettings />);
 
-    expect(screen.getAllByText("Changes on this page apply after a restart.")).toHaveLength(1);
-    // No group repeats its own "Changes apply after a restart" line, and no
-    // individual field shows a restart chip either.
-    expect(screen.queryByText("Changes apply after a restart")).not.toBeInTheDocument();
+    // No page-wide claim: the Logs group applies live, and a blanket line
+    // would tell an admin to restart for it.
+    expect(
+      screen.queryByText("Changes on this page apply after a restart."),
+    ).not.toBeInTheDocument();
+    // Redis, both storage buckets, and Database each say it once; their
+    // fields drop the per-field chips.
+    expect(screen.getAllByText(/Changes apply after a restart/)).toHaveLength(4);
     expect(screen.queryAllByLabelText("Takes effect after a server restart")).toHaveLength(0);
+    const logsGroup = within(screen.getByRole("group", { name: "Logs" }));
+    expect(logsGroup.queryByText(/Changes apply after a restart/)).not.toBeInTheDocument();
+  });
+
+  it("demotes a group to per-field chips when one of its keys stops needing a restart", () => {
+    // The same page against a future registry where the Redis URL hot-reloads:
+    // the group-level claim must disappear on its own rather than stay wrong.
+    restartKeysMock.mockReturnValueOnce({
+      has: (key: string) => /^(s3|database|userdb)\./.test(key),
+    });
+    mockForm();
+
+    render(<InfrastructureSettings />);
+
+    const redisGroup = within(screen.getByRole("group", { name: "Redis" }));
+    expect(redisGroup.queryByText(/Changes apply after a restart/)).not.toBeInTheDocument();
+  });
+
+  it("says what each bucket holds", () => {
+    mockForm();
+
+    render(<InfrastructureSettings />);
+
+    expect(
+      screen.getByText(
+        /Files clients download directly: cached artwork, uploaded posters, and branding images/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Files only the server reads: profile avatars, diagnostics bundles, and catalog seed artifacts/,
+      ),
+    ).toBeInTheDocument();
   });
 
   it("puts units beside the control rather than in the label", () => {
@@ -143,6 +187,9 @@ describe("InfrastructureSettings", () => {
     expect(keys).toEqual(
       expect.arrayContaining(["s3.public_bucket", "s3.private_bucket", OPSLOG_BUCKET_POLICIES_KEY]),
     );
+    // Artwork storage lives on Library & Metadata, beside the rest of the
+    // metadata behavior; this page only owns the buckets it writes into.
+    expect(keys).not.toContain("metadata.cache_images");
     // The disabled Litestream storage tab is gone; its keys keep working through the API.
     expect(keys.filter((key) => key.startsWith("s3.user_db_"))).toEqual([]);
   });

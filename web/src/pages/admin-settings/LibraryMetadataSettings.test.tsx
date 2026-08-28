@@ -92,7 +92,7 @@ describe("LibraryMetadataSettings", () => {
   it("renders every field group heading", () => {
     const rendered = text(render({ "catalog.search.provider": "meilisearch" }));
 
-    for (const heading of ["Metadata", "Scanning", "Intro and credits markers", "Search"]) {
+    for (const heading of ["Artwork", "Scanning", "Intro and credits markers", "Search"]) {
       expect(rendered).toContain(heading);
     }
   });
@@ -101,7 +101,7 @@ describe("LibraryMetadataSettings", () => {
     const rendered = text(render({ "catalog.search.provider": "postgres" }));
 
     expect(rendered).toContain("Library & Metadata");
-    expect(rendered).toContain("S3 image caching");
+    expect(rendered).toContain("Store artwork in your bucket");
     expect(rendered).toContain("Find intros and credits");
     expect(rendered).toContain("Search engine");
   });
@@ -184,45 +184,46 @@ describe("LibraryMetadataSettings", () => {
     expect(text(render({ "catalog.search.provider": "meilisearch" }))).toContain("Meilisearch URL");
   });
 
-  it("leaves S3 image caching editable and unannotated while public storage is active", () => {
+  it("leaves artwork storage editable and unannotated while public storage is active", () => {
     const rendered = render({ "s3.public_bucket": "silo-public" });
 
-    expect(text(rendered)).toContain("S3 image caching");
-    expect(text(rendered)).not.toContain("Restart the server for image caching to start");
-    expect(text(rendered)).not.toContain("Image caching needs a public S3 bucket");
-    expect(toggleDisabled(rendered, "S3 image caching")).toBe(false);
+    expect(text(rendered)).toContain("Store artwork in your bucket");
+    expect(text(rendered)).not.toContain("Restart the server for artwork storage to start");
+    expect(text(rendered)).not.toContain("Artwork storage needs a public S3 bucket");
+    expect(toggleDisabled(rendered, "Store artwork in your bucket")).toBe(false);
   });
 
-  it("keeps S3 image caching settable when the bucket is saved but not active yet", () => {
+  it("keeps artwork storage settable when the bucket is saved but not active yet", () => {
     storageAvailableMock.mockReturnValue(false);
 
     const rendered = render({ "s3.public_bucket": "silo-public" });
 
-    expect(text(rendered)).toContain("Restart the server for image caching to start");
-    expect(toggleDisabled(rendered, "S3 image caching")).toBe(false);
+    expect(text(rendered)).toContain("Restart the server for artwork storage to start");
+    expect(toggleDisabled(rendered, "Store artwork in your bucket")).toBe(false);
   });
 
-  it("disables S3 image caching and links to Infrastructure when no bucket is configured", () => {
+  it("disables artwork storage and links to Storage & Database when no bucket is configured", () => {
     storageAvailableMock.mockReturnValue(false);
 
     const rendered = render({});
 
-    expect(text(rendered)).toContain("Image caching needs a public S3 bucket");
+    expect(text(rendered)).toContain("Artwork storage needs a public S3 bucket");
+    expect(text(rendered)).toContain("Storage & Database");
     expect(rendered).toContain("/admin/settings/infrastructure");
-    expect(toggleDisabled(rendered, "S3 image caching")).toBe(true);
+    expect(toggleDisabled(rendered, "Store artwork in your bucket")).toBe(true);
   });
 
-  it("still allows switching S3 image caching off when the bucket went away", () => {
+  it("still allows switching artwork storage off when the bucket went away", () => {
     storageAvailableMock.mockReturnValue(false);
 
     const rendered = render({ "metadata.cache_images": "true" });
 
-    expect(text(rendered)).toContain("Image caching needs a public S3 bucket");
-    expect(toggleDisabled(rendered, "S3 image caching")).toBe(false);
+    expect(text(rendered)).toContain("Artwork storage needs a public S3 bucket");
+    expect(toggleDisabled(rendered, "Store artwork in your bucket")).toBe(false);
   });
 
   it("says it once for a group where every field needs a restart", () => {
-    useRestartKeysMock.mockReturnValue(new Set(["metadata.cache_images"]));
+    useRestartKeysMock.mockReturnValue(new Set(["markers.mode", "markers.lazy_playback"]));
 
     const rendered = render({ "catalog.search.provider": "postgres" });
 

@@ -83,7 +83,7 @@ export default function RecommendationsSection() {
 
   return (
     <div className="relative space-y-6 px-4 pt-6 pb-12 sm:px-6 lg:px-10 xl:px-12">
-      <PageBack to="/recommendations" preferHistory={false} />
+      <PageBack to="/recommendations" up />
       <div className="mt-10 flex flex-col gap-1.5 sm:mt-12">
         <h1 className="text-foreground text-2xl font-bold tracking-tight sm:text-3xl">{title}</h1>
         {data && data.items.length > 0 && (

@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -78,6 +79,7 @@ import (
 	_ "github.com/Silo-Server/silo-server/internal/metadata/nfo"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/nodeconfig"
+	"github.com/Silo-Server/silo-server/internal/nodemetrics"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
 	"github.com/Silo-Server/silo-server/internal/noderecipe"
 	"github.com/Silo-Server/silo-server/internal/nodesessions"
@@ -138,6 +140,227 @@ func resolveNodeIdentity() string {
 	return h
 }
 
+// nodeCapabilityFetcher adapts the authenticated node capability client to the
+// node health sweep, which stores capability reports opaquely.
+//
+// What is persisted is the node's own response bytes, not this server's
+// re-marshaling of the decoded struct. The two differ exactly when the node is
+// newer than the API server reading it, which is every rolling upgrade: a
+// re-marshal drops the fields this build has no struct member for, and stores
+// the truncation under the node's hash. After the API is upgraded the sweep
+// then sees the hashes agree and never refetches, leaving the durable inventory
+// permanently missing fields the new code reads. The bytes are bounded and
+// already parsed by the client, so storing them verbatim costs nothing but
+// keeps the payload honest about the hash filed with it.
+//
+// The hash comes out of the payload itself, because only the node knows what it
+// hashed. A report without one is refused rather than given a synthetic hash,
+// which would make an old node look like it had capability tracking.
+// The request bound comes from budget rather than a constant. A cold node's
+// answer runs the whole FFmpeg probe matrix, and the size of that matrix is a
+// function of how many hardware devices that node will actually probe — two
+// render devices legitimately push the advertised budget past two minutes.
+// Bounding every fetch at a fixed two minutes abandons such a node mid-probe
+// and reports a fetch failure for a node operating inside its published
+// contract. budget takes the node because the device set is a per-node
+// property: an hw_device override is exactly a node that probes a different
+// matrix from the one the cluster setting describes.
+func nodeCapabilityFetcher(jwtSecret string, budget func(*nodepool.Node) time.Duration) nodepool.CapabilityFetcher {
+	client := &http.Client{}
+	return func(ctx context.Context, node *nodepool.Node) ([]byte, string, error) {
+		if node == nil {
+			return nil, "", fmt.Errorf("node capability request has no node")
+		}
+		ctx, cancel := context.WithTimeout(ctx, budget(node))
+		defer cancel()
+		info, payload, status, err := transcodenode.FetchHWCapabilitiesPayload(ctx, client, node.URL, jwtSecret)
+		if err != nil {
+			return nil, "", err
+		}
+		if status != http.StatusOK {
+			return nil, "", fmt.Errorf("node capability request returned status %d", status)
+		}
+		return payload, info.CapabilityHash, nil
+	}
+}
+
+// libraryPathProvider adapts the folder repository to the sampler's media-root
+// provider.
+//
+// It runs on the sampling goroutine every interval, so it is bounded separately
+// from the caller's context: a database that has stopped answering must cost one
+// interval's disk sampling, not the sampler.
+func libraryPathProvider(repo *catalog.FolderRepository) func(context.Context) []string {
+	if repo == nil {
+		return nil
+	}
+	return cachedLibraryPaths(func(ctx context.Context) ([]string, error) {
+		queryCtx, cancel := context.WithTimeout(ctx, libraryPathQueryTimeout)
+		defer cancel()
+		return repo.DistinctLibraryPaths(queryCtx)
+	})
+}
+
+// cachedLibraryPaths wraps a library-root query so a failed read reuses the last
+// set that succeeded.
+//
+// Returning nothing on error is not the harmless degradation it looks like. The
+// sampler treats the returned set as the whole truth: refreshDisks prunes every
+// path outside it — dropping the cached capacity readings with it — and
+// diskStats omits them from the sample. A two-second database hiccup would
+// therefore blank every library mount from the admin resource panel and from
+// Prometheus, and leave the next pass reporting them unavailable until fresh
+// probes land, all while the mounts themselves are perfectly healthy. Only the
+// query failed, so the previous answer is still the best one available.
+//
+// An empty result that the database actually returned is cached like any other:
+// an operator who removed their last library has genuinely no roots.
+func cachedLibraryPaths(query func(context.Context) ([]string, error)) func(context.Context) []string {
+	var (
+		mu       sync.Mutex
+		lastGood []string
+	)
+	return func(ctx context.Context) []string {
+		paths, err := query(ctx)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			slog.DebugContext(ctx, "library paths unavailable for resource sampling; reusing the last known set",
+				"component", "app", "error", err, "roots", len(lastGood))
+			return slices.Clone(lastGood)
+		}
+		lastGood = slices.Clone(paths)
+		return paths
+	}
+}
+
+// libraryPathQueryTimeout bounds the per-sample library root lookup.
+const libraryPathQueryTimeout = 2 * time.Second
+
+// nodeCapabilityRequestTimeout is the floor under one capability request.
+//
+// The real bound is the node's own advertised probe budget, which
+// nodeCapabilityProbeBudget computes from the configured hardware — that grows
+// with the device count and passes two minutes at two devices. This floor covers
+// the rest of what a fetch does (transport, a node answering from a warm cache
+// but under load) and keeps a misconfigured or unreadable setting from
+// producing an absurdly small bound. The fetch runs detached from the health
+// sweep, so a generous bound costs the sweep nothing and lets a cold node's
+// first report land instead of timing out.
+const nodeCapabilityRequestTimeout = 2 * time.Minute
+
+// nodeCapabilityProbeBudget reports how long to allow one node's capability
+// fetch.
+//
+// The cluster settings are read live on every call, so an operator adding a
+// second render device does not have to restart the API for its fetches to stop
+// being cut short. The node's own overrides win over them, because the worker
+// builds its probe matrix from the policy it will actually run: a node that
+// overrides hw_device with two devices needs the two-device budget even on a
+// cluster configured with one, and it is precisely that node whose inventory
+// would otherwise fail to refresh every sweep.
+func nodeCapabilityProbeBudget(live func() *config.Config) func(*nodepool.Node) time.Duration {
+	return func(node *nodepool.Node) time.Duration {
+		hwAccel, hwDevice := "", ""
+		if live != nil {
+			if current := live(); current != nil {
+				hwAccel, hwDevice = current.Playback.HWAccel, current.Playback.HWDevice
+			}
+		}
+		// The same ladder every other caller prices a node's capability read
+		// with — its own advertisement, then its own policy, then this floor —
+		// so the sweep, the re-probe, and the two planning paths cannot end up
+		// allowing different amounts of time for one node's matrix.
+		return playback.ColdCapabilityRequestTimeout(
+			node.StoredCapabilities(),
+			node.EffectiveHWAccel(hwAccel),
+			node.EffectiveHWDevice(hwDevice),
+			nodeCapabilityRequestTimeout,
+		)
+	}
+}
+
+func clientIPResolverFromConfig(cfg *config.Config) (*clientip.Resolver, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("config is not loaded")
+	}
+	raw := cfg.ClientIP.TrustedProxies
+	if raw == "" {
+		raw = clientip.DefaultTrustedProxies
+	}
+	cidrs, err := clientip.ParseCIDRs(raw)
+	if err != nil {
+		return nil, err
+	}
+	return clientip.NewResolver(cidrs), nil
+}
+
+func registerClientIPConfigReload(watcher *nodeconfig.Watcher, resolver *clientip.Resolver) {
+	watcher.OnChange(func(old, updated *config.Config) {
+		if old != nil && old.ClientIP.TrustedProxies == updated.ClientIP.TrustedProxies {
+			return
+		}
+		raw := updated.ClientIP.TrustedProxies
+		if raw == "" {
+			raw = clientip.DefaultTrustedProxies
+		}
+		cidrs, err := clientip.ParseCIDRs(raw)
+		if err != nil {
+			slog.WarnContext(context.Background(), "clientip config reload failed", "component", "app", "error", err)
+			return
+		}
+		resolver.UpdateTrustedCIDRs(cidrs)
+	})
+}
+
+// newStreamTelemetryRegistry builds the telemetry registry for this process,
+// preferring the Redis-backed store in distributed mode. Distributed mode is
+// derived from whether Redis is configured unless the operator pinned
+// SILO_STREAM_TELEMETRY_DISTRIBUTED: a single-process deployment then stays on
+// the local store and a clustered one merges, without either being asked to set
+// a variable that only restates its own topology. Every process builds its
+// registry here, so the derivation belongs in this function rather than at the
+// call sites. It never falls back to LocalStore on a failed ping:
+// cache.NewRedisClient builds a lazy client that never dials, and a Redis
+// restart mid-deploy must not strand a publisher local-only for the life of the
+// process.
+func newStreamTelemetryRegistry(ctx context.Context, nodeID string, redisClient *redis.Client) *streamtelemetry.Registry {
+	streamTelemetryConfig := streamtelemetry.ConfigFromEnv(nodeID)
+	if !streamTelemetryConfig.DistributedExplicit {
+		streamTelemetryConfig.Distributed = redisClient != nil
+	}
+	store := streamtelemetry.GlobalSnapshotStore(streamtelemetry.NewLocalStore())
+	if streamTelemetryConfig.Enabled && streamTelemetryConfig.Distributed {
+		if redisClient != nil {
+			store = streamtelemetry.NewRedisStore(redisClient, streamTelemetryConfig, slog.Default())
+			pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
+			if pingErr := redisClient.Ping(pingCtx).Err(); pingErr != nil {
+				slog.ErrorContext(ctx, "stream telemetry distributed mode cannot reach redis; publisher will retry each sweep", "address", redisClient.Options().Addr, "error", pingErr)
+			}
+			pingCancel()
+		} else {
+			slog.ErrorContext(ctx, "stream telemetry distributed mode requested but redis is not configured; using local store")
+		}
+	}
+	if streamTelemetryConfig.Enabled {
+		slog.InfoContext(ctx, "stream telemetry observing families",
+			"families", strings.Join(streamTelemetryConfig.ObservedFamilies(), ","))
+	}
+	return streamtelemetry.NewRegistry(streamTelemetryConfig, store, slog.Default())
+}
+
+// newStreamTelemetryViewCache builds the bounded-staleness cache the admin
+// parity endpoint reads. It shares one cached view across every reader so the
+// merged rebuild is paid at most once per TTL, not once per request.
+func newStreamTelemetryViewCache(registry *streamtelemetry.Registry) *streamtelemetry.ViewCache {
+	if registry == nil {
+		return nil
+	}
+	// Reads the TTL off the registry rather than calling ConfigFromEnv again:
+	// a second parse logs every invalid variable twice and the two calls could
+	// disagree if the environment changed between them.
+	return streamtelemetry.NewViewCache(registry, registry.ViewTTL(), slog.Default())
+}
 func resolvePluginCacheDir() string {
 	if v := strings.TrimSpace(os.Getenv("SILO_PLUGIN_CACHE_DIR")); v != "" {
 		return v
@@ -708,12 +931,32 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Resolved before the watcher starts: NODE_URL is this process's
+		// stream_nodes identity, and the watcher needs it on its very first
+		// load to overlay the node's own acceleration overrides.
+		nodeURL := os.Getenv("NODE_URL")
+		nodeName := os.Getenv("NODE_NAME")
+		if nodeURL == "" {
+			nodeURL = "http://localhost" + cfg.Server.Listen
+			// The guess is this process's whole identity: it keys session
+			// bookkeeping *and* selects the stream_nodes row whose acceleration
+			// overrides this node adopts. Two nodes listening on the same port
+			// guess the same URL and would share both.
+			slog.Warn("NODE_URL not set, using listen address — session keys may collide across nodes, and this node adopts the acceleration overrides of whichever stream_nodes row carries that URL",
+				"node_url", nodeURL)
+		}
+		if nodeName == "" {
+			nodeName = mode
+		}
+
 		bootstrap := nodeconfig.BootstrapOverrides{
 			Listen:      cfg.Server.Listen,
 			Mode:        cfg.Server.Mode,
 			DatabaseURL: cfg.Database.URL,
 			JFListen:    cfg.JellyfinCompat.Listen,
 			RedisURL:    bc.RedisURL,
+			NodeURL:     nodeURL,
+			NodeName:    nodeName,
 		}
 		watcher := nodeconfig.NewWatcher(pool, dataCipher, eventBus, bootstrap)
 		watcher.OnLoad(normalizeLoadedConfig)
@@ -722,19 +965,8 @@ func main() {
 			os.Exit(1)
 		}
 
-		nodeURL := os.Getenv("NODE_URL")
-		nodeName := os.Getenv("NODE_NAME")
-		if nodeURL == "" {
-			nodeURL = "http://localhost" + cfg.Server.Listen
-			slog.Warn("NODE_URL not set, using listen address — session keys may collide across nodes")
-		}
-		if nodeName == "" {
-			nodeName = mode
-		}
-
 		streamTelemetryRegistry = newStreamTelemetryRegistry(appCtx, nodeID, redisClient)
 		streamTelemetryRegistry.Start(appCtx)
-
 		tracker := nodesessions.NewTracker(redisClient, nodeURL, nodeName, mode)
 		tracker.StartRefresh(appCtx)
 		defer func() {
@@ -755,6 +987,12 @@ func main() {
 				watcher.Config,
 				nil,
 			))
+			// Keep the capability hash /health advertises current, so the API's
+			// sweep refetches this proxy's inventory only when it actually changed.
+			srv.StartCapabilitySnapshots(appCtx)
+			// Sample host and GPU resources so /health, /status and /metrics can
+			// report them without doing any work on the request.
+			srv.StartMetricsSampler(appCtx)
 			handler = srv.Handler()
 		} else {
 			srv := transcodenode.NewServer(watcher, tracker)
@@ -765,7 +1003,12 @@ func main() {
 			// restart (the node hop token is recipe-less). Shares the offload Redis.
 			srv.SetRecipeStore(noderecipe.NewStore(redisClient, 0))
 			srv.SetStreamTelemetry(streamTelemetryRegistry)
-			srv.StartHardwareEncoderWarmup(appCtx)
+			// The first capability snapshot waits on warmup so it measures a
+			// primed encoder rather than racing it into a probe failure.
+			srv.StartCapabilitySnapshots(appCtx, srv.StartHardwareEncoderWarmup(appCtx))
+			// Sample host and GPU resources so /health, /status and /metrics can
+			// report them without doing any work on the request.
+			srv.StartMetricsSampler(appCtx)
 			// Reclaim orphaned transcode dirs at boot and hourly thereafter, bound
 			// to appCtx so it stops on shutdown.
 			srv.StartOrphanSweeper(appCtx)
@@ -781,7 +1024,9 @@ func main() {
 	// Hot-reload config watcher for integrated/api mode. Reloads on
 	// EventSettingsChanged (Redis) with a 60s poll fallback, so settings
 	// changes apply without restart even on Redis-less deployments. The
-	// watcher's config supersedes the startup snapshot from here on.
+	// watcher's config supersedes the startup snapshot from here on. No
+	// NodeURL: an API host is not a stream node and has no row whose
+	// acceleration overrides could apply to it.
 	configWatcher := nodeconfig.NewWatcher(pool, dataCipher, eventBus, nodeconfig.BootstrapOverrides{
 		Listen:      bc.Listen,
 		Mode:        bc.Mode,
@@ -977,8 +1222,38 @@ func main() {
 		deps.NodePlanner = nodepool.NewPlanner(proxyPool, transcodePool)
 
 		healthChecker := nodepool.NewHealthChecker(proxyPool, transcodePool, nodeRepo)
+		capabilityBudget := nodeCapabilityProbeBudget(configWatcher.Config)
+		healthChecker.SetCapabilityFetcher(nodeCapabilityFetcher(cfg.Auth.JWTSecret, capabilityBudget))
+		// The sweep's backstop is derived from the same budget, so it can never
+		// be the deadline that fires first on a node with many devices.
+		healthChecker.SetCapabilityFetchBudget(capabilityBudget)
+		deps.NodeHealthChecker = healthChecker
 		healthChecker.Start(appCtx)
 		slog.Info("node pools initialized", "proxy_nodes", len(proxyNodes), "transcode_nodes", len(transcodeNodes))
+
+		// The API host runs the same sampler the nodes do. It is not a
+		// registered stream node, so without this the machine serving admin
+		// requests — and, in integrated mode, transcoding — is the one host with
+		// no resource visibility. Unlike a node it also samples library roots:
+		// it is the process that knows what the library is, and its own view of
+		// a media mount is the one that is authoritative.
+		resourceSampler := nodemetrics.NewSampler(nodemetrics.Options{
+			// Read per sample rather than captured: in integrated mode this host
+			// is the one transcoding, and playback.transcode_dir is
+			// hot-reloadable. A startup snapshot would keep reporting headroom on
+			// the volume it used to write to while the new one fills unwatched.
+			ScratchDir: func() string {
+				if live := configWatcher.Config(); live != nil {
+					return live.Playback.TranscodeDir
+				}
+				return cfg.Playback.TranscodeDir
+			},
+			MediaRoots:       libraryPathProvider(catalog.NewFolderRepository(pool)),
+			DeviceSessions:   playback.HWDeviceLoadSnapshot,
+			DeviceIdentities: playback.SamplerDeviceIdentities,
+		})
+		resourceSampler.Start(appCtx)
+		deps.ResourceSampler = resourceSampler
 
 		// Subscribe to node pool change events for multi-instance reload.
 		_ = eventBus.Subscribe(appCtx, cache.ChannelAdmin, func(event cache.Event) {
@@ -2176,6 +2451,10 @@ func main() {
 			if deps.NodeRepo != nil {
 				preparer.SetOriginLookup(deps.NodeRepo)
 			}
+			// Prepared downloads cache a node's inventory separately from
+			// protocol-v3 planning, so the router's invalidation has to reach
+			// both. Set before NewRouter, which composes them.
+			deps.NodeCapabilityInvalidator = preparer.InvalidateNodeCapabilities
 			artifactMgr := downloads.NewArtifactManager(
 				downloads.NewArtifactRepository(deps.DB),
 				downloads.NewRepository(deps.DB),
@@ -3636,29 +3915,4 @@ type audiobooksSettingsAdapter struct {
 
 func (a *audiobooksSettingsAdapter) GetString(ctx context.Context, key string) (string, error) {
 	return a.repo.Get(ctx, key)
-}
-
-func newStreamTelemetryRegistry(ctx context.Context, nodeID string, redisClient *redis.Client) *streamtelemetry.Registry {
-	streamTelemetryConfig := streamtelemetry.ConfigFromEnv(nodeID)
-	if !streamTelemetryConfig.DistributedExplicit {
-		streamTelemetryConfig.Distributed = redisClient != nil
-	}
-	store := streamtelemetry.GlobalSnapshotStore(streamtelemetry.NewLocalStore())
-	if streamTelemetryConfig.Enabled && streamTelemetryConfig.Distributed {
-		if redisClient != nil {
-			store = streamtelemetry.NewRedisStore(redisClient, streamTelemetryConfig, slog.Default())
-			pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
-			if pingErr := redisClient.Ping(pingCtx).Err(); pingErr != nil {
-				slog.ErrorContext(ctx, "stream telemetry distributed mode cannot reach redis; publisher will retry each sweep", "address", redisClient.Options().Addr, "error", pingErr)
-			}
-			pingCancel()
-		} else {
-			slog.ErrorContext(ctx, "stream telemetry distributed mode requested but redis is not configured; using local store")
-		}
-	}
-	if streamTelemetryConfig.Enabled {
-		slog.InfoContext(ctx, "stream telemetry observing families",
-			"families", strings.Join(streamTelemetryConfig.ObservedFamilies(), ","))
-	}
-	return streamtelemetry.NewRegistry(streamTelemetryConfig, store, slog.Default())
 }

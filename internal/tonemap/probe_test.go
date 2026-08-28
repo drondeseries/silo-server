@@ -5,7 +5,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -94,14 +98,20 @@ func TestProbeTotalTimeoutCoversBoundedCommandMatrix(t *testing.T) {
 }
 
 func TestProbeEndpointTimeoutCoversDetectionAndProbeBudgets(t *testing.T) {
-	if got, want := ProbeEndpointTimeout(BackendQSV, "/dev/dri/renderD128"), 81*time.Second; got != want {
+	if got, want := ProbeEndpointTimeout(BackendQSV, "/dev/dri/renderD128"), 106*time.Second; got != want {
 		t.Fatalf("ProbeEndpointTimeout() = %s, want %s", got, want)
 	}
-	if got, want := ProbeEndpointTimeout("auto", "/dev/dri/renderD128,/dev/dri/renderD129"), 106*time.Second; got != want {
+	if got, want := ProbeEndpointTimeout("auto", "/dev/dri/renderD128,/dev/dri/renderD129"), 131*time.Second; got != want {
 		t.Fatalf("ProbeEndpointTimeout(auto) = %s, want %s", got, want)
 	}
-	if got, want := ProbeRequestTimeout(BackendQSV, "/dev/dri/renderD128"), 86*time.Second; got != want {
+	if got, want := ProbeRequestTimeout(BackendQSV, "/dev/dri/renderD128"), 111*time.Second; got != want {
 		t.Fatalf("ProbeRequestTimeout() = %s, want %s", got, want)
+	}
+	// The slack has to outlast a full hardware detection walk plus the
+	// transformation registry probe, or a node answers 503 while its own
+	// detection is still running.
+	if probeEndpointSlack < 30*time.Second+3*3*time.Second {
+		t.Fatalf("probeEndpointSlack = %s, too small for detection and registry probes", probeEndpointSlack)
 	}
 }
 
@@ -396,10 +406,101 @@ func TestProbeCallerCancellationDoesNotCancelSharedProbe(t *testing.T) {
 	}
 }
 
-// resetProbeCache clears shared probe state between tests.
+// resetProbeCache clears shared probe state between tests. It delegates to the
+// exported invalidation so tests exercise the same seam the operator-facing
+// re-probe action uses.
 func resetProbeCache(t *testing.T) {
 	t.Helper()
-	probeCache.Lock()
-	probeCache.entries = make(map[string]probeCacheEntry)
-	probeCache.Unlock()
+	InvalidateProbeCache()
+}
+
+// A tone-map probe outlives its caller by design, so a component that released
+// its own claim on the GPU when its call returned can leave smoke encodes
+// running with nothing accounting for them. The count is what lets the transcode
+// node's re-probe gate see that.
+func TestProbesInFlightCountsADetachedProbe(t *testing.T) {
+	awaitNoProbesInFlight(t)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	// The probe runs several commands; only the first needs to announce itself.
+	var announce, released sync.Once
+	t.Cleanup(func() { released.Do(func() { close(release) }) })
+
+	// The probe has to be running before the caller gives up, or the flight
+	// finishes on the canceled context and there is nothing detached to count.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := probeCached(ctx, "ffmpeg", BackendQSV, "/dev/dri/renderD128",
+			func(context.Context, string, ...string) ([]byte, error) {
+				announce.Do(func() { close(started) })
+				<-release
+				return nil, errors.New("probe abandoned")
+			}, time.Now)
+		done <- err
+	}()
+
+	<-started
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("an abandoned probe reported success")
+	}
+
+	// Checked the instant the caller returned, which is when its own claim on
+	// the encoder goes away while the smoke encode keeps running.
+	if got := ProbesInFlight(); got < 1 {
+		t.Fatalf("ProbesInFlight() = %d the moment the caller returned, want at least 1", got)
+	}
+	released.Do(func() { close(release) })
+	awaitNoProbesInFlight(t)
+}
+
+// awaitNoProbesInFlight waits for every claim on the encoder to be released,
+// including ones detached from a caller that has already returned. Waiting on
+// the counter rather than on a delay keeps this independent of machine load.
+func awaitNoProbesInFlight(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if got := ProbesInFlight(); got == 0 {
+			return
+		} else if time.Now().After(deadline) {
+			t.Fatalf("ProbesInFlight() = %d, want every detached probe released", got)
+		}
+		runtime.Gosched()
+	}
+}
+
+// The advertised budget every caller clamps to assumes a largest device set. If
+// the worker probed past it, it would advertise a budget those callers then cut
+// below what it actually needs, and cold capability requests would be canceled
+// short forever. The probe set is capped so the two ends agree.
+func TestProbeDevicesCapsTheConfiguredSet(t *testing.T) {
+	configured := make([]string, 0, MaxProbedDevices+4)
+	for i := range MaxProbedDevices + 4 {
+		configured = append(configured, defaultDRIRenderDevice+strconv.Itoa(i))
+	}
+
+	got := probeDevices(strings.Join(configured, ","), BackendQSV)
+	if len(got) != MaxProbedDevices {
+		t.Fatalf("probed %d devices, want the %d cap", len(got), MaxProbedDevices)
+	}
+	if !slices.Equal(got, configured[:MaxProbedDevices]) {
+		t.Fatalf("probed %v, want the first %d configured", got, MaxProbedDevices)
+	}
+
+	// The budget a node advertises for that capped set is therefore never above
+	// what its callers allow — which is the property the cap exists for.
+	if advertised, ceiling := ProbeRequestTimeout(BackendQSV, strings.Join(configured, ",")),
+		MaxProbeRequestTimeout(); advertised > ceiling {
+		t.Fatalf("advertised %v exceeds the %v callers allow", advertised, ceiling)
+	}
+
+	// A set inside the cap is untouched.
+	small := configured[:3]
+	if got := probeDevices(strings.Join(small, ","), BackendQSV); !slices.Equal(got, small) {
+		t.Fatalf("probed %v, want the configured %v unchanged", got, small)
+	}
 }

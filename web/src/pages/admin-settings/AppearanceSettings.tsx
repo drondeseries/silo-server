@@ -235,7 +235,8 @@ export default function AppearanceSettings() {
                 ) : (
                   <>
                     Image uploads need a public S3 bucket, set in{" "}
-                    <span className="text-foreground font-medium">Infrastructure</span> settings.
+                    <span className="text-foreground font-medium">Storage &amp; Database</span>{" "}
+                    settings.
                   </>
                 )}
               </p>

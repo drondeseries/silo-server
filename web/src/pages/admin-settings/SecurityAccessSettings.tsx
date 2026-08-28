@@ -388,7 +388,7 @@ export default function SecurityAccessSettings() {
               description={
                 redisSelectable
                   ? "Redis shares counters across servers, after a restart."
-                  : "Redis shares counters across servers, after a restart. Configure Redis under Infrastructure first."
+                  : "Redis shares counters across servers, after a restart. Configure Redis under Storage & Database first."
               }
               status={
                 runningBackendDiffers ? (
