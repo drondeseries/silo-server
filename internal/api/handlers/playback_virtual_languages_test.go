@@ -478,3 +478,75 @@ func TestMaybeTriggerSubtitleSearchDeduplicatesTransientFilesDistinctly(t *testi
 		t.Fatalf("expected 2 distinct searches, got %d (%v)", len(seen), seen)
 	}
 }
+
+func TestMaybeTriggerSubtitleSearchSuppressesDuplicatesForSameTransientCandidate(t *testing.T) {
+	started := make(chan struct{})
+	blockSearch := make(chan struct{})
+	var callCount atomicInt
+	h := &PlaybackHandler{
+		SubtitleSearchInFlight: &sync.Map{},
+		VirtualSubtitleSearcher: func(ctx context.Context, contentID, imdbID, title string, year, season, episode, mediaFileID int, subtitleLanguages []string) {
+			callCount.add(1)
+			close(started)
+			<-blockSearch
+		},
+	}
+
+	file := &models.MediaFile{ID: 0, ContentID: "movie-transient-1"}
+	cand := VirtualPlaybackStream{URI: "virtual://movie/transient?res=1", SubtitleLanguages: []string{"eng"}}
+
+	// First search begins and blocks.
+	h.maybeTriggerSubtitleSearch(context.Background(), file, cand)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first search to begin")
+	}
+
+	// Second search with the exact same transient candidate while the first is in-flight.
+	// It must be suppressed.
+	h.maybeTriggerSubtitleSearch(context.Background(), file, cand)
+	time.Sleep(50 * time.Millisecond)
+
+	if got := callCount.get(); got != 1 {
+		t.Fatalf("callCount while in-flight = %d, want 1 (duplicate suppressed)", got)
+	}
+
+	// Unblock first search and allow it to finish.
+	close(blockSearch)
+	time.Sleep(50 * time.Millisecond)
+
+	// Now that the search finished, a subsequent call can trigger a search again.
+	doneSearch := make(chan struct{})
+	h.VirtualSubtitleSearcher = func(ctx context.Context, contentID, imdbID, title string, year, season, episode, mediaFileID int, subtitleLanguages []string) {
+		callCount.add(1)
+		close(doneSearch)
+	}
+	h.maybeTriggerSubtitleSearch(context.Background(), file, cand)
+	select {
+	case <-doneSearch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for subsequent search after completion")
+	}
+
+	if got := callCount.get(); got != 2 {
+		t.Fatalf("callCount after completion = %d, want 2", got)
+	}
+}
+
+type atomicInt struct {
+	mu sync.Mutex
+	v  int
+}
+
+func (a *atomicInt) add(delta int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.v += delta
+}
+
+func (a *atomicInt) get() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.v
+}
