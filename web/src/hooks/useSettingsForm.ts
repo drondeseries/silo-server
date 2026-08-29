@@ -60,6 +60,8 @@ export function useSettingsForm({ keys }: UseSettingsFormOptions) {
     [localValues, settings],
   );
 
+  const getPersistedValue = useCallback((key: string) => settings?.[key] ?? "", [settings]);
+
   const setValue = useCallback((key: string, value: string) => {
     editVersions.current.set(key, (editVersions.current.get(key) ?? 0) + 1);
     setLocalValues((prev) => ({ ...prev, [key]: value }));
@@ -181,6 +183,7 @@ export function useSettingsForm({ keys }: UseSettingsFormOptions) {
     isLoading,
     isError,
     getValue,
+    getPersistedValue,
     setValue,
     resetValue,
     dirtyCount,
