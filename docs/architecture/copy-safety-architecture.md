@@ -26,7 +26,7 @@ over optimistic mid-stream races for the following reasons:
 
 2. **Deterministic Capability Resolution:**
    - Files are probed at ingestion or dynamically upon first virtual resolution, with probe results and copy-safety
-     verdicts persisted in the catalog/database (`scanner_file_probe_verdicts`).
+     verdicts persisted in the catalog database (`media_files.copy_safety_multi`, `copy_safety_checked_size`, `copy_safety_checked_at`).
    - The capability planner (`PlanPlaybackV3`) deterministically evaluates container, video codec, audio codec,
      and dynamic range against the client's reported device profile before playback starts.
    - If a stream requires audio downmixing, container remuxing, or HDR tone-mapping, Silo selects the appropriate

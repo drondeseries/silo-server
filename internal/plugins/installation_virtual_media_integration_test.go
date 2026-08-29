@@ -34,24 +34,20 @@ func TestInstallationStoreUpdateReplacementCleansVirtualMediaAtomically(t *testi
 
 	const folderID = 969
 	const contentID = "movie-test-virtual-replacement"
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO media_folders(id,name,type,enabled)
-		VALUES($1,'Atomic Replacement','movies',true);
-		INSERT INTO media_items(
-			content_id,type,title,virtual_owner_installation_id,virtual_source
-		) VALUES($2,'movie','Atomic Replacement',$3,'test-source');
-		INSERT INTO media_files(
-			content_id,media_folder_id,file_path,file_size,container,
-			probe_source,virtual_owner_installation_id
-		) VALUES($2,$1,'virtual://movie/test-virtual-replacement',0,'virtual','virtual',$3);
-		INSERT INTO virtual_media_source_claims(
-			plugin_installation_id,source_key,content_id,media_folder_id,owns_item_metadata
-		) VALUES($3,'test-source',$2,$1,true);
-		INSERT INTO virtual_media_file_source_claims(
-			plugin_installation_id,source_key,content_id,media_folder_id,file_path
-		) VALUES($3,'test-source',$2,$1,'virtual://movie/test-virtual-replacement')`,
-		folderID, contentID, installationID); err != nil {
-		t.Fatalf("seed virtual replacement catalog: %v", err)
+	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES($1,'Atomic Replacement','movies',true)`, folderID); err != nil {
+		t.Fatalf("seed virtual replacement folder: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO media_items(content_id,type,title,virtual_owner_installation_id,virtual_source) VALUES($1,'movie','Atomic Replacement',$2,'test-source')`, contentID, installationID); err != nil {
+		t.Fatalf("seed virtual replacement item: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,probe_source,virtual_owner_installation_id) VALUES($1,$2,'virtual://movie/test-virtual-replacement',0,'virtual','virtual',$3)`, contentID, folderID, installationID); err != nil {
+		t.Fatalf("seed virtual replacement file: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO virtual_media_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,owns_item_metadata) VALUES($1,'test-source',$2,$3,true)`, installationID, contentID, folderID); err != nil {
+		t.Fatalf("seed virtual replacement source claim: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO virtual_media_file_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,file_path) VALUES($1,'test-source',$2,$3,'virtual://movie/test-virtual-replacement')`, installationID, contentID, folderID); err != nil {
+		t.Fatalf("seed virtual replacement file claim: %v", err)
 	}
 	t.Cleanup(func() {
 		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)
@@ -117,24 +113,20 @@ func TestInstallationStoreUpdateReplacementRollsBackVirtualCleanupOnFailure(t *t
 
 	const folderID = 968
 	const contentID = "movie-test-virtual-replacement-rollback"
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO media_folders(id,name,type,enabled)
-		VALUES($1,'Atomic Replacement Rollback','movies',true);
-		INSERT INTO media_items(
-			content_id,type,title,virtual_owner_installation_id,virtual_source
-		) VALUES($2,'movie','Atomic Replacement Rollback',$3,'test-source');
-		INSERT INTO media_files(
-			content_id,media_folder_id,file_path,file_size,container,
-			probe_source,virtual_owner_installation_id
-		) VALUES($2,$1,'virtual://movie/test-virtual-replacement-rollback',0,'virtual','virtual',$3);
-		INSERT INTO virtual_media_source_claims(
-			plugin_installation_id,source_key,content_id,media_folder_id,owns_item_metadata
-		) VALUES($3,'test-source',$2,$1,true);
-		INSERT INTO virtual_media_file_source_claims(
-			plugin_installation_id,source_key,content_id,media_folder_id,file_path
-		) VALUES($3,'test-source',$2,$1,'virtual://movie/test-virtual-replacement-rollback')`,
-		folderID, contentID, installationID); err != nil {
-		t.Fatalf("seed rollback virtual catalog: %v", err)
+	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES($1,'Atomic Replacement Rollback','movies',true)`, folderID); err != nil {
+		t.Fatalf("seed rollback virtual folder: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO media_items(content_id,type,title,virtual_owner_installation_id,virtual_source) VALUES($1,'movie','Atomic Replacement Rollback',$2,'test-source')`, contentID, installationID); err != nil {
+		t.Fatalf("seed rollback virtual item: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,probe_source,virtual_owner_installation_id) VALUES($1,$2,'virtual://movie/test-virtual-replacement-rollback',0,'virtual','virtual',$3)`, contentID, folderID, installationID); err != nil {
+		t.Fatalf("seed rollback virtual file: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO virtual_media_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,owns_item_metadata) VALUES($1,'test-source',$2,$3,true)`, installationID, contentID, folderID); err != nil {
+		t.Fatalf("seed rollback virtual source claim: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO virtual_media_file_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,file_path) VALUES($1,'test-source',$2,$3,'virtual://movie/test-virtual-replacement-rollback')`, installationID, contentID, folderID); err != nil {
+		t.Fatalf("seed rollback virtual file claim: %v", err)
 	}
 	t.Cleanup(func() {
 		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)

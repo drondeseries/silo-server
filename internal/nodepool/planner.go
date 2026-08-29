@@ -324,6 +324,7 @@ func (p *Planner) PlanTranscodeSessionWithLocalEgress(sessionID, currentTranscod
 	p.reserved[sessionID] = &reservation{transcodeURL: node.URL, createdAt: now}
 	return Plan{TranscodeNode: node}
 }
+
 // filterNodes returns the nodes accepted by keep, preserving pool order so
 // round-robin cursors stay meaningful across selections.
 func filterNodes(nodes []*Node, keep func(*Node) bool) []*Node {
@@ -715,6 +716,7 @@ func (p *Planner) pickLocalEgressTranscode(transcodes, pool []*Node, groupHealth
 		return p.transcodeEligible(n, nil, groupHealthy, 0, now)
 	}, p.physicalGPULoadScore(pool, now))
 }
+
 // transcodeEligible reports whether a transcode node may take a new session:
 // it must be healthy and under cap, and a grouped node additionally requires
 // its whole group healthy and — when the group contains proxies — at least

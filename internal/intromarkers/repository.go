@@ -58,7 +58,7 @@ const baseCandidateSelect = `
 	JOIN episodes e ON e.content_id = mf.episode_id
 	WHERE mf.episode_id IS NOT NULL
 	  AND mf.file_path NOT LIKE 'virtual://%'
-	  AND mf.container <> 'virtual'
+	  AND (mf.container IS NULL OR mf.container <> 'virtual')
 	  AND COALESCE(e.season_id, '') <> ''
 	  AND folders.enabled = true
 	  AND folders.intro_detection_enabled = true

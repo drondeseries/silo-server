@@ -799,15 +799,20 @@ func TestReleasedEpisodeReconciliationSkipsFutureEpisodes(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO seasons(content_id,series_id,season_number,title)
-		VALUES('season-tvdb-80-1',$1,1,'Season 1')`, seriesID); err != nil {
+		VALUES('season-tvdb-80-1',$1,1,'Season 1')
+		ON CONFLICT (content_id) DO NOTHING`, seriesID); err != nil {
 		t.Fatalf("seed season: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM media_files WHERE content_id=$1 AND episode_id IS NOT NULL`, seriesID); err != nil {
+		t.Fatalf("clean initial episode files: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO episodes(
 			content_id,series_id,season_id,season_number,episode_number,title,air_date
 		) VALUES
 			('episode-tvdb-80-1-1',$1,'season-tvdb-80-1',1,1,'Released',CURRENT_DATE),
-			('episode-tvdb-80-1-2',$1,'season-tvdb-80-1',1,2,'Future',CURRENT_DATE+1)`,
+			('episode-tvdb-80-1-2',$1,'season-tvdb-80-1',1,2,'Future',CURRENT_DATE+1)
+		ON CONFLICT (content_id) DO UPDATE SET air_date=EXCLUDED.air_date, title=EXCLUDED.title`,
 		seriesID); err != nil {
 		t.Fatalf("seed episodes: %v", err)
 	}
@@ -1182,12 +1187,14 @@ func TestReleasedEpisodeReconciliationMaintainsCollectionClaims(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO seasons(content_id,series_id,season_number,title)
-		VALUES('season-tvdb-204-1',$1,1,'Season 1')`, seriesID); err != nil {
+		VALUES('season-tvdb-204-1',$1,1,'Season 1')
+		ON CONFLICT (content_id) DO NOTHING`, seriesID); err != nil {
 		t.Fatalf("seed season: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO episodes(content_id,series_id,season_id,season_number,episode_number,title,air_date)
-		VALUES('episode-tvdb-204-1-1',$1,'season-tvdb-204-1',1,1,'Released',CURRENT_DATE)`, seriesID); err != nil {
+		VALUES('episode-tvdb-204-1-1',$1,'season-tvdb-204-1',1,1,'Released',CURRENT_DATE)
+		ON CONFLICT (content_id) DO UPDATE SET air_date=EXCLUDED.air_date, title=EXCLUDED.title`, seriesID); err != nil {
 		t.Fatalf("seed released episode: %v", err)
 	}
 	if err := repo.MaterializeVirtualPlaybackEpisodes(ctx, seriesID); err != nil {

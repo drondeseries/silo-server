@@ -2351,6 +2351,7 @@ func (h *PlaybackHandler) deleteNodeRecipeV3(ctx context.Context, transportID st
 			"component", "api", "transport", transportID, "error", err)
 	}
 }
+
 // planIdentityProxyV3 selects the proxy node that will serve a direct-play or
 // progressive-remux session. These deliveries need no transcode node — the
 // bytes are either the source file or a single remux pipe — so the planner is

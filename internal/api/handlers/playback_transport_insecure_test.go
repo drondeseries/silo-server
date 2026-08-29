@@ -47,3 +47,31 @@ func TestResolveVirtualInputRelayRespectsAllowInsecureOptIn(t *testing.T) {
 		}
 	})
 }
+
+func TestVirtualTranscodeStartupFailsOverOnResolutionError(t *testing.T) {
+	attempts := make([]string, 0)
+	h := &PlaybackHandler{
+		VirtualMediaResolver: VirtualMediaResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
+			attempts = append(attempts, virtualURI)
+			if virtualURI == "virtual://series/tt1/1/1?result=dead" {
+				return "", context.DeadlineExceeded
+			}
+			return "http://localhost:8080/stream.m3u8", nil
+		}),
+	}
+
+	// Attempt 0: "virtual://series/tt1/1/1?result=dead"
+	relayURL0, _, err0 := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1?result=dead", 5, 1, "profile", false)
+	if err0 == nil {
+		t.Fatalf("expected attempt 0 to fail, got %q", relayURL0)
+	}
+
+	// Attempt 1: neutral fallback "virtual://series/tt1/1/1"
+	relayURL1, _, err1 := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 5, 1, "profile", true)
+	if err1 != nil {
+		t.Fatalf("expected attempt 1 to succeed, got error: %v", err1)
+	}
+	if relayURL1 != "http://localhost:8080/stream.m3u8" {
+		t.Fatalf("expected stream url, got %q", relayURL1)
+	}
+}

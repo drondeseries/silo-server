@@ -98,7 +98,7 @@ func TestEpisodeSearchPostgresAndDocumentSource(t *testing.T) {
 	if len(docs[0].LibraryIDs) != 1 || int(docs[0].LibraryIDs[0]) != folderID {
 		t.Fatalf("episode library ids = %v, want [%d]", docs[0].LibraryIDs, folderID)
 	}
-	if docs[0].Vectors != nil {
+	if vec, ok := docs[0].Vectors[DefaultMeilisearchEmbedder]; !ok || vec != nil {
 		t.Fatalf("episode document unexpectedly has vectors: %#v", docs[0].Vectors)
 	}
 }

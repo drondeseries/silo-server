@@ -114,7 +114,7 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		targetURI := canonicalPath
-		if attempt > 0 && sessionVirtualURI == "" {
+		if attempt > 0 {
 			targetURI = neutralPath
 		}
 		relayURL, cleanup, resolveErr := h.resolveVirtualInputURI(
@@ -122,7 +122,24 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		)
 		if resolveErr != nil {
 			lastErr = resolveErr
-			break
+			if h.BestResultCache != nil && file != nil {
+				neutralURI := virtualPlaybackNeutralKey(canonicalPath)
+				h.BestResultCache.RemoveCandidate(bestResultCacheKey(file.ContentID, neutralURI, ownerInstallationID), targetURI)
+			}
+			if clearer, ok := h.fileResolver.(interface {
+				ClearVirtualResultPin(context.Context, int) error
+			}); ok && file != nil && file.ID > 0 &&
+				strings.Contains(file.FilePath, "?result=") && targetURI == canonicalPath {
+				unpinCtx, unpinCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+				if err := clearer.ClearVirtualResultPin(unpinCtx, file.ID); err != nil {
+					slog.WarnContext(ctx, "failed to clear virtual result pin after transport failure", "component", "api", "file_id", file.ID, "error", err)
+				} else {
+					file.FilePath = virtualPlaybackNeutralKey(file.FilePath)
+					canonicalPath = file.FilePath
+				}
+				unpinCancel()
+			}
+			continue
 		}
 		transcodeCtx, transcodeCancel := context.WithCancel(context.Background())
 		timer := time.AfterFunc(4*time.Hour, transcodeCancel)

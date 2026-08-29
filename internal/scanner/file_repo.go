@@ -2992,7 +2992,7 @@ func claimRepresentativeWindow(limit int) int {
 // MarkMissing sets the missing_since timestamp for the given media file.
 func (r *FileRepository) MarkMissing(ctx context.Context, id int, since time.Time) error {
 	tag, err := r.pool.Exec(ctx,
-		"UPDATE media_files SET missing_since = $1, updated_at = NOW() WHERE id = $2 AND container <> 'virtual' AND file_path NOT LIKE 'virtual://%'",
+		"UPDATE media_files SET missing_since = $1, updated_at = NOW() WHERE id = $2 AND (container IS NULL OR container <> 'virtual') AND file_path NOT LIKE 'virtual://%'",
 		since, id,
 	)
 	if err != nil {
@@ -3021,7 +3021,7 @@ func (r *FileRepository) DeleteMissingByFolder(ctx context.Context, folderID int
 	// Virtual plugin-backed files are not present on the local filesystem by
 	// design. They must never be treated as missing physical files by scanner
 	// cleanup, otherwise a scan/restart disables playback for every virtual item.
-	query := "DELETE FROM media_files WHERE media_folder_id = $1 AND missing_since IS NOT NULL AND missing_since < $2 AND container <> 'virtual' AND file_path NOT LIKE 'virtual://%'"
+	query := "DELETE FROM media_files WHERE media_folder_id = $1 AND missing_since IS NOT NULL AND missing_since < $2 AND (container IS NULL OR container <> 'virtual') AND file_path NOT LIKE 'virtual://%'"
 	args := []any{folderID, cutoff}
 	if clauses, clauseArgs := rootCoverageClauses(protectedRoots, len(args)+1); len(clauses) > 0 {
 		query += " AND NOT (" + strings.Join(clauses, " OR ") + ")"
@@ -3155,7 +3155,7 @@ func (r *FileRepository) DeleteByIDs(ctx context.Context, ids []int) (int, error
 // longer covered by any configured root.
 func (r *FileRepository) ListIDsOutsideRoots(ctx context.Context, folderID int, roots []string) ([]int, error) {
 	if len(roots) == 0 {
-		rows, err := r.pool.Query(ctx, `SELECT id FROM media_files WHERE media_folder_id = $1 AND container <> 'virtual' AND file_path NOT LIKE 'virtual://%'`, folderID)
+		rows, err := r.pool.Query(ctx, `SELECT id FROM media_files WHERE media_folder_id = $1 AND (container IS NULL OR container <> 'virtual') AND file_path NOT LIKE 'virtual://%'`, folderID)
 		if err != nil {
 			return nil, fmt.Errorf("querying file ids outside roots: %w", err)
 		}
@@ -3180,7 +3180,7 @@ func (r *FileRepository) ListIDsOutsideRoots(ctx context.Context, folderID int, 
 	coveredClauses, coveredArgs := rootCoverageClauses(roots, 2)
 	args = append(args, coveredArgs...)
 
-	query := `SELECT id FROM media_files WHERE media_folder_id = $1 AND container <> 'virtual' AND file_path NOT LIKE 'virtual://%' AND NOT (` + strings.Join(coveredClauses, " OR ") + `)`
+	query := `SELECT id FROM media_files WHERE media_folder_id = $1 AND (container IS NULL OR container <> 'virtual') AND file_path NOT LIKE 'virtual://%' AND NOT (` + strings.Join(coveredClauses, " OR ") + `)`
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying file ids outside roots: %w", err)

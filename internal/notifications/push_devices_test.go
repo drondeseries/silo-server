@@ -312,6 +312,8 @@ func newPushDeviceTestRepo(t *testing.T) (*PushDeviceRepository, *pgxpool.Pool) 
 			apns_topic text,
 			apns_token_ciphertext text,
 			apns_token_hash text,
+			fcm_token_ciphertext text,
+			fcm_token_hash text,
 			server_device_id text NOT NULL,
 			push_mode text NOT NULL DEFAULT 'private_push',
 			enabled boolean NOT NULL DEFAULT true,

@@ -335,7 +335,7 @@ func (r *ItemRepository) purgeVirtualPlaybackItemsOnce(ctx context.Context, opts
 			      SELECT 1 FROM media_files physical
 			      LEFT JOIN episodes ep ON ep.content_id = physical.episode_id
 			      WHERE (physical.content_id = claim.content_id OR ep.series_id = claim.content_id)
-			        AND physical.container <> 'virtual'
+			        AND (physical.container IS NULL OR physical.container <> 'virtual')
 			        AND physical.file_path NOT LIKE 'virtual://%'
 			  )
 			ORDER BY claim.content_id,claim.owns_item_metadata DESC,
@@ -1815,25 +1815,31 @@ func materializeVirtualPlaybackEpisodesTx(ctx context.Context, tx pgx.Tx, series
 	episodeRows.Close()
 
 	if len(episodes) == 0 {
-		seasonID := fmt.Sprintf("%s-1", strings.Replace(seriesID, "series-", "season-", 1))
-		episodeID := fmt.Sprintf("%s-1-1", strings.Replace(seriesID, "series-", "episode-", 1))
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO seasons(content_id,series_id,season_number,title,metadata_source)
-			VALUES($1,$2,1,'Season 1','provider') ON CONFLICT DO NOTHING`, seasonID, seriesID); err != nil {
-			return fmt.Errorf("create default virtual season: %w", err)
+		var anyEpisodesExist bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM episodes WHERE series_id=$1)`, seriesID).Scan(&anyEpisodesExist); err != nil {
+			return fmt.Errorf("check existing episodes: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO episodes(content_id,series_id,season_id,season_number,episode_number,title,metadata_source)
-			VALUES($1,$2,$3,1,1,'Episode 1','provider') ON CONFLICT DO NOTHING`, episodeID, seriesID, seasonID); err != nil {
-			return fmt.Errorf("create default virtual episode: %w", err)
+		if !anyEpisodesExist {
+			seasonID := fmt.Sprintf("%s-1", strings.Replace(seriesID, "series-", "season-", 1))
+			episodeID := fmt.Sprintf("%s-1-1", strings.Replace(seriesID, "series-", "episode-", 1))
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO seasons(content_id,series_id,season_number,title,metadata_source)
+				VALUES($1,$2,1,'Season 1','provider') ON CONFLICT DO NOTHING`, seasonID, seriesID); err != nil {
+				return fmt.Errorf("create default virtual season: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO episodes(content_id,series_id,season_id,season_number,episode_number,title,metadata_source)
+				VALUES($1,$2,$3,1,1,'Episode 1','provider') ON CONFLICT DO NOTHING`, episodeID, seriesID, seasonID); err != nil {
+				return fmt.Errorf("create default virtual episode: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO episode_libraries(episode_id,media_folder_id)
+				SELECT $1, media_folder_id FROM media_files WHERE content_id=$2 AND episode_id IS NULL
+				ON CONFLICT DO NOTHING`, episodeID, seriesID); err != nil {
+				return fmt.Errorf("link default virtual episode: %w", err)
+			}
+			episodes = append(episodes, episodeCoordinate{id: episodeID, season: 1, episode: 1})
 		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO episode_libraries(episode_id,media_folder_id)
-			SELECT $1, media_folder_id FROM media_files WHERE content_id=$2 AND episode_id IS NULL
-			ON CONFLICT DO NOTHING`, episodeID, seriesID); err != nil {
-			return fmt.Errorf("link default virtual episode: %w", err)
-		}
-		episodes = append(episodes, episodeCoordinate{id: episodeID, season: 1, episode: 1})
 	}
 
 	expectedPaths := make([]string, 0, len(bases)*len(episodes))
