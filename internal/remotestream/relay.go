@@ -60,6 +60,7 @@ type relayEntry struct {
 	baseName  string
 	createdAt time.Time
 	insecure  bool // private/local destinations explicitly allowed by admin
+	headers   map[string]string
 }
 
 // ProxyError reports whether an upstream failure happened before any response
@@ -159,17 +160,27 @@ func (r *Relay) Close(ctx context.Context) error {
 // idempotent release function. The provider URL never appears in the returned
 // value, transcode recipe, or FFmpeg command line.
 func (r *Relay) Register(ctx context.Context, source string) (string, func(), error) {
-	return r.register(ctx, source, false)
+	return r.register(ctx, source, false, nil)
 }
 
 // RegisterInsecure registers a structurally valid source while allowing the
 // owning plugin's explicit private-host opt-in. FFmpeg still receives only a
 // loopback relay URL; the insecure transport is isolated to this entry.
 func (r *Relay) RegisterInsecure(ctx context.Context, source string) (string, func(), error) {
-	return r.register(ctx, source, true)
+	return r.register(ctx, source, true, nil)
 }
 
-func (r *Relay) register(ctx context.Context, source string, insecure bool) (string, func(), error) {
+// RegisterWithHeaders registers a source with optional upstream request headers.
+func (r *Relay) RegisterWithHeaders(ctx context.Context, source string, headers map[string]string) (string, func(), error) {
+	return r.register(ctx, source, false, headers)
+}
+
+// RegisterInsecureWithHeaders registers an insecure source with optional upstream request headers.
+func (r *Relay) RegisterInsecureWithHeaders(ctx context.Context, source string, headers map[string]string) (string, func(), error) {
+	return r.register(ctx, source, true, headers)
+}
+
+func (r *Relay) register(ctx context.Context, source string, insecure bool, headers map[string]string) (string, func(), error) {
 	if r == nil {
 		return "", nil, errors.New("remote stream relay is not configured")
 	}
@@ -217,7 +228,7 @@ func (r *Relay) register(ctx context.Context, source string, insecure bool) (str
 		return "", nil, errors.New("remote stream relay is at capacity")
 	}
 	r.entries[token] = &relayEntry{
-		source: sourceURL, baseName: baseName, createdAt: now, insecure: insecure,
+		source: sourceURL, baseName: baseName, createdAt: now, insecure: insecure, headers: headers,
 	}
 	baseURL := r.baseURL
 	r.mu.Unlock()
@@ -299,9 +310,9 @@ func (r *Relay) handle(w http.ResponseWriter, request *http.Request) {
 	tracked := &relayResponseWriter{ResponseWriter: w}
 	var proxyErr error
 	if entry.insecure {
-		proxyErr = r.proxyWithClient(tracked, request, target.String(), token, r.insecureHTTPClient())
+		proxyErr = r.proxyWithClient(tracked, request, target.String(), token, r.insecureHTTPClient(), entry.headers)
 	} else {
-		proxyErr = r.proxy(tracked, request, target.String(), token)
+		proxyErr = r.proxyWithClient(tracked, request, target.String(), token, r.client, entry.headers)
 	}
 	if proxyErr != nil {
 		if !tracked.wroteHeader {
@@ -340,7 +351,7 @@ func (r *Relay) ProxyInsecure(w http.ResponseWriter, request *http.Request, sour
 		return err
 	}
 	tracked := &relayResponseWriter{ResponseWriter: w}
-	if err := r.proxyWithClient(tracked, request, parsed.String(), "", r.insecureHTTPClient()); err != nil {
+	if err := r.proxyWithClient(tracked, request, parsed.String(), "", r.insecureHTTPClient(), nil); err != nil {
 		return &ProxyError{Started: tracked.wroteHeader, Err: err}
 	}
 	return nil
@@ -362,10 +373,10 @@ func (r *Relay) insecureHTTPClient() *http.Client {
 }
 
 func (r *Relay) proxy(w http.ResponseWriter, request *http.Request, source, relayToken string) error {
-	return r.proxyWithClient(w, request, source, relayToken, r.client)
+	return r.proxyWithClient(w, request, source, relayToken, r.client, nil)
 }
 
-func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, source, relayToken string, client *http.Client) error {
+func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, source, relayToken string, client *http.Client, extraHeaders map[string]string) error {
 	if request.Method != http.MethodGet && request.Method != http.MethodHead {
 		return errors.New("remote stream relay supports only GET and HEAD")
 	}
@@ -376,6 +387,14 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 	for _, header := range []string{"Range", "If-Range", "If-Modified-Since", "If-None-Match", "Accept", "User-Agent"} {
 		if value := request.Header.Get(header); value != "" {
 			upstream.Header.Set(header, value)
+		}
+	}
+	if len(extraHeaders) > 0 {
+		for k, v := range extraHeaders {
+			kLower := strings.ToLower(k)
+			if kLower == "referer" || kLower == "origin" || kLower == "user-agent" {
+				upstream.Header.Set(k, v)
+			}
 		}
 	}
 	response, err := client.Do(upstream)

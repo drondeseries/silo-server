@@ -12,32 +12,39 @@ import (
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
+func (h *PlaybackHandler) requestDeviceCapabilities(r *http.Request) (plugins.DeviceCapabilities, bool) {
+	if h == nil || h.DeviceCapabilitySource == nil || r == nil {
+		return plugins.DeviceCapabilities{}, false
+	}
+	return h.DeviceCapabilitySource.DeviceCapabilitiesFor(r.Context(), apimw.GetProfileID(r.Context()), requestDeviceID(r))
+}
+
 // rankVirtualCandidatesForDevice ranks the candidate list for the requesting
 // device using its persisted capability profile. When no profile is known the
 // provider returns candidates unchanged (device order), preserving the
 // pre-feature resolution-label behavior.
-func (h *PlaybackHandler) rankVirtualCandidatesForDevice(r *http.Request, streams []VirtualPlaybackStream) []VirtualPlaybackStream {
-	if h.DeviceCapabilitySource == nil || len(streams) == 0 {
-		return streams
+func (h *PlaybackHandler) rankVirtualCandidatesForDevice(r *http.Request, streams []VirtualPlaybackStream) ([]VirtualPlaybackStream, plugins.DeviceCapabilities) {
+	if len(streams) == 0 {
+		return streams, plugins.DeviceCapabilities{}
+	}
+	capabilities, ok := h.requestDeviceCapabilities(r)
+	if !ok {
+		return streams, plugins.DeviceCapabilities{}
 	}
 	meta := make([]plugins.VirtualStreamMetadata, len(streams))
 	for i := range streams {
 		meta[i] = &streams[i]
-	}
-	capabilities, ok := h.DeviceCapabilitySource.DeviceCapabilitiesFor(r.Context(), apimw.GetProfileID(r.Context()), requestDeviceID(r))
-	if !ok {
-		return streams
 	}
 	ranked := plugins.RankVirtualStreamsForDevice(meta, capabilities)
 	out := make([]VirtualPlaybackStream, len(ranked))
 	for i := range ranked {
 		stream, ok := ranked[i].(*VirtualPlaybackStream)
 		if !ok {
-			return streams
+			return streams, capabilities
 		}
 		out[i] = *stream
 	}
-	return out
+	return out, capabilities
 }
 
 // requestDeviceID returns the durable device ID the web/app clients send on

@@ -20,6 +20,7 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"golang.org/x/text/language"
 )
@@ -188,12 +189,13 @@ func (c *VirtualBestResultCache) set(key string, streams []VirtualPlaybackStream
 }
 
 // bestResultCacheKey builds a deterministic key from the content_id, neutral
-// URI (without result=), and owner installation ID. The owner keeps provider
-// switches from reusing a result= that belongs to a different installation.
-// The key is deliberately device-blind: provider candidate lists are identical
-// for every device, and per-device ranking happens on every hit instead.
-func bestResultCacheKey(contentID, neutralURI string, ownerInstallationID int) string {
-	digest := sha256.Sum256([]byte(contentID + "\x00" + neutralURI + "\x00" + strconv.Itoa(ownerInstallationID)))
+// URI (without result=), and owner installation ID, with an optional device fingerprint.
+func bestResultCacheKey(contentID, neutralURI string, ownerInstallationID int, deviceFingerprint ...string) string {
+	raw := contentID + "\x00" + neutralURI + "\x00" + strconv.Itoa(ownerInstallationID)
+	if len(deviceFingerprint) > 0 && deviceFingerprint[0] != "" {
+		raw += "\x00" + deviceFingerprint[0]
+	}
+	digest := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(digest[:16])
 }
 
@@ -210,23 +212,26 @@ func (f VirtualPlaybackResolverFunc) ResolveVirtualPlayback(ctx context.Context,
 // VirtualPlaybackStream is the provider-neutral candidate shape used by the
 // just-in-time picker. Implementations must never expose provider URLs here.
 type VirtualPlaybackStream struct {
-	ID                  string   `json:"id"`
-	Label               string   `json:"label"`
-	URI                 string   `json:"uri"`
-	Resolution          string   `json:"resolution,omitempty"`
-	CodecVideo          string   `json:"codec_video,omitempty"`
-	CodecAudio          string   `json:"codec_audio,omitempty"`
-	HDR                 string   `json:"hdr,omitempty"`
-	SourceType          string   `json:"source_type,omitempty"`
-	FileSize            int64    `json:"file_size,omitempty"`
-	Container           string   `json:"container,omitempty"`
-	Bitrate             int      `json:"bitrate,omitempty"`
-	FrameRate           string   `json:"frame_rate,omitempty"`
-	AudioLanguages      []string `json:"audio_languages,omitempty"`
-	SubtitleLanguages   []string `json:"subtitle_languages,omitempty"`
-	OwnerInstallationID int      `json:"-"`
-	Visible             bool     `json:"-"`
-	VisibilitySpecified bool     `json:"-"`
+	ID                  string            `json:"id"`
+	Label               string            `json:"label"`
+	URI                 string            `json:"uri"`
+	Resolution          string            `json:"resolution,omitempty"`
+	CodecVideo          string            `json:"codec_video,omitempty"`
+	CodecAudio          string            `json:"codec_audio,omitempty"`
+	HDR                 string            `json:"hdr,omitempty"`
+	SourceType          string            `json:"source_type,omitempty"`
+	FileSize            int64             `json:"file_size,omitempty"`
+	Container           string            `json:"container,omitempty"`
+	Bitrate             int               `json:"bitrate,omitempty"`
+	FrameRate           string            `json:"frame_rate,omitempty"`
+	AudioLanguages      []string          `json:"audio_languages,omitempty"`
+	SubtitleLanguages   []string          `json:"subtitle_languages,omitempty"`
+	HasAtmos            bool              `json:"has_atmos,omitempty"`
+	QualityScore        int               `json:"quality_score,omitempty"`
+	RequestHeaders      map[string]string `json:"-"`
+	OwnerInstallationID int               `json:"-"`
+	Visible             bool              `json:"-"`
+	VisibilitySpecified bool              `json:"-"`
 }
 
 // Get* accessors satisfy plugins.VirtualStreamMetadata so the shared device
@@ -286,11 +291,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	}}
 	noResult := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) == ""
 	needsCandidateMetadata := !completeVirtualVideoEvidenceV3(file) || !completeVirtualAudioEvidenceV3(file) || !completeVirtualContainerEvidenceV3(file)
-	// Sticky pin: the candidate URI that last played successfully for this
-	// content. Rotation between equally ranked releases churned sessions and
-	// invalidated client-cached track identities; while the pinned source is
-	// still offered, it always leads.
-	stickyKey := bestResultCacheKey(file.ContentID, virtualPlaybackNeutralKey(file.FilePath), file.VirtualOwnerInstallationID)
+	deviceCaps, _ := h.requestDeviceCapabilities(r)
+	stickyKey := bestResultCacheKey(file.ContentID, virtualPlaybackNeutralKey(file.FilePath), file.VirtualOwnerInstallationID, deviceCaps.Fingerprint())
 	pinnedURI := h.peekVirtualSticky(stickyKey)
 	// Check the best-result cache before listing candidates. A previous
 	// successful play of this content may have a cached result= URI that
@@ -302,7 +304,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// Cache holds the filtered, device-neutral candidate list; rank it
 			// for this device so a TV and a phone pick their own best stream
 			// without another provider round-trip.
-			candidates = h.rankVirtualCandidatesForDevice(r, cached)
+			candidates, _ = h.rankVirtualCandidatesForDevice(r, cached)
 			noResult = false // treated as if file already had a result=
 		}
 	}
@@ -329,13 +331,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					neutralURI := virtualPlaybackNeutralKey(file.FilePath)
 					h.BestResultCache.set(bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID), filtered, time.Now())
 				}
-				candidates = h.rankVirtualCandidatesForDevice(r, filtered)
+				candidates, _ = h.rankVirtualCandidatesForDevice(r, filtered)
 			}
 		}
 		cancel()
 	}
 	maxAttempts := h.maxVirtualFailoverAttempts(r.Context())
-	candidates = h.applyVirtualStickyPin(stickyKey, pinnedURI, candidates)
+	candidates = h.applyVirtualStickyPin(stickyKey, pinnedURI, candidates, deviceCaps)
 	if len(candidates) > maxAttempts {
 		candidates = candidates[:maxAttempts]
 	}
@@ -1437,26 +1439,46 @@ func (h *PlaybackHandler) unpinVirtualSticky(key, uri string) {
 }
 
 // applyVirtualStickyPin moves the pinned candidate to the front of the list
-// while it is still offered; if the provider no longer offers it, the pin is
-// released so selection falls back to normal ranking.
-func (h *PlaybackHandler) applyVirtualStickyPin(key, pinnedURI string, candidates []VirtualPlaybackStream) []VirtualPlaybackStream {
+// while it is still offered, provided it meets score parity with the device-preferred
+// candidate at index 0. If the pinned candidate has vanished or has a lower compatibility
+// score for the requesting device, it is not promoted.
+func (h *PlaybackHandler) applyVirtualStickyPin(key, pinnedURI string, candidates []VirtualPlaybackStream, device ...plugins.DeviceCapabilities) []VirtualPlaybackStream {
 	if pinnedURI == "" || len(candidates) == 0 {
 		return candidates
 	}
+	pinnedIdx := -1
 	for i, cand := range candidates {
-		if cand.URI != pinnedURI {
-			continue
+		if cand.URI == pinnedURI {
+			pinnedIdx = i
+			break
 		}
-		if i == 0 {
-			return candidates
-		}
-		reordered := make([]VirtualPlaybackStream, 0, len(candidates))
-		reordered = append(reordered, cand)
-		reordered = append(reordered, candidates[:i]...)
-		reordered = append(reordered, candidates[i+1:]...)
-		return reordered
 	}
-	// Pinned URI vanished from the offered set.
-	h.unpinVirtualSticky(key, pinnedURI)
-	return candidates
+	if pinnedIdx < 0 {
+		// Pinned URI vanished from the offered set.
+		h.unpinVirtualSticky(key, pinnedURI)
+		return candidates
+	}
+	if pinnedIdx == 0 {
+		return candidates
+	}
+
+	// Score parity guard: if device capabilities are present, only promote the pinned
+	// candidate if its score is >= the device-ranked candidate at index 0.
+	if len(device) > 0 {
+		d := device[0]
+		if len(d.CodecsVideo) > 0 || len(d.CodecsAudio) > 0 || d.HDR || d.DolbyVision || d.MaxResolution != "" {
+			pinnedScore := plugins.ScoreCandidate(&candidates[pinnedIdx], d)
+			topScore := plugins.ScoreCandidate(&candidates[0], d)
+			if pinnedScore < topScore {
+				return candidates
+			}
+		}
+	}
+
+	cand := candidates[pinnedIdx]
+	reordered := make([]VirtualPlaybackStream, 0, len(candidates))
+	reordered = append(reordered, cand)
+	reordered = append(reordered, candidates[:pinnedIdx]...)
+	reordered = append(reordered, candidates[pinnedIdx+1:]...)
+	return reordered
 }

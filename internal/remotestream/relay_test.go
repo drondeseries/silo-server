@@ -454,3 +454,42 @@ func firstMediaURI(t *testing.T, playlist string) string {
 	t.Fatalf("playlist has no media URI: %s", playlist)
 	return ""
 }
+
+func TestRegisterWithHeadersForwardsAllowedHeaders(t *testing.T) {
+	var receivedReferer, receivedOrigin string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedReferer = r.Header.Get("Referer")
+		receivedOrigin = r.Header.Get("Origin")
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("mp4-data"))
+	}))
+	defer server.Close()
+
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+
+	headers := map[string]string{
+		"Referer": "https://provider.example/player",
+		"Origin":  "https://provider.example",
+		"Cookie":  "secret-cookie", // must NOT be forwarded
+	}
+	relayURL, release, err := relay.RegisterInsecureWithHeaders(context.Background(), server.URL+"/stream.mp4", headers)
+	if err != nil {
+		t.Fatalf("RegisterInsecureWithHeaders failed: %v", err)
+	}
+	defer release()
+
+	req, _ := http.NewRequest(http.MethodGet, relayURL, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do relay request failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if receivedReferer != "https://provider.example/player" {
+		t.Fatalf("received Referer = %q, want https://provider.example/player", receivedReferer)
+	}
+	if receivedOrigin != "https://provider.example" {
+		t.Fatalf("received Origin = %q, want https://provider.example", receivedOrigin)
+	}
+}

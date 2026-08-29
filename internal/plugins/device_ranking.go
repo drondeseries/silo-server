@@ -19,6 +19,17 @@ type DeviceCapabilities struct {
 	DolbyVision   bool
 }
 
+func (d DeviceCapabilities) Fingerprint() string {
+	return userstore.DeviceCapabilityFingerprint(userstore.DeviceCapabilityProfile{
+		CodecsVideo:   d.CodecsVideo,
+		CodecsAudio:   d.CodecsAudio,
+		Containers:    d.Containers,
+		MaxResolution: d.MaxResolution,
+		HDR:           d.HDR,
+		DolbyVision:   d.DolbyVision,
+	})
+}
+
 // VirtualStreamMetadata is the minimal candidate surface the device ranker
 // needs. Both the plugins.VirtualPlaybackStream (prewarm) and the
 // handlers.VirtualPlaybackStream (playback start) shapes implement it, so
@@ -69,7 +80,7 @@ func RankVirtualStreamsForDevice[T VirtualStreamMetadata](candidates []T, device
 	}
 	indexed := make([]virtualRankedStream[T], len(candidates))
 	for i, c := range candidates {
-		indexed[i] = virtualRankedStream[T]{stream: c, score: scoreCandidate(c, device), index: i}
+		indexed[i] = virtualRankedStream[T]{stream: c, score: ScoreCandidate(c, device), index: i}
 	}
 	sort.SliceStable(indexed, func(i, j int) bool {
 		if indexed[i].score != indexed[j].score {
@@ -84,7 +95,7 @@ func RankVirtualStreamsForDevice[T VirtualStreamMetadata](candidates []T, device
 	return out
 }
 
-func scoreCandidate[T VirtualStreamMetadata](c T, device DeviceCapabilities) int {
+func ScoreCandidate[T VirtualStreamMetadata](c T, device DeviceCapabilities) int {
 	score := 0
 
 	// Video codec match (biggest factor)

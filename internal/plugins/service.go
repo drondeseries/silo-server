@@ -121,6 +121,7 @@ type Service struct {
 type resolvedURLEntry struct {
 	url        string
 	resolvedAt time.Time
+	expiresAt  time.Time
 	cancel     context.CancelFunc
 	// refreshes counts background warm-refresh cycles this entry has served.
 	// Chains are capped so a memo only stays warm for an active playback

@@ -2232,6 +2232,20 @@ func (r *FileRepository) ClearVirtualResultPin(ctx context.Context, fileID int) 
 	return nil
 }
 
+// ReplaceVirtualResultPin conditionally updates a virtual file's path if it still
+// matches expectedPath. This prevents concurrent playback sessions or stale attempts
+// from clobbering a newer or already-updated file path.
+func (r *FileRepository) ReplaceVirtualResultPin(ctx context.Context, fileID int, expectedPath, replacementPath string) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE media_files
+		SET file_path = $1
+		WHERE id = $2 AND file_path = $3`, replacementPath, fileID, expectedPath)
+	if err != nil {
+		return false, fmt.Errorf("replace virtual result pin for file %d: %w", fileID, err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // GetByIDs retrieves media files by primary key.
 func (r *FileRepository) GetByIDs(ctx context.Context, ids []int) ([]*models.MediaFile, error) {
 	if len(ids) == 0 {

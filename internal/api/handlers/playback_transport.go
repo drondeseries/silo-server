@@ -92,11 +92,15 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 	if neutralPath == "" || strings.HasSuffix(neutralPath, "://") {
 		neutralPath = virtualPlaybackNeutralKey(opts.InputPath)
 	}
+	initialPinnedPath := ""
+	if file != nil && strings.Contains(file.FilePath, "?result=") {
+		initialPinnedPath = file.FilePath
+	}
 	opts.CanonicalInputPath = canonicalPath
 	opts.VirtualSourceOwnerInstallationID = ownerInstallationID
 	opts.RefreshInput = func(refreshCtx context.Context) (string, func(), error) {
 		// A restart renews the exact candidate pinned to this session, never a
-		// provider-neural re-selection: re-resolving through the neutral path
+		// provider-neutral re-selection: re-resolving through the neutral path
 		// can silently swap to a differently-ranked candidate mid-stream. The
 		// canonical path still carries the ?result= identity the session bound
 		// to during planning.
@@ -126,18 +130,11 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 				neutralURI := virtualPlaybackNeutralKey(canonicalPath)
 				h.BestResultCache.RemoveCandidate(bestResultCacheKey(file.ContentID, neutralURI, ownerInstallationID), targetURI)
 			}
-			if clearer, ok := h.fileResolver.(interface {
-				ClearVirtualResultPin(context.Context, int) error
-			}); ok && file != nil && file.ID > 0 &&
-				strings.Contains(file.FilePath, "?result=") && targetURI == canonicalPath {
-				unpinCtx, unpinCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-				if err := clearer.ClearVirtualResultPin(unpinCtx, file.ID); err != nil {
-					slog.WarnContext(ctx, "failed to clear virtual result pin after transport failure", "component", "api", "file_id", file.ID, "error", err)
-				} else {
-					file.FilePath = virtualPlaybackNeutralKey(file.FilePath)
-					canonicalPath = file.FilePath
+			if targetURI == canonicalPath {
+				canonicalPath = neutralPath
+				if file != nil {
+					file.FilePath = neutralPath
 				}
-				unpinCancel()
 			}
 			continue
 		}
@@ -156,6 +153,17 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		session, startErr := playback.StartTranscode(transcodeCtx, attemptOpts)
 		if startErr == nil {
 			if _, readyErr := session.WaitForManifest(playback.ManifestStartupTimeout); readyErr == nil {
+				// Transport successfully ready. If this was a fallback attempt from a dead pin,
+				// update the persisted pin compare-and-swap so future sessions use the live source.
+				if replacer, ok := h.fileResolver.(interface {
+					ReplaceVirtualResultPin(context.Context, int, string, string) (bool, error)
+				}); ok && file != nil && file.ID > 0 && initialPinnedPath != "" && targetURI != initialPinnedPath {
+					unpinCtx, unpinCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+					if _, err := replacer.ReplaceVirtualResultPin(unpinCtx, file.ID, initialPinnedPath, targetURI); err != nil {
+						slog.WarnContext(ctx, "failed to update virtual result pin after fallback success", "component", "api", "file_id", file.ID, "error", err)
+					}
+					unpinCancel()
+				}
 				return session, nil
 			} else {
 				startErr = readyErr
@@ -168,27 +176,24 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			neutralURI := virtualPlaybackNeutralKey(canonicalPath)
 			h.BestResultCache.RemoveCandidate(bestResultCacheKey(file.ContentID, neutralURI, ownerInstallationID), targetURI)
 		}
-		// A pinned ?result= row whose link just failed would start every later
-		// play on the same dead candidate; un-pin it so the next attempt's
-		// first resolve lists live candidates. Failover below already refreshes
-		// within this attempt chain — this heals the row for the plays after it.
-		if clearer, ok := h.fileResolver.(interface {
-			ClearVirtualResultPin(context.Context, int) error
-		}); ok && file != nil && file.ID > 0 &&
-			strings.Contains(file.FilePath, "?result=") && targetURI == canonicalPath {
-			unpinCtx, unpinCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-			if err := clearer.ClearVirtualResultPin(unpinCtx, file.ID); err != nil {
-				slog.WarnContext(ctx, "failed to clear virtual result pin after transport failure", "component", "api", "file_id", file.ID, "error", err)
-			} else {
-				file.FilePath = virtualPlaybackNeutralKey(file.FilePath)
-				canonicalPath = file.FilePath
+		if targetURI == canonicalPath {
+			canonicalPath = neutralPath
+			if file != nil {
+				file.FilePath = neutralPath
 			}
-			unpinCancel()
 		}
 		lastErr = startErr
 	}
 	if lastErr == nil {
 		lastErr = errors.New("virtual transcode provider returned no usable stream")
+	}
+	// All attempts failed: conditionally clear the initial dead pin so future plays re-list
+	if replacer, ok := h.fileResolver.(interface {
+		ReplaceVirtualResultPin(context.Context, int, string, string) (bool, error)
+	}); ok && file != nil && file.ID > 0 && initialPinnedPath != "" {
+		unpinCtx, unpinCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		_, _ = replacer.ReplaceVirtualResultPin(unpinCtx, file.ID, initialPinnedPath, neutralPath)
+		unpinCancel()
 	}
 	return nil, lastErr
 }

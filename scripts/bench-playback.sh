@@ -111,26 +111,20 @@ fire_start() {
   local body
   body=$(build_body "$file_id" "$attempt_id" "$ctx")
 
-  local ttfb total
-  ttfb=$(curl -s \
+  local timing
+  timing=$(curl -s \
     -X POST "$SERVER/api/v1/playback/start" \
     -H "$AUTH" \
     -H "Content-Type: application/json" \
     -H "X-Profile-Id: $PROFILE_ID" \
     -H "X-Device-Id: bench-${tag}-${file_id}" \
     -o "$resp_file" \
-    -w "%{time_starttransfer}" \
-    -d "$body" 2>/dev/null || echo "0")
+    -w "%{time_starttransfer} %{time_total}" \
+    -d "$body" 2>/dev/null || echo "0 0")
 
-  total=$(curl -s \
-    -X POST "$SERVER/api/v1/playback/start" \
-    -H "$AUTH" \
-    -H "Content-Type: application/json" \
-    -H "X-Profile-Id: $PROFILE_ID" \
-    -H "X-Device-Id: bench-${tag}-${file_id}" \
-    -o /dev/null \
-    -w "%{time_total}" \
-    -d "$body" 2>/dev/null || echo "0")
+  local ttfb total
+  ttfb=$(echo "$timing" | awk '{print $1}')
+  total=$(echo "$timing" | awk '{print $2}')
 
   local ttfb_ms total_ms outcome sid
   ttfb_ms=$(python3 -c "print(f'{float('$ttfb')*1000:.0f}')" 2>/dev/null || echo "0")

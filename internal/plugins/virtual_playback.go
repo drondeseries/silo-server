@@ -86,23 +86,27 @@ type VirtualPlaybackVariant struct {
 // virtual file. The provider URL is deliberately not returned or persisted;
 // it is resolved again when the selected file is played.
 type VirtualPlaybackStream struct {
-	ID                  string   `json:"id"`
-	Label               string   `json:"label"`
-	URI                 string   `json:"uri"`
-	Resolution          string   `json:"resolution,omitempty"`
-	CodecVideo          string   `json:"codec_video,omitempty"`
-	CodecAudio          string   `json:"codec_audio,omitempty"`
-	HDR                 string   `json:"hdr,omitempty"`
-	SourceType          string   `json:"source_type,omitempty"`
-	FileSize            int64    `json:"file_size,omitempty"`
-	Container           string   `json:"container,omitempty"`
-	Bitrate             int      `json:"bitrate,omitempty"`
-	FrameRate           string   `json:"frame_rate,omitempty"`
-	AudioLanguages      []string `json:"audio_languages,omitempty"`
-	SubtitleLanguages   []string `json:"subtitle_languages,omitempty"`
-	OwnerInstallationID int      `json:"-"`
-	Visible             bool     `json:"-"`
-	VisibilitySpecified bool     `json:"-"`
+	ID                  string            `json:"id"`
+	Label               string            `json:"label"`
+	URI                 string            `json:"uri"`
+	Resolution          string            `json:"resolution,omitempty"`
+	CodecVideo          string            `json:"codec_video,omitempty"`
+	CodecAudio          string            `json:"codec_audio,omitempty"`
+	HDR                 string            `json:"hdr,omitempty"`
+	SourceType          string            `json:"source_type,omitempty"`
+	FileSize            int64             `json:"file_size,omitempty"`
+	Container           string            `json:"container,omitempty"`
+	Bitrate             int               `json:"bitrate,omitempty"`
+	FrameRate           string            `json:"frame_rate,omitempty"`
+	AudioLanguages      []string          `json:"audio_languages,omitempty"`
+	SubtitleLanguages   []string          `json:"subtitle_languages,omitempty"`
+	HasAtmos            bool              `json:"has_atmos,omitempty"`
+	QualityScore        int               `json:"quality_score,omitempty"`
+	RequestHeaders      map[string]string `json:"-"`
+	ExpiresAt           time.Time         `json:"-"`
+	OwnerInstallationID int               `json:"-"`
+	Visible             bool              `json:"-"`
+	VisibilitySpecified bool              `json:"-"`
 }
 
 // Get* accessors satisfy plugins.VirtualStreamMetadata so the shared device
@@ -229,7 +233,11 @@ func (s *Service) resolveVirtualPlaybackWithRouting(
 			lastValidateErr = validateErr
 			continue
 		}
-		s.storeResolvedURL(virtualPath, userID, profileID, routing.OwnerInstallationID, validated)
+		var exp time.Time
+		if candidate.GetExpiresAt() != nil && candidate.GetExpiresAt().IsValid() {
+			exp = candidate.GetExpiresAt().AsTime()
+		}
+		s.storeResolvedURL(virtualPath, userID, profileID, routing.OwnerInstallationID, validated, exp)
 		return validated, nil
 	}
 
@@ -251,7 +259,11 @@ func (s *Service) resolveVirtualPlaybackWithRouting(
 			if validateErr != nil {
 				continue
 			}
-			s.storeResolvedURL(virtualPath, userID, profileID, routing.OwnerInstallationID, validated)
+			var exp time.Time
+			if candidate.GetExpiresAt() != nil && candidate.GetExpiresAt().IsValid() {
+				exp = candidate.GetExpiresAt().AsTime()
+			}
+			s.storeResolvedURL(virtualPath, userID, profileID, routing.OwnerInstallationID, validated, exp)
 			return validated, nil
 		}
 	}
@@ -972,6 +984,10 @@ func streamsFromVirtualResult(virtualPath string, result *pluginv1.VirtualStream
 		if sourceType == "" {
 			sourceType = candidate.GetProviderId()
 		}
+		var exp time.Time
+		if candidate.GetExpiresAt() != nil && candidate.GetExpiresAt().IsValid() {
+			exp = candidate.GetExpiresAt().AsTime()
+		}
 		streams = append(streams, VirtualPlaybackStream{
 			ID:                  candidate.GetCandidateId(),
 			Label:               label,
@@ -979,6 +995,10 @@ func streamsFromVirtualResult(virtualPath string, result *pluginv1.VirtualStream
 			Resolution:          candidate.GetResolution().GetLabel(),
 			CodecVideo:          candidate.GetVideoCodec(),
 			CodecAudio:          candidate.GetAudioCodec(),
+			HasAtmos:            candidate.GetHasAtmos(),
+			QualityScore:        int(candidate.GetQualityScore()),
+			RequestHeaders:      candidate.GetRequestHeaders(),
+			ExpiresAt:           exp,
 			HDR:                 virtualCandidateHDR(candidate),
 			SourceType:          sourceType,
 			FileSize:            candidate.GetFileSizeBytes(),
@@ -1424,7 +1444,14 @@ func (s *Service) lookupResolvedURL(virtualPath string, userID int, profileID st
 	if !ok {
 		return ""
 	}
-	if time.Since(entry.resolvedAt) > resolvedURLMemoTTL {
+	now := time.Now()
+	expired := false
+	if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+		expired = true
+	} else if now.Sub(entry.resolvedAt) > resolvedURLMemoTTL {
+		expired = true
+	}
+	if expired {
 		if entry.cancel != nil {
 			entry.cancel()
 		}
@@ -1434,8 +1461,12 @@ func (s *Service) lookupResolvedURL(virtualPath string, userID int, profileID st
 	return entry.url
 }
 
-func (s *Service) storeResolvedURL(virtualPath string, userID int, profileID string, ownerInstallationID int, url string) {
-	s.storeResolvedURLDepth(virtualPath, userID, profileID, ownerInstallationID, url, 0)
+func (s *Service) storeResolvedURL(virtualPath string, userID int, profileID string, ownerInstallationID int, url string, expiresAt ...time.Time) {
+	var exp time.Time
+	if len(expiresAt) > 0 {
+		exp = expiresAt[0]
+	}
+	s.storeResolvedURLDepth(virtualPath, userID, profileID, ownerInstallationID, url, 0, exp)
 }
 
 // storeResolvedURLDepth memoizes a resolved provider URL. depth counts how
@@ -1443,7 +1474,7 @@ func (s *Service) storeResolvedURL(virtualPath string, userID int, profileID str
 // is reached the entry is stored WITHOUT re-arming the refresh timer and
 // simply ages out at the memo TTL. This bounds each memo's lifetime to an
 // active playback startup window instead of the process lifetime.
-func (s *Service) storeResolvedURLDepth(virtualPath string, userID int, profileID string, ownerInstallationID int, url string, depth int) {
+func (s *Service) storeResolvedURLDepth(virtualPath string, userID int, profileID string, ownerInstallationID int, url string, depth int, expiresAt time.Time) {
 	if s == nil || url == "" {
 		return
 	}
@@ -1467,7 +1498,7 @@ func (s *Service) storeResolvedURLDepth(virtualPath string, userID int, profileI
 	// without bound.
 	if now.After(s.resolvedURLsNextSweep) {
 		for k, entry := range s.resolvedURLs {
-			if now.Sub(entry.resolvedAt) > resolvedURLMemoTTL {
+			if (!entry.expiresAt.IsZero() && now.After(entry.expiresAt)) || now.Sub(entry.resolvedAt) > resolvedURLMemoTTL {
 				if entry.cancel != nil {
 					entry.cancel()
 				}
@@ -1494,18 +1525,24 @@ func (s *Service) storeResolvedURLDepth(virtualPath string, userID int, profileI
 		existing.cancel()
 	}
 	bgCtx, bgCancel := context.WithCancel(context.Background())
-	if depth >= maxResolvedRefreshChain {
+	memoTTL := resolvedURLMemoTTL
+	if !expiresAt.IsZero() && expiresAt.Before(now.Add(memoTTL)) {
+		if d := time.Until(expiresAt); d > 0 {
+			memoTTL = d
+		}
+	}
+	if depth >= maxResolvedRefreshChain || memoTTL <= 15*time.Second {
 		// Terminal store: no timer goroutine; natural TTL expiry applies.
 		bgCancel()
-		s.resolvedURLs[key] = resolvedURLEntry{url: url, resolvedAt: now}
+		s.resolvedURLs[key] = resolvedURLEntry{url: url, resolvedAt: now, expiresAt: expiresAt}
 		return
 	}
-	s.resolvedURLs[key] = resolvedURLEntry{url: url, resolvedAt: now, cancel: bgCancel, refreshes: depth + 1}
+	s.resolvedURLs[key] = resolvedURLEntry{url: url, resolvedAt: now, expiresAt: expiresAt, cancel: bgCancel, refreshes: depth + 1}
 	// Spawn a background refresh that wakes 10s before the TTL expires,
 	// keeping the memo warm for active playback sessions.
 	depth += 1
 	go func() {
-		timer := time.NewTimer(resolvedURLMemoTTL - 10*time.Second)
+		timer := time.NewTimer(memoTTL - 10*time.Second)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
@@ -1530,7 +1567,7 @@ func (s *Service) refreshResolvedURL(ctx context.Context, virtualPath string, us
 		slog.DebugContext(ctx, "virtual URL background refresh failed", "component", "plugins", "virtual_path", virtualPath, "error", err)
 		return
 	}
-	s.storeResolvedURLDepth(virtualPath, userID, profileID, ownerInstallationID, streamURL, depth)
+	s.storeResolvedURLDepth(virtualPath, userID, profileID, ownerInstallationID, streamURL, depth, time.Time{})
 }
 
 // Clear flushes all in-memory virtual playback caches (streams, profiles,

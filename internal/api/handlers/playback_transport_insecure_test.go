@@ -2,8 +2,13 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 )
 
@@ -48,30 +53,130 @@ func TestResolveVirtualInputRelayRespectsAllowInsecureOptIn(t *testing.T) {
 	})
 }
 
+type fakePinFileResolver struct {
+	file        *models.MediaFile
+	replacedOld string
+	replacedNew string
+}
+
+func (r *fakePinFileResolver) GetByID(ctx context.Context, id int) (*models.MediaFile, error) {
+	return r.file, nil
+}
+
+func (r *fakePinFileResolver) ReplaceVirtualResultPin(ctx context.Context, fileID int, expectedPath, replacementPath string) (bool, error) {
+	r.replacedOld = expectedPath
+	r.replacedNew = replacementPath
+	if r.file != nil {
+		r.file.FilePath = replacementPath
+	}
+	return true, nil
+}
+
 func TestVirtualTranscodeStartupFailsOverOnResolutionError(t *testing.T) {
 	attempts := make([]string, 0)
+	cache := NewVirtualBestResultCache(time.Minute, 10)
+	cacheKey := bestResultCacheKey("content-1", "virtual://series/tt1/1/1", 5)
+	cache.set(cacheKey, []VirtualPlaybackStream{
+		{URI: "virtual://series/tt1/1/1?result=dead"},
+		{URI: "virtual://series/tt1/1/1?result=live"},
+	}, time.Now())
+
+	fileRes := &fakePinFileResolver{
+		file: &models.MediaFile{
+			ID:                         10,
+			ContentID:                  "content-1",
+			FilePath:                   "virtual://series/tt1/1/1?result=dead",
+			VirtualOwnerInstallationID: 5,
+		},
+	}
+
 	h := &PlaybackHandler{
+		BestResultCache: cache,
+		fileResolver:    fileRes,
+		sessionMgr:      playback.NewSessionManager(0, 0),
 		VirtualMediaResolver: VirtualMediaResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
 			attempts = append(attempts, virtualURI)
 			if virtualURI == "virtual://series/tt1/1/1?result=dead" {
-				return "", context.DeadlineExceeded
+				return "", errors.New("candidate link expired")
 			}
-			return "http://localhost:8080/stream.m3u8", nil
+			return "http://localhost:8080/stream.mp4", nil
+		}),
+		VirtualMediaRefreshResolver: VirtualMediaRefreshResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
+			attempts = append(attempts, virtualURI)
+			return "http://localhost:8080/stream.mp4", nil
 		}),
 	}
 
-	// Attempt 0: "virtual://series/tt1/1/1?result=dead"
-	relayURL0, _, err0 := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1?result=dead", 5, 1, "profile", false)
-	if err0 == nil {
-		t.Fatalf("expected attempt 0 to fail, got %q", relayURL0)
+	opts := playback.TranscodeOpts{
+		MediaFileID:                      10,
+		InputPath:                        "virtual://series/tt1/1/1?result=dead",
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "sess-retry-test",
 	}
 
-	// Attempt 1: neutral fallback "virtual://series/tt1/1/1"
-	relayURL1, _, err1 := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 5, 1, "profile", true)
-	if err1 != nil {
-		t.Fatalf("expected attempt 1 to succeed, got error: %v", err1)
+	// startLocalPlaybackTransportOnce runs attempt 0 (which fails at resolve)
+	// and attempt 1 (which falls back to neutral URI).
+	_, _ = h.startLocalPlaybackTransportOnce(context.Background(), opts)
+
+	if len(attempts) < 2 {
+		t.Fatalf("expected at least 2 attempts, got %d: %#v", len(attempts), attempts)
 	}
-	if relayURL1 != "http://localhost:8080/stream.m3u8" {
-		t.Fatalf("expected stream url, got %q", relayURL1)
+	if attempts[0] != "virtual://series/tt1/1/1?result=dead" {
+		t.Fatalf("attempt 0 = %q, want pinned dead URI", attempts[0])
+	}
+	if attempts[1] != "virtual://series/tt1/1/1" {
+		t.Fatalf("attempt 1 = %q, want fallback neutral URI", attempts[1])
+	}
+
+	// Dead candidate must be evicted from the BestResultCache
+	cached := cache.get(cacheKey, time.Now())
+	for _, c := range cached {
+		if c.URI == "virtual://series/tt1/1/1?result=dead" {
+			t.Fatalf("dead candidate was not evicted from BestResultCache: %#v", cached)
+		}
+	}
+}
+
+func TestDeviceAwareStickyParity(t *testing.T) {
+	h := &PlaybackHandler{}
+	key := "content-1"
+
+	tvCandidates := []VirtualPlaybackStream{
+		{URI: "virtual://movie/1?result=4k-dv", Resolution: "2160p", CodecVideo: "hevc", HDR: "dv"},
+		{URI: "virtual://movie/1?result=1080p-sdr", Resolution: "1080p", CodecVideo: "h264"},
+	}
+
+	phoneCandidates := []VirtualPlaybackStream{
+		{URI: "virtual://movie/1?result=1080p-sdr", Resolution: "1080p", CodecVideo: "h264"},
+		{URI: "virtual://movie/1?result=4k-dv", Resolution: "2160p", CodecVideo: "hevc", HDR: "dv"},
+	}
+
+	// 1. TV plays and pins 4k-dv
+	h.pinVirtualSticky(key, "virtual://movie/1?result=4k-dv")
+
+	// 2. SDR Phone requests candidates: SDR device capabilities
+	phoneCaps := plugins.DeviceCapabilities{
+		CodecsVideo:   []string{"h264"},
+		MaxResolution: "1080p",
+		HDR:           false,
+		DolbyVision:   false,
+	}
+
+	// applyVirtualStickyPin should NOT promote the 4k-dv pin for the SDR phone because 1080p-sdr has higher score!
+	applied := h.applyVirtualStickyPin(key, "virtual://movie/1?result=4k-dv", phoneCandidates, phoneCaps)
+	if applied[0].URI != "virtual://movie/1?result=1080p-sdr" {
+		t.Fatalf("sticky pin improperly overrode phone ranking: got %q, want 1080p-sdr", applied[0].URI)
+	}
+
+	// 3. 4K DV TV requests candidates: DV TV device capabilities
+	tvCaps := plugins.DeviceCapabilities{
+		CodecsVideo:   []string{"h264", "hevc"},
+		MaxResolution: "2160p",
+		HDR:           true,
+		DolbyVision:   true,
+	}
+	appliedTV := h.applyVirtualStickyPin(key, "virtual://movie/1?result=4k-dv", tvCandidates, tvCaps)
+	if appliedTV[0].URI != "virtual://movie/1?result=4k-dv" {
+		t.Fatalf("sticky pin was not promoted for compatible TV: got %q, want 4k-dv", appliedTV[0].URI)
 	}
 }
