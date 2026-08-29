@@ -241,6 +241,8 @@ func (s VirtualPlaybackStream) GetCodecAudio() string { return s.CodecAudio }
 func (s VirtualPlaybackStream) GetHDR() string        { return s.HDR }
 func (s VirtualPlaybackStream) GetContainer() string  { return s.Container }
 func (s VirtualPlaybackStream) GetResolution() string { return s.Resolution }
+func (s VirtualPlaybackStream) GetHasAtmos() bool     { return s.HasAtmos }
+func (s VirtualPlaybackStream) GetQualityScore() int  { return s.QualityScore }
 
 type VirtualPlaybackStreamLister interface {
 	ListVirtualPlaybackStreams(ctx context.Context, virtualPath string, userID int, profileID string, ownerInstallationID int) ([]VirtualPlaybackStream, error)
@@ -291,8 +293,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	}}
 	noResult := parsed != nil && strings.TrimSpace(parsed.Query().Get("result")) == ""
 	needsCandidateMetadata := !completeVirtualVideoEvidenceV3(file) || !completeVirtualAudioEvidenceV3(file) || !completeVirtualContainerEvidenceV3(file)
-	deviceCaps, _ := h.requestDeviceCapabilities(r)
-	stickyKey := bestResultCacheKey(file.ContentID, virtualPlaybackNeutralKey(file.FilePath), file.VirtualOwnerInstallationID, deviceCaps.Fingerprint())
+	deviceCaps, hasCaps := h.requestDeviceCapabilities(r)
+	fingerprint := ""
+	if hasCaps {
+		fingerprint = deviceCaps.Fingerprint()
+	}
+	stickyKey := bestResultCacheKey(file.ContentID, virtualPlaybackNeutralKey(file.FilePath), file.VirtualOwnerInstallationID, fingerprint)
 	pinnedURI := h.peekVirtualSticky(stickyKey)
 	// Check the best-result cache before listing candidates. A previous
 	// successful play of this content may have a cached result= URI that

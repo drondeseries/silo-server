@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -93,8 +94,12 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		neutralPath = virtualPlaybackNeutralKey(opts.InputPath)
 	}
 	initialPinnedPath := ""
+	initialPinnedResultID := ""
 	if file != nil && strings.Contains(file.FilePath, "?result=") {
 		initialPinnedPath = file.FilePath
+		if parsed, err := url.Parse(file.FilePath); err == nil {
+			initialPinnedResultID = parsed.Query().Get("result")
+		}
 	}
 	opts.CanonicalInputPath = canonicalPath
 	opts.VirtualSourceOwnerInstallationID = ownerInstallationID
@@ -104,10 +109,11 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		// can silently swap to a differently-ranked candidate mid-stream. The
 		// canonical path still carries the ?result= identity the session bound
 		// to during planning.
-		return h.resolveVirtualInputURI(
+		res, cleanup, err := h.resolveVirtualInputURI(
 			refreshCtx, canonicalPath, ownerInstallationID,
-			userID, profileID, true,
+			userID, profileID, true, nil, "",
 		)
+		return res.URL, cleanup, err
 	}
 	var lastErr error
 	startupCtx, startupCancel := context.WithTimeout(context.WithoutCancel(ctx), virtualStartupBudget)
@@ -116,16 +122,26 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 	if sessionVirtualURI != "" {
 		maxAttempts = min(2, maxAttempts)
 	}
+	failedCandidateIDs := make([]string, 0)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		targetURI := canonicalPath
 		if attempt > 0 {
 			targetURI = neutralPath
 		}
-		relayURL, cleanup, resolveErr := h.resolveVirtualInputURI(
-			startupCtx, targetURI, ownerInstallationID, userID, profileID, attempt > 0,
+		resolvedMedia, cleanup, resolveErr := h.resolveVirtualInputURI(
+			startupCtx, targetURI, ownerInstallationID, userID, profileID, attempt > 0, failedCandidateIDs, initialPinnedResultID,
 		)
 		if resolveErr != nil {
 			lastErr = resolveErr
+			failedID := resolvedMedia.CandidateID
+			if failedID == "" {
+				if parsed, err := url.Parse(targetURI); err == nil {
+					failedID = parsed.Query().Get("result")
+				}
+			}
+			if failedID != "" {
+				failedCandidateIDs = append(failedCandidateIDs, failedID)
+			}
 			if h.BestResultCache != nil && file != nil {
 				neutralURI := virtualPlaybackNeutralKey(canonicalPath)
 				h.BestResultCache.RemoveCandidate(bestResultCacheKey(file.ContentID, neutralURI, ownerInstallationID), targetURI)
@@ -148,7 +164,7 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			}
 		}
 		attemptOpts := opts
-		attemptOpts.InputPath = relayURL
+		attemptOpts.InputPath = resolvedMedia.URL
 		attemptOpts.InputCleanup = cleanupWithCancel
 		session, startErr := playback.StartTranscode(transcodeCtx, attemptOpts)
 		if startErr == nil {
@@ -157,12 +173,22 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 				// update the persisted pin compare-and-swap so future sessions use the live source.
 				if replacer, ok := h.fileResolver.(interface {
 					ReplaceVirtualResultPin(context.Context, int, string, string) (bool, error)
-				}); ok && file != nil && file.ID > 0 && initialPinnedPath != "" && targetURI != initialPinnedPath {
-					unpinCtx, unpinCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-					if _, err := replacer.ReplaceVirtualResultPin(unpinCtx, file.ID, initialPinnedPath, targetURI); err != nil {
-						slog.WarnContext(ctx, "failed to update virtual result pin after fallback success", "component", "api", "file_id", file.ID, "error", err)
+				}); ok && file != nil && file.ID > 0 && initialPinnedPath != "" {
+					winningURI := resolvedMedia.URI
+					if winningURI == "" || winningURI == neutralPath {
+						if resolvedMedia.CandidateID != "" {
+							winningURI = neutralPath + "?result=" + resolvedMedia.CandidateID
+						} else {
+							winningURI = targetURI
+						}
 					}
-					unpinCancel()
+					if winningURI != "" && winningURI != initialPinnedPath {
+						unpinCtx, unpinCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+						if _, err := replacer.ReplaceVirtualResultPin(unpinCtx, file.ID, initialPinnedPath, winningURI); err != nil {
+							slog.WarnContext(ctx, "failed to update virtual result pin after fallback success", "component", "api", "file_id", file.ID, "error", err)
+						}
+						unpinCancel()
+					}
 				}
 				return session, nil
 			} else {
@@ -171,6 +197,9 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			_ = session.Close()
 		} else if cleanup != nil {
 			cleanupWithCancel()
+		}
+		if resolvedMedia.CandidateID != "" {
+			failedCandidateIDs = append(failedCandidateIDs, resolvedMedia.CandidateID)
 		}
 		if h.BestResultCache != nil && file != nil {
 			neutralURI := virtualPlaybackNeutralKey(canonicalPath)
@@ -205,29 +234,47 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 	userID int,
 	profileID string,
 	forceRefresh bool,
-) (string, func(), error) {
-	var inputPath string
+	excludedCandidateIDs []string,
+	preferredCandidateID string,
+) (ResolvedVirtualMedia, func(), error) {
+	var res ResolvedVirtualMedia
 	var err error
-	if forceRefresh && h.VirtualMediaRefreshResolver != nil {
+	if h.VirtualMediaDetailedResolver != nil {
+		res, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+			ctx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID,
+		)
+	} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {
+		var inputPath string
 		inputPath, err = h.VirtualMediaRefreshResolver.RefreshVirtualMedia(
 			ctx, virtualURI, ownerInstallationID, userID, profileID,
 		)
+		res = ResolvedVirtualMedia{URL: inputPath, URI: virtualURI}
 	} else {
+		var inputPath string
 		inputPath, err = resolveVirtualMediaPath(
 			ctx, h.VirtualMediaResolver, virtualURI,
 			ownerInstallationID, userID, profileID,
 		)
+		res = ResolvedVirtualMedia{URL: inputPath, URI: virtualURI}
 	}
 	if err != nil {
-		return "", nil, fmt.Errorf("resolve virtual input: %w", err)
+		return ResolvedVirtualMedia{}, nil, fmt.Errorf("resolve virtual input: %w", err)
 	}
 	if h.RemoteStreamRelay == nil {
-		return inputPath, nil, nil
+		return res, nil, nil
 	}
+	var relayURL string
+	var cleanup func()
 	if h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(ownerInstallationID) {
-		return h.RemoteStreamRelay.RegisterInsecure(ctx, inputPath)
+		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterInsecureWithHeaders(ctx, res.URL, res.RequestHeaders)
+	} else {
+		relayURL, cleanup, err = h.RemoteStreamRelay.RegisterWithHeaders(ctx, res.URL, res.RequestHeaders)
 	}
-	return h.RemoteStreamRelay.Register(ctx, inputPath)
+	if err != nil {
+		return ResolvedVirtualMedia{}, nil, err
+	}
+	res.URL = relayURL
+	return res, cleanup, nil
 }
 
 // startRemotePlaybackTransport is the shared remote-node launch primitive.

@@ -140,6 +140,16 @@ type PlaybackChapterThumbnailQueuer interface {
 	QueuePriorityFileAtPosition(ctx context.Context, fileID int, targetSeconds float64)
 }
 
+// ResolvedVirtualMedia represents a resolved virtual stream with provider details,
+// temporary URL, candidate identity, and proxy request headers.
+type ResolvedVirtualMedia struct {
+	URL            string
+	URI            string
+	CandidateID    string
+	RequestHeaders map[string]string
+	ExpiresAt      time.Time
+}
+
 type VirtualMediaResolver interface {
 	ResolveVirtualMedia(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error)
 }
@@ -158,6 +168,16 @@ type VirtualMediaRefreshResolverFunc func(context.Context, string, int, int, str
 
 func (f VirtualMediaRefreshResolverFunc) RefreshVirtualMedia(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
 	return f(ctx, virtualURI, ownerInstallationID, userID, profileID)
+}
+
+type VirtualMediaDetailedResolver interface {
+	ResolveVirtualMediaDetailed(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error)
+}
+
+type VirtualMediaDetailedResolverFunc func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error)
+
+func (f VirtualMediaDetailedResolverFunc) ResolveVirtualMediaDetailed(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
+	return f(ctx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID)
 }
 
 type VirtualPlaybackSourceProber func(context.Context, string, *models.MediaFile) (*models.MediaFile, error)
@@ -279,27 +299,28 @@ type PlaybackHandler struct {
 	// CopySafetyRacer resolves an unknown H.264 copy-safety verdict behind an
 	// already-issued stream-copy plan. Optional: nil keeps unknown verdicts
 	// unknown and never withdraws a copy route.
-	CopySafetyRacer             PlaybackCopySafetyRacer
-	ChapterThumbnailQueuer      PlaybackChapterThumbnailQueuer
-	IntroAnalyzer               IntroEpisodeAnalyzer
-	IntroRepository             PlaybackIntroEligibilityChecker
-	MarkerRegistry              *markers.Registry
-	MarkerResolver              markers.ExternalIDResolver
-	MarkerUpserter              PlaybackMarkerUpserter
-	MarkerUpdateNotifier        PlaybackMarkerUpdateNotifier
-	MarkerLazyContext           context.Context
-	MarkerLazyInFlight          sync.Map
-	v3StartEffectsOnce          sync.Once
-	v3StartEffectsQueue         chan playbackStartSideEffectsV3
-	v3StartEffectsMu            sync.Mutex
-	v3StartEffectsPending       map[string]*playbackStartSideEffectsStateV3
-	SubtitleRepo                subtitles.Repository // optional; enables downloaded subtitles in playback
-	RealtimeHub                 *playback.RealtimeHub
-	CommandTracker              *playback.CommandTracker
-	CommandDispatcher           *playback.CommandDispatcher
-	VirtualMediaResolver        VirtualMediaResolver
-	VirtualMediaRefreshResolver VirtualMediaRefreshResolver
-	RemoteStreamRelay           *remotestream.Relay
+	CopySafetyRacer              PlaybackCopySafetyRacer
+	ChapterThumbnailQueuer       PlaybackChapterThumbnailQueuer
+	IntroAnalyzer                IntroEpisodeAnalyzer
+	IntroRepository              PlaybackIntroEligibilityChecker
+	MarkerRegistry               *markers.Registry
+	MarkerResolver               markers.ExternalIDResolver
+	MarkerUpserter               PlaybackMarkerUpserter
+	MarkerUpdateNotifier         PlaybackMarkerUpdateNotifier
+	MarkerLazyContext            context.Context
+	MarkerLazyInFlight           sync.Map
+	v3StartEffectsOnce           sync.Once
+	v3StartEffectsQueue          chan playbackStartSideEffectsV3
+	v3StartEffectsMu             sync.Mutex
+	v3StartEffectsPending        map[string]*playbackStartSideEffectsStateV3
+	SubtitleRepo                 subtitles.Repository // optional; enables downloaded subtitles in playback
+	RealtimeHub                  *playback.RealtimeHub
+	CommandTracker               *playback.CommandTracker
+	CommandDispatcher            *playback.CommandDispatcher
+	VirtualMediaResolver         VirtualMediaResolver
+	VirtualMediaRefreshResolver  VirtualMediaRefreshResolver
+	VirtualMediaDetailedResolver VirtualMediaDetailedResolver
+	RemoteStreamRelay            *remotestream.Relay
 	// AllowInsecureVirtual reports whether the owning plugin installation has
 	// explicitly enabled allow_insecure_http for private/local stream hosts.
 	AllowInsecureVirtual        func(installationID int) bool

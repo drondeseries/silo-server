@@ -1143,6 +1143,21 @@ func NewRouter(deps Dependencies) chi.Router {
 					ctx, path, userID, profileID, ownerInstallationID, false,
 				)
 			})
+			playbackHandler.VirtualMediaDetailedResolver = handlers.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (handlers.ResolvedVirtualMedia, error) {
+				res, err := deps.PluginService.ResolveVirtualPlaybackDetailedForInstallation(
+					ctx, path, userID, profileID, ownerInstallationID, false, forceRefresh, excludedCandidateIDs, preferredCandidateID,
+				)
+				if err != nil {
+					return handlers.ResolvedVirtualMedia{}, err
+				}
+				return handlers.ResolvedVirtualMedia{
+					URL:            res.URL,
+					URI:            res.URI,
+					CandidateID:    res.CandidateID,
+					RequestHeaders: res.RequestHeaders,
+					ExpiresAt:      res.ExpiresAt,
+				}, nil
+			})
 		}
 		playbackHandler.BestResultCache = handlers.NewVirtualBestResultCache(30*time.Minute, 512)
 		if deps.UserStoreProvider != nil {

@@ -146,6 +146,7 @@ func NewRouter(deps Dependencies) chi.Router {
 	playbackHandler.StableIdentityResolver = deps.StableIdentityResolver
 	playbackHandler.VirtualMediaResolver = deps.VirtualMediaResolver
 	playbackHandler.VirtualMediaRefreshResolver = deps.VirtualMediaRefreshResolver
+	playbackHandler.VirtualMediaDetailedResolver = deps.VirtualMediaDetailedResolver
 	playbackHandler.VirtualPlaybackStreamLister = deps.VirtualPlaybackStreamLister
 	playbackHandler.VirtualSourceProber = deps.VirtualSourceProber
 	playbackHandler.RemoteStreamRelay = deps.RemoteStreamRelay

@@ -25,28 +25,28 @@ func TestResolveVirtualInputRelayRespectsAllowInsecureOptIn(t *testing.T) {
 
 	t.Run("opt-in off rejects private host", func(t *testing.T) {
 		h.AllowInsecureVirtual = nil
-		relayURL, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 5, 1, "profile", false)
+		res, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 5, 1, "profile", false, nil, "")
 		if err == nil {
 			cleanup()
-			t.Fatalf("expected private host to be rejected without allow_insecure_http, got relay %q", relayURL)
+			t.Fatalf("expected private host to be rejected without allow_insecure_http, got relay %q", res.URL)
 		}
 	})
 
 	t.Run("opt-in on accepts private host", func(t *testing.T) {
 		h.AllowInsecureVirtual = func(installationID int) bool { return installationID == 5 }
-		relayURL, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 5, 1, "profile", false)
+		res, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 5, 1, "profile", false, nil, "")
 		if err != nil {
 			t.Fatalf("expected private host to be accepted with allow_insecure_http: %v", err)
 		}
 		defer cleanup()
-		if relayURL == "" {
+		if res.URL == "" {
 			t.Fatal("expected a relay URL")
 		}
 	})
 
 	t.Run("opt-in on for other installation stays strict", func(t *testing.T) {
 		h.AllowInsecureVirtual = func(installationID int) bool { return installationID == 5 }
-		if _, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 7, 1, "profile", false); err == nil {
+		if _, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://series/tt1/1/1", 7, 1, "profile", false, nil, ""); err == nil {
 			cleanup()
 			t.Fatal("expected private host to be rejected for an installation without the opt-in")
 		}
@@ -137,6 +137,59 @@ func TestVirtualTranscodeStartupFailsOverOnResolutionError(t *testing.T) {
 	}
 }
 
+func TestVirtualTranscodeStartupFailsOverAndPinsWinningCandidate(t *testing.T) {
+	cache := NewVirtualBestResultCache(time.Minute, 10)
+
+	fileRes := &fakePinFileResolver{
+		file: &models.MediaFile{
+			ID:                         10,
+			ContentID:                  "content-1",
+			FilePath:                   "virtual://series/tt1/1/1?result=dead",
+			VirtualOwnerInstallationID: 5,
+		},
+	}
+
+	var attemptsExcluded [][]string
+	h := &PlaybackHandler{
+		BestResultCache: cache,
+		fileResolver:    fileRes,
+		sessionMgr:      playback.NewSessionManager(0, 0),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
+			attemptsExcluded = append(attemptsExcluded, append([]string(nil), excludedCandidateIDs...))
+			if virtualURI == "virtual://series/tt1/1/1?result=dead" {
+				return ResolvedVirtualMedia{CandidateID: "dead"}, errors.New("stream 404")
+			}
+			return ResolvedVirtualMedia{
+				URL:            "http://localhost:8080/stream.mp4",
+				URI:            "virtual://series/tt1/1/1?result=live-winner",
+				CandidateID:    "live-winner",
+				RequestHeaders: map[string]string{"Referer": "https://stream.example/"},
+			}, nil
+		}),
+	}
+
+	opts := playback.TranscodeOpts{
+		MediaFileID:                      10,
+		InputPath:                        "virtual://series/tt1/1/1?result=dead",
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "sess-winner-pin-test",
+	}
+
+	_, _ = h.startLocalPlaybackTransportOnce(context.Background(), opts)
+
+	if len(attemptsExcluded) < 2 {
+		t.Fatalf("expected at least 2 attempts, got %d", len(attemptsExcluded))
+	}
+	// Attempt 0 should have no exclusions
+	if len(attemptsExcluded[0]) != 0 {
+		t.Fatalf("attempt 0 should have no exclusions, got %#v", attemptsExcluded[0])
+	}
+	// Attempt 1 should exclude "dead"
+	if len(attemptsExcluded[1]) == 0 || attemptsExcluded[1][0] != "dead" {
+		t.Fatalf("attempt 1 did not exclude 'dead': got %#v", attemptsExcluded[1])
+	}
+}
+
 func TestDeviceAwareStickyParity(t *testing.T) {
 	h := &PlaybackHandler{}
 	key := "content-1"
@@ -178,5 +231,43 @@ func TestDeviceAwareStickyParity(t *testing.T) {
 	appliedTV := h.applyVirtualStickyPin(key, "virtual://movie/1?result=4k-dv", tvCandidates, tvCaps)
 	if appliedTV[0].URI != "virtual://movie/1?result=4k-dv" {
 		t.Fatalf("sticky pin was not promoted for compatible TV: got %q, want 4k-dv", appliedTV[0].URI)
+	}
+
+	// 4. Unknown device (no profile) has no capabilities and uses clean key
+	keyClean := bestResultCacheKey("content-1", "virtual://movie/1", 5)
+	keyEmptyFingerprint := bestResultCacheKey("content-1", "virtual://movie/1", 5, "")
+	if keyClean != keyEmptyFingerprint {
+		t.Fatalf("clean key %q != empty fingerprint key %q", keyClean, keyEmptyFingerprint)
+	}
+}
+
+func TestVirtualInputRelayForwardsHeaders(t *testing.T) {
+	relay := remotestream.NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+
+	h := &PlaybackHandler{
+		RemoteStreamRelay:    relay,
+		AllowInsecureVirtual: func(id int) bool { return true },
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{
+				URL:            "http://stream.example/media.mp4",
+				URI:            virtualURI,
+				CandidateID:    "cand-1",
+				RequestHeaders: map[string]string{"Referer": "https://stream.example/app"},
+			}, nil
+		}),
+	}
+
+	res, cleanup, err := h.resolveVirtualInputURI(context.Background(), "virtual://movie/1", 5, 1, "profile", false, nil, "")
+	if err != nil {
+		t.Fatalf("resolveVirtualInputURI failed: %v", err)
+	}
+	defer cleanup()
+
+	if res.URL == "" || res.URL == "http://stream.example/media.mp4" {
+		t.Fatalf("expected loopback relay URL, got %q", res.URL)
+	}
+	if res.RequestHeaders["Referer"] != "https://stream.example/app" {
+		t.Fatalf("res.RequestHeaders = %#v", res.RequestHeaders)
 	}
 }

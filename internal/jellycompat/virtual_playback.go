@@ -26,6 +26,16 @@ const (
 	compatVirtualMaxProbeAttempts = 5
 )
 
+// ResolvedVirtualMedia represents a resolved virtual stream with provider details,
+// temporary URL, candidate identity, and proxy request headers.
+type ResolvedVirtualMedia struct {
+	URL            string
+	URI            string
+	CandidateID    string
+	RequestHeaders map[string]string
+	ExpiresAt      time.Time
+}
+
 // VirtualMediaResolver resolves a provider-neutral virtual URI to a temporary
 // provider URL. Implementations must keep credentials out of returned errors.
 type VirtualMediaResolver interface {
@@ -47,6 +57,16 @@ type VirtualMediaRefreshResolverFunc func(context.Context, string, int, int, str
 
 func (f VirtualMediaRefreshResolverFunc) RefreshVirtualMedia(ctx context.Context, virtualURI string, ownerInstallationID, userID int, profileID string) (string, error) {
 	return f(ctx, virtualURI, ownerInstallationID, userID, profileID)
+}
+
+type VirtualMediaDetailedResolver interface {
+	ResolveVirtualMediaDetailed(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error)
+}
+
+type VirtualMediaDetailedResolverFunc func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error)
+
+func (f VirtualMediaDetailedResolverFunc) ResolveVirtualMediaDetailed(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
+	return f(ctx, virtualURI, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID)
 }
 
 // VirtualPlaybackStream is the provider-neutral portion of a current provider
@@ -90,7 +110,27 @@ type insecureRemoteStreamRegistrar interface {
 	RegisterInsecure(context.Context, string) (string, func(), error)
 }
 
+type headerRemoteStreamRegistrar interface {
+	RegisterWithHeaders(context.Context, string, map[string]string) (string, func(), error)
+	RegisterInsecureWithHeaders(context.Context, string, map[string]string) (string, func(), error)
+}
+
+type headerRemoteStreamProxy interface {
+	ProxyWithHeaders(http.ResponseWriter, *http.Request, string, map[string]string) error
+	ProxyInsecureWithHeaders(http.ResponseWriter, *http.Request, string, map[string]string) error
+}
+
 func registerRemoteStreamInput(ctx context.Context, relay RemoteStreamRelay, resolved string, insecure bool) (string, func(), error) {
+	return registerRemoteStreamInputWithHeaders(ctx, relay, resolved, nil, insecure)
+}
+
+func registerRemoteStreamInputWithHeaders(ctx context.Context, relay RemoteStreamRelay, resolved string, headers map[string]string, insecure bool) (string, func(), error) {
+	if hr, ok := relay.(headerRemoteStreamRegistrar); ok {
+		if insecure {
+			return hr.RegisterInsecureWithHeaders(ctx, resolved, headers)
+		}
+		return hr.RegisterWithHeaders(ctx, resolved, headers)
+	}
 	if insecure {
 		if registrar, ok := relay.(insecureRemoteStreamRegistrar); ok {
 			return registrar.RegisterInsecure(ctx, resolved)
@@ -645,25 +685,30 @@ func virtualMediaFileForSource(file *models.MediaFile, source PlaybackMediaSourc
 	return &copy
 }
 
-func (h *PlaybackHandler) resolveVirtualTransport(ctx context.Context, session *Session, source PlaybackMediaSource, forceRefresh bool) (string, error) {
+func (h *PlaybackHandler) resolveVirtualTransport(ctx context.Context, session *Session, source PlaybackMediaSource, forceRefresh bool) (ResolvedVirtualMedia, error) {
 	if session == nil {
-		return "", errors.New("compat playback session is unavailable")
+		return ResolvedVirtualMedia{}, errors.New("compat playback session is unavailable")
 	}
 	return h.resolveVirtualTransportForIdentity(ctx, session.StreamAppUserID, session.ProfileID, source, forceRefresh)
 }
 
-func (h *PlaybackHandler) resolveVirtualTransportForIdentity(ctx context.Context, userID int, profileID string, source PlaybackMediaSource, forceRefresh bool) (string, error) {
+func (h *PlaybackHandler) resolveVirtualTransportForIdentity(ctx context.Context, userID int, profileID string, source PlaybackMediaSource, forceRefresh bool) (ResolvedVirtualMedia, error) {
 	uri := strings.TrimSpace(source.VirtualSourceURI)
 	if !isCompatVirtualPath(uri) {
-		return "", errors.New("virtual playback source is not bound")
+		return ResolvedVirtualMedia{}, errors.New("virtual playback source is not bound")
 	}
-	if h.VirtualMediaResolver == nil {
-		return "", errors.New("virtual playback resolver is not configured")
+	if h.VirtualMediaDetailedResolver != nil {
+		return h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(ctx, uri, source.VirtualSourceOwnerInstallationID, userID, profileID, forceRefresh, nil, "")
 	}
 	if forceRefresh && h.VirtualMediaRefreshResolver != nil {
-		return h.VirtualMediaRefreshResolver.RefreshVirtualMedia(ctx, uri, source.VirtualSourceOwnerInstallationID, userID, profileID)
+		url, err := h.VirtualMediaRefreshResolver.RefreshVirtualMedia(ctx, uri, source.VirtualSourceOwnerInstallationID, userID, profileID)
+		return ResolvedVirtualMedia{URL: url, URI: uri}, err
 	}
-	return h.VirtualMediaResolver.ResolveVirtualMedia(ctx, uri, source.VirtualSourceOwnerInstallationID, userID, profileID)
+	if h.VirtualMediaResolver != nil {
+		url, err := h.VirtualMediaResolver.ResolveVirtualMedia(ctx, uri, source.VirtualSourceOwnerInstallationID, userID, profileID)
+		return ResolvedVirtualMedia{URL: url, URI: uri}, err
+	}
+	return ResolvedVirtualMedia{}, errors.New("virtual playback resolver is not configured")
 }
 
 func (h *PlaybackHandler) registerVirtualInput(ctx context.Context, session *Session, source PlaybackMediaSource, forceRefresh bool) (string, func(), error) {
@@ -682,7 +727,7 @@ func (h *PlaybackHandler) registerVirtualInputForIdentity(ctx context.Context, u
 		return "", nil, errors.New("remote stream relay is not configured")
 	}
 	insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(source.VirtualSourceOwnerInstallationID)
-	relayURL, cleanup, err := registerRemoteStreamInput(ctx, h.RemoteStreamRelay, resolved, insecure)
+	relayURL, cleanup, err := registerRemoteStreamInputWithHeaders(ctx, h.RemoteStreamRelay, resolved.URL, resolved.RequestHeaders, insecure)
 	if err != nil {
 		return "", nil, err
 	}
@@ -722,11 +767,18 @@ func (h *PlaybackHandler) serveVirtualDirect(w http.ResponseWriter, r *http.Requ
 // proxyVirtualStream routes the resolved URL through the strict SSRF-protected
 // proxy, or through the insecure proxy when the owning plugin installation has
 // explicitly enabled allow_insecure_http for private/local hosts.
-func (h *PlaybackHandler) proxyVirtualStream(w http.ResponseWriter, r *http.Request, source PlaybackMediaSource, resolved string) error {
-	if h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(source.VirtualSourceOwnerInstallationID) {
-		return h.RemoteStreamRelay.ProxyInsecure(w, r, resolved)
+func (h *PlaybackHandler) proxyVirtualStream(w http.ResponseWriter, r *http.Request, source PlaybackMediaSource, resolved ResolvedVirtualMedia) error {
+	insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(source.VirtualSourceOwnerInstallationID)
+	if hp, ok := h.RemoteStreamRelay.(headerRemoteStreamProxy); ok {
+		if insecure {
+			return hp.ProxyInsecureWithHeaders(w, r, resolved.URL, resolved.RequestHeaders)
+		}
+		return hp.ProxyWithHeaders(w, r, resolved.URL, resolved.RequestHeaders)
 	}
-	return h.RemoteStreamRelay.Proxy(w, r, resolved)
+	if insecure {
+		return h.RemoteStreamRelay.ProxyInsecure(w, r, resolved.URL)
+	}
+	return h.RemoteStreamRelay.Proxy(w, r, resolved.URL)
 }
 
 func virtualDownloadName(version catalog.FileVersion) string {

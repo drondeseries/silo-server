@@ -40,6 +40,8 @@ type VirtualStreamMetadata interface {
 	GetHDR() string
 	GetContainer() string
 	GetResolution() string
+	GetHasAtmos() bool
+	GetQualityScore() int
 }
 
 // DeviceCapabilitiesFromProfile converts a persisted, normalized capability
@@ -129,9 +131,26 @@ func ScoreCandidate[T VirtualStreamMetadata](c T, device DeviceCapabilities) int
 		score += 50
 	}
 
+	// Dolby Atmos bonus when device supports Atmos or compatible multi-channel passthrough
+	if c.GetHasAtmos() {
+		if deviceSupportsCodec(device.CodecsAudio, "eac3") || deviceSupportsCodec(device.CodecsAudio, "truehd") || deviceSupportsCodec(device.CodecsAudio, "atmos") {
+			score += 15
+		}
+	}
+
 	// Container match
 	if c.GetContainer() != "" && deviceSupportsContainer(device.Containers, c.GetContainer()) {
 		score += 10
+	}
+
+	// Custom format or provider quality score (clamped to prevent overriding hard compatibility)
+	if qs := c.GetQualityScore(); qs != 0 {
+		if qs > 50 {
+			qs = 50
+		} else if qs < -50 {
+			qs = -50
+		}
+		score += qs / 5
 	}
 
 	return score

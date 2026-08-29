@@ -3002,6 +3002,19 @@ func main() {
 			compatDeps.VirtualMediaRefreshResolver = jellycompat.VirtualMediaRefreshResolverFunc(func(ctx context.Context, path string, ownerInstallationID, userID int, profileID string) (string, error) {
 				return pluginService.RefreshVirtualPlaybackForInstallation(ctx, path, userID, profileID, ownerInstallationID, false)
 			})
+			compatDeps.VirtualMediaDetailedResolver = jellycompat.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (jellycompat.ResolvedVirtualMedia, error) {
+				res, err := pluginService.ResolveVirtualPlaybackDetailedForInstallation(ctx, path, userID, profileID, ownerInstallationID, false, forceRefresh, excludedCandidateIDs, preferredCandidateID)
+				if err != nil {
+					return jellycompat.ResolvedVirtualMedia{}, err
+				}
+				return jellycompat.ResolvedVirtualMedia{
+					URL:            res.URL,
+					URI:            res.URI,
+					CandidateID:    res.CandidateID,
+					RequestHeaders: res.RequestHeaders,
+					ExpiresAt:      res.ExpiresAt,
+				}, nil
+			})
 			compatDeps.VirtualPlaybackStreamLister = jellycompat.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]jellycompat.VirtualPlaybackStream, error) {
 				streams, err := pluginService.ListVirtualPlaybackStreamsForInstallation(ctx, path, userID, profileID, ownerInstallationID, false)
 				if err != nil {

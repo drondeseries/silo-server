@@ -832,3 +832,71 @@ func TestInstallationAllowsInsecureFailClosed(t *testing.T) {
 		t.Fatal("invalid installation ID must fail closed")
 	}
 }
+
+func TestResolvedURLMemoHonorsDynamicExpiresAt(t *testing.T) {
+	service := &Service{}
+	now := time.Now()
+	// Stored with an explicit short expiry (in the past relative to check)
+	shortExpiry := now.Add(-10 * time.Second)
+	service.storeResolvedURL("virtual://movie/tt000002", 1, "profile1", 7, "https://1.1.1.1/short-lived", shortExpiry)
+
+	// Lookup must recognize the passed expiry and drop the entry
+	if got := service.lookupResolvedURL("virtual://movie/tt000002", 1, "profile1", 7); got != "" {
+		t.Fatalf("lookupResolvedURL returned %q for expired candidate URL", got)
+	}
+
+	// Stored with future expiry
+	futureExpiry := now.Add(2 * time.Hour)
+	service.storeResolvedURL("virtual://movie/tt000003", 1, "profile1", 7, "https://1.1.1.1/future-lived", futureExpiry)
+	if got := service.lookupResolvedURL("virtual://movie/tt000003", 1, "profile1", 7); got != "https://1.1.1.1/future-lived" {
+		t.Fatalf("lookupResolvedURL = %q, want https://1.1.1.1/future-lived", got)
+	}
+}
+
+func TestResolveVirtualPlaybackDetailedPropagatesHeadersAndExclusions(t *testing.T) {
+	var capturedExcluded []string
+	var capturedPreferred string
+	cand := virtualCandidate("cand-1", "https://1.1.1.1/video.mp4")
+	cand.RequestHeaders = map[string]string{"Referer": "https://stream.example/player"}
+	cand.HasAtmos = true
+	cand.QualityScore = 25
+	futureExp := time.Now().Add(30 * time.Minute)
+	cand.ExpiresAt = timestamppb.New(futureExp)
+
+	service, _ := newVirtualPlaybackTestService(t, func(ctx context.Context, req *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+		capturedExcluded = req.GetExcludedCandidateIds()
+		capturedPreferred = req.GetPreferredCandidateId()
+		return virtualResponse(cand), nil
+	})
+
+	res, err := service.ResolveVirtualPlaybackDetailedForInstallation(
+		context.Background(),
+		"virtual://movie/tt1234567",
+		1, "profile1", 101,
+		false, false,
+		[]string{"dead-1", "dead-2"},
+		"cand-1",
+	)
+	if err != nil {
+		t.Fatalf("ResolveVirtualPlaybackDetailedForInstallation error: %v", err)
+	}
+
+	if len(capturedExcluded) != 2 || capturedExcluded[0] != "dead-1" || capturedExcluded[1] != "dead-2" {
+		t.Fatalf("capturedExcluded = %#v, want [dead-1, dead-2]", capturedExcluded)
+	}
+	if capturedPreferred != "cand-1" {
+		t.Fatalf("capturedPreferred = %q, want cand-1", capturedPreferred)
+	}
+	if res.URL != "https://1.1.1.1/video.mp4" {
+		t.Fatalf("res.URL = %q, want https://1.1.1.1/video.mp4", res.URL)
+	}
+	if res.RequestHeaders["Referer"] != "https://stream.example/player" {
+		t.Fatalf("res.RequestHeaders = %#v", res.RequestHeaders)
+	}
+	if res.CandidateID != "cand-1" {
+		t.Fatalf("res.CandidateID = %q, want cand-1", res.CandidateID)
+	}
+	if res.ExpiresAt.IsZero() {
+		t.Fatal("res.ExpiresAt is zero")
+	}
+}

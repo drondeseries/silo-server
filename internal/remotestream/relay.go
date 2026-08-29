@@ -325,6 +325,11 @@ func (r *Relay) handle(w http.ResponseWriter, request *http.Request) {
 // request/response headers are forwarded; cookies and authorization headers
 // from the Silo request are never sent upstream.
 func (r *Relay) Proxy(w http.ResponseWriter, request *http.Request, source string) error {
+	return r.ProxyWithHeaders(w, request, source, nil)
+}
+
+// ProxyWithHeaders streams one validated provider response with optional upstream request headers.
+func (r *Relay) ProxyWithHeaders(w http.ResponseWriter, request *http.Request, source string, headers map[string]string) error {
 	if r == nil {
 		return errors.New("remote stream relay is not configured")
 	}
@@ -333,7 +338,7 @@ func (r *Relay) Proxy(w http.ResponseWriter, request *http.Request, source strin
 		return err
 	}
 	tracked := &relayResponseWriter{ResponseWriter: w}
-	if err := r.proxy(tracked, request, validated.String(), ""); err != nil {
+	if err := r.proxyWithClient(tracked, request, validated.String(), "", r.client, headers); err != nil {
 		return &ProxyError{Started: tracked.wroteHeader, Err: err}
 	}
 	return nil
@@ -343,6 +348,11 @@ func (r *Relay) Proxy(w http.ResponseWriter, request *http.Request, source strin
 // Use only when the admin has explicitly enabled allow_insecure_http for a
 // plugin — otherwise local and private IP stream URLs are rejected by Proxy.
 func (r *Relay) ProxyInsecure(w http.ResponseWriter, request *http.Request, source string) error {
+	return r.ProxyInsecureWithHeaders(w, request, source, nil)
+}
+
+// ProxyInsecureWithHeaders is like ProxyWithHeaders but allows private/local hosts when opted in.
+func (r *Relay) ProxyInsecureWithHeaders(w http.ResponseWriter, request *http.Request, source string, headers map[string]string) error {
 	if r == nil {
 		return errors.New("remote stream relay is not configured")
 	}
@@ -351,7 +361,7 @@ func (r *Relay) ProxyInsecure(w http.ResponseWriter, request *http.Request, sour
 		return err
 	}
 	tracked := &relayResponseWriter{ResponseWriter: w}
-	if err := r.proxyWithClient(tracked, request, parsed.String(), "", r.insecureHTTPClient(), nil); err != nil {
+	if err := r.proxyWithClient(tracked, request, parsed.String(), "", r.insecureHTTPClient(), headers); err != nil {
 		return &ProxyError{Started: tracked.wroteHeader, Err: err}
 	}
 	return nil
@@ -370,10 +380,6 @@ func (r *Relay) insecureHTTPClient() *http.Client {
 		}
 	}
 	return r.insecureClient
-}
-
-func (r *Relay) proxy(w http.ResponseWriter, request *http.Request, source, relayToken string) error {
-	return r.proxyWithClient(w, request, source, relayToken, r.client, nil)
 }
 
 func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, source, relayToken string, client *http.Client, extraHeaders map[string]string) error {

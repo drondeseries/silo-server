@@ -2020,15 +2020,15 @@ func (h *PlaybackHandler) prepareTransportTimelineV3(ctx context.Context, sessio
 			// protocol it cannot open.
 			anchorInput := file.FilePath
 			releaseAnchor := func() {}
-			if isVirtualPlaybackFile(file) && h.RemoteStreamRelay != nil && h.VirtualMediaResolver != nil {
-				resolved, cleanup, resolveErr := h.resolveVirtualInputURI(
+			if isVirtualPlaybackFile(file) && h.RemoteStreamRelay != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil) {
+				res, cleanup, resolveErr := h.resolveVirtualInputURI(
 					ctx, file.FilePath, file.VirtualOwnerInstallationID,
-					session.UserID, session.ProfileID, false,
+					session.UserID, session.ProfileID, false, nil, "",
 				)
 				if resolveErr != nil {
 					return preparedTimelineV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "Failed to resolve remux seek position.", retryable: true, cause: resolveErr}
 				}
-				anchorInput = resolved
+				anchorInput = res.URL
 				releaseAnchor = cleanup
 			}
 			resolver := h.copySeekAnchor

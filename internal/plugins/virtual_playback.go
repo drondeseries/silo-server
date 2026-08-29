@@ -116,6 +116,8 @@ func (s VirtualPlaybackStream) GetCodecAudio() string { return s.CodecAudio }
 func (s VirtualPlaybackStream) GetHDR() string        { return s.HDR }
 func (s VirtualPlaybackStream) GetContainer() string  { return s.Container }
 func (s VirtualPlaybackStream) GetResolution() string { return s.Resolution }
+func (s VirtualPlaybackStream) GetHasAtmos() bool     { return s.HasAtmos }
+func (s VirtualPlaybackStream) GetQualityScore() int  { return s.QualityScore }
 
 var ErrVirtualPlaybackResolverNotInstalled = errors.New("virtual playback resolver is not installed")
 
@@ -160,6 +162,16 @@ func (s *Service) ListVirtualPlaybackStreamsForInstallation(
 	})
 }
 
+// ResolvedVirtualStream contains the complete outcome of resolving a virtual media stream,
+// including the provider stream URL, canonical URI, request headers, candidate ID, and expiration.
+type ResolvedVirtualStream struct {
+	URL            string
+	URI            string
+	CandidateID    string
+	RequestHeaders map[string]string
+	ExpiresAt      time.Time
+}
+
 // ResolveVirtualPlayback is the compatibility entry point for callers that do
 // not yet pass the MediaFile owner. It explicitly opts into provider fallback.
 func (s *Service) ResolveVirtualPlayback(ctx context.Context, virtualPath string, userID int, profileID string) (string, error) {
@@ -190,6 +202,24 @@ func (s *Service) resolveVirtualPlaybackWithRouting(
 	routing VirtualPlaybackRouting,
 	forceRefresh bool,
 ) (string, error) {
+	res, err := s.ResolveVirtualPlaybackDetailedWithRouting(ctx, virtualPath, userID, profileID, routing, forceRefresh, nil, "")
+	if err != nil {
+		return "", err
+	}
+	return res.URL, nil
+}
+
+// ResolveVirtualPlaybackDetailedWithRouting resolves a virtual stream and returns full stream details including headers and candidate identity.
+func (s *Service) ResolveVirtualPlaybackDetailedWithRouting(
+	ctx context.Context,
+	virtualPath string,
+	userID int,
+	profileID string,
+	routing VirtualPlaybackRouting,
+	forceRefresh bool,
+	excludedCandidateIDs []string,
+	preferredCandidateID string,
+) (ResolvedVirtualStream, error) {
 	// Short-lived memo: the same virtual URI is resolved once for probing and
 	// again when the transport opens. Skip the provider RPC on the second call
 	// within a few seconds — provider URLs rotate, so this is never long-lived.
@@ -198,16 +228,16 @@ func (s *Service) resolveVirtualPlaybackWithRouting(
 			// Do not synchronously fetch the memoized URL here. The relay
 			// revalidates and fetches it when playback opens, so a slow provider
 			// cannot consume the startup budget before a session is returned.
-			return memo, nil
+			return ResolvedVirtualStream{URL: memo, URI: virtualPath}, nil
 		}
 	}
-	request, selection, err := virtualStreamRequestWithRefresh(virtualPath, userID, profileID, forceRefresh)
+	request, selection, err := virtualStreamRequestWithRefresh(virtualPath, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID)
 	if err != nil {
-		return "", err
+		return ResolvedVirtualStream{}, err
 	}
 	result, _, err := s.resolveVirtualStreamResult(ctx, request, selection, routing)
 	if err != nil {
-		return "", err
+		return ResolvedVirtualStream{}, err
 	}
 	candidatesToTry := result.GetCandidates()
 	if selection.resultID != "" {
@@ -238,7 +268,18 @@ func (s *Service) resolveVirtualPlaybackWithRouting(
 			exp = candidate.GetExpiresAt().AsTime()
 		}
 		s.storeResolvedURL(virtualPath, userID, profileID, routing.OwnerInstallationID, validated, exp)
-		return validated, nil
+		candID := candidate.GetCandidateId()
+		resURI := virtualPath
+		if candID != "" && !strings.Contains(virtualPath, "?result=") {
+			resURI = virtualPlaybackNeutralKey(virtualPath) + "?result=" + candID
+		}
+		return ResolvedVirtualStream{
+			URL:            validated,
+			URI:            resURI,
+			CandidateID:    candID,
+			RequestHeaders: candidate.GetRequestHeaders(),
+			ExpiresAt:      exp,
+		}, nil
 	}
 
 	// A pinned candidate that passed URL validation is returned immediately;
@@ -264,14 +305,39 @@ func (s *Service) resolveVirtualPlaybackWithRouting(
 				exp = candidate.GetExpiresAt().AsTime()
 			}
 			s.storeResolvedURL(virtualPath, userID, profileID, routing.OwnerInstallationID, validated, exp)
-			return validated, nil
+			candID := candidate.GetCandidateId()
+			resURI := virtualPath
+			if candID != "" && !strings.Contains(virtualPath, "?result=") {
+				resURI = virtualPlaybackNeutralKey(virtualPath) + "?result=" + candID
+			}
+			return ResolvedVirtualStream{
+				URL:            validated,
+				URI:            resURI,
+				CandidateID:    candID,
+				RequestHeaders: candidate.GetRequestHeaders(),
+				ExpiresAt:      exp,
+			}, nil
 		}
 	}
 
 	if lastValidateErr != nil {
-		return "", fmt.Errorf("virtual playback provider returned an unsafe stream URL: %w", lastValidateErr)
+		return ResolvedVirtualStream{}, fmt.Errorf("virtual playback provider returned an unsafe stream URL: %w", lastValidateErr)
 	}
-	return "", fmt.Errorf("virtual playback provider returned no usable stream (%d candidates)", len(result.GetCandidates()))
+	return ResolvedVirtualStream{}, fmt.Errorf("virtual playback provider returned no usable stream (%d candidates)", len(result.GetCandidates()))
+}
+
+func virtualPlaybackNeutralKey(virtualPath string) string {
+	parsed, err := url.Parse(virtualPath)
+	if err != nil {
+		return virtualPath
+	}
+	q := parsed.Query()
+	if strings.TrimSpace(q.Get("result")) == "" {
+		return virtualPath
+	}
+	q.Del("result")
+	parsed.RawQuery = q.Encode()
+	return parsed.String()
 }
 
 func (s *Service) ResolveVirtualPlaybackForInstallation(
@@ -304,16 +370,41 @@ func (s *Service) RefreshVirtualPlaybackForInstallation(
 	}, true)
 }
 
+func (s *Service) ResolveVirtualPlaybackDetailedForInstallation(
+	ctx context.Context,
+	virtualPath string,
+	userID int,
+	profileID string,
+	ownerInstallationID int,
+	allowFallback bool,
+	forceRefresh bool,
+	excludedCandidateIDs []string,
+	preferredCandidateID string,
+) (ResolvedVirtualStream, error) {
+	return s.ResolveVirtualPlaybackDetailedWithRouting(ctx, virtualPath, userID, profileID, VirtualPlaybackRouting{
+		OwnerInstallationID: ownerInstallationID,
+		AllowFallback:       allowFallback,
+		AllowInsecure:       s.InstallationAllowsInsecure(ctx, ownerInstallationID),
+	}, forceRefresh, excludedCandidateIDs, preferredCandidateID)
+}
+
 type virtualStreamSelection struct {
 	resultID string
 	profile  string
 }
 
 func virtualStreamRequest(virtualPath string, userID int, profileID string) (*pluginv1.ResolveVirtualStreamRequest, virtualStreamSelection, error) {
-	return virtualStreamRequestWithRefresh(virtualPath, userID, profileID, false)
+	return virtualStreamRequestWithRefresh(virtualPath, userID, profileID, false, nil, "")
 }
 
-func virtualStreamRequestWithRefresh(virtualPath string, userID int, profileID string, forceRefresh bool) (*pluginv1.ResolveVirtualStreamRequest, virtualStreamSelection, error) {
+func virtualStreamRequestWithRefresh(
+	virtualPath string,
+	userID int,
+	profileID string,
+	forceRefresh bool,
+	excludedCandidateIDs []string,
+	preferredCandidateID string,
+) (*pluginv1.ResolveVirtualStreamRequest, virtualStreamSelection, error) {
 	raw := strings.TrimSpace(virtualPath)
 	if raw == "" || len(raw) > maxVirtualMetadataStringLen {
 		return nil, virtualStreamSelection{}, errors.New("virtual media URI is empty or too long")
@@ -395,11 +486,13 @@ func virtualStreamRequestWithRefresh(virtualPath string, userID int, profileID s
 		return nil, virtualStreamSelection{}, fmt.Errorf("build virtual stream request metadata: %w", err)
 	}
 	return &pluginv1.ResolveVirtualStreamRequest{
-		MediaType:     mediaType,
-		ExternalIds:   externalIDs,
-		SeasonNumber:  season,
-		EpisodeNumber: episode,
-		Metadata:      metadata,
+		MediaType:            mediaType,
+		ExternalIds:          externalIDs,
+		SeasonNumber:         season,
+		EpisodeNumber:        episode,
+		Metadata:             metadata,
+		ExcludedCandidateIds: excludedCandidateIDs,
+		PreferredCandidateId: preferredCandidateID,
 	}, selection, nil
 }
 
@@ -1562,12 +1655,12 @@ func (s *Service) refreshResolvedURL(ctx context.Context, virtualPath string, us
 	// Bypass the memo: this refresh exists to obtain a FRESH provider URL.
 	// Reading our own nearly-expired memo would be a no-op that pins potentially
 	// stale URLs past their rotation lifetime.
-	streamURL, err := s.resolveVirtualPlaybackWithRouting(ctx, virtualPath, userID, profileID, VirtualPlaybackRouting{OwnerInstallationID: ownerInstallationID}, true)
-	if err != nil || streamURL == "" {
+	res, err := s.ResolveVirtualPlaybackDetailedWithRouting(ctx, virtualPath, userID, profileID, VirtualPlaybackRouting{OwnerInstallationID: ownerInstallationID}, true, nil, "")
+	if err != nil || res.URL == "" {
 		slog.DebugContext(ctx, "virtual URL background refresh failed", "component", "plugins", "virtual_path", virtualPath, "error", err)
 		return
 	}
-	s.storeResolvedURLDepth(virtualPath, userID, profileID, ownerInstallationID, streamURL, depth, time.Time{})
+	s.storeResolvedURLDepth(virtualPath, userID, profileID, ownerInstallationID, res.URL, depth, res.ExpiresAt)
 }
 
 // Clear flushes all in-memory virtual playback caches (streams, profiles,

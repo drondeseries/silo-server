@@ -2,8 +2,10 @@ package plugins
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -111,26 +113,31 @@ func TestInstallationStoreUpdateReplacementRollsBackVirtualCleanupOnFailure(t *t
 		_, _ = pool.Exec(ctx, `DELETE FROM plugin_installations WHERE id=$1`, installationID)
 	})
 
-	const folderID = 968
-	const contentID = "movie-test-virtual-replacement-rollback"
-	if _, err := pool.Exec(ctx, `INSERT INTO media_folders(id,name,type,enabled) VALUES($1,'Atomic Replacement Rollback','movies',true)`, folderID); err != nil {
+	suffix := time.Now().UnixNano()
+	contentID := fmt.Sprintf("movie-test-virtual-replacement-rollback-%d", suffix)
+	var folderID int
+	if err := pool.QueryRow(ctx, `INSERT INTO media_folders(name,type,enabled) VALUES($1,'movies',true) RETURNING id`, fmt.Sprintf("Atomic Replacement Rollback %d", suffix)).Scan(&folderID); err != nil {
 		t.Fatalf("seed rollback virtual folder: %v", err)
 	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM virtual_media_file_source_claims WHERE plugin_installation_id=$1`, installationID)
+		_, _ = pool.Exec(ctx, `DELETE FROM virtual_media_source_claims WHERE plugin_installation_id=$1`, installationID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_files WHERE virtual_owner_installation_id=$1`, installationID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_items WHERE virtual_owner_installation_id=$1`, installationID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)
+	})
 	if _, err := pool.Exec(ctx, `INSERT INTO media_items(content_id,type,title,virtual_owner_installation_id,virtual_source) VALUES($1,'movie','Atomic Replacement Rollback',$2,'test-source')`, contentID, installationID); err != nil {
 		t.Fatalf("seed rollback virtual item: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,probe_source,virtual_owner_installation_id) VALUES($1,$2,'virtual://movie/test-virtual-replacement-rollback',0,'virtual','virtual',$3)`, contentID, folderID, installationID); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,probe_source,virtual_owner_installation_id) VALUES($1,$2,$3,0,'virtual','virtual',$4)`, contentID, folderID, "virtual://movie/"+contentID, installationID); err != nil {
 		t.Fatalf("seed rollback virtual file: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO virtual_media_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,owns_item_metadata) VALUES($1,'test-source',$2,$3,true)`, installationID, contentID, folderID); err != nil {
 		t.Fatalf("seed rollback virtual source claim: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO virtual_media_file_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,file_path) VALUES($1,'test-source',$2,$3,'virtual://movie/test-virtual-replacement-rollback')`, installationID, contentID, folderID); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO virtual_media_file_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,file_path) VALUES($1,'test-source',$2,$3,$4)`, installationID, contentID, folderID, "virtual://movie/"+contentID); err != nil {
 		t.Fatalf("seed rollback virtual file claim: %v", err)
 	}
-	t.Cleanup(func() {
-		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)
-	})
 
 	version := "0.0.2"
 	store := NewInstallationStore(pool)
