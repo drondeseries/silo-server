@@ -137,7 +137,8 @@ func TestVirtualTranscodeStartupFailsOverOnResolutionError(t *testing.T) {
 	}
 }
 
-func TestVirtualTranscodeStartupFailsOverAndPinsWinningCandidate(t *testing.T) {
+func TestVirtualTranscodeStartupFailsOverAndPinsWinningCandidateOnManifestReady(t *testing.T) {
+	tempDir := t.TempDir()
 	cache := NewVirtualBestResultCache(time.Minute, 10)
 
 	fileRes := &fakePinFileResolver{
@@ -150,6 +151,7 @@ func TestVirtualTranscodeStartupFailsOverAndPinsWinningCandidate(t *testing.T) {
 	}
 
 	var attemptsExcluded [][]string
+	var refreshedURI string
 	h := &PlaybackHandler{
 		BestResultCache: cache,
 		fileResolver:    fileRes,
@@ -159,6 +161,15 @@ func TestVirtualTranscodeStartupFailsOverAndPinsWinningCandidate(t *testing.T) {
 			if virtualURI == "virtual://series/tt1/1/1?result=dead" {
 				return ResolvedVirtualMedia{CandidateID: "dead"}, errors.New("stream 404")
 			}
+			if forceRefresh && len(excludedCandidateIDs) == 0 {
+				refreshedURI = virtualURI
+				return ResolvedVirtualMedia{
+					URL:            "http://localhost:8080/stream-refreshed.mp4",
+					URI:            virtualURI,
+					CandidateID:    "live-winner",
+					RequestHeaders: map[string]string{"Referer": "https://stream.example/renewed"},
+				}, nil
+			}
 			return ResolvedVirtualMedia{
 				URL:            "http://localhost:8080/stream.mp4",
 				URI:            "virtual://series/tt1/1/1?result=live-winner",
@@ -166,6 +177,10 @@ func TestVirtualTranscodeStartupFailsOverAndPinsWinningCandidate(t *testing.T) {
 				RequestHeaders: map[string]string{"Referer": "https://stream.example/"},
 			}, nil
 		}),
+		StartTranscodeFunc: func(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+			opts.OutputDir = tempDir
+			return playback.NewReadyTranscodeSessionForTesting(tempDir, opts)
+		},
 	}
 
 	opts := playback.TranscodeOpts{
@@ -173,9 +188,14 @@ func TestVirtualTranscodeStartupFailsOverAndPinsWinningCandidate(t *testing.T) {
 		InputPath:                        "virtual://series/tt1/1/1?result=dead",
 		VirtualSourceOwnerInstallationID: 5,
 		SessionID:                        "sess-winner-pin-test",
+		OutputDir:                        tempDir,
 	}
 
-	_, _ = h.startLocalPlaybackTransportOnce(context.Background(), opts)
+	session, err := h.startLocalPlaybackTransportOnce(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("startLocalPlaybackTransportOnce failed: %v", err)
+	}
+	defer func() { _ = session.Close() }()
 
 	if len(attemptsExcluded) < 2 {
 		t.Fatalf("expected at least 2 attempts, got %d", len(attemptsExcluded))
@@ -189,9 +209,119 @@ func TestVirtualTranscodeStartupFailsOverAndPinsWinningCandidate(t *testing.T) {
 		t.Fatalf("attempt 1 did not exclude 'dead': got %#v", attemptsExcluded[1])
 	}
 
+	// Winning candidate must be CAS-pinned to the database row
+	if fileRes.replacedOld != "virtual://series/tt1/1/1?result=dead" || fileRes.replacedNew != "virtual://series/tt1/1/1?result=live-winner" {
+		t.Fatalf("CAS pin update mismatch: got old=%q new=%q, want old=dead new=live-winner", fileRes.replacedOld, fileRes.replacedNew)
+	}
+	if fileRes.file.FilePath != "virtual://series/tt1/1/1?result=live-winner" {
+		t.Fatalf("file.FilePath = %q, want live-winner", fileRes.file.FilePath)
+	}
+
+	// Verify RefreshInput renews the exact live-winner candidate
+	refreshInput := session.Opts().RefreshInput
+	if refreshInput == nil {
+		t.Fatal("session.Opts().RefreshInput is nil")
+	}
+	renewedURL, cleanup, err := refreshInput(context.Background())
+	if err != nil {
+		t.Fatalf("RefreshInput error: %v", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if renewedURL != "http://localhost:8080/stream-refreshed.mp4" {
+		t.Fatalf("renewedURL = %q, want refreshed stream", renewedURL)
+	}
+	if refreshedURI != "virtual://series/tt1/1/1?result=live-winner" {
+		t.Fatalf("refreshedURI = %q, want winning candidate URI", refreshedURI)
+	}
+}
+
+func TestVirtualTranscodeStartupAllFailuresUnpinsToNeutral(t *testing.T) {
+	cache := NewVirtualBestResultCache(time.Minute, 10)
+
+	fileRes := &fakePinFileResolver{
+		file: &models.MediaFile{
+			ID:                         10,
+			ContentID:                  "content-1",
+			FilePath:                   "virtual://series/tt1/1/1?result=dead",
+			VirtualOwnerInstallationID: 5,
+		},
+	}
+
+	h := &PlaybackHandler{
+		BestResultCache: cache,
+		fileResolver:    fileRes,
+		sessionMgr:      playback.NewSessionManager(0, 0),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{CandidateID: "dead"}, errors.New("stream 404")
+		}),
+	}
+
+	opts := playback.TranscodeOpts{
+		MediaFileID:                      10,
+		InputPath:                        "virtual://series/tt1/1/1?result=dead",
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "sess-unpin-test",
+	}
+
+	_, err := h.startLocalPlaybackTransportOnce(context.Background(), opts)
+	if err == nil {
+		t.Fatal("expected start failure when all attempts fail")
+	}
+
 	// When all attempts fail transport start, dead pin must be cleared to neutral
 	if fileRes.replacedOld != "virtual://series/tt1/1/1?result=dead" || fileRes.replacedNew != "virtual://series/tt1/1/1" {
 		t.Fatalf("failed transcode unpin: got old=%q new=%q", fileRes.replacedOld, fileRes.replacedNew)
+	}
+}
+
+func TestVirtualTranscodeStartupExcludesCandidateOnNeutralResolveError(t *testing.T) {
+	cache := NewVirtualBestResultCache(time.Minute, 10)
+
+	fileRes := &fakePinFileResolver{
+		file: &models.MediaFile{
+			ID:                         10,
+			ContentID:                  "content-1",
+			FilePath:                   "virtual://series/tt1/1/1",
+			VirtualOwnerInstallationID: 5,
+		},
+	}
+
+	var attemptsExcluded [][]string
+	h := &PlaybackHandler{
+		BestResultCache: cache,
+		fileResolver:    fileRes,
+		sessionMgr:      playback.NewSessionManager(0, 0),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
+			attemptsExcluded = append(attemptsExcluded, append([]string(nil), excludedCandidateIDs...))
+			if len(excludedCandidateIDs) == 0 {
+				// First attempt fails but returns the candidate ID that failed
+				return ResolvedVirtualMedia{CandidateID: "cand-broken-1"}, errors.New("debrid link expired")
+			}
+			return ResolvedVirtualMedia{
+				URL:         "http://localhost:8080/stream-live.mp4",
+				URI:         "virtual://series/tt1/1/1?result=cand-live-2",
+				CandidateID: "cand-live-2",
+			}, nil
+		}),
+	}
+
+	opts := playback.TranscodeOpts{
+		MediaFileID:                      10,
+		InputPath:                        "virtual://series/tt1/1/1",
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "sess-neutral-exclusion-test",
+	}
+
+	_, _ = h.startLocalPlaybackTransportOnce(context.Background(), opts)
+
+	if len(attemptsExcluded) < 2 {
+		t.Fatalf("expected at least 2 attempts, got %d", len(attemptsExcluded))
+	}
+	// Attempt 1 must exclude "cand-broken-1" discovered during neutral resolution failure
+	if len(attemptsExcluded[1]) == 0 || attemptsExcluded[1][0] != "cand-broken-1" {
+		t.Fatalf("attempt 1 did not exclude 'cand-broken-1': got %#v", attemptsExcluded[1])
 	}
 }
 

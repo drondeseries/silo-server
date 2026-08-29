@@ -26,6 +26,17 @@ const (
 	compatVirtualMaxProbeAttempts = 5
 )
 
+func cloneHeaderMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 // ResolvedVirtualMedia represents a resolved virtual stream with provider details,
 // temporary URL, candidate identity, and proxy request headers.
 type ResolvedVirtualMedia struct {
@@ -698,7 +709,9 @@ func (h *PlaybackHandler) resolveVirtualTransportForIdentity(ctx context.Context
 		return ResolvedVirtualMedia{}, errors.New("virtual playback source is not bound")
 	}
 	if h.VirtualMediaDetailedResolver != nil {
-		return h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(ctx, uri, source.VirtualSourceOwnerInstallationID, userID, profileID, forceRefresh, nil, "")
+		res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(ctx, uri, source.VirtualSourceOwnerInstallationID, userID, profileID, forceRefresh, nil, "")
+		res.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
+		return res, err
 	}
 	if forceRefresh && h.VirtualMediaRefreshResolver != nil {
 		url, err := h.VirtualMediaRefreshResolver.RefreshVirtualMedia(ctx, uri, source.VirtualSourceOwnerInstallationID, userID, profileID)

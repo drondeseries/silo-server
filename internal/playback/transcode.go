@@ -299,6 +299,26 @@ const (
 	minStaleProducedWindow       = 5 * time.Second
 )
 
+// NewReadyTranscodeSessionForTesting creates a TranscodeSession with an outputDir
+// containing a valid stream.m3u8 and startup segments for unit testing.
+func NewReadyTranscodeSessionForTesting(outputDir string, opts TranscodeOpts) (*TranscodeSession, error) {
+	for _, name := range []string{"seg_00000.ts", "seg_00001.ts", "seg_00002.ts"} {
+		if err := os.WriteFile(filepath.Join(outputDir, name), []byte("test-segment-bytes"), 0644); err != nil {
+			return nil, err
+		}
+	}
+	manifestPath := filepath.Join(outputDir, "stream.m3u8")
+	manifestContent := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:4.000000,\nseg_00000.ts\n#EXTINF:4.000000,\nseg_00001.ts\n#EXTINF:4.000000,\nseg_00002.ts\n"
+	if err := os.WriteFile(manifestPath, []byte(manifestContent), 0644); err != nil {
+		return nil, err
+	}
+	return &TranscodeSession{
+		outputDir: outputDir,
+		opts:      opts,
+		running:   true,
+	}, nil
+}
+
 // StartTranscode launches an ffmpeg process that produces HLS segments.
 func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession, error) {
 	if !validVideoSampleEntry(opts.VideoSampleEntry) ||

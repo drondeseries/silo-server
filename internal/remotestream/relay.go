@@ -180,6 +180,17 @@ func (r *Relay) RegisterInsecureWithHeaders(ctx context.Context, source string, 
 	return r.register(ctx, source, true, headers)
 }
 
+func cloneHeaderMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 func (r *Relay) register(ctx context.Context, source string, insecure bool, headers map[string]string) (string, func(), error) {
 	if r == nil {
 		return "", nil, errors.New("remote stream relay is not configured")
@@ -228,7 +239,7 @@ func (r *Relay) register(ctx context.Context, source string, insecure bool, head
 		return "", nil, errors.New("remote stream relay is at capacity")
 	}
 	r.entries[token] = &relayEntry{
-		source: sourceURL, baseName: baseName, createdAt: now, insecure: insecure, headers: headers,
+		source: sourceURL, baseName: baseName, createdAt: now, insecure: insecure, headers: cloneHeaderMap(headers),
 	}
 	baseURL := r.baseURL
 	r.mu.Unlock()

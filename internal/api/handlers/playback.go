@@ -307,6 +307,7 @@ type PlaybackHandler struct {
 	MarkerResolver               markers.ExternalIDResolver
 	MarkerUpserter               PlaybackMarkerUpserter
 	MarkerUpdateNotifier         PlaybackMarkerUpdateNotifier
+	StartTranscodeFunc           func(context.Context, playback.TranscodeOpts) (*playback.TranscodeSession, error)
 	MarkerLazyContext            context.Context
 	MarkerLazyInFlight           sync.Map
 	v3StartEffectsOnce           sync.Once

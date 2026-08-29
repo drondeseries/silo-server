@@ -209,6 +209,17 @@ func (s *Service) resolveVirtualPlaybackWithRouting(
 	return res.URL, nil
 }
 
+func cloneHeaderMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 func withVirtualResultKey(virtualPath, candID string) string {
 	if candID == "" {
 		return virtualPath
@@ -287,7 +298,7 @@ func (s *Service) ResolveVirtualPlaybackDetailedWithRouting(
 			URL:            validated,
 			URI:            resURI,
 			CandidateID:    candID,
-			RequestHeaders: candidate.GetRequestHeaders(),
+			RequestHeaders: cloneHeaderMap(candidate.GetRequestHeaders()),
 			ExpiresAt:      exp,
 		}
 		s.storeResolvedStream(virtualPath, userID, profileID, routing.OwnerInstallationID, stream)
@@ -322,7 +333,7 @@ func (s *Service) ResolveVirtualPlaybackDetailedWithRouting(
 				URL:            validated,
 				URI:            resURI,
 				CandidateID:    candID,
-				RequestHeaders: candidate.GetRequestHeaders(),
+				RequestHeaders: cloneHeaderMap(candidate.GetRequestHeaders()),
 				ExpiresAt:      exp,
 			}
 			s.storeResolvedStream(virtualPath, userID, profileID, routing.OwnerInstallationID, stream)
@@ -1086,7 +1097,7 @@ func streamsFromVirtualResult(virtualPath string, result *pluginv1.VirtualStream
 			CodecAudio:          candidate.GetAudioCodec(),
 			HasAtmos:            candidate.GetHasAtmos(),
 			QualityScore:        int(candidate.GetQualityScore()),
-			RequestHeaders:      candidate.GetRequestHeaders(),
+			RequestHeaders:      cloneHeaderMap(candidate.GetRequestHeaders()),
 			ExpiresAt:           exp,
 			HDR:                 virtualCandidateHDR(candidate),
 			SourceType:          sourceType,
@@ -1551,7 +1562,7 @@ func (s *Service) lookupResolvedStream(virtualPath string, userID int, profileID
 		URL:            entry.url,
 		URI:            entry.uri,
 		CandidateID:    entry.candidateID,
-		RequestHeaders: entry.requestHeaders,
+		RequestHeaders: cloneHeaderMap(entry.requestHeaders),
 		ExpiresAt:      entry.expiresAt,
 	}, true
 }
@@ -1649,7 +1660,7 @@ func (s *Service) storeResolvedStreamDepth(virtualPath string, userID int, profi
 			url:            stream.URL,
 			uri:            stream.URI,
 			candidateID:    stream.CandidateID,
-			requestHeaders: stream.RequestHeaders,
+			requestHeaders: cloneHeaderMap(stream.RequestHeaders),
 			resolvedAt:     now,
 			expiresAt:      stream.ExpiresAt,
 		}
@@ -1659,7 +1670,7 @@ func (s *Service) storeResolvedStreamDepth(virtualPath string, userID int, profi
 		url:            stream.URL,
 		uri:            stream.URI,
 		candidateID:    stream.CandidateID,
-		requestHeaders: stream.RequestHeaders,
+		requestHeaders: cloneHeaderMap(stream.RequestHeaders),
 		resolvedAt:     now,
 		expiresAt:      stream.ExpiresAt,
 		cancel:         bgCancel,

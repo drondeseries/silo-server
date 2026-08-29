@@ -45,9 +45,16 @@ func (h *PlaybackHandler) startLocalPlaybackTransport(ctx context.Context, opts 
 	return h.startLocalPlaybackTransportOnce(ctx, opts)
 }
 
+func (h *PlaybackHandler) startTranscodeSession(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+	if h != nil && h.StartTranscodeFunc != nil {
+		return h.StartTranscodeFunc(ctx, opts)
+	}
+	return playback.StartTranscode(ctx, opts)
+}
+
 func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
 	if !strings.HasPrefix(strings.ToLower(opts.InputPath), virtualPlaybackPrefix) {
-		session, startErr := playback.StartTranscode(context.WithoutCancel(ctx), opts)
+		session, startErr := h.startTranscodeSession(context.WithoutCancel(ctx), opts)
 		if startErr != nil {
 			return nil, startErr
 		}
@@ -173,7 +180,7 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		attemptOpts := opts
 		attemptOpts.InputPath = resolvedMedia.URL
 		attemptOpts.InputCleanup = cleanupWithCancel
-		session, startErr := playback.StartTranscode(transcodeCtx, attemptOpts)
+		session, startErr := h.startTranscodeSession(transcodeCtx, attemptOpts)
 		if startErr == nil {
 			if _, readyErr := session.WaitForManifest(playback.ManifestStartupTimeout); readyErr == nil {
 				winningURI := resolvedMedia.URI
@@ -269,7 +276,7 @@ func (h *PlaybackHandler) resolveVirtualInputURI(
 		res = ResolvedVirtualMedia{URL: inputPath, URI: virtualURI}
 	}
 	if err != nil {
-		return ResolvedVirtualMedia{}, nil, fmt.Errorf("resolve virtual input: %w", err)
+		return res, nil, fmt.Errorf("resolve virtual input: %w", err)
 	}
 	if h.RemoteStreamRelay == nil {
 		return res, nil, nil

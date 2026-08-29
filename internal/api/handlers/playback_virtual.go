@@ -364,7 +364,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if err == nil {
 				streamURL = res.URL
 				if len(res.RequestHeaders) > 0 && cand.RequestHeaders == nil {
-					cand.RequestHeaders = res.RequestHeaders
+					cand.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
 				}
 			} else {
 				resolveErr = err
@@ -828,6 +828,17 @@ func hasHiddenVirtualPlaybackStreams(streams []VirtualPlaybackStream) bool {
 		}
 	}
 	return false
+}
+
+func cloneHeaderMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func isVirtualPlaybackFile(file *models.MediaFile) bool {
