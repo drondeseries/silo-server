@@ -5960,6 +5960,60 @@ func writePlaybackTestFFmpegFailingForInputPattern(t *testing.T, failPattern str
 	return path
 }
 
+func TestHandleStartPlaybackV3PreservesInitialCatalogIDAfterCandidateEnrichment(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 150
+	source.FilePath = "virtual://movie/source-150"
+	source.VirtualOwnerInstallationID = 5
+
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: map[int]*models.MediaFile{source.ID: source}})
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	handler.VirtualCandidateFileLookup = func(_ context.Context, path, _ string, _ string, _ int) (*models.MediaFile, error) {
+		candidate := *source
+		candidate.ID = 1150
+		candidate.FilePath = path
+		candidate.Container = "mp4"
+		return &candidate, nil
+	}
+
+	start := v3HandlerStartRequest()
+	start.FileID = source.ID
+	responseRecorder := httptest.NewRecorder()
+	handler.HandleStartPlayback(responseRecorder, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+	if responseRecorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", responseRecorder.Code, responseRecorder.Body.String())
+	}
+	var response playback.DecisionResponseV3
+	if err := json.Unmarshal(responseRecorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("response invalid: %v", err)
+	}
+	if response.PlaybackPlan == nil {
+		t.Fatalf("response has no playback plan: %#v", response)
+	}
+	if response.PlaybackPlan.RequestedMediaFileID != source.ID || response.PlaybackPlan.EffectiveMediaFileID != source.ID || response.PlaybackPlan.Source.MediaFileID != source.ID {
+		t.Fatalf("plan identity = requested %d effective %d source %d, want %d", response.PlaybackPlan.RequestedMediaFileID, response.PlaybackPlan.EffectiveMediaFileID, response.PlaybackPlan.Source.MediaFileID, source.ID)
+	}
+	session, err := manager.GetSession(response.SessionID)
+	if err != nil {
+		t.Fatalf("session lookup failed: %v", err)
+	}
+	if session.MediaFileID != source.ID {
+		t.Fatalf("session file = %d, want %d", session.MediaFileID, source.ID)
+	}
+	record, err := handler.PlanStoreV3.GetAttemptByPlaybackAttemptID(context.Background(), start.PlaybackAttemptID)
+	if err != nil {
+		t.Fatalf("attempt lookup failed: %v", err)
+	}
+	if record.RequestedMediaFileID != source.ID || record.EffectiveMediaFileID != source.ID || record.CurrentPlan.EffectiveMediaFileID != source.ID {
+		t.Fatalf("attempt identity = requested %d effective %d plan %d, want %d", record.RequestedMediaFileID, record.EffectiveMediaFileID, record.CurrentPlan.EffectiveMediaFileID, source.ID)
+	}
+}
+
 func TestHandleStartPlaybackV3SkipsUnresolvableVirtualAlternateForLaterWorkingAlternate(t *testing.T) {
 	source := v3HandlerFixtureFile(t)
 	source.ID = 100
@@ -6011,6 +6065,16 @@ func TestHandleStartPlaybackV3SkipsUnresolvableVirtualAlternateForLaterWorkingAl
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
 	})
+	handler.VirtualCandidateFileLookup = func(_ context.Context, path, _ string, _ string, _ int) (*models.MediaFile, error) {
+		for _, file := range []*models.MediaFile{source, &altBroken, &altGood} {
+			if file.FilePath == path {
+				candidate := *file
+				candidate.ID += 1000
+				return &candidate, nil
+			}
+		}
+		return nil, nil
+	}
 
 	start := v3HandlerStartRequest()
 	start.FileID = source.ID
@@ -6032,6 +6096,23 @@ func TestHandleStartPlaybackV3SkipsUnresolvableVirtualAlternateForLaterWorkingAl
 	}
 	if response.PlaybackPlan.RequestedMediaFileID != source.ID {
 		t.Fatalf("requested file = %d, want original source %d", response.PlaybackPlan.RequestedMediaFileID, source.ID)
+	}
+	if response.PlaybackPlan.Source.MediaFileID != altGood.ID {
+		t.Fatalf("source file = %d, want catalog alternate %d after candidate enrichment", response.PlaybackPlan.Source.MediaFileID, altGood.ID)
+	}
+	session, err := manager.GetSession(response.SessionID)
+	if err != nil {
+		t.Fatalf("session lookup failed: %v", err)
+	}
+	if session.MediaFileID != altGood.ID {
+		t.Fatalf("session file = %d, want catalog alternate %d", session.MediaFileID, altGood.ID)
+	}
+	record, err := handler.PlanStoreV3.GetAttemptByPlaybackAttemptID(context.Background(), start.PlaybackAttemptID)
+	if err != nil {
+		t.Fatalf("attempt lookup failed: %v", err)
+	}
+	if record.EffectiveMediaFileID != altGood.ID || record.CurrentPlan.EffectiveMediaFileID != altGood.ID {
+		t.Fatalf("attempt identity = effective %d plan %d, want %d", record.EffectiveMediaFileID, record.CurrentPlan.EffectiveMediaFileID, altGood.ID)
 	}
 }
 
@@ -6219,6 +6300,9 @@ func TestPrepareVirtualAlternateFileV3BindsOwnerInstallationAndResolvedURI(t *te
 	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
 		return "http://relay.local/stream?resolved=true", nil
 	})
+	handler.VirtualCandidateFileLookup = func(_ context.Context, path, _ string, episodeID string, _ int) (*models.MediaFile, error) {
+		return &models.MediaFile{ID: 1099, FilePath: path, EpisodeID: episodeID, Container: "mp4"}, nil
+	}
 	handler.EpisodeLookup = testEpisodeLookup{
 		episode: &models.Episode{ContentID: "ep-101", Runtime: 45},
 	}
@@ -6243,6 +6327,9 @@ func TestPrepareVirtualAlternateFileV3BindsOwnerInstallationAndResolvedURI(t *te
 	}
 	if prepared.VirtualOwnerInstallationID != resolvedOwner {
 		t.Fatalf("prepared VirtualOwnerInstallationID = %d, want %d", prepared.VirtualOwnerInstallationID, resolvedOwner)
+	}
+	if prepared.Container != "mp4" {
+		t.Fatalf("prepared Container = %q, want candidate metadata mp4", prepared.Container)
 	}
 	if prepared.Duration != 45*60 {
 		t.Fatalf("prepared Duration = %d, want %d (45 mins in seconds)", prepared.Duration, 45*60)

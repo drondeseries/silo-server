@@ -1198,6 +1198,7 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 	// probe them through the virtual provider before the generic probe repair
 	// path, which only understands local/HTTP media files.
 	if isVirtualPlaybackFile(requestedFile) {
+		requestedCatalogFileID := requestedFile.ID
 		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, false)
 		if resolveErr != nil {
 			termFileID := requestedFile.ID
@@ -1219,10 +1220,13 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 			writeJSON(w, http.StatusCreated, response)
 			return
 		}
-		requestedFile = resolved.File
-		if requestedFile.ID == 0 {
-			requestedFile.ID = req.FileID
+		if resolved.File == nil {
+			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
+			return
 		}
+		resolvedFile := *resolved.File
+		resolvedFile.ID = requestedCatalogFileID
+		requestedFile = &resolvedFile
 		requestedFile.FilePath = resolved.URI
 		requestedFile.VirtualOwnerInstallationID = resolved.OwnerID
 		// Do NOT mutate req.FileID here: the original caller-supplied file ID
@@ -1477,9 +1481,12 @@ func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alterna
 	if err != nil {
 		return nil, err
 	}
-	if resolved.File.ID == 0 {
-		resolved.File.ID = alternate.ID
+	if resolved.File == nil {
+		return nil, errors.New("virtual playback resolver returned no file")
 	}
+	resolvedFile := *resolved.File
+	resolvedFile.ID = alternate.ID
+	resolved.File = &resolvedFile
 	resolved.File.FilePath = resolved.URI
 	resolved.File.VirtualOwnerInstallationID = resolved.OwnerID
 	if resolved.File.Duration <= 0 {
