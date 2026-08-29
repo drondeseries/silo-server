@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,6 +135,106 @@ func TestVirtualTranscodeStartupFailsOverOnResolutionError(t *testing.T) {
 		if c.URI == "virtual://series/tt1/1/1?result=dead" {
 			t.Fatalf("dead candidate was not evicted from BestResultCache: %#v", cached)
 		}
+	}
+	foundLive := false
+	for _, c := range cached {
+		if c.URI == "virtual://series/tt1/1/1?result=live" {
+			foundLive = true
+		}
+	}
+	if !foundLive {
+		t.Fatalf("live candidate was incorrectly evicted from BestResultCache: %#v", cached)
+	}
+
+}
+
+func TestVirtualTranscodeNeutralResolutionFailureEvictsExactCandidate(t *testing.T) {
+	cache := NewVirtualBestResultCache(time.Minute, 10)
+	cacheKey := bestResultCacheKey("content-1", "virtual://series/tt1/1/1", 5)
+	cache.set(cacheKey, []VirtualPlaybackStream{
+		{URI: "virtual://series/tt1/1/1?result=broken"},
+		{URI: "virtual://series/tt1/1/1?result=live"},
+	}, time.Now())
+	fileRes := &fakePinFileResolver{file: &models.MediaFile{ID: 10, ContentID: "content-1", FilePath: "virtual://series/tt1/1/1", VirtualOwnerInstallationID: 5}}
+	h := &PlaybackHandler{
+		BestResultCache: cache,
+		fileResolver:    fileRes,
+		sessionMgr:      playback.NewSessionManager(0, 0),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, excluded []string, _ string) (ResolvedVirtualMedia, error) {
+			if len(excluded) == 0 {
+				return ResolvedVirtualMedia{CandidateID: "broken"}, errors.New("candidate unavailable")
+			}
+			return ResolvedVirtualMedia{}, errors.New("all candidates unavailable")
+		}),
+	}
+	_, _ = h.startLocalPlaybackTransportOnce(context.Background(), playback.TranscodeOpts{MediaFileID: 10, InputPath: "virtual://series/tt1/1/1", VirtualSourceOwnerInstallationID: 5, SessionID: "neutral-exact-eviction"})
+	cached := cache.get(cacheKey, time.Now())
+	for _, candidate := range cached {
+		if candidate.URI == "virtual://series/tt1/1/1?result=broken" {
+			t.Fatalf("failed concrete candidate remained cached: %#v", cached)
+		}
+	}
+	foundLive := false
+	for _, candidate := range cached {
+		if candidate.URI == "virtual://series/tt1/1/1?result=live" {
+			foundLive = true
+		}
+	}
+	if !foundLive {
+		t.Fatalf("unrelated live candidate was removed: %#v", cached)
+	}
+}
+
+func TestVirtualTranscodeManifestFailureEvictsExactCandidate(t *testing.T) {
+	tempDir := t.TempDir()
+	cache := NewVirtualBestResultCache(time.Minute, 10)
+	cacheKey := bestResultCacheKey("content-1", "virtual://series/tt1/1/1", 5)
+	cache.set(cacheKey, []VirtualPlaybackStream{
+		{URI: "virtual://series/tt1/1/1?result=broken"},
+		{URI: "virtual://series/tt1/1/1?result=live"},
+	}, time.Now())
+	fileRes := &fakePinFileResolver{file: &models.MediaFile{ID: 10, ContentID: "content-1", FilePath: "virtual://series/tt1/1/1?result=broken", VirtualOwnerInstallationID: 5}}
+	attemptsExcluded := make([][]string, 0)
+	h := &PlaybackHandler{
+		BestResultCache: cache,
+		fileResolver:    fileRes,
+		sessionMgr:      playback.NewSessionManager(0, 0),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, excluded []string, _ string) (ResolvedVirtualMedia, error) {
+			attemptsExcluded = append(attemptsExcluded, append([]string(nil), excluded...))
+			if len(excluded) == 0 {
+				return ResolvedVirtualMedia{URL: "http://localhost:8080/broken.mp4", URI: uri, CandidateID: "broken"}, nil
+			}
+			return ResolvedVirtualMedia{URL: "http://localhost:8080/live.mp4", URI: "virtual://series/tt1/1/1?result=live", CandidateID: "live"}, nil
+		}),
+		StartTranscodeFunc: func(_ context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+			if strings.Contains(opts.InputPath, "broken.mp4") {
+				return nil, errors.New("manifest startup failed")
+			}
+			return playback.NewReadyTranscodeSessionForTesting(tempDir, opts)
+		},
+	}
+	session, err := h.startLocalPlaybackTransportOnce(context.Background(), playback.TranscodeOpts{MediaFileID: 10, InputPath: "virtual://series/tt1/1/1?result=broken", VirtualSourceOwnerInstallationID: 5, SessionID: "manifest-exact-eviction", OutputDir: tempDir})
+	if err != nil {
+		t.Fatalf("startLocalPlaybackTransportOnce failed: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+	if len(attemptsExcluded) < 2 || len(attemptsExcluded[1]) != 1 || attemptsExcluded[1][0] != "broken" {
+		t.Fatalf("failed candidate was not excluded on retry: %#v", attemptsExcluded)
+	}
+	cached := cache.get(cacheKey, time.Now())
+	for _, candidate := range cached {
+		if candidate.URI == "virtual://series/tt1/1/1?result=broken" {
+			t.Fatalf("failed concrete candidate remained cached: %#v", cached)
+		}
+	}
+	foundLive := false
+	for _, candidate := range cached {
+		if candidate.URI == "virtual://series/tt1/1/1?result=live" {
+			foundLive = true
+		}
+	}
+	if !foundLive {
+		t.Fatalf("unrelated live candidate was removed: %#v", cached)
 	}
 }
 

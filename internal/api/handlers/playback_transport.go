@@ -158,7 +158,11 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 			}
 			if h.BestResultCache != nil && file != nil {
 				neutralURI := virtualPlaybackNeutralKey(canonicalPath)
-				h.BestResultCache.RemoveCandidate(bestResultCacheKey(file.ContentID, neutralURI, ownerInstallationID), targetURI)
+				failedURI := targetURI
+				if failedID != "" {
+					failedURI = withVirtualResultKey(neutralURI, failedID)
+				}
+				h.BestResultCache.RemoveCandidate(bestResultCacheKey(file.ContentID, neutralURI, ownerInstallationID), failedURI)
 			}
 			if targetURI == canonicalPath {
 				canonicalPath = neutralPath
@@ -221,7 +225,11 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		}
 		if h.BestResultCache != nil && file != nil {
 			neutralURI := virtualPlaybackNeutralKey(canonicalPath)
-			h.BestResultCache.RemoveCandidate(bestResultCacheKey(file.ContentID, neutralURI, ownerInstallationID), targetURI)
+			failedURI := targetURI
+			if resolvedMedia.CandidateID != "" {
+				failedURI = withVirtualResultKey(neutralURI, resolvedMedia.CandidateID)
+			}
+			h.BestResultCache.RemoveCandidate(bestResultCacheKey(file.ContentID, neutralURI, ownerInstallationID), failedURI)
 		}
 		if targetURI == canonicalPath {
 			canonicalPath = neutralPath

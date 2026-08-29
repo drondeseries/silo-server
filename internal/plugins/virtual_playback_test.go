@@ -853,6 +853,43 @@ func TestResolvedURLMemoHonorsDynamicExpiresAt(t *testing.T) {
 	}
 }
 
+func TestVirtualStreamResponseRejectsInvalidRequestHeaders(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{name: "too many", headers: map[string]string{"A": "1", "B": "2", "C": "3", "D": "4", "E": "5", "F": "6", "G": "7", "H": "8", "I": "9"}},
+		{name: "invalid name", headers: map[string]string{"Bad\nName": "value"}},
+		{name: "oversized name", headers: map[string]string{strings.Repeat("x", maxVirtualRequestHeaderKeyLen+1): "value"}},
+		{name: "disallowed cookie", headers: map[string]string{"Cookie": "secret"}},
+		{name: "disallowed authorization", headers: map[string]string{"Authorization": "secret"}},
+		{name: "invalid value", headers: map[string]string{"Referer": "bad\nvalue"}},
+		{name: "oversized value", headers: map[string]string{"Referer": strings.Repeat("x", maxVirtualRequestHeaderValueLen+1)}},
+		{name: "duplicate case", headers: map[string]string{"Referer": "one", "referer": "two"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := virtualCandidate("header-test", "https://1.1.1.1/video.mp4")
+			candidate.RequestHeaders = tc.headers
+			if _, err := validateVirtualStreamResponse(virtualResponse(candidate)); err == nil {
+				t.Fatal("expected invalid request headers to be rejected")
+			}
+		})
+	}
+}
+
+func TestVirtualStreamResponseAcceptsAllowedRequestHeaders(t *testing.T) {
+	candidate := virtualCandidate("header-valid", "https://1.1.1.1/video.mp4")
+	candidate.RequestHeaders = map[string]string{
+		"Referer":    "https://stream.example/player",
+		"Origin":     "https://stream.example",
+		"User-Agent": "Silo/1.0",
+	}
+	if _, err := validateVirtualStreamResponse(virtualResponse(candidate)); err != nil {
+		t.Fatalf("validateVirtualStreamResponse rejected allowed headers: %v", err)
+	}
+}
+
 func TestResolveVirtualPlaybackDetailedPropagatesHeadersAndExclusions(t *testing.T) {
 	var capturedExcluded []string
 	var capturedPreferred string

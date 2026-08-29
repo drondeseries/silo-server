@@ -37,6 +37,9 @@ const (
 	maxVirtualLabelLen                  = 256
 	maxVirtualMetadataStringLen         = 1024
 	maxVirtualMetadataLen               = 64 << 10
+	maxVirtualRequestHeaders            = 8
+	maxVirtualRequestHeaderKeyLen       = 128
+	maxVirtualRequestHeaderValueLen     = 4096
 	maxVirtualLanguages                 = 32
 	maxVirtualLanguageLen               = 35
 )
@@ -927,6 +930,9 @@ func validateVirtualStreamCandidate(candidate *pluginv1.VirtualStreamCandidate, 
 	if err := validateVirtualStatus(candidate.GetAvailability(), candidate.GetError(), candidate.GetMetadata()); err != nil {
 		return err
 	}
+	if err := validateVirtualRequestHeaders(candidate.GetRequestHeaders()); err != nil {
+		return err
+	}
 	if err := validateVirtualCandidateDisplayMetadata(candidate.GetMetadata()); err != nil {
 		return err
 	}
@@ -935,6 +941,37 @@ func validateVirtualStreamCandidate(candidate *pluginv1.VirtualStreamCandidate, 
 	}
 	if err := validateLanguages(candidate.GetSubtitleLanguages()); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateVirtualRequestHeaders(headers map[string]string) error {
+	if len(headers) > maxVirtualRequestHeaders {
+		return errors.New("virtual stream provider returned too many request headers")
+	}
+	normalized := make(map[string]struct{}, len(headers))
+	for key, value := range headers {
+		if len(key) == 0 || len(key) > maxVirtualRequestHeaderKeyLen || strings.ContainsAny(key, "\x00\r\n\t") {
+			return errors.New("virtual stream provider returned an invalid request header name")
+		}
+		canonical := ""
+		switch {
+		case strings.EqualFold(key, "Referer"):
+			canonical = "referer"
+		case strings.EqualFold(key, "Origin"):
+			canonical = "origin"
+		case strings.EqualFold(key, "User-Agent"):
+			canonical = "user-agent"
+		default:
+			return errors.New("virtual stream provider returned a disallowed request header")
+		}
+		if _, duplicate := normalized[canonical]; duplicate {
+			return errors.New("virtual stream provider returned duplicate request headers")
+		}
+		normalized[canonical] = struct{}{}
+		if len(value) > maxVirtualRequestHeaderValueLen || strings.ContainsAny(value, "\x00\r\n") {
+			return errors.New("virtual stream provider returned an invalid request header value")
+		}
 	}
 	return nil
 }

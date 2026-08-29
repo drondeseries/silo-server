@@ -150,8 +150,7 @@ func (c *VirtualBestResultCache) RemoveCandidate(key string, candURI string) {
 	candNeutral := virtualPlaybackNeutralKey(candURI)
 	filtered := make([]VirtualPlaybackStream, 0, len(entry.streams))
 	for _, s := range entry.streams {
-		sNeutral := virtualPlaybackNeutralKey(s.URI)
-		if s.URI == candURI || (candNeutral != "" && (s.URI == candNeutral || sNeutral == candURI || sNeutral == candNeutral)) {
+		if s.URI == candURI || (candNeutral != "" && s.URI == candNeutral) {
 			continue
 		}
 		filtered = append(filtered, s)
