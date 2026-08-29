@@ -1129,7 +1129,7 @@ func virtualDVLabel(isDV bool, profile int) string {
 // embedded tracks here: a synthesized SubtitleTrack carries a stream ordinal
 // that no real subtitle stream backs, and the extractor maps it straight to
 // ffmpeg's `0:s:N` specifier. That produced phantom subtitle selections that
-// always failed at FFmpeg ("Stream map '' matches no streams"). Real embedded
+// always failed at FFmpeg ("Stream map ” matches no streams"). Real embedded
 // subtitle inventory comes only from the probe; provider subtitle hints stay on
 // the candidate stream for the picker and drive the background subtitle search.
 func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualPlaybackStream) {
