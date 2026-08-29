@@ -103,3 +103,45 @@ func TestRankVirtualStreamsForDeviceDoesNotTreatDVDAsDolbyVision(t *testing.T) {
 		t.Fatalf("DVD should not receive DV penalty, got %+v", got)
 	}
 }
+
+func TestRankVirtualStreamsForDeviceAtmosBonusRequiresAudioEvidence(t *testing.T) {
+	candidates := []VirtualPlaybackStream{
+		{URI: "virtual://movie/1?result=plain", CodecVideo: "h264", CodecAudio: "aac", HasAtmos: false},
+		{URI: "virtual://movie/1?result=atmos", CodecVideo: "h264", CodecAudio: "eac3", HasAtmos: true},
+	}
+
+	// 1. Device with explicit EAC3 audio capability receives Atmos bonus and ranks Atmos first
+	eac3Device := DeviceCapabilities{
+		CodecsVideo: []string{"h264"},
+		CodecsAudio: []string{"aac", "eac3"},
+	}
+	rankedEAC3 := RankVirtualStreamsForDevice(candidates, eac3Device)
+	if rankedEAC3[0].URI != candidates[1].URI {
+		t.Fatalf("expected Atmos stream first for EAC3 device, got %s", rankedEAC3[0].URI)
+	}
+
+	// 2. Device with video capability but NO audio codec capability does NOT receive Atmos bonus
+	noAudioDevice := DeviceCapabilities{
+		CodecsVideo: []string{"h264"},
+		CodecsAudio: nil,
+	}
+	rankedNoAudio := RankVirtualStreamsForDevice(candidates, noAudioDevice)
+	if rankedNoAudio[0].URI != candidates[0].URI {
+		t.Fatalf("expected provider order preserved when audio capability unknown, got %s", rankedNoAudio[0].URI)
+	}
+}
+
+func TestRankVirtualStreamsForDeviceQualityScoreTieBreak(t *testing.T) {
+	candidates := []VirtualPlaybackStream{
+		{URI: "virtual://movie/1?result=low-quality", Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", QualityScore: -10},
+		{URI: "virtual://movie/1?result=high-quality", Resolution: "1080p", CodecVideo: "h264", CodecAudio: "aac", QualityScore: 40},
+	}
+	device := DeviceCapabilities{
+		CodecsVideo: []string{"h264"},
+		CodecsAudio: []string{"aac"},
+	}
+	ranked := RankVirtualStreamsForDevice(candidates, device)
+	if ranked[0].URI != candidates[1].URI {
+		t.Fatalf("expected higher quality score stream first on equal codec match, got %s", ranked[0].URI)
+	}
+}

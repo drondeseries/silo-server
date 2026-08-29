@@ -355,9 +355,27 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if oid <= 0 {
 			oid = file.VirtualOwnerInstallationID
 		}
-		streamURL, resolveErr := h.VirtualPlaybackResolver.ResolveVirtualPlayback(
-			attemptCtx, cand.URI, userID, profileID, oid,
-		)
+		var streamURL string
+		var resolveErr error
+		if h.VirtualMediaDetailedResolver != nil {
+			res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+				attemptCtx, cand.URI, oid, userID, profileID, false, nil, "",
+			)
+			if err == nil {
+				streamURL = res.URL
+				if len(res.RequestHeaders) > 0 && cand.RequestHeaders == nil {
+					cand.RequestHeaders = res.RequestHeaders
+				}
+			} else {
+				resolveErr = err
+			}
+		} else if h.VirtualPlaybackResolver != nil {
+			streamURL, resolveErr = h.VirtualPlaybackResolver.ResolveVirtualPlayback(
+				attemptCtx, cand.URI, userID, profileID, oid,
+			)
+		} else {
+			resolveErr = errors.New("virtual playback resolver is not configured")
+		}
 		if resolveErr != nil {
 			return nil, resolveErr
 		}
@@ -832,6 +850,20 @@ func isUnplayableVirtualURI(uri string) bool {
 		}
 	}
 	return false
+}
+
+func withVirtualResultKey(virtualPath, candID string) string {
+	if candID == "" {
+		return virtualPath
+	}
+	parsed, err := url.Parse(virtualPath)
+	if err != nil {
+		return virtualPath + "?result=" + candID
+	}
+	q := parsed.Query()
+	q.Set("result", candID)
+	parsed.RawQuery = q.Encode()
+	return parsed.String()
 }
 
 // virtualPlaybackNeutralKey returns the virtual URI with any concrete "result="

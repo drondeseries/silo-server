@@ -131,8 +131,8 @@ func ScoreCandidate[T VirtualStreamMetadata](c T, device DeviceCapabilities) int
 		score += 50
 	}
 
-	// Dolby Atmos bonus when device supports Atmos or compatible multi-channel passthrough
-	if c.GetHasAtmos() {
+	// Dolby Atmos bonus when device explicitly supports Atmos or compatible multi-channel passthrough
+	if c.GetHasAtmos() && len(device.CodecsAudio) > 0 {
 		if deviceSupportsCodec(device.CodecsAudio, "eac3") || deviceSupportsCodec(device.CodecsAudio, "truehd") || deviceSupportsCodec(device.CodecsAudio, "atmos") {
 			score += 15
 		}

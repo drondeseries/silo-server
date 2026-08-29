@@ -128,8 +128,15 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		if attempt > 0 {
 			targetURI = neutralPath
 		}
+		preferredID := initialPinnedResultID
+		for _, failed := range failedCandidateIDs {
+			if preferredID == failed {
+				preferredID = ""
+				break
+			}
+		}
 		resolvedMedia, cleanup, resolveErr := h.resolveVirtualInputURI(
-			startupCtx, targetURI, ownerInstallationID, userID, profileID, attempt > 0, failedCandidateIDs, initialPinnedResultID,
+			startupCtx, targetURI, ownerInstallationID, userID, profileID, attempt > 0, failedCandidateIDs, preferredID,
 		)
 		if resolveErr != nil {
 			lastErr = resolveErr
@@ -169,19 +176,23 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		session, startErr := playback.StartTranscode(transcodeCtx, attemptOpts)
 		if startErr == nil {
 			if _, readyErr := session.WaitForManifest(playback.ManifestStartupTimeout); readyErr == nil {
+				winningURI := resolvedMedia.URI
+				if winningURI == "" || winningURI == neutralPath {
+					if resolvedMedia.CandidateID != "" {
+						winningURI = withVirtualResultKey(neutralPath, resolvedMedia.CandidateID)
+					} else {
+						winningURI = targetURI
+					}
+				}
+				canonicalPath = winningURI
+				if file != nil {
+					file.FilePath = winningURI
+				}
 				// Transport successfully ready. If this was a fallback attempt from a dead pin,
 				// update the persisted pin compare-and-swap so future sessions use the live source.
 				if replacer, ok := h.fileResolver.(interface {
 					ReplaceVirtualResultPin(context.Context, int, string, string) (bool, error)
 				}); ok && file != nil && file.ID > 0 && initialPinnedPath != "" {
-					winningURI := resolvedMedia.URI
-					if winningURI == "" || winningURI == neutralPath {
-						if resolvedMedia.CandidateID != "" {
-							winningURI = neutralPath + "?result=" + resolvedMedia.CandidateID
-						} else {
-							winningURI = targetURI
-						}
-					}
 					if winningURI != "" && winningURI != initialPinnedPath {
 						unpinCtx, unpinCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 						if _, err := replacer.ReplaceVirtualResultPin(unpinCtx, file.ID, initialPinnedPath, winningURI); err != nil {

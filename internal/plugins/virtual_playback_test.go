@@ -899,4 +899,28 @@ func TestResolveVirtualPlaybackDetailedPropagatesHeadersAndExclusions(t *testing
 	if res.ExpiresAt.IsZero() {
 		t.Fatal("res.ExpiresAt is zero")
 	}
+
+	// Second resolution hits memo and must preserve RequestHeaders, CandidateID, and ExpiresAt
+	memoHit, err := service.ResolveVirtualPlaybackDetailedForInstallation(
+		context.Background(),
+		"virtual://movie/tt1234567",
+		1, "profile1", 101,
+		false, false,
+		nil, "",
+	)
+	if err != nil {
+		t.Fatalf("memo hit error: %v", err)
+	}
+	if memoHit.URL != "https://1.1.1.1/video.mp4" {
+		t.Fatalf("memoHit.URL = %q", memoHit.URL)
+	}
+	if memoHit.RequestHeaders["Referer"] != "https://stream.example/player" {
+		t.Fatalf("memoHit.RequestHeaders = %#v, want Referer preserved", memoHit.RequestHeaders)
+	}
+	if memoHit.CandidateID != "cand-1" {
+		t.Fatalf("memoHit.CandidateID = %q, want cand-1", memoHit.CandidateID)
+	}
+	if memoHit.ExpiresAt.IsZero() {
+		t.Fatal("memoHit.ExpiresAt is zero")
+	}
 }

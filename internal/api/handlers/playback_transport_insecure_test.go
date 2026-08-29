@@ -188,6 +188,11 @@ func TestVirtualTranscodeStartupFailsOverAndPinsWinningCandidate(t *testing.T) {
 	if len(attemptsExcluded[1]) == 0 || attemptsExcluded[1][0] != "dead" {
 		t.Fatalf("attempt 1 did not exclude 'dead': got %#v", attemptsExcluded[1])
 	}
+
+	// When all attempts fail transport start, dead pin must be cleared to neutral
+	if fileRes.replacedOld != "virtual://series/tt1/1/1?result=dead" || fileRes.replacedNew != "virtual://series/tt1/1/1" {
+		t.Fatalf("failed transcode unpin: got old=%q new=%q", fileRes.replacedOld, fileRes.replacedNew)
+	}
 }
 
 func TestDeviceAwareStickyParity(t *testing.T) {

@@ -130,10 +130,16 @@ type recordingCompatRelay struct {
 	proxyErr        error
 	lastRange       string
 	registerCalls   int
+	lastHeaders     map[string]string
 }
 
 func (r *recordingCompatRelay) Proxy(w http.ResponseWriter, req *http.Request, source string) error {
+	return r.ProxyWithHeaders(w, req, source, nil)
+}
+
+func (r *recordingCompatRelay) ProxyWithHeaders(w http.ResponseWriter, req *http.Request, source string, headers map[string]string) error {
 	r.proxiedURL = source
+	r.lastHeaders = headers
 	if req != nil {
 		r.lastRange = req.Header.Get("Range")
 	}
@@ -151,7 +157,12 @@ func (r *recordingCompatRelay) Proxy(w http.ResponseWriter, req *http.Request, s
 }
 
 func (r *recordingCompatRelay) ProxyInsecure(w http.ResponseWriter, req *http.Request, source string) error {
+	return r.ProxyInsecureWithHeaders(w, req, source, nil)
+}
+
+func (r *recordingCompatRelay) ProxyInsecureWithHeaders(w http.ResponseWriter, req *http.Request, source string, headers map[string]string) error {
 	r.proxiedInsecure = source
+	r.lastHeaders = headers
 	if req != nil {
 		r.lastRange = req.Header.Get("Range")
 	}
@@ -168,9 +179,20 @@ func (r *recordingCompatRelay) ProxyInsecure(w http.ResponseWriter, req *http.Re
 	return nil
 }
 
-func (r *recordingCompatRelay) Register(context.Context, string) (string, func(), error) {
+func (r *recordingCompatRelay) Register(ctx context.Context, source string) (string, func(), error) {
+	return r.RegisterWithHeaders(ctx, source, nil)
+}
+
+func (r *recordingCompatRelay) RegisterWithHeaders(ctx context.Context, source string, headers map[string]string) (string, func(), error) {
 	r.registerCalls++
+	r.lastHeaders = headers
 	return "http://127.0.0.1/relay", func() {}, nil
+}
+
+func (r *recordingCompatRelay) RegisterInsecureWithHeaders(ctx context.Context, source string, headers map[string]string) (string, func(), error) {
+	r.registerCalls++
+	r.lastHeaders = headers
+	return "http://127.0.0.1/relay-insecure", func() {}, nil
 }
 
 func TestServeVirtualDirectResolvesBoundSourceThroughRelay(t *testing.T) {
@@ -215,7 +237,66 @@ func TestServeVirtualDirectRoutesInsecureOptInThroughProxyInsecure(t *testing.T)
 		t.Fatalf("serveVirtualDirect: %v", err)
 	}
 	if relay.proxiedInsecure != "http://10.0.0.7/private" {
-		t.Fatalf("insecure proxied URL = %q", relay.proxiedInsecure)
+		t.Fatalf("proxiedInsecure=%q", relay.proxiedInsecure)
+	}
+}
+
+func TestServeVirtualDirectForwardsRequestHeaders(t *testing.T) {
+	relay := &recordingCompatRelay{body: "media-with-headers"}
+	headers := map[string]string{
+		"Referer": "https://stream.example/player",
+		"Origin":  "https://stream.example",
+	}
+	h := &PlaybackHandler{
+		RemoteStreamRelay: relay,
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, owner, user int, profile string, forceRefresh bool, excluded []string, preferred string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{
+				URL:            "https://provider.example/protected.mp4",
+				URI:            uri,
+				CandidateID:    "cand-1",
+				RequestHeaders: headers,
+			}, nil
+		}),
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/Videos/item/stream", nil)
+	source := PlaybackMediaSource{VirtualSourceURI: "virtual://movie/tt0133093", VirtualSourceOwnerInstallationID: 3}
+	if err := h.serveVirtualDirect(w, r, &Session{StreamAppUserID: 8, ProfileID: "kid"}, source); err != nil {
+		t.Fatalf("serveVirtualDirect: %v", err)
+	}
+	if relay.proxiedURL != "https://provider.example/protected.mp4" {
+		t.Fatalf("proxiedURL=%q", relay.proxiedURL)
+	}
+	if relay.lastHeaders["Referer"] != "https://stream.example/player" || relay.lastHeaders["Origin"] != "https://stream.example" {
+		t.Fatalf("relay.lastHeaders = %#v", relay.lastHeaders)
+	}
+}
+
+func TestRegisterVirtualInputForwardsRequestHeaders(t *testing.T) {
+	relay := &recordingCompatRelay{}
+	headers := map[string]string{"User-Agent": "SpecialPlayer/1.0"}
+	h := &PlaybackHandler{
+		RemoteStreamRelay: relay,
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, owner, user int, profile string, forceRefresh bool, excluded []string, preferred string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{
+				URL:            "https://provider.example/transcode.mp4",
+				URI:            uri,
+				CandidateID:    "cand-2",
+				RequestHeaders: headers,
+			}, nil
+		}),
+	}
+	source := PlaybackMediaSource{VirtualSourceURI: "virtual://movie/tt0133093", VirtualSourceOwnerInstallationID: 3}
+	relayURL, cleanup, err := h.registerVirtualInput(context.Background(), &Session{StreamAppUserID: 8, ProfileID: "kid"}, source, false)
+	if err != nil {
+		t.Fatalf("registerVirtualInput error: %v", err)
+	}
+	defer cleanup()
+	if relayURL != "http://127.0.0.1/relay" {
+		t.Fatalf("relayURL=%q", relayURL)
+	}
+	if relay.lastHeaders["User-Agent"] != "SpecialPlayer/1.0" {
+		t.Fatalf("relay.lastHeaders = %#v", relay.lastHeaders)
 	}
 }
 

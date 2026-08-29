@@ -119,10 +119,13 @@ type Service struct {
 // entry hot only within a single playback start window. cancel stops the
 // background refresh goroutine when the entry is superseded or evicted.
 type resolvedURLEntry struct {
-	url        string
-	resolvedAt time.Time
-	expiresAt  time.Time
-	cancel     context.CancelFunc
+	url            string
+	uri            string
+	candidateID    string
+	requestHeaders map[string]string
+	resolvedAt     time.Time
+	expiresAt      time.Time
+	cancel         context.CancelFunc
 	// refreshes counts background warm-refresh cycles this entry has served.
 	// Chains are capped so a memo only stays warm for an active playback
 	// startup window instead of living for the lifetime of the process.
