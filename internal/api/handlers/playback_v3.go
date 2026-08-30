@@ -3839,12 +3839,21 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "source_unavailable", message: "The effective media source is unavailable."}
 	}
 	if isVirtualPlaybackFile(currentEffectiveFile) {
-		if session, sessionErr := h.sessionMgr.GetSession(record.SessionID); sessionErr == nil && session != nil && session.VirtualSourceURI != "" {
+		session, sessionErr := h.sessionMgr.GetSession(record.SessionID)
+		if sessionErr != nil {
+			slog.WarnContext(r.Context(), "virtual playback rehydration session lookup failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "error", sessionErr)
+		} else if session == nil || session.VirtualSourceURI == "" {
+			slog.WarnContext(r.Context(), "virtual playback rehydration has no pinned source", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID)
+		} else {
 			pinnedFile := *currentEffectiveFile
 			pinnedFile.FilePath = session.VirtualSourceURI
 			pinnedFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
 			resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false)
-			if resolveErr == nil && resolved.File != nil {
+			if resolveErr != nil {
+				slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", resolveErr)
+			} else if resolved.File == nil {
+				slog.WarnContext(r.Context(), "virtual playback rehydration returned no file", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID)
+			} else {
 				resolvedFile := *resolved.File
 				resolvedFile.ID = currentEffectiveFile.ID
 				resolvedFile.FilePath = resolved.URI
