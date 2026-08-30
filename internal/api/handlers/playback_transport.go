@@ -243,11 +243,17 @@ func (h *PlaybackHandler) startLocalPlaybackTransportOnce(ctx context.Context, o
 		lastErr = errors.New("virtual transcode provider returned no usable stream")
 	}
 	// All attempts failed: conditionally clear the initial dead pin so future plays re-list
-	if replacer, ok := h.fileResolver.(interface {
-		ReplaceVirtualResultPin(context.Context, int, string, string) (bool, error)
-	}); ok && file != nil && file.ID > 0 && initialPinnedPath != "" {
+	if file != nil && file.ID > 0 {
 		unpinCtx, unpinCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-		_, _ = replacer.ReplaceVirtualResultPin(unpinCtx, file.ID, initialPinnedPath, neutralPath)
+		if replacer, ok := h.fileResolver.(interface {
+			ReplaceVirtualResultPin(context.Context, int, string, string) (bool, error)
+		}); ok && initialPinnedPath != "" {
+			_, _ = replacer.ReplaceVirtualResultPin(unpinCtx, file.ID, initialPinnedPath, neutralPath)
+		} else if cleaner, ok := h.fileResolver.(interface {
+			ClearVirtualResultPin(context.Context, int) error
+		}); ok {
+			_ = cleaner.ClearVirtualResultPin(unpinCtx, file.ID)
+		}
 		unpinCancel()
 	}
 	return nil, lastErr

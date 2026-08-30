@@ -1015,15 +1015,27 @@ func NewPlaybackHandler(
 		if !isCompatVirtualPath(canonicalPath) {
 			return "", nil, nil
 		}
-		if h.VirtualMediaResolver == nil || h.RemoteStreamRelay == nil {
+		if (h.VirtualMediaDetailedResolver == nil && h.VirtualMediaResolver == nil) || h.RemoteStreamRelay == nil {
 			return "", nil, errors.New("virtual playback reconstruction is not configured")
 		}
-		resolved, err := h.VirtualMediaResolver.ResolveVirtualMedia(ctx, canonicalPath, ownerInstallationID, userID, profileID)
-		if err != nil {
-			return "", nil, err
+		var resolved string
+		var headers map[string]string
+		var err error
+		if h.VirtualMediaDetailedResolver != nil {
+			res, dErr := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(ctx, canonicalPath, ownerInstallationID, userID, profileID, false, nil, "")
+			if dErr != nil {
+				return "", nil, dErr
+			}
+			resolved = res.URL
+			headers = res.RequestHeaders
+		} else {
+			resolved, err = h.VirtualMediaResolver.ResolveVirtualMedia(ctx, canonicalPath, ownerInstallationID, userID, profileID)
+			if err != nil {
+				return "", nil, err
+			}
 		}
 		insecure := h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(ownerInstallationID)
-		relayURL, cleanup, err := registerRemoteStreamInput(ctx, h.RemoteStreamRelay, resolved, insecure)
+		relayURL, cleanup, err := registerRemoteStreamInputWithHeaders(ctx, h.RemoteStreamRelay, resolved, headers, insecure)
 		if err != nil {
 			return "", nil, err
 		}

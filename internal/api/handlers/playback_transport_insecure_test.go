@@ -3,6 +3,8 @@ package handlers
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -185,7 +187,7 @@ func TestVirtualTranscodeNeutralResolutionFailureEvictsExactCandidate(t *testing
 	}
 }
 
-func TestVirtualTranscodeManifestFailureEvictsExactCandidate(t *testing.T) {
+func TestVirtualTranscodeStartupFailureEvictsExactCandidate(t *testing.T) {
 	tempDir := t.TempDir()
 	cache := NewVirtualBestResultCache(time.Minute, 10)
 	cacheKey := bestResultCacheKey("content-1", "virtual://series/tt1/1/1", 5)
@@ -211,6 +213,72 @@ func TestVirtualTranscodeManifestFailureEvictsExactCandidate(t *testing.T) {
 				return nil, errors.New("manifest startup failed")
 			}
 			return playback.NewReadyTranscodeSessionForTesting(tempDir, opts)
+		},
+	}
+	session, err := h.startLocalPlaybackTransportOnce(context.Background(), playback.TranscodeOpts{MediaFileID: 10, InputPath: "virtual://series/tt1/1/1?result=broken", VirtualSourceOwnerInstallationID: 5, SessionID: "manifest-exact-eviction", OutputDir: tempDir})
+	if err != nil {
+		t.Fatalf("startLocalPlaybackTransportOnce failed: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+	if len(attemptsExcluded) < 2 || len(attemptsExcluded[1]) != 1 || attemptsExcluded[1][0] != "broken" {
+		t.Fatalf("failed candidate was not excluded on retry: %#v", attemptsExcluded)
+	}
+	cached := cache.get(cacheKey, time.Now())
+	for _, candidate := range cached {
+		if candidate.URI == "virtual://series/tt1/1/1?result=broken" {
+			t.Fatalf("failed concrete candidate remained cached: %#v", cached)
+		}
+	}
+	foundLive := false
+	for _, candidate := range cached {
+		if candidate.URI == "virtual://series/tt1/1/1?result=live" {
+			foundLive = true
+		}
+	}
+	if !foundLive {
+		t.Fatalf("unrelated live candidate was removed: %#v", cached)
+	}
+}
+
+func TestVirtualTranscodeManifestFailureEvictsExactCandidate(t *testing.T) {
+	tempDir := t.TempDir()
+	cache := NewVirtualBestResultCache(time.Minute, 10)
+	cacheKey := bestResultCacheKey("content-1", "virtual://series/tt1/1/1", 5)
+	cache.set(cacheKey, []VirtualPlaybackStream{
+		{URI: "virtual://series/tt1/1/1?result=broken"},
+		{URI: "virtual://series/tt1/1/1?result=live"},
+	}, time.Now())
+	fileRes := &fakePinFileResolver{file: &models.MediaFile{ID: 10, ContentID: "content-1", FilePath: "virtual://series/tt1/1/1?result=broken", VirtualOwnerInstallationID: 5}}
+	attemptsExcluded := make([][]string, 0)
+	h := &PlaybackHandler{
+		BestResultCache: cache,
+		fileResolver:    fileRes,
+		sessionMgr:      playback.NewSessionManager(0, 0),
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, excluded []string, _ string) (ResolvedVirtualMedia, error) {
+			attemptsExcluded = append(attemptsExcluded, append([]string(nil), excluded...))
+			if len(excluded) == 0 {
+				return ResolvedVirtualMedia{URL: "http://localhost:8080/broken.mp4", URI: uri, CandidateID: "broken"}, nil
+			}
+			return ResolvedVirtualMedia{URL: "http://localhost:8080/live.mp4", URI: "virtual://series/tt1/1/1?result=live", CandidateID: "live"}, nil
+		}),
+		StartTranscodeFunc: func(_ context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+			dir := filepath.Join(tempDir, strings.TrimSuffix(filepath.Base(opts.InputPath), filepath.Ext(opts.InputPath)))
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return nil, err
+			}
+			opts.OutputDir = dir
+			if strings.Contains(opts.InputPath, "broken.mp4") {
+				opts.TargetCodecVideo = "copy"
+				session, err := playback.NewReadyTranscodeSessionForTesting(opts.OutputDir, opts)
+				if err != nil {
+					return nil, err
+				}
+				if err := os.WriteFile(filepath.Join(opts.OutputDir, "stream.m3u8"), []byte("#EXTM3U\n"), 0644); err != nil {
+					return nil, err
+				}
+				return session, nil
+			}
+			return playback.NewReadyTranscodeSessionForTesting(opts.OutputDir, opts)
 		},
 	}
 	session, err := h.startLocalPlaybackTransportOnce(context.Background(), playback.TranscodeOpts{MediaFileID: 10, InputPath: "virtual://series/tt1/1/1?result=broken", VirtualSourceOwnerInstallationID: 5, SessionID: "manifest-exact-eviction", OutputDir: tempDir})

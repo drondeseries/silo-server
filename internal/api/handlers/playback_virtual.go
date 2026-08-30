@@ -303,7 +303,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	// lets us skip the entire list+resolve+probe sequence on replay.
 	if noResult && h.BestResultCache != nil {
 		neutralURI := virtualPlaybackNeutralKey(file.FilePath)
-		cacheKey := bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID)
+		cacheKey := bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID, fingerprint)
 		if cached := h.BestResultCache.get(cacheKey, time.Now()); len(cached) > 0 {
 			// Cache holds the filtered, device-neutral candidate list; rank it
 			// for this device so a TV and a phone pick their own best stream
@@ -333,7 +333,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if filtered := filterVirtualPlaybackStreams(file, streams); len(filtered) > 0 {
 				if h.BestResultCache != nil {
 					neutralURI := virtualPlaybackNeutralKey(file.FilePath)
-					h.BestResultCache.set(bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID), filtered, time.Now())
+					h.BestResultCache.set(bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID, fingerprint), filtered, time.Now())
 				}
 				candidates, _ = h.rankVirtualCandidatesForDevice(r, filtered)
 			}

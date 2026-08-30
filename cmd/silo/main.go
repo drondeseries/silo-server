@@ -3022,7 +3022,20 @@ func main() {
 				}
 				out := make([]jellycompat.VirtualPlaybackStream, 0, len(streams))
 				for _, stream := range streams {
-					out = append(out, jellycompat.VirtualPlaybackStream{URI: stream.URI, Label: stream.Label, OwnerInstallationID: stream.OwnerInstallationID})
+					out = append(out, jellycompat.VirtualPlaybackStream{
+						URI:                 stream.URI,
+						Label:               stream.Label,
+						Resolution:          stream.Resolution,
+						CodecVideo:          stream.CodecVideo,
+						CodecAudio:          stream.CodecAudio,
+						HDR:                 stream.HDR,
+						Container:           stream.Container,
+						FileSize:            stream.FileSize,
+						Bitrate:             stream.Bitrate,
+						AudioLanguages:      stream.AudioLanguages,
+						SubtitleLanguages:   stream.SubtitleLanguages,
+						OwnerInstallationID: stream.OwnerInstallationID,
+					})
 				}
 				return out, nil
 			})

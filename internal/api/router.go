@@ -1278,7 +1278,7 @@ func NewRouter(deps Dependencies) chi.Router {
 				streamHandler.MissingMarker = deps.FileRepo
 			}
 		}
-		if deps.FileRepo != nil && playbackHandler.VirtualMediaResolver != nil {
+		if deps.FileRepo != nil && (playbackHandler.VirtualMediaDetailedResolver != nil || playbackHandler.VirtualMediaResolver != nil) {
 			playbackHandler.TranscodeManager().ResolveInput = func(ctx context.Context, mediaFileID int, ownerInstallationID int, userID int, profileID string, canonicalPath string) (string, func(), error) {
 				if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(canonicalPath)), "virtual://") {
 					return canonicalPath, nil, nil
@@ -1291,7 +1291,17 @@ func NewRouter(deps Dependencies) chi.Router {
 					ownerInstallationID = file.VirtualOwnerInstallationID
 				}
 				var resolved string
-				if playbackHandler.VirtualMediaRefreshResolver != nil {
+				var headers map[string]string
+				if playbackHandler.VirtualMediaDetailedResolver != nil {
+					res, dErr := playbackHandler.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+						ctx, canonicalPath, ownerInstallationID, userID, profileID, false, nil, "",
+					)
+					if dErr != nil {
+						return "", nil, dErr
+					}
+					resolved = res.StreamURL
+					headers = res.RequestHeaders
+				} else if playbackHandler.VirtualMediaRefreshResolver != nil {
 					resolved, err = playbackHandler.VirtualMediaRefreshResolver.RefreshVirtualMedia(
 						ctx, canonicalPath, ownerInstallationID, userID, profileID,
 					)
@@ -1311,7 +1321,17 @@ func NewRouter(deps Dependencies) chi.Router {
 				}
 				var relayURL string
 				var cleanup func()
-				if deps.PluginService != nil && deps.PluginService.InstallationAllowsInsecure(context.Background(), ownerInstallationID) {
+				insecure := deps.PluginService != nil && deps.PluginService.InstallationAllowsInsecure(context.Background(), ownerInstallationID)
+				if hr, ok := remoteStreamRelay.(interface {
+					RegisterWithHeaders(context.Context, string, map[string]string) (string, func(), error)
+					RegisterInsecureWithHeaders(context.Context, string, map[string]string) (string, func(), error)
+				}); ok {
+					if insecure {
+						relayURL, cleanup, err = hr.RegisterInsecureWithHeaders(ctx, resolved, headers)
+					} else {
+						relayURL, cleanup, err = hr.RegisterWithHeaders(ctx, resolved, headers)
+					}
+				} else if insecure {
 					relayURL, cleanup, err = remoteStreamRelay.RegisterInsecure(ctx, resolved)
 				} else {
 					relayURL, cleanup, err = remoteStreamRelay.Register(ctx, resolved)

@@ -548,11 +548,6 @@ func putVirtualExternalID(ids map[string]string, raw, defaultProvider string) {
 	ids[provider] = value
 }
 
-//nolint:unused // Retained for compatibility with dormant integration paths.
-func isTestStreamURL(raw string) bool {
-	return strings.Contains(raw, "example") || strings.Contains(raw, "127.0.0.1") || strings.Contains(raw, "1.1.1.1") || strings.Contains(raw, "8.8.8.8")
-}
-
 func boundedQueryValue(value string) string {
 	value = strings.TrimSpace(value)
 	if len(value) > maxVirtualLabelLen {
