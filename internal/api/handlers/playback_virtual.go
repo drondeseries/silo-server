@@ -316,7 +316,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	if (noResult || needsCandidateMetadata) && h.VirtualPlaybackStreamLister != nil {
 		// Candidate listing is part of the startup critical path. Keep it
 		// bounded so the first-byte SLA cannot be defeated before resolution.
-		listCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 15*time.Second)
+		listCtx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		streams, err := h.VirtualPlaybackStreamLister.ListVirtualPlaybackStreams(
 			listCtx, file.FilePath, userID, profileID, file.VirtualOwnerInstallationID,
 		)
@@ -346,7 +346,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	if len(candidates) > maxAttempts {
 		candidates = candidates[:maxAttempts]
 	}
-	attemptCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), virtualStartupBudget)
+	attemptCtx, cancel := context.WithTimeout(r.Context(), virtualStartupBudget)
 	defer cancel()
 
 	resolveAndProbe := func(i int, cand VirtualPlaybackStream) (*resolvedVirtualPlaybackSource, error) {
@@ -514,14 +514,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if result.File != nil && result.File.ID > 0 {
 				targetID = result.File.ID
 			}
-			if h.VirtualFileMetadataSaver != nil && result.File != nil && targetID > 0 {
-				videoJSON := marshalTracksJSON(sanitizeTrackSlice(result.File.VideoTracks))
-				audioJSON := marshalTracksJSON(sanitizeTrackSlice(result.File.AudioTracks))
-				subJSON := marshalTracksJSON(sanitizeTrackSlice(result.File.SubtitleTracks))
-				if err := h.VirtualFileMetadataSaver(r.Context(), targetID, videoJSON, audioJSON, subJSON, result.File.Resolution, result.File.CodecVideo, result.File.CodecAudio, result.File.Container, result.File.HDR, result.File.Bitrate, result.File.Duration); err != nil {
-					slog.ErrorContext(r.Context(), "virtual metadata persist failed", "component", "api", "file_id", targetID, "error", err)
-				}
-			}
+			h.persistVirtualMetadataBounded(r.Context(), targetID, result.File)
 			// The filtered candidate list is already cached device-neutrally
 			// above (and ranked for this device), so replays skip the provider
 			// round-trip and re-rank for the requesting device. Pin this URI
@@ -542,14 +535,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if firstResolved.File != nil && firstResolved.File.ID > 0 {
 			targetID = firstResolved.File.ID
 		}
-		if h.VirtualFileMetadataSaver != nil && firstResolved.File != nil && targetID > 0 {
-			videoJSON := marshalTracksJSON(sanitizeTrackSlice(firstResolved.File.VideoTracks))
-			audioJSON := marshalTracksJSON(sanitizeTrackSlice(firstResolved.File.AudioTracks))
-			subJSON := marshalTracksJSON(sanitizeTrackSlice(firstResolved.File.SubtitleTracks))
-			if err := h.VirtualFileMetadataSaver(r.Context(), targetID, videoJSON, audioJSON, subJSON, firstResolved.File.Resolution, firstResolved.File.CodecVideo, firstResolved.File.CodecAudio, firstResolved.File.Container, firstResolved.File.HDR, firstResolved.File.Bitrate, firstResolved.File.Duration); err != nil {
-				slog.ErrorContext(r.Context(), "virtual candidate metadata persist failed", "component", "api", "file_id", targetID, "error", err)
-			}
-		}
+		h.persistVirtualMetadataBounded(r.Context(), targetID, firstResolved.File)
 		return *firstResolved, nil
 	}
 	if attemptErr == nil {
@@ -565,6 +551,23 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		return *fb, nil
 	}
 	return resolvedVirtualPlaybackSource{}, attemptErr
+}
+
+func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, targetID int, file *models.MediaFile) {
+	if h == nil || h.VirtualFileMetadataSaver == nil || file == nil || targetID <= 0 {
+		return
+	}
+	videoJSON := marshalTracksJSON(sanitizeTrackSlice(file.VideoTracks))
+	audioJSON := marshalTracksJSON(sanitizeTrackSlice(file.AudioTracks))
+	subJSON := marshalTracksJSON(sanitizeTrackSlice(file.SubtitleTracks))
+	res, vCodec, aCodec, container, hdr, bitrate, duration := file.Resolution, file.CodecVideo, file.CodecAudio, file.Container, file.HDR, file.Bitrate, file.Duration
+	go func() {
+		persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer persistCancel()
+		if err := h.VirtualFileMetadataSaver(persistCtx, targetID, videoJSON, audioJSON, subJSON, res, vCodec, aCodec, container, hdr, bitrate, duration); err != nil {
+			slog.ErrorContext(persistCtx, "virtual metadata persist failed", "component", "api", "file_id", targetID, "error", err)
+		}
+	}()
 }
 
 // applyVirtualStreamEvidence backfills the content-keyed aggregate evidence

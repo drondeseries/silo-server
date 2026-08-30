@@ -64,7 +64,8 @@ type StreamHandler struct {
 	S3Bucket      string               // bucket for subtitle storage
 	// VirtualMediaResolver resolves virtual:// URIs to a real provider URL.
 	// Required for embedded subtitle extraction from virtual sources.
-	VirtualMediaResolver VirtualMediaResolver
+	VirtualMediaResolver         VirtualMediaResolver
+	VirtualMediaDetailedResolver VirtualMediaDetailedResolver
 	// RemoteStreamRelay pins the resolved provider URL to a loopback relay
 	// so ffmpeg reads through it with a stable IP.
 	RemoteStreamRelay *remotestream.Relay
@@ -81,31 +82,50 @@ func (h *StreamHandler) ffmpegPath() string {
 	return ""
 }
 
-// resolveVirtualInputURI resolves a virtual:// file path to a relay URL that
-// ffmpeg can open. Virtual sources are provider-neutral URIs, not FFmpeg
-// inputs, so embedded subtitle extraction must resolve through the relay
-// before spawning ffmpeg — otherwise ffprobe fails on a "Protocol not found"
-// error.
+// bindSessionVirtualSource returns a copy of a virtual file bound to the
+// provider-neutral source captured by the playback session.
+func bindSessionVirtualSource(file *models.MediaFile, session *playback.Session) *models.MediaFile {
+	if file == nil || session == nil || session.VirtualSourceURI == "" || !isVirtualPlaybackFile(file) {
+		return file
+	}
+	bound := *file
+	bound.FilePath = session.VirtualSourceURI
+	bound.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
+	return &bound
+}
+
+func hasVirtualMediaResolver(h *StreamHandler) bool {
+	return h != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil)
+}
+
 func (h *StreamHandler) resolveVirtualInputURI(
 	ctx context.Context,
 	file *models.MediaFile,
 	userID int,
 	profileID string,
 ) (string, func(), error) {
-	inputPath, err := resolveVirtualMediaPath(
-		ctx, h.VirtualMediaResolver, file.FilePath,
-		file.VirtualOwnerInstallationID, userID, profileID,
-	)
+	resolved := ResolvedVirtualMedia{URI: file.FilePath}
+	var err error
+	if h.VirtualMediaDetailedResolver != nil {
+		resolved, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+			ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, false, nil, "",
+		)
+	} else {
+		resolved.URL, err = resolveVirtualMediaPath(
+			ctx, h.VirtualMediaResolver, file.FilePath,
+			file.VirtualOwnerInstallationID, userID, profileID,
+		)
+	}
 	if err != nil {
 		return "", nil, fmt.Errorf("resolve virtual input: %w", err)
 	}
 	if h.RemoteStreamRelay == nil {
-		return inputPath, nil, nil
+		return resolved.URL, func() {}, nil
 	}
 	if h.AllowInsecureVirtual != nil && h.AllowInsecureVirtual(file.VirtualOwnerInstallationID) {
-		return h.RemoteStreamRelay.RegisterInsecure(ctx, inputPath)
+		return h.RemoteStreamRelay.RegisterInsecureWithHeaders(ctx, resolved.URL, resolved.RequestHeaders)
 	}
-	return h.RemoteStreamRelay.Register(ctx, inputPath)
+	return h.RemoteStreamRelay.RegisterWithHeaders(ctx, resolved.URL, resolved.RequestHeaders)
 }
 
 // NewStreamHandler creates a new StreamHandler backed by the given session
@@ -185,13 +205,11 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	// Bind to the session's planned virtual URI when available: the catalog
 	// row's path is mutable (candidate rotation), but the session captured
 	// the exact URI that was resolved and probed during planning.
-	if session.VirtualSourceURI != "" && isVirtualPlaybackFile(file) {
-		file.FilePath = session.VirtualSourceURI
-	}
+	file = bindSessionVirtualSource(file, session)
 
 	inputPath := file.FilePath
 	releaseInput := func() {}
-	if isVirtualPlaybackFile(file) && h.VirtualMediaResolver != nil {
+	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID)
 		if resolveErr != nil {
 			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
@@ -200,7 +218,11 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		inputPath = resolved
 		releaseInput = cleanup
 	}
-	defer releaseInput()
+	defer func() {
+		if releaseInput != nil {
+			releaseInput()
+		}
+	}()
 
 	switch session.PlayMethod {
 	case playback.PlayDirect:
@@ -209,24 +231,40 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				_ = h.sessionMgr.EndTransport(sessionID)
 			}()
 		}
-		if isVirtualPlaybackFile(file) && strings.HasPrefix(inputPath, "http://") {
+		if isVirtualPlaybackFile(file) {
 			targetURL, err := url.Parse(inputPath)
+			if err == nil && targetURL.Scheme != "http" {
+				err = fmt.Errorf("unsupported virtual stream scheme %q", targetURL.Scheme)
+			}
 			if err != nil {
 				h.handleTransportStartFailure(r.Context(), session, file, err)
+				writeError(w, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source")
 				return
 			}
 			// This proxy forwards client headers to the target by design; that
 			// is only safe because virtual inputs always resolve to the local
 			// relay. Assert the invariant rather than trusting every caller.
-			if host := targetURL.Hostname(); host != "127.0.0.1" && host != "::1" && host != "[::1]" {
+			host := targetURL.Hostname()
+			if host != "127.0.0.1" && host != "::1" && host != "[::1]" {
 				err := fmt.Errorf("virtual direct-play proxy target %q is not the local relay", targetURL.Host)
 				h.handleTransportStartFailure(r.Context(), session, file, err)
+				writeError(w, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source")
 				return
 			}
 			proxy := &httputil.ReverseProxy{
 				Rewrite: func(pr *httputil.ProxyRequest) {
-					pr.SetURL(targetURL)
+					pr.Out.URL = targetURL
 					pr.Out.Host = targetURL.Host
+				},
+				ModifyResponse: func(res *http.Response) error {
+					if res.StatusCode >= http.StatusInternalServerError {
+						return fmt.Errorf("relay returned HTTP %d", res.StatusCode)
+					}
+					return nil
+				},
+				ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
+					h.handleTransportStartFailure(req.Context(), session, file, proxyErr)
+					writeError(rw, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source")
 				},
 			}
 			proxy.ServeHTTP(w, r)
@@ -325,9 +363,7 @@ func (h *StreamHandler) HandleSubtitle(w http.ResponseWriter, r *http.Request) {
 	// session captured the exact URI that was resolved and probed during
 	// planning. Extracting from a different row would silently switch the
 	// source under an in-flight play.
-	if session.VirtualSourceURI != "" && isVirtualPlaybackFile(file) {
-		file.FilePath = session.VirtualSourceURI
-	}
+	file = bindSessionVirtualSource(file, session)
 
 	// trackIndex is a combined ordinal, resolved through the same three
 	// consecutive ranges playback.BuildSubtitleInventoryV3 assigns them from:
@@ -625,7 +661,8 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 
 	inputPath := file.FilePath
 	releaseInput := func() {}
-	if isVirtualPlaybackFile(file) && h.VirtualMediaResolver != nil {
+	file = bindSessionVirtualSource(file, session)
+	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 		inputPath, releaseInput, err = h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "virtual_resolve_failed", "Failed to resolve virtual source")
@@ -767,7 +804,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// spawns its own ffmpeg independent of the video pipeline, so it must
 	// resolve separately even though the transcode transport already did.
 	releaseInput := func() {}
-	if isVirtualPlaybackFile(file) && h.VirtualMediaResolver != nil && h.RemoteStreamRelay != nil {
+	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) && h.RemoteStreamRelay != nil {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID)
 		if resolveErr != nil {
 			writeError(w, http.StatusBadGateway, "virtual_resolve_failed",

@@ -5592,6 +5592,9 @@ func TestHandleReplanPlaybackV3RehydratesPinnedVirtualSourceBeforePlanning(t *te
 	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
 		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
 	}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"mp4"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
 	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
 	degraded := &models.MediaFile{ID: complete.ID, FilePath: complete.FilePath, Container: "virtual", VirtualOwnerInstallationID: 5}
 	files[complete.ID] = degraded
@@ -5599,7 +5602,7 @@ func TestHandleReplanPlaybackV3RehydratesPinnedVirtualSourceBeforePlanning(t *te
 	failedKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
 	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
 		ProtocolVersion:       playback.ProtocolV3,
-		Operation:             playback.ReplanOperationQualityChangeV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
 		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
 		ReplanRequestID:       "replan-virtual-hydrate-0001",
 		FailedPlanID:          started.PlaybackPlan.PlanID,
@@ -5609,7 +5612,7 @@ func TestHandleReplanPlaybackV3RehydratesPinnedVirtualSourceBeforePlanning(t *te
 		AttemptCount:          1,
 		QualityPreference:     "auto",
 		PositionSeconds:       12,
-		Failure:               playback.FailureV3{},
+		Failure:               playback.FailureV3{Classification: "playback_error"},
 		Capabilities:          startRequest.Capabilities,
 		ClientPlaybackContext: startRequest.ClientPlaybackContext,
 	})
@@ -6295,8 +6298,9 @@ func TestHandleReplanPlaybackV3ExhaustivelyTriesVirtualAlternatesOnFailureRecove
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
 	handler.PlaybackConfig = playbackTestConfig("", "")
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	failPinned := false
 	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
-		if strings.Contains(path, "replan-alt-broken") {
+		if strings.Contains(path, "replan-alt-broken") || (failPinned && strings.Contains(path, "replan-source-300")) {
 			return "", errors.New("resolution failed for broken candidate")
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
@@ -6319,6 +6323,7 @@ func TestHandleReplanPlaybackV3ExhaustivelyTriesVirtualAlternatesOnFailureRecove
 	if startRR.Code != http.StatusCreated || json.Unmarshal(startRR.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
 		t.Fatalf("start status=%d body=%s", startRR.Code, startRR.Body.String())
 	}
+	failPinned = true
 
 	replanCapabilities := startRequest.Capabilities
 	replanCapabilities.CodecsVideo = []string{"hevc"}
@@ -6348,6 +6353,313 @@ func TestHandleReplanPlaybackV3ExhaustivelyTriesVirtualAlternatesOnFailureRecove
 	}
 	if replanned.PlaybackPlan.RequestedMediaFileID != source.ID {
 		t.Fatalf("requested file = %d, want original source %d", replanned.PlaybackPlan.RequestedMediaFileID, source.ID)
+	}
+}
+
+func TestHandleReplanPlaybackV3VirtualRehydrationAllAlternatesFailReturnsVirtualSourceUnavailable(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 310
+	source.FilePath = "virtual://movie/replan-source-310"
+	source.VirtualOwnerInstallationID = 5
+
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: map[int]*models.MediaFile{source.ID: source}})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	failPinned := false
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		if failPinned && strings.Contains(path, "replan-source-310") {
+			return "", errors.New("provider stream permanently down")
+		}
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = source.ID
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	failPinned = true
+
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	replanReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "virtual-exhaust-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "virtual-plan-exhaust-0001",
+		PlanAttemptKey:        currentKey,
+		AttemptedPlanKeys:     []string{currentKey},
+		AttemptCount:          1,
+		QualityPreference:     "auto",
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "playback_error"},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	response := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+	if response.Terminal == nil || response.Terminal.Reason != "virtual_source_unavailable" || !response.Terminal.Retryable {
+		t.Fatalf("expected retryable virtual_source_unavailable terminal, got %#v", response)
+	}
+
+	record, err := handler.PlanStoreV3.GetAttempt(context.Background(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.CurrentReplanRequestID != replanReq.ReplanRequestID {
+		t.Fatalf("current replan request id = %q, want %q", record.CurrentReplanRequestID, replanReq.ReplanRequestID)
+	}
+
+	replayed := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+	if replayed.Terminal == nil || replayed.Terminal.Reason != "virtual_source_unavailable" {
+		t.Fatalf("idempotent replay failed, got %#v", replayed)
+	}
+}
+
+func TestHandleReplanPlaybackV3VirtualRehydrationDeadlineExceededReturnsTimeout(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 320
+	source.FilePath = "virtual://movie/replan-source-320"
+	source.VirtualOwnerInstallationID = 5
+
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: map[int]*models.MediaFile{source.ID: source}})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	timeoutPinned := false
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		if timeoutPinned {
+			return "", context.DeadlineExceeded
+		}
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = source.ID
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	timeoutPinned = true
+
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	replanReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "virtual-timeout-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "virtual-plan-timeout-0001",
+		PlanAttemptKey:        currentKey,
+		AttemptedPlanKeys:     []string{currentKey},
+		AttemptCount:          1,
+		QualityPreference:     "auto",
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "playback_error"},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	response := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+	if response.Terminal == nil || response.Terminal.Reason != "replan_virtual_input_timeout" || !response.Terminal.Retryable {
+		t.Fatalf("expected retryable replan_virtual_input_timeout terminal, got %#v", response)
+	}
+}
+
+func TestHandleReplanPlaybackV3VirtualRehydrationFirstAlternateFailsPlanningSecondSucceeds(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 330
+	source.Resolution = "2160p"
+	source.FilePath = "virtual://movie/source-330"
+	source.VirtualOwnerInstallationID = 5
+
+	altIncompatible := *source
+	altIncompatible.ID = 331
+	altIncompatible.Resolution = "1080p"
+	altIncompatible.FilePath = "virtual://movie/alt-incompatible-331"
+	altIncompatible.CodecVideo = "av1"
+	altIncompatible.VideoTracks = []models.VideoTrack{{
+		Codec: "av1", Profile: "main", Width: 1920, Height: 1080,
+	}}
+
+	altPlayable := *source
+	altPlayable.ID = 332
+	altPlayable.Resolution = "1080p"
+	altPlayable.FilePath = "virtual://movie/alt-playable-332"
+	altPlayable.CodecVideo = "h264"
+	altPlayable.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080,
+	}}
+
+	manager := playback.NewSessionManager(0, 0)
+	files := map[int]*models.MediaFile{source.ID: source, altIncompatible.ID: &altIncompatible, altPlayable.ID: &altPlayable}
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, &altIncompatible, &altPlayable},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	failPinned := false
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		if failPinned && strings.Contains(path, "source-330") {
+			return "", errors.New("source offline")
+		}
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = source.ID
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	failPinned = true
+
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	replanReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "virtual-plan-fail-pass-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "virtual-plan-fail-pass-0001",
+		PlanAttemptKey:        currentKey,
+		AttemptedPlanKeys:     []string{currentKey},
+		AttemptCount:          1,
+		QualityPreference:     "auto",
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "playback_error"},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	response := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("expected successful plan on second alternate, got response=%#v terminal=%#v", response, response.Terminal)
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != altPlayable.ID {
+		t.Fatalf("effective file = %d, want playable alternate %d", response.PlaybackPlan.EffectiveMediaFileID, altPlayable.ID)
+	}
+}
+
+func TestHandleReplanPlaybackV3VirtualRehydrationOriginalQualityAllowsAlternate(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 340
+	source.FilePath = "virtual://movie/source-340"
+	source.VirtualOwnerInstallationID = 5
+
+	alt := *source
+	alt.ID = 341
+	alt.FilePath = "virtual://movie/alt-341"
+
+	manager := playback.NewSessionManager(0, 0)
+	files := map[int]*models.MediaFile{source.ID: source, alt.ID: &alt}
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, &alt},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	failPinned := false
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		if failPinned && strings.Contains(path, "source-340") {
+			return "", errors.New("source offline")
+		}
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = source.ID
+	startRequest.QualityPreference = "original"
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	failPinned = true
+
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	replanReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "virtual-orig-quality-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "virtual-orig-quality-0001",
+		PlanAttemptKey:        currentKey,
+		AttemptedPlanKeys:     []string{currentKey},
+		AttemptCount:          1,
+		QualityPreference:     "original",
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "playback_error"},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	response := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("expected successful plan on alternate despite original quality, got %#v", response)
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != alt.ID {
+		t.Fatalf("effective file = %d, want alternate %d", response.PlaybackPlan.EffectiveMediaFileID, alt.ID)
+	}
+}
+
+func TestHandleReplanPlaybackV3VirtualRehydrationSeekRecoveryPinsCurrentVersion(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 350
+	source.FilePath = "virtual://movie/source-350"
+	source.VirtualOwnerInstallationID = 5
+
+	alt := *source
+	alt.ID = 351
+	alt.FilePath = "virtual://movie/alt-351"
+
+	manager := playback.NewSessionManager(0, 0)
+	files := map[int]*models.MediaFile{source.ID: source, alt.ID: &alt}
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, &alt},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	failPinned := false
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		if failPinned && strings.Contains(path, "source-350") {
+			return "", errors.New("source offline")
+		}
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = source.ID
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	failPinned = true
+
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	for _, op := range []playback.ReplanOperationV3{playback.ReplanOperationSeekReanchorV3, playback.ReplanOperationSeekFailureRecoveryV3} {
+		failure := playback.FailureV3{Classification: "playback_error"}
+		if op == playback.ReplanOperationSeekReanchorV3 {
+			failure = playback.FailureV3{}
+		}
+		replanReq := playback.ReplanRequestV3{
+			ProtocolVersion:       playback.ProtocolV3,
+			Operation:             op,
+			PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+			ReplanRequestID:       "virtual-seek-pinned-0001-" + string(op),
+			FailedPlanID:          started.PlaybackPlan.PlanID,
+			PlanAttemptID:         "virtual-seek-pinned-0001",
+			PlanAttemptKey:        currentKey,
+			AttemptedPlanKeys:     []string{currentKey},
+			AttemptCount:          1,
+			QualityPreference:     startRequest.QualityPreference,
+			PositionSeconds:       10,
+			SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+			Failure:               failure,
+			Capabilities:          startRequest.Capabilities,
+			ClientPlaybackContext: startRequest.ClientPlaybackContext,
+		}
+		response := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+		if response.Terminal == nil || (response.Terminal.Reason != "virtual_source_unavailable" && response.Terminal.Reason != "source_unavailable") {
+			t.Fatalf("seek operation %q should have produced source unavailable terminal, got reason=%q terminal=%#v", op, response.Terminal.Reason, response.Terminal)
+		}
 	}
 }
 
@@ -6470,6 +6782,406 @@ func TestHandleStartPlaybackV3SubtitleRemapFailurePreservesOriginalSelectionForL
 	}
 	if response.PlaybackPlan.RequestedMediaFileID != source.ID {
 		t.Fatalf("requested file = %d, want original source %d", response.PlaybackPlan.RequestedMediaFileID, source.ID)
+	}
+}
+
+func TestHandleReplanPlaybackV3VirtualFirstAlternateTransportFailsSecondSucceeds(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 450
+	source.Container = "mkv"
+	source.FilePath = "virtual://movie/source-450"
+	source.VirtualOwnerInstallationID = 5
+
+	altTransportFails := *source
+	altTransportFails.ID = 451
+	altTransportFails.Container = "mkv"
+	altTransportFails.FilePath = "virtual://movie/alt-fail-451"
+
+	altTransportSucceeds := *source
+	altTransportSucceeds.ID = 452
+	altTransportSucceeds.Container = "mkv"
+	altTransportSucceeds.FilePath = "virtual://movie/alt-success-452"
+
+	manager := playback.NewSessionManager(0, 0)
+	files := map[int]*models.MediaFile{source.ID: source, altTransportFails.ID: &altTransportFails, altTransportSucceeds.ID: &altTransportSucceeds}
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, &altTransportFails, &altTransportSucceeds},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	failPinned := false
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		if failPinned && strings.Contains(path, "source-450") {
+			return "", errors.New("source offline")
+		}
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	handler.copySeekAnchor = func(_ context.Context, _ string, input string, requested float64, _ int) (float64, int, error) {
+		if strings.Contains(input, "alt-fail-451") {
+			return 0, 0, errors.New("seek anchor extraction failed for alt 451")
+		}
+		return requested, 0, nil
+	}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = source.ID
+	startRequest.StartPosition = new(float64)
+	*startRequest.StartPosition = 10.0
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"mp4"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	failPinned = true
+
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	replanReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "virtual-transport-fail-pass-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "virtual-transport-fail-pass-0001",
+		PlanAttemptKey:        currentKey,
+		AttemptedPlanKeys:     []string{currentKey},
+		AttemptCount:          1,
+		QualityPreference:     "auto",
+		PositionSeconds:       10.0,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "playback_error"},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	response := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("expected successful plan on second alternate after first failed transport, got response=%#v terminal=%#v", response, response.Terminal)
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != altTransportSucceeds.ID {
+		t.Fatalf("effective file = %d, want second alternate %d", response.PlaybackPlan.EffectiveMediaFileID, altTransportSucceeds.ID)
+	}
+}
+
+func TestHandleReplanPlaybackV3VirtualAllAlternateTransportsFail(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 460
+	source.Container = "mkv"
+	source.FilePath = "virtual://movie/source-460"
+	source.VirtualOwnerInstallationID = 5
+
+	alt1 := *source
+	alt1.ID = 461
+	alt1.Container = "mkv"
+	alt1.FilePath = "virtual://movie/alt-fail-461"
+
+	alt2 := *source
+	alt2.ID = 462
+	alt2.Container = "mkv"
+	alt2.FilePath = "virtual://movie/alt-fail-462"
+
+	manager := playback.NewSessionManager(0, 0)
+	files := map[int]*models.MediaFile{source.ID: source, alt1.ID: &alt1, alt2.ID: &alt2}
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, &alt1, &alt2},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	failPinned := false
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		if failPinned && strings.Contains(path, "source-460") {
+			return "", errors.New("source offline")
+		}
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	handler.copySeekAnchor = func(_ context.Context, _ string, input string, requested float64, _ int) (float64, int, error) {
+		if failPinned {
+			return 0, 0, errors.New("all seek anchors failed")
+		}
+		return requested, 0, nil
+	}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = source.ID
+	startRequest.StartPosition = new(float64)
+	*startRequest.StartPosition = 10.0
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"mp4"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	failPinned = true
+
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	replanReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "virtual-all-transports-fail-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "virtual-all-transports-fail-0001",
+		PlanAttemptKey:        currentKey,
+		AttemptedPlanKeys:     []string{currentKey},
+		AttemptCount:          1,
+		QualityPreference:     "auto",
+		PositionSeconds:       10.0,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "playback_error"},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	response := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+	if response.Terminal == nil || response.Terminal.Reason != transcodeStartFailedReasonV3 || !response.Terminal.Retryable {
+		t.Fatalf("expected retryable %s terminal, got %#v", transcodeStartFailedReasonV3, response)
+	}
+
+	replayed := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+	if replayed.Terminal == nil || replayed.Terminal.Reason != transcodeStartFailedReasonV3 {
+		t.Fatalf("idempotent replay failed, got %#v", replayed)
+	}
+}
+
+func TestHandleReplanPlaybackV3TerminalAllowsAlternateFirstFailsTransportSecondSucceeds(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 470
+	source.Resolution = "2160p"
+	source.CodecVideo = "h264"
+	source.Container = "mp4"
+	source.FilePath = "virtual://movie/source-470"
+	source.VirtualOwnerInstallationID = 5
+	source.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 51, Width: 3840, Height: 2160,
+	}}
+
+	alt1 := *source
+	alt1.ID = 471
+	alt1.Resolution = "1080p"
+	alt1.CodecVideo = "h264"
+	alt1.Container = "mkv"
+	alt1.FilePath = "virtual://movie/alt-fail-471"
+	alt1.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080,
+	}}
+
+	alt2 := *source
+	alt2.ID = 472
+	alt2.Resolution = "1080p"
+	alt2.CodecVideo = "h264"
+	alt2.Container = "mkv"
+	alt2.FilePath = "virtual://movie/alt-success-472"
+	alt2.VideoTracks = []models.VideoTrack{{
+		Codec: "h264", Profile: "high", Level: 41, Width: 1920, Height: 1080,
+	}}
+
+	manager := playback.NewSessionManager(0, 0)
+	files := map[int]*models.MediaFile{source.ID: source, alt1.ID: &alt1, alt2.ID: &alt2}
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, &alt1, &alt2},
+	}}
+	// Disallow 4K transcode so 4K source produces a terminal allowing alternate fallback
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	var alt1Tried, alt2Tried bool
+	handler.copySeekAnchor = func(_ context.Context, _ string, input string, requested float64, _ int) (float64, int, error) {
+		if strings.Contains(input, "alt-fail-471") {
+			alt1Tried = true
+			return 0, 0, errors.New("seek anchor extraction failed for alt 471")
+		}
+		if strings.Contains(input, "alt-success-472") {
+			alt2Tried = true
+			return requested, 0, nil
+		}
+		return requested, 0, nil
+	}
+
+	// Start playback on 4K source initially with 4K capabilities
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = source.ID
+	startRequest.Capabilities.MaxResolution = "2160p"
+	startRequest.Capabilities.VideoDecode[0].Levels = []int{52}
+	startRequest.Capabilities.VideoDecode[0].MaxWidth = 3840
+	startRequest.Capabilities.VideoDecode[0].MaxHeight = 2160
+	startRequest.Capabilities.VideoDecode[0].MaxBitrateKbps = 50_000
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"mp4"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	replanCaps := startRequest.Capabilities
+	replanCaps.MaxResolution = "1080p"
+	replanCaps.VideoDecode[0].Levels = []int{41}
+	replanCaps.VideoDecode[0].MaxWidth = 1920
+	replanCaps.VideoDecode[0].MaxHeight = 1080
+	replanContext := startRequest.ClientPlaybackContext
+	replanContext.Deliveries = make(map[string]playback.DeliveryCapabilityV3)
+	for k, v := range startRequest.ClientPlaybackContext.Deliveries {
+		replanContext.Deliveries[k] = v
+	}
+	replanContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	replanContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"mp4"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	replanReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationQualityChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "terminal-alt-transport-fail-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "terminal-alt-transport-fail-0001",
+		PlanAttemptKey:        currentKey,
+		AttemptedPlanKeys:     []string{currentKey},
+		AttemptCount:          1,
+		QualityPreference:     "1080p",
+		PositionSeconds:       10.0,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Capabilities:          replanCaps,
+		ClientPlaybackContext: replanContext,
+	}
+	response := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("expected successful plan on alt2 after alt1 failed transport, got response=%#v terminal=%#v", response, response.Terminal)
+	}
+	if !alt1Tried {
+		t.Fatal("alt1 transport preparation was not attempted before fallback")
+	}
+	if !alt2Tried {
+		t.Fatal("alt2 transport preparation was not attempted")
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != alt2.ID {
+		t.Fatalf("effective file = %d, want second alternate %d", response.PlaybackPlan.EffectiveMediaFileID, alt2.ID)
+	}
+}
+
+type failSubtitleRepoForFileID struct {
+	subtitles.Repository
+	failMediaFileID int
+}
+
+func (r failSubtitleRepoForFileID) GetDownloadedSubtitle(ctx context.Context, id int) (*subtitles.DownloadedSubtitle, error) {
+	if r.failMediaFileID > 0 && id == r.failMediaFileID {
+		return nil, errors.New("downloaded subtitle store error for failed file")
+	}
+	return &subtitles.DownloadedSubtitle{ID: id, MediaFileID: id, Language: "eng", Format: "srt"}, nil
+}
+
+func (r failSubtitleRepoForFileID) ListDownloadedSubtitles(ctx context.Context, mediaFileID int) ([]subtitles.DownloadedSubtitle, error) {
+	return []subtitles.DownloadedSubtitle{{
+		ID:          mediaFileID,
+		MediaFileID: mediaFileID,
+		Language:    "eng",
+		Format:      "srt",
+	}}, nil
+}
+
+func TestHandleReplanPlaybackV3RollsBackAllocatedTransportOnSubtitleArtifactFailure(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 480
+	source.Container = "mkv"
+	source.FilePath = "virtual://movie/source-480"
+	source.VirtualOwnerInstallationID = 5
+	source.ExternalSubtitles = nil
+	source.SubtitleTracks = nil
+
+	alt1 := *source
+	alt1.ID = 481
+	alt1.Container = "mkv"
+	alt1.FilePath = "virtual://movie/alt-fail-sub-481"
+	alt1.ExternalSubtitles = nil
+	alt1.SubtitleTracks = nil
+
+	alt2 := *source
+	alt2.ID = 482
+	alt2.Container = "mkv"
+	alt2.FilePath = "virtual://movie/alt-success-482"
+	alt2.ExternalSubtitles = nil
+	alt2.SubtitleTracks = nil
+
+	manager := playback.NewSessionManager(0, 0)
+	files := map[int]*models.MediaFile{source.ID: source, alt1.ID: &alt1, alt2.ID: &alt2}
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source, &alt1, &alt2},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	failPinned := false
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		if failPinned && strings.Contains(path, "source-480") {
+			return "", errors.New("source offline")
+		}
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+
+	var alt1Prepared, alt2Prepared bool
+	handler.copySeekAnchor = func(_ context.Context, _ string, input string, requested float64, _ int) (float64, int, error) {
+		if strings.Contains(input, "alt-fail-sub-481") {
+			alt1Prepared = true
+		}
+		if strings.Contains(input, "alt-success-482") {
+			alt2Prepared = true
+		}
+		return requested, 0, nil
+	}
+
+	handler.SubtitleRepo = failSubtitleRepoForFileID{failMediaFileID: -1} // all succeed initially
+
+	subIndex := 0
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = source.ID
+	startRequest.SubtitleTrackIndex = &subIndex
+	startRequest.StartPosition = new(float64)
+	*startRequest.StartPosition = 10.0
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"mp4"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	failPinned = true
+
+	// Now fail subtitle repo list for alt1 so attachSubtitleArtifactV3 fails after transport preparation
+	handler.SubtitleRepo = failSubtitleRepoForFileID{failMediaFileID: alt1.ID}
+
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	replanReq := playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "virtual-sub-fail-pass-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "virtual-sub-fail-pass-0001",
+		PlanAttemptKey:        currentKey,
+		AttemptedPlanKeys:     []string{currentKey},
+		AttemptCount:          1,
+		QualityPreference:     "auto",
+		PositionSeconds:       10.0,
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "playback_error"},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	}
+	response := postPlaybackReplanV3(t, handler, started.SessionID, replanReq)
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("expected successful plan on second alternate after first failed subtitle artifact, got response=%#v terminal=%#v", response, response.Terminal)
+	}
+	if !alt1Prepared {
+		t.Fatal("alt1 transport preparation was not reached")
+	}
+	if !alt2Prepared {
+		t.Fatal("alt2 transport preparation was not reached")
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != alt2.ID {
+		t.Fatalf("effective file = %d, want second alternate %d", response.PlaybackPlan.EffectiveMediaFileID, alt2.ID)
 	}
 }
 

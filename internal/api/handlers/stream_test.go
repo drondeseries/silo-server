@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/remotestream"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
@@ -38,6 +40,244 @@ func (m *hookedSessionManager) BeginTransport(sessionID string) error {
 		m.beginTransportHook()
 	}
 	return m.SessionManager.BeginTransport(sessionID)
+}
+
+func TestHandleStream_VirtualDirectPlayUsesPinnedRelayPathAndHeaders(t *testing.T) {
+	var gotPath, gotRange, gotReferer string
+	var gotQuery url.Values
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.Query()
+		gotRange = r.Header.Get("Range")
+		gotReferer = r.Header.Get("Referer")
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Range", "bytes 2-13/14")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("virtual-media"))
+	}))
+	defer upstream.Close()
+
+	file := &models.MediaFile{
+		ID:                         42,
+		ContentID:                  "movie-virtual",
+		FilePath:                   "virtual://movie/movie-virtual?result=selected",
+		VirtualOwnerInstallationID: 7,
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := sessionMgr.SetVirtualSource(session.ID, file.FilePath, file.VirtualOwnerInstallationID); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.RemoteStreamRelay = remotestream.NewRelay()
+	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
+	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, ownerInstallationID, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
+		if uri != file.FilePath || ownerInstallationID != 7 || userID != 1 || profileID != "profile-1" || forceRefresh || len(excludedCandidateIDs) != 0 || preferredCandidateID != "" {
+			t.Fatalf("unexpected resolver arguments: uri=%q owner=%d user=%d profile=%q refresh=%v excluded=%v preferred=%q", uri, ownerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID)
+		}
+		return ResolvedVirtualMedia{
+			URL:            upstream.URL + "/provider/video.mp4?provider=1",
+			RequestHeaders: map[string]string{"Referer": "https://provider.example/player"},
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID+"?st=server-token", nil)
+	req.Header.Set("Range", "bytes=2-")
+	req = req.WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", session.ID)
+	rr := httptest.NewRecorder()
+	handler.HandleStream(rr, req)
+
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Content-Range") != "bytes 2-13/14" || rr.Header().Get("Accept-Ranges") != "bytes" {
+		t.Fatalf("range headers = Content-Range %q Accept-Ranges %q", rr.Header().Get("Content-Range"), rr.Header().Get("Accept-Ranges"))
+	}
+	if rr.Body.String() != "virtual-media" {
+		t.Fatalf("body = %q, want virtual-media", rr.Body.String())
+	}
+	if gotPath != "/provider/video.mp4" {
+		t.Fatalf("upstream path = %q, want /provider/video.mp4", gotPath)
+	}
+	if gotQuery.Get("provider") != "1" || gotQuery.Get("st") != "" {
+		t.Fatalf("upstream query = %q, want provider=1 without stream token", gotQuery.Encode())
+	}
+	if gotRange != "bytes=2-" {
+		t.Fatalf("upstream Range = %q, want bytes=2-", gotRange)
+	}
+	if gotReferer != "https://provider.example/player" {
+		t.Fatalf("upstream Referer = %q, want provider header", gotReferer)
+	}
+}
+
+func TestHandleStream_VirtualDirectPlayProxyErrorHandlerReturns502(t *testing.T) {
+	file := &models.MediaFile{
+		ID:                         42,
+		ContentID:                  "movie-virtual-broken",
+		FilePath:                   "virtual://movie/movie-broken?result=dead",
+		VirtualOwnerInstallationID: 7,
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := sessionMgr.SetVirtualSource(session.ID, file.FilePath, file.VirtualOwnerInstallationID); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	// Create an ephemeral closed port
+	deadServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := deadServer.URL
+	deadServer.Close()
+
+	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		// Return an unreachable loopback URL without a relay wrapper to trigger ReverseProxy dial failure and ErrorHandler
+		return ResolvedVirtualMedia{
+			URL: deadURL + "/video.mp4",
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil)
+	req = req.WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", session.ID)
+	rr := httptest.NewRecorder()
+	handler.HandleStream(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502, body = %s", rr.Code, rr.Body.String())
+	}
+	var errResp struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("decode json response: %v, body = %s", err, rr.Body.String())
+	}
+	if errResp.Error != "virtual_stream_unavailable" {
+		t.Fatalf("error code = %q, want virtual_stream_unavailable", errResp.Error)
+	}
+}
+
+func TestHandleStream_VirtualDirectPlayRelay502ReturnsStructuredJSON(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("upstream provider failure"))
+	}))
+	defer upstream.Close()
+
+	file := &models.MediaFile{
+		ID:                         42,
+		ContentID:                  "movie-virtual-relay-fail",
+		FilePath:                   "virtual://movie/movie-fail?result=dead",
+		VirtualOwnerInstallationID: 7,
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := sessionMgr.SetVirtualSource(session.ID, file.FilePath, file.VirtualOwnerInstallationID); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.RemoteStreamRelay = remotestream.NewRelay()
+	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
+	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		return ResolvedVirtualMedia{
+			URL: upstream.URL + "/provider/stream.mp4",
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil)
+	req = req.WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", session.ID)
+	rr := httptest.NewRecorder()
+	handler.HandleStream(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502, body = %s", rr.Code, rr.Body.String())
+	}
+	var errResp struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("decode json response: %v, body = %s", err, rr.Body.String())
+	}
+	if errResp.Error != "virtual_stream_unavailable" {
+		t.Fatalf("error code = %q, want virtual_stream_unavailable", errResp.Error)
+	}
+}
+
+func TestHandleStream_VirtualDirectPlayInvalidTargetOrNonLoopbackReturnsStructured502(t *testing.T) {
+	file := &models.MediaFile{
+		ID:                         42,
+		ContentID:                  "movie-virtual-ssrf",
+		FilePath:                   "virtual://movie/movie-ssrf?result=ssrf",
+		VirtualOwnerInstallationID: 7,
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := sessionMgr.SetVirtualSource(session.ID, file.FilePath, file.VirtualOwnerInstallationID); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		return ResolvedVirtualMedia{
+			URL: "http://non-loopback.example.com/video.mp4",
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil)
+	req = req.WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", session.ID)
+	rr := httptest.NewRecorder()
+	handler.HandleStream(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502, body = %s", rr.Code, rr.Body.String())
+	}
+	var errResp struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("decode json response: %v, body = %s", err, rr.Body.String())
+	}
+	if errResp.Error != "virtual_stream_unavailable" {
+		t.Fatalf("error code = %q, want virtual_stream_unavailable", errResp.Error)
+	}
+}
+
+func TestBindSessionVirtualSourceUsesPinnedURIAndOwner(t *testing.T) {
+	file := &models.MediaFile{ID: 42, FilePath: "virtual://movie/catalog?result=old", VirtualOwnerInstallationID: 7}
+	session := &playback.Session{VirtualSourceURI: "virtual://movie/session?result=pinned", VirtualSourceOwnerInstallationID: 0}
+
+	bound := bindSessionVirtualSource(file, session)
+	if bound == file {
+		t.Fatal("binding returned the catalog file instead of a copy")
+	}
+	if bound.FilePath != session.VirtualSourceURI || bound.VirtualOwnerInstallationID != 0 {
+		t.Fatalf("bound source = (%q, owner=%d), want (%q, owner=0)", bound.FilePath, bound.VirtualOwnerInstallationID, session.VirtualSourceURI)
+	}
+	if file.FilePath != "virtual://movie/catalog?result=old" || file.VirtualOwnerInstallationID != 7 {
+		t.Fatalf("catalog file mutated: %#v", file)
+	}
 }
 
 func TestHandleStream_PausedSessionResumesWithDelayedRangeRequest(t *testing.T) {

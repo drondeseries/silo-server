@@ -1180,6 +1180,7 @@ func NewRouter(deps Dependencies) chi.Router {
 		if streamHandler != nil {
 			streamHandler.RemoteStreamRelay = remoteStreamRelay
 			streamHandler.VirtualMediaResolver = playbackHandler.VirtualMediaResolver
+			streamHandler.VirtualMediaDetailedResolver = playbackHandler.VirtualMediaDetailedResolver
 			streamHandler.AllowInsecureVirtual = playbackHandler.AllowInsecureVirtual
 		}
 		playbackHandler.RemuxDBEnabled = true
