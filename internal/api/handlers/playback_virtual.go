@@ -21,7 +21,6 @@ import (
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
-	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"golang.org/x/text/language"
 )
 
@@ -411,6 +410,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 			}
 		}
+		mergeVirtualCandidateTracks(&transient, cand)
+		if !transient.HDR && cand.HDR != "" {
+			transient.HDR = true
+		}
 		hasCompleteVideoEvidence := completeVirtualVideoEvidenceV3(&transient)
 		hasCompleteAudioEvidence := completeVirtualAudioEvidenceV3(&transient)
 		hasCompleteContainerEvidence := completeVirtualContainerEvidenceV3(&transient)
@@ -425,10 +428,6 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 		}
 		if skipProbe || h.VirtualPlaybackSourceProber == nil {
-			mergeVirtualCandidateTracks(&transient, cand)
-			if !transient.HDR && cand.HDR != "" {
-				transient.HDR = true
-			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: skipProbe,
@@ -439,10 +438,6 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		probeCancel()
 		if probeErr != nil || probed == nil {
 			slog.DebugContext(r.Context(), "virtual stream probe timed out or failed; using candidate metadata", "component", "api", "candidate_uri", cand.URI, "error", probeErr)
-			mergeVirtualCandidateTracks(&transient, cand)
-			if !transient.HDR && cand.HDR != "" {
-				transient.HDR = true
-			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false,
@@ -571,15 +566,13 @@ func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, tar
 }
 
 // applyVirtualStreamEvidence backfills the content-keyed aggregate evidence
-// (SiloDB or crowdsourced RemuxDB) into a file whose own probe evidence is
-// missing, so a cold start can choose the stream-copy remux route without a
-// provider probe. Only facts the file does not already carry are filled;
-// per-stream probe detail always wins.
+// (SiloDB) into a file whose own probe evidence is missing, so a cold start
+// can choose the stream-copy remux route without a provider probe. Only facts
+// the file does not already carry are filled; per-stream probe detail always wins.
 func (h *PlaybackHandler) applyVirtualStreamEvidence(ctx context.Context, file *models.MediaFile) *models.MediaFile {
 	if file == nil {
 		return file
 	}
-	// 1. Try local SiloDB first
 	if h.VirtualStreamMetadataStore != nil && file.ContentID != "" {
 		cid := file.ContentID
 		if file.SeasonNumber > 0 || file.EpisodeNumber > 0 {
@@ -607,39 +600,6 @@ func (h *PlaybackHandler) applyVirtualStreamEvidence(ctx context.Context, file *
 				backfilled.Resolution = ev.Resolution
 			}
 			return &backfilled
-		}
-	}
-
-	// 2. Try RemuxDB crowdsourced metadata if file lacks detailed video tracks
-	if (h.RemuxDBEnabled || h.RemuxDBClient != nil) && len(file.VideoTracks) == 0 {
-		imdbID := remuxdb.ExtractIMDbID(file.ContentID)
-		if imdbID == "" {
-			imdbID = remuxdb.ExtractIMDbID(file.FilePath)
-		}
-		if imdbID != "" {
-			client := h.RemuxDBClient
-			if client == nil {
-				client = remuxdb.NewClient("", "")
-			}
-			var seasonPtr, epPtr *int
-			if file.SeasonNumber > 0 {
-				s := file.SeasonNumber
-				seasonPtr = &s
-			}
-			if file.EpisodeNumber > 0 {
-				e := file.EpisodeNumber
-				epPtr = &e
-			}
-			remuxCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			infos, err := client.FetchProbe(remuxCtx, imdbID, seasonPtr, epPtr)
-			cancel()
-			if err == nil && len(infos) > 0 {
-				backfilled := *file
-				if remuxdb.PopulateMediaFileFromRemuxDB(infos[0], &backfilled) {
-					slog.InfoContext(ctx, "remuxdb evidence applied", "component", "api", "imdb_id", imdbID, "codec", backfilled.CodecVideo, "res", backfilled.Resolution)
-					return &backfilled
-				}
-			}
 		}
 	}
 

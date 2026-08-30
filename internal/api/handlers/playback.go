@@ -29,7 +29,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/nodepool"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
-	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
 	"github.com/Silo-Server/silo-server/internal/settingskeys"
 	"github.com/Silo-Server/silo-server/internal/settingsresolve"
@@ -327,8 +326,6 @@ type PlaybackHandler struct {
 	AllowInsecureVirtual        func(installationID int) bool
 	VirtualPlaybackSourceProber VirtualPlaybackSourceProber
 	VirtualStreamMetadataStore  virtualmetadata.Store
-	RemuxDBClient               *remuxdb.Client
-	RemuxDBEnabled              bool
 	BestResultCache             *VirtualBestResultCache
 	VirtualFileUpdater          VirtualFileUpdateFunc
 	VirtualFileMetadataSaver    VirtualFileMetadataSaver

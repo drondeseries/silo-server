@@ -61,7 +61,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/ratelimit"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
-	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
 	"github.com/Silo-Server/silo-server/internal/s3client"
 	"github.com/Silo-Server/silo-server/internal/scanner"
@@ -1183,12 +1182,9 @@ func NewRouter(deps Dependencies) chi.Router {
 			streamHandler.VirtualMediaDetailedResolver = playbackHandler.VirtualMediaDetailedResolver
 			streamHandler.AllowInsecureVirtual = playbackHandler.AllowInsecureVirtual
 		}
-		playbackHandler.RemuxDBEnabled = true
-		playbackHandler.RemuxDBClient = remuxdb.NewClient("", "")
 		if deps.DB != nil {
 			store := virtualmetadata.NewPostgresStore(deps.DB)
 			playbackHandler.VirtualStreamMetadataStore = store
-			virtualmetadata.SyncRemuxDBOnStartup(context.Background(), deps.DB, store, playbackHandler.RemuxDBClient)
 			playbackHandler.VirtualFileUpdater = func(ctx context.Context, fileID int, newFilePath string) error {
 				_, _ = deps.DB.Exec(ctx, `DELETE FROM media_files WHERE file_path=$1 AND id != $2 AND virtual_owner_installation_id IS NOT NULL`, newFilePath, fileID)
 				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET file_path=$1, updated_at=now() WHERE id=$2`, newFilePath, fileID)
