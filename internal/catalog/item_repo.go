@@ -444,7 +444,6 @@ func (r *ItemRepository) purgeVirtualPlaybackItemsOnce(ctx context.Context, opts
 		`DELETE FROM user_ratings p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
 		`DELETE FROM user_watchlist p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.media_item_id)`,
 		`DELETE FROM metadata_refresh_debt p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.content_id)`,
-		`DELETE FROM virtual_stream_metadata p WHERE NOT EXISTS (SELECT 1 FROM media_items mi WHERE mi.content_id = p.content_id)`,
 	} {
 		stateResult, err := tx.Exec(ctx, stmt)
 		if err != nil {

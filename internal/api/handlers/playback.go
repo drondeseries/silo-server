@@ -38,7 +38,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
 	"github.com/Silo-Server/silo-server/internal/userstore"
-	"github.com/Silo-Server/silo-server/internal/virtualmetadata"
 	"github.com/Silo-Server/silo-server/internal/watchstate"
 	"github.com/Silo-Server/silo-server/internal/watchsync"
 )
@@ -325,7 +324,6 @@ type PlaybackHandler struct {
 	// explicitly enabled allow_insecure_http for private/local stream hosts.
 	AllowInsecureVirtual        func(installationID int) bool
 	VirtualPlaybackSourceProber VirtualPlaybackSourceProber
-	VirtualStreamMetadataStore  virtualmetadata.Store
 	BestResultCache             *VirtualBestResultCache
 	VirtualFileUpdater          VirtualFileUpdateFunc
 	VirtualFileMetadataSaver    VirtualFileMetadataSaver

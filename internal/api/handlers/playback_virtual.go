@@ -410,24 +410,25 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 			}
 		}
-		mergeVirtualCandidateTracks(&transient, cand)
-		if !transient.HDR && cand.HDR != "" {
-			transient.HDR = true
-		}
 		hasCompleteVideoEvidence := completeVirtualVideoEvidenceV3(&transient)
 		hasCompleteAudioEvidence := completeVirtualAudioEvidenceV3(&transient)
 		hasCompleteContainerEvidence := completeVirtualContainerEvidenceV3(&transient)
 		skipProbe := hasCompleteVideoEvidence && hasCompleteAudioEvidence && hasCompleteContainerEvidence
-		if !skipProbe {
-			if backfilled := h.applyVirtualStreamEvidence(attemptCtx, &transient); backfilled != nil {
-				transient = *backfilled
-				hasCompleteVideoEvidence = completeVirtualVideoEvidenceV3(&transient)
-				hasCompleteAudioEvidence = completeVirtualAudioEvidenceV3(&transient)
-				hasCompleteContainerEvidence = completeVirtualContainerEvidenceV3(&transient)
-				skipProbe = hasCompleteVideoEvidence && hasCompleteAudioEvidence && hasCompleteContainerEvidence
+		if !skipProbe && cand.CodecVideo != "" && cand.Resolution != "" && cand.CodecAudio != "" && canSkipProbeForContainer(cand.Container) {
+			mergeVirtualCandidateTracks(&transient, cand)
+			if !transient.HDR && cand.HDR != "" {
+				transient.HDR = true
 			}
+			hasCompleteVideoEvidence = completeVirtualVideoEvidenceV3(&transient)
+			hasCompleteAudioEvidence = completeVirtualAudioEvidenceV3(&transient)
+			hasCompleteContainerEvidence = completeVirtualContainerEvidenceV3(&transient)
+			skipProbe = hasCompleteVideoEvidence && hasCompleteAudioEvidence && hasCompleteContainerEvidence
 		}
 		if skipProbe || h.VirtualPlaybackSourceProber == nil {
+			mergeVirtualCandidateTracks(&transient, cand)
+			if !transient.HDR && cand.HDR != "" {
+				transient.HDR = true
+			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: skipProbe,
@@ -438,6 +439,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		probeCancel()
 		if probeErr != nil || probed == nil {
 			slog.DebugContext(r.Context(), "virtual stream probe timed out or failed; using candidate metadata", "component", "api", "candidate_uri", cand.URI, "error", probeErr)
+			mergeVirtualCandidateTracks(&transient, cand)
+			if !transient.HDR && cand.HDR != "" {
+				transient.HDR = true
+			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false,
@@ -563,71 +568,6 @@ func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, tar
 			slog.ErrorContext(persistCtx, "virtual metadata persist failed", "component", "api", "file_id", targetID, "error", err)
 		}
 	}()
-}
-
-// applyVirtualStreamEvidence backfills the content-keyed aggregate evidence
-// (SiloDB) into a file whose own probe evidence is missing, so a cold start
-// can choose the stream-copy remux route without a provider probe. Only facts
-// the file does not already carry are filled; per-stream probe detail always wins.
-func (h *PlaybackHandler) applyVirtualStreamEvidence(ctx context.Context, file *models.MediaFile) *models.MediaFile {
-	if file == nil {
-		return file
-	}
-	if h.VirtualStreamMetadataStore != nil && file.ContentID != "" {
-		cid := file.ContentID
-		if file.SeasonNumber > 0 || file.EpisodeNumber > 0 {
-			cid = fmt.Sprintf("%s-s%de%d", file.ContentID, file.SeasonNumber, file.EpisodeNumber)
-		}
-		ev, ok, err := h.VirtualStreamMetadataStore.Get(ctx, cid)
-		if (err != nil || !ok || ev.Empty()) && cid != file.ContentID {
-			ev, ok, err = h.VirtualStreamMetadataStore.Get(ctx, file.ContentID)
-		}
-		if err == nil && ok && !ev.Empty() {
-			backfilled := *file
-			if backfilled.Container == "" || backfilled.Container == "virtual" {
-				backfilled.Container = ev.Container
-			}
-			if backfilled.CodecVideo == "" {
-				backfilled.CodecVideo = ev.CodecVideo
-			}
-			if backfilled.CodecAudio == "" {
-				backfilled.CodecAudio = ev.CodecAudio
-			}
-			if !backfilled.HDR && rangeIndicatesHDRV3(ev.VideoRange) {
-				backfilled.HDR = true
-			}
-			if backfilled.Resolution == "" {
-				backfilled.Resolution = ev.Resolution
-			}
-			return &backfilled
-		}
-	}
-
-	return file
-}
-
-// videoRangeFromV3 normalizes the probe's video range fact for the aggregate.
-//
-//nolint:unused // Retained for compatibility with dormant integration paths.
-func videoRangeFromV3(file *models.MediaFile) string {
-	if file != nil && len(file.VideoTracks) > 0 {
-		if r := strings.ToLower(strings.TrimSpace(file.VideoTracks[0].VideoRange)); r != "" {
-			return r
-		}
-	}
-	if file != nil && file.HDR {
-		return "hdr_unknown"
-	}
-	return "sdr"
-}
-
-// rangeIndicatesHDRV3 reports whether an aggregate range flag implies HDR.
-func rangeIndicatesHDRV3(r string) bool {
-	switch strings.ToLower(strings.TrimSpace(r)) {
-	case "hdr", "hdr10", "hdr10_plus", "hlg", "dolby_vision":
-		return true
-	}
-	return false
 }
 
 // fallbackResolveStaleVirtualSource re-lists the provider's current candidates

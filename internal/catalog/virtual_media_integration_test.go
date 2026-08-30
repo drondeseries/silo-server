@@ -1502,7 +1502,6 @@ func TestPurgeVirtualPlaybackItemsRemovesDanglingUserState(t *testing.T) {
 		{sql: `INSERT INTO user_watchlist(user_id,profile_id,media_item_id,added_at) VALUES($1,$2,'movie-tmdb-996',NOW())`, args: []any{userID, profileID}},
 		{sql: `INSERT INTO metadata_refresh_debt(content_id,priority,reason_mask,next_refresh_at,target_type)
 		  VALUES('movie-tmdb-996',5,1,NOW(),'item')`},
-		{sql: `INSERT INTO virtual_stream_metadata(content_id) VALUES('movie-tmdb-996')`},
 	} {
 		if _, err := pool.Exec(ctx, stmt.sql, stmt.args...); err != nil {
 			t.Fatalf("seed virtual item with user state: %v", err)
@@ -1516,24 +1515,23 @@ func TestPurgeVirtualPlaybackItemsRemovesDanglingUserState(t *testing.T) {
 	if purgeResult.FilesDeleted != 1 || purgeResult.ItemsDeleted != 1 {
 		t.Fatalf("purge files=%d items=%d, want 1/1", purgeResult.FilesDeleted, purgeResult.ItemsDeleted)
 	}
-	if purgeResult.StateRowsDeleted < 6 {
-		t.Fatalf("state_rows_deleted=%d, want at least the six seeded state rows", purgeResult.StateRowsDeleted)
+	if purgeResult.StateRowsDeleted < 5 {
+		t.Fatalf("state_rows_deleted=%d, want at least the five seeded state rows", purgeResult.StateRowsDeleted)
 	}
-	var progressLeft, favoritesLeft, ratingsLeft, watchlistLeft, debtLeft, metadataLeft int
+	var progressLeft, favoritesLeft, ratingsLeft, watchlistLeft, debtLeft int
 	if err := pool.QueryRow(ctx, `
 		SELECT
 		  (SELECT count(*) FROM user_watch_progress WHERE media_item_id='movie-tmdb-996'),
 		  (SELECT count(*) FROM user_favorites WHERE media_item_id='movie-tmdb-996'),
 		  (SELECT count(*) FROM user_ratings WHERE media_item_id='movie-tmdb-996'),
 		  (SELECT count(*) FROM user_watchlist WHERE media_item_id='movie-tmdb-996'),
-		  (SELECT count(*) FROM metadata_refresh_debt WHERE content_id='movie-tmdb-996'),
-		  (SELECT count(*) FROM virtual_stream_metadata WHERE content_id='movie-tmdb-996')`,
-	).Scan(&progressLeft, &favoritesLeft, &ratingsLeft, &watchlistLeft, &debtLeft, &metadataLeft); err != nil {
+		  (SELECT count(*) FROM metadata_refresh_debt WHERE content_id='movie-tmdb-996')`,
+	).Scan(&progressLeft, &favoritesLeft, &ratingsLeft, &watchlistLeft, &debtLeft); err != nil {
 		t.Fatalf("inspect post-purge state: %v", err)
 	}
-	if progressLeft+favoritesLeft+ratingsLeft+watchlistLeft+debtLeft+metadataLeft != 0 {
-		t.Fatalf("dangling state survived: progress=%d favorites=%d ratings=%d watchlist=%d debt=%d metadata=%d",
-			progressLeft, favoritesLeft, ratingsLeft, watchlistLeft, debtLeft, metadataLeft)
+	if progressLeft+favoritesLeft+ratingsLeft+watchlistLeft+debtLeft != 0 {
+		t.Fatalf("dangling state survived: progress=%d favorites=%d ratings=%d watchlist=%d debt=%d",
+			progressLeft, favoritesLeft, ratingsLeft, watchlistLeft, debtLeft)
 	}
 }
 
