@@ -5567,6 +5567,63 @@ func TestRemoteToneMapProbeTimeoutUsesTargetNodeBudget(t *testing.T) {
 // rewrite the row before its replacement probe finishes. A replan re-reads that
 // row, so it must heal it through the same on-demand probe repair the start
 // path uses instead of refusing the route as source_metadata_incomplete.
+func TestHandleReplanPlaybackV3RehydratesPinnedVirtualSourceBeforePlanning(t *testing.T) {
+	complete := v3HandlerFixtureFile(t)
+	complete.FilePath = "virtual://movie/tt-replan"
+	complete.VirtualOwnerInstallationID = 5
+	files := map[int]*models.MediaFile{complete.ID: complete}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	stubCopySeekAnchorV3(handler)
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	handler.VirtualCandidateFileLookup = func(_ context.Context, path, _ string, _ string, _ int) (*models.MediaFile, error) {
+		candidate := *complete
+		candidate.ID = complete.ID + 1000
+		candidate.FilePath = path
+		return &candidate, nil
+	}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = complete.ID
+	startRequest.QualityPreference = "auto"
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	degraded := &models.MediaFile{ID: complete.ID, FilePath: complete.FilePath, Container: "virtual", VirtualOwnerInstallationID: 5}
+	files[complete.ID] = degraded
+
+	failedKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationQualityChangeV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-virtual-hydrate-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-virtual-hydrate-0001",
+		PlanAttemptKey:        failedKey,
+		AttemptedPlanKeys:     []string{failedKey},
+		AttemptCount:          1,
+		QualityPreference:     "auto",
+		PositionSeconds:       12,
+		Failure:               playback.FailureV3{},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("virtual replan response = %#v terminal=%+v", response, response.Terminal)
+	}
+	if response.PlaybackPlan.Source.VideoCodec != "h264" || response.PlaybackPlan.Source.Width != 1920 || response.PlaybackPlan.Source.Height != 1080 {
+		t.Fatalf("rehydrated source = %#v", response.PlaybackPlan.Source)
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != complete.ID || response.PlaybackPlan.Source.MediaFileID != complete.ID {
+		t.Fatalf("virtual replan identity = effective %d source %d, want %d", response.PlaybackPlan.EffectiveMediaFileID, response.PlaybackPlan.Source.MediaFileID, complete.ID)
+	}
+}
+
 func TestHandleReplanPlaybackV3HealsIncompleteCatalogRowBeforePlanning(t *testing.T) {
 	complete := v3HandlerFixtureFile(t)
 	files := map[int]*models.MediaFile{complete.ID: complete}

@@ -3838,7 +3838,23 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if err != nil || currentEffectiveFile == nil {
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "source_unavailable", message: "The effective media source is unavailable."}
 	}
-	currentEffectiveFile = h.ensurePlaybackProbe(r.Context(), currentEffectiveFile)
+	if isVirtualPlaybackFile(currentEffectiveFile) {
+		if session, sessionErr := h.sessionMgr.GetSession(record.SessionID); sessionErr == nil && session != nil && session.VirtualSourceURI != "" {
+			pinnedFile := *currentEffectiveFile
+			pinnedFile.FilePath = session.VirtualSourceURI
+			pinnedFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
+			resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false)
+			if resolveErr == nil && resolved.File != nil {
+				resolvedFile := *resolved.File
+				resolvedFile.ID = currentEffectiveFile.ID
+				resolvedFile.FilePath = resolved.URI
+				resolvedFile.VirtualOwnerInstallationID = resolved.OwnerID
+				currentEffectiveFile = &resolvedFile
+			}
+		}
+	} else {
+		currentEffectiveFile = h.ensurePlaybackProbe(r.Context(), currentEffectiveFile)
+	}
 	effectiveFile := currentEffectiveFile
 	currentEffectiveStart := start
 	if intentChange && !trackChange {
