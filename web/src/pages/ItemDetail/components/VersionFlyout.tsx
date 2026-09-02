@@ -1,5 +1,6 @@
-import { Play } from "lucide-react";
+import { ListFilter, Play } from "lucide-react";
 import type { FileVersion } from "@/api/types";
+import { Badge } from "@/components/ui/badge";
 import {
   DropdownMenuItem,
   DropdownMenuLabel,
@@ -87,6 +88,10 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
       {sorted.map((version) => {
         const qualitySummary = buildQualitySummary(version);
         const detailLine = buildDetailLine(version);
+        const isMoreAction = qualitySummary === "More results…";
+        const isVirtual =
+          version.container === "virtual" ||
+          Boolean(version.file_path?.toLowerCase().startsWith("virtual://"));
 
         return (
           <DropdownMenuItem
@@ -95,12 +100,21 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
             onSelect={() => onPlayVersion(version.file_id)}
           >
             <span className="bg-accent/70 flex size-7 shrink-0 items-center justify-center rounded-full">
-              <Play className="text-foreground size-3.5 fill-current" />
+              {isMoreAction ? (
+                <ListFilter className="text-foreground size-3.5" />
+              ) : (
+                <Play className="text-foreground size-3.5 fill-current" />
+              )}
             </span>
 
             <span className="min-w-0 flex-1">
-              <span className="text-foreground block truncate text-sm font-semibold">
-                {qualitySummary}
+              <span className="text-foreground flex items-center gap-1.5 truncate text-sm font-semibold">
+                <span className="truncate">{qualitySummary}</span>
+                {isVirtual && !isMoreAction && (
+                  <Badge variant="secondary" className="px-1.5 py-0 text-[10px] font-medium shrink-0">
+                    Virtual
+                  </Badge>
+                )}
               </span>
               {detailLine && (
                 <span className="text-muted-foreground block text-xs">{detailLine}</span>
