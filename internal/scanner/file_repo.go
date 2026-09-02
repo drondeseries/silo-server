@@ -1096,8 +1096,22 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 	if r == nil || r.pool == nil {
 		return errors.New("file repository is not configured")
 	}
-	if source == nil || source.ContentID == "" || source.VirtualOwnerInstallationID <= 0 {
-		return errors.New("virtual candidate source and installation owner are required")
+	if source == nil || source.ContentID == "" {
+		return errors.New("virtual candidate source is required")
+	}
+	if source.VirtualOwnerInstallationID <= 0 {
+		for _, candidate := range candidates {
+			if candidate.OwnerInstallationID > 0 {
+				source.VirtualOwnerInstallationID = candidate.OwnerInstallationID
+				break
+			}
+		}
+		if source.VirtualOwnerInstallationID <= 0 && source.ContentID != "" {
+			_ = r.pool.QueryRow(ctx, `SELECT COALESCE(virtual_owner_installation_id, 0) FROM media_items WHERE content_id = $1`, source.ContentID).Scan(&source.VirtualOwnerInstallationID)
+		}
+		if source.VirtualOwnerInstallationID <= 0 {
+			_ = r.pool.QueryRow(ctx, `SELECT id FROM plugin_installations WHERE enabled = true ORDER BY id ASC LIMIT 1`).Scan(&source.VirtualOwnerInstallationID)
+		}
 	}
 	if len(candidates) > 50 {
 		candidates = candidates[:50]

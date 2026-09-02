@@ -330,18 +330,40 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				visible := visibleVirtualPlaybackStreams(streams)
 				_ = h.VirtualPlaybackStreamSink(listCtx, file, visible)
 			}
-			if filtered := filterVirtualPlaybackStreams(file, streams); len(filtered) > 0 {
-				if h.BestResultCache != nil {
-					neutralURI := virtualPlaybackNeutralKey(file.FilePath)
-					h.BestResultCache.set(bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID, fingerprint), filtered, time.Now())
+			filtered := filterVirtualPlaybackStreams(file, streams)
+			if h.BestResultCache != nil && len(filtered) > 0 {
+				neutralURI := virtualPlaybackNeutralKey(file.FilePath)
+				h.BestResultCache.set(bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID, fingerprint), filtered, time.Now())
+			}
+			if noResult {
+				if len(filtered) > 0 {
+					candidates, _ = h.rankVirtualCandidatesForDevice(r, filtered)
 				}
-				candidates, _ = h.rankVirtualCandidatesForDevice(r, filtered)
+			} else {
+				// Explicit candidate selected. Find it in streams to enrich its metadata,
+				// and keep it at index 0 without overwriting it with device re-ranking.
+				resultID := ""
+				if parsed != nil {
+					resultID = strings.TrimSpace(parsed.Query().Get("result"))
+				}
+				for _, s := range streams {
+					if s.URI == file.FilePath || (resultID != "" && s.ID == resultID) {
+						candidates[0] = s
+						break
+					}
+				}
+				if len(filtered) > 0 {
+					rankedAlternatives, _ := h.rankVirtualCandidatesForDevice(r, filtered)
+					candidates = append([]VirtualPlaybackStream{candidates[0]}, rankedAlternatives...)
+				}
 			}
 		}
 		cancel()
 	}
 	maxAttempts := h.maxVirtualFailoverAttempts(r.Context())
-	candidates = h.applyVirtualStickyPin(stickyKey, pinnedURI, candidates, deviceCaps)
+	if noResult {
+		candidates = h.applyVirtualStickyPin(stickyKey, pinnedURI, candidates, deviceCaps)
+	}
 	if len(candidates) > maxAttempts {
 		candidates = candidates[:maxAttempts]
 	}

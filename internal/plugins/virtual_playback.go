@@ -622,14 +622,18 @@ func (s *Service) virtualStreamProviders(ctx context.Context, routing VirtualPla
 		} else if !routing.AllowFallback {
 			return nil, fmt.Errorf("load owning virtual stream provider: %w", err)
 		}
-	} else if !routing.AllowFallback {
-		return nil, errors.New("virtual playback owner is required when provider fallback is disabled")
 	}
-	if !routing.AllowFallback {
+	// When an owner is explicitly specified and fallback is disabled, use only the owner.
+	// Otherwise (including when no owner is specified), query all enabled providers so
+	// virtual playback always plays without requiring ownership.
+	if routing.OwnerInstallationID > 0 && !routing.AllowFallback {
 		return routes, nil
 	}
 	installations, err := s.installations.ListEnabled(ctx)
 	if err != nil {
+		if len(routes) > 0 {
+			return routes, nil
+		}
 		return nil, fmt.Errorf("list enabled virtual stream providers: %w", err)
 	}
 	for _, installation := range installations {
@@ -644,6 +648,9 @@ func (s *Service) virtualStreamProviders(ctx context.Context, routing VirtualPla
 			continue
 		}
 		routes = append(routes, virtualStreamProviderRoute{installationID: installation.ID, capabilityID: capabilityID})
+	}
+	if len(routes) == 0 {
+		return nil, ErrVirtualPlaybackResolverNotInstalled
 	}
 	return routes, nil
 }

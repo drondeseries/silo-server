@@ -393,6 +393,60 @@ func TestResolveVirtualPlaybackSourceKeepsUnprobedPinnedFallbackWhenOthersFail(t
 	}
 }
 
+func TestResolveVirtualPlaybackSourceExplicitResultPreservesSelectedVersion(t *testing.T) {
+	highestQualityStream := VirtualPlaybackStream{
+		ID:         "stream-4k",
+		URI:        "virtual://movie/1?result=stream-4k",
+		Resolution: "4K",
+		CodecVideo: "hevc",
+		HDR:        "hdr10",
+		Bitrate:    50000000,
+	}
+	selectedVersionStream := VirtualPlaybackStream{
+		ID:         "stream-1080p",
+		URI:        "virtual://movie/1?result=stream-1080p",
+		Resolution: "1080p",
+		CodecVideo: "h264",
+		Bitrate:    8000000,
+	}
+
+	var attemptedPaths []string
+	h := &PlaybackHandler{
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{highestQualityStream, selectedVersionStream}, nil
+		}),
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
+			attemptedPaths = append(attemptedPaths, path)
+			if path == selectedVersionStream.URI {
+				return "http://localhost:8080/1080p.mp4", nil
+			}
+			return "http://localhost:8080/4k.mp4", nil
+		}),
+		VirtualPlaybackSourceProber: func(ctx context.Context, streamURL string, transient *models.MediaFile) (*models.MediaFile, error) {
+			transient.VideoTracks = []models.VideoTrack{{Codec: "h264"}}
+			return transient, nil
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
+	file := &models.MediaFile{
+		ID:        20,
+		ContentID: "movie-1",
+		FilePath:  "virtual://movie/1?result=stream-1080p",
+	}
+
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false)
+	if err != nil {
+		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
+	}
+	if resolved.URI != selectedVersionStream.URI {
+		t.Fatalf("resolved URI = %q, want %q", resolved.URI, selectedVersionStream.URI)
+	}
+	if len(attemptedPaths) == 0 || attemptedPaths[0] != selectedVersionStream.URI {
+		t.Fatalf("first attempted path = %v, want %q", attemptedPaths, selectedVersionStream.URI)
+	}
+}
+
 func TestFallbackResolveStaleVirtualSourceRespectsMaxFailoverLimit(t *testing.T) {
 	resolveAttempts := 0
 	streams := make([]VirtualPlaybackStream, 0, 15)

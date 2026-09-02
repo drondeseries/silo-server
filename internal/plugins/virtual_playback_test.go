@@ -548,6 +548,30 @@ func TestVirtualPlaybackMissingOwnerFallsBackToReplacementProvider(t *testing.T)
 	}
 }
 
+func TestVirtualPlaybackResolvesWithoutOwner(t *testing.T) {
+	service, calls := newVirtualPlaybackTestService(t,
+		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+			return virtualResponse(virtualCandidate("p101", "https://1.1.1.1/p101")), nil
+		},
+	)
+	resolved, err := service.ResolveVirtualPlaybackWithRouting(
+		context.Background(),
+		"virtual://movie/tt1234?result=p101",
+		7,
+		"p1",
+		VirtualPlaybackRouting{OwnerInstallationID: 0, AllowFallback: false},
+	)
+	if err != nil {
+		t.Fatalf("expected resolution without owner to succeed, got: %v", err)
+	}
+	if resolved != "https://1.1.1.1/p101" {
+		t.Fatalf("got %q, want https://1.1.1.1/p101", resolved)
+	}
+	if calls[101].Load() != 1 {
+		t.Fatalf("expected call to provider 101, got %d", calls[101].Load())
+	}
+}
+
 func TestVirtualPlaybackCacheIsBoundedAndLifecycleInvalidated(t *testing.T) {
 	service := &Service{}
 	now := time.Now()

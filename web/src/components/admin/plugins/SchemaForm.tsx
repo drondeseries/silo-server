@@ -299,7 +299,7 @@ export function SchemaForm({
       );
     }
 
-    if (field.control === "TEXTAREA" || field.multiline) {
+    if (field.multiline || field.control === "TEXTAREA") {
       return (
         <textarea
           id={id}
@@ -307,21 +307,22 @@ export function SchemaForm({
           rows={field.rows && field.rows > 0 ? field.rows : 4}
           value={String(effectiveValue(field, values) ?? "")}
           placeholder={field.placeholder}
+          autoComplete="off"
+          data-1p-ignore="true"
+          data-bwignore="true"
           onChange={(event) => setField(field.key, event.target.value)}
         />
       );
     }
 
+    const isSecretOrPassword = field.control === "PASSWORD" || field.secret;
     return (
       <Input
         id={id}
-        type={
-          field.control === "PASSWORD" || field.secret
-            ? "password"
-            : field.control === "NUMBER"
-              ? "number"
-              : "text"
-        }
+        type={isSecretOrPassword ? "password" : field.control === "NUMBER" ? "number" : "text"}
+        autoComplete={isSecretOrPassword ? "new-password" : "off"}
+        data-1p-ignore="true"
+        data-bwignore="true"
         value={String(effectiveValue(field, values) ?? "")}
         placeholder={field.placeholder}
         onChange={(event) => setField(field.key, event.target.value)}

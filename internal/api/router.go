@@ -1066,12 +1066,12 @@ func NewRouter(deps Dependencies) chi.Router {
 			if deps.PluginService != nil {
 				playbackHandler.VirtualPlaybackResolver = handlers.VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
 					return deps.PluginService.ResolveVirtualPlaybackForInstallation(
-						ctx, path, userID, profileID, ownerInstallationID, false,
+						ctx, path, userID, profileID, ownerInstallationID, true,
 					)
 				})
 				playbackHandler.VirtualPlaybackStreamLister = handlers.VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]handlers.VirtualPlaybackStream, error) {
 					streams, err := deps.PluginService.ListVirtualPlaybackStreamsForInstallation(
-						ctx, path, userID, profileID, ownerInstallationID, false,
+						ctx, path, userID, profileID, ownerInstallationID, true,
 					)
 					if err != nil {
 						return nil, err
@@ -1125,7 +1125,7 @@ func NewRouter(deps Dependencies) chi.Router {
 			if deps.PluginService != nil {
 				playbackHandler.VirtualPlaybackResolver = handlers.VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
 					return deps.PluginService.ResolveVirtualPlaybackForInstallation(
-						ctx, path, userID, profileID, ownerInstallationID, false,
+						ctx, path, userID, profileID, ownerInstallationID, true,
 					)
 				})
 			}
@@ -1133,17 +1133,17 @@ func NewRouter(deps Dependencies) chi.Router {
 		if deps.PluginService != nil {
 			playbackHandler.VirtualMediaResolver = handlers.VirtualMediaResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
 				return deps.PluginService.ResolveVirtualPlaybackForInstallation(
-					ctx, path, userID, profileID, ownerInstallationID, false,
+					ctx, path, userID, profileID, ownerInstallationID, true,
 				)
 			})
 			playbackHandler.VirtualMediaRefreshResolver = handlers.VirtualMediaRefreshResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string) (string, error) {
 				return deps.PluginService.RefreshVirtualPlaybackForInstallation(
-					ctx, path, userID, profileID, ownerInstallationID, false,
+					ctx, path, userID, profileID, ownerInstallationID, true,
 				)
 			})
 			playbackHandler.VirtualMediaDetailedResolver = handlers.VirtualMediaDetailedResolverFunc(func(ctx context.Context, path string, ownerInstallationID int, userID int, profileID string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (handlers.ResolvedVirtualMedia, error) {
 				res, err := deps.PluginService.ResolveVirtualPlaybackDetailedForInstallation(
-					ctx, path, userID, profileID, ownerInstallationID, false, forceRefresh, excludedCandidateIDs, preferredCandidateID,
+					ctx, path, userID, profileID, ownerInstallationID, true, forceRefresh, excludedCandidateIDs, preferredCandidateID,
 				)
 				if err != nil {
 					return handlers.ResolvedVirtualMedia{}, err
@@ -1299,7 +1299,7 @@ func NewRouter(deps Dependencies) chi.Router {
 					if dErr != nil {
 						return "", nil, dErr
 					}
-					resolved = res.StreamURL
+					resolved = res.URL
 					headers = res.RequestHeaders
 				} else if playbackHandler.VirtualMediaRefreshResolver != nil {
 					resolved, err = playbackHandler.VirtualMediaRefreshResolver.RefreshVirtualMedia(
@@ -1322,19 +1322,10 @@ func NewRouter(deps Dependencies) chi.Router {
 				var relayURL string
 				var cleanup func()
 				insecure := deps.PluginService != nil && deps.PluginService.InstallationAllowsInsecure(context.Background(), ownerInstallationID)
-				if hr, ok := remoteStreamRelay.(interface {
-					RegisterWithHeaders(context.Context, string, map[string]string) (string, func(), error)
-					RegisterInsecureWithHeaders(context.Context, string, map[string]string) (string, func(), error)
-				}); ok {
-					if insecure {
-						relayURL, cleanup, err = hr.RegisterInsecureWithHeaders(ctx, resolved, headers)
-					} else {
-						relayURL, cleanup, err = hr.RegisterWithHeaders(ctx, resolved, headers)
-					}
-				} else if insecure {
-					relayURL, cleanup, err = remoteStreamRelay.RegisterInsecure(ctx, resolved)
+				if insecure {
+					relayURL, cleanup, err = remoteStreamRelay.RegisterInsecureWithHeaders(ctx, resolved, headers)
 				} else {
-					relayURL, cleanup, err = remoteStreamRelay.Register(ctx, resolved)
+					relayURL, cleanup, err = remoteStreamRelay.RegisterWithHeaders(ctx, resolved, headers)
 				}
 				if err != nil {
 					return "", nil, err

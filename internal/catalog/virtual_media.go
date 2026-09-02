@@ -1437,9 +1437,10 @@ func upsertVirtualFileWithMeta(ctx context.Context, tx pgx.Tx, contentID, episod
 					ELSE COALESCE((SELECT runtime * 60 FROM episodes WHERE content_id = NULLIF($2,'')),(SELECT runtime * 60 FROM media_items WHERE content_id = $1 AND NULLIF($2,'') IS NULL))
 				END,
 				audio_tracks=COALESCE((SELECT jsonb_agg(jsonb_build_object('language', x)) FROM unnest($13::text[]) x),'[]'::jsonb),
-				subtitle_tracks=COALESCE((SELECT jsonb_agg(jsonb_build_object('language', x)) FROM unnest($14::text[]) x),'[]'::jsonb)
+				subtitle_tracks=COALESCE((SELECT jsonb_agg(jsonb_build_object('language', x)) FROM unnest($14::text[]) x),'[]'::jsonb),
+				virtual_owner_installation_id=COALESCE(NULLIF($16,0), virtual_owner_installation_id)
 			WHERE id=$15`,
-			contentID, episodeID, folderID, uri, duration, in.Resolution, in.CodecVideo, in.CodecAudio, isHDR, in.Bitrate, fileSize, "virtual", audioLangs, subLangs, adoptID); err != nil {
+			contentID, episodeID, folderID, uri, duration, in.Resolution, in.CodecVideo, in.CodecAudio, isHDR, in.Bitrate, fileSize, "virtual", audioLangs, subLangs, adoptID, installationID); err != nil {
 			return fmt.Errorf("adopt virtual file rotation: %w", err)
 		}
 		dropVirtualSiblingRows(ctx, tx, contentID, episodeID, folderID, installationID, adoptID, neutralURI, "")
