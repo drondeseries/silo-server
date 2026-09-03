@@ -86,7 +86,7 @@ func (e *httpRemoteFrameExtractor) ExtractFrame(
 	if err != nil {
 		return nil, chapterThumbnailNodeUnavailableReason, fmt.Errorf("chapter thumbnail remote extract: request failed: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		reason := chapterThumbnailNodeUnavailableReason

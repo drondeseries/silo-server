@@ -221,7 +221,7 @@ type testProbeEnsurer struct {
 	err  error
 }
 
-func (e testProbeEnsurer) Ensure(context.Context, *models.MediaFile) (*models.MediaFile, error) {
+func (e testProbeEnsurer) EnsureProbeOnly(context.Context, *models.MediaFile) (*models.MediaFile, error) {
 	if e.err != nil {
 		return nil, e.err
 	}
