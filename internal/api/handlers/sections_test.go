@@ -89,6 +89,37 @@ func TestSectionBackdropPathUsesExpectedVariants(t *testing.T) {
 	}
 }
 
+func TestWriteSectionDeleteErrorDistinguishesMissingSectionsFromRepositoryFailures(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{
+			name:       "missing section",
+			err:        fmt.Errorf("loading section: %w", sections.ErrSectionNotFound),
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "repository failure",
+			err:        fmt.Errorf("database unavailable"),
+			wantStatus: http.StatusInternalServerError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+
+			writeSectionDeleteError(recorder, tt.err)
+
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", recorder.Code, tt.wantStatus, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestBuildSectionsResponseEnrichesEpisodeMetadata(t *testing.T) {
 	seasonNumber := 1
 	episodeNumber := 1

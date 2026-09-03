@@ -53,6 +53,18 @@ type Session struct {
 	TranscodeTransportID string // remote node process identity; empty means session ID
 	AudioTrackIndex      int
 
+	// RoutingWorkload and the execution/egress fields describe the committed
+	// node-routing assignment independently from the transcode process route.
+	// Node URLs are internal identities used by the session sync layer to join
+	// stable stream-node IDs; they are never returned as client media origins.
+	RoutingWorkload         string
+	RoutingExecution        string
+	RoutingExecutionNodeID  int
+	RoutingExecutionNodeURL string
+	RoutingEgress           string
+	RoutingEgressNodeID     int
+	RoutingEgressNodeURL    string
+
 	StreamBitrateKbps      int          // currently delivered bitrate, when known
 	TargetResolution       string       // requested output resolution for transcodes
 	TargetVideoCodec       string       // requested output video codec for transcodes
@@ -116,6 +128,13 @@ type SessionStreamState struct {
 	TranscodeNodeURL                 string
 	TranscodeTransportID             string
 	TranscodeRouteSet                bool
+	RoutingWorkload                  string
+	RoutingExecution                 string
+	RoutingExecutionNodeID           int
+	RoutingExecutionNodeURL          string
+	RoutingEgress                    string
+	RoutingEgressNodeID              int
+	RoutingEgressNodeURL             string
 	RequireMediaAuthorization        bool
 	MediaAuthorizationSet            bool
 	VirtualSourceURI                 string
@@ -138,6 +157,20 @@ type SessionStreamState struct {
 type TranscodeRoute struct {
 	NodeURL     string
 	TransportID string
+}
+
+// NodeRoutingAssignment is the committed placement of one playback workload.
+// The string vocabulary belongs to the routing package; playback stores it as
+// opaque session state to avoid coupling session lifetime management to route
+// selection.
+type NodeRoutingAssignment struct {
+	Workload         string
+	Execution        string
+	ExecutionNodeID  int
+	ExecutionNodeURL string
+	Egress           string
+	EgressNodeID     int
+	EgressNodeURL    string
 }
 
 // SessionReplacement is the complete mutable session state associated with a
@@ -274,6 +307,9 @@ type SessionManager struct {
 	activeGrace      time.Duration
 	pausedGrace      time.Duration
 	expireHook       func(*Session)
+	// transportStops holds the stop channels of media transports this replica
+	// is currently serving, keyed by session ID. See WatchTransportStop.
+	transportStops map[string]map[chan struct{}]struct{}
 }
 
 // SessionLimits stores per-user admission limits. Zero values mean unlimited.
@@ -966,6 +1002,13 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 	if state.TranscodeRouteSet {
 		s.TranscodeNodeURL = state.TranscodeNodeURL
 		s.TranscodeTransportID = state.TranscodeTransportID
+		s.RoutingWorkload = state.RoutingWorkload
+		s.RoutingExecution = state.RoutingExecution
+		s.RoutingExecutionNodeID = state.RoutingExecutionNodeID
+		s.RoutingExecutionNodeURL = state.RoutingExecutionNodeURL
+		s.RoutingEgress = state.RoutingEgress
+		s.RoutingEgressNodeID = state.RoutingEgressNodeID
+		s.RoutingEgressNodeURL = state.RoutingEgressNodeURL
 	}
 	if state.VirtualSourceSet {
 		s.VirtualSourceURI = state.VirtualSourceURI
@@ -1007,6 +1050,13 @@ func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 		TranscodeNodeURL:                 s.TranscodeNodeURL,
 		TranscodeTransportID:             s.TranscodeTransportID,
 		TranscodeRouteSet:                true,
+		RoutingWorkload:                  s.RoutingWorkload,
+		RoutingExecution:                 s.RoutingExecution,
+		RoutingExecutionNodeID:           s.RoutingExecutionNodeID,
+		RoutingExecutionNodeURL:          s.RoutingExecutionNodeURL,
+		RoutingEgress:                    s.RoutingEgress,
+		RoutingEgressNodeID:              s.RoutingEgressNodeID,
+		RoutingEgressNodeURL:             s.RoutingEgressNodeURL,
 		RequireMediaAuthorization:        s.RequireMediaAuthorization,
 		MediaAuthorizationSet:            true,
 		SubtitleTrackIndex:               s.SubtitleTrackIndex,
@@ -1041,6 +1091,14 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.ToneMapMode = state.ToneMapMode
 	s.TranscodeNodeURL = state.TranscodeNodeURL
 	s.TranscodeTransportID = state.TranscodeTransportID
+	s.RoutingWorkload = state.RoutingWorkload
+	s.RoutingExecution = state.RoutingExecution
+	s.RoutingExecutionNodeID = state.RoutingExecutionNodeID
+	s.RoutingExecutionNodeURL = state.RoutingExecutionNodeURL
+	s.RoutingEgress = state.RoutingEgress
+	s.RoutingEgressNodeID = state.RoutingEgressNodeID
+	s.RoutingEgressNodeURL = state.RoutingEgressNodeURL
+	s.RequireMediaAuthorization = state.RequireMediaAuthorization
 	s.VirtualSourceURI = state.VirtualSourceURI
 	s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
@@ -1196,6 +1254,30 @@ func (m *SessionManager) SetTranscodeNodeURL(sessionID, url string) error {
 	}
 
 	s.TranscodeNodeURL = url
+	s.streamRevision++
+	m.touchSessionLocked(s)
+	return nil
+}
+
+// SetNodeRoutingAssignment records the successfully prepared route exposed by
+// live-session observability. Callers invoke it only after the selected route
+// has enough authority to serve the client.
+func (m *SessionManager) SetNodeRoutingAssignment(sessionID string, assignment NodeRoutingAssignment) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	s, ok := m.sessions[sessionID]
+	if !ok {
+		return ErrSessionNotFound
+	}
+
+	s.RoutingWorkload = assignment.Workload
+	s.RoutingExecution = assignment.Execution
+	s.RoutingExecutionNodeID = assignment.ExecutionNodeID
+	s.RoutingExecutionNodeURL = assignment.ExecutionNodeURL
+	s.RoutingEgress = assignment.Egress
+	s.RoutingEgressNodeID = assignment.EgressNodeID
+	s.RoutingEgressNodeURL = assignment.EgressNodeURL
 	s.streamRevision++
 	m.touchSessionLocked(s)
 	return nil
@@ -1364,7 +1446,87 @@ func (m *SessionManager) EndTransport(sessionID string) error {
 	return nil
 }
 
-// StopSession removes a session from the manager.
+// WatchTransportStop returns a channel that is closed when the session is
+// stopped, and the release the caller must run when its transport ends.
+//
+// A progressive remux is a single HTTP response whose ffmpeg is owned by the
+// serving handler and canceled only by that request's context, so removing the
+// session from this manager does not reach it: an unnegotiated client would go
+// on consuming a stream the server has already disowned — for a copy-unsafe
+// source, corrupt bytes its decoder cannot recover from. This is the smallest
+// handle that lets a stop interrupt one. Segmented transports (HLS, transcode)
+// do not need it: each of their requests is short, and the next one is refused
+// once the session is gone.
+//
+// A session that is already gone yields an immediately-closed channel. The stop
+// that removed it has run and will never run again, so a watcher registered
+// after it would be closed by nobody: the caller's BeginTransport can succeed
+// and the session be stopped before the registration lands, and the progressive
+// remux that hole leaves behind runs to EOF serving bytes the server disowned.
+// Reporting the stop it missed collapses that race into the ordinary path.
+//
+// The channel is closed at most once: StopSession takes the whole watcher set
+// out of the map under the lock before closing it, and release drops a watcher
+// that was never signaled.
+func (m *SessionManager) WatchTransportStop(sessionID string) (<-chan struct{}, func()) {
+	if m == nil || sessionID == "" {
+		return nil, func() {}
+	}
+
+	stop := make(chan struct{})
+	m.mu.Lock()
+	if _, live := m.sessions[sessionID]; !live {
+		m.mu.Unlock()
+		close(stop)
+		return stop, func() {}
+	}
+	if m.transportStops == nil {
+		m.transportStops = make(map[string]map[chan struct{}]struct{})
+	}
+	watchers, ok := m.transportStops[sessionID]
+	if !ok {
+		watchers = make(map[chan struct{}]struct{})
+		m.transportStops[sessionID] = watchers
+	}
+	watchers[stop] = struct{}{}
+	m.mu.Unlock()
+
+	var once sync.Once
+	return stop, func() {
+		once.Do(func() { m.releaseTransportStop(sessionID, stop) })
+	}
+}
+
+func (m *SessionManager) releaseTransportStop(sessionID string, stop chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	watchers, ok := m.transportStops[sessionID]
+	if !ok {
+		return
+	}
+	delete(watchers, stop)
+	if len(watchers) == 0 {
+		delete(m.transportStops, sessionID)
+	}
+}
+
+// stopTransportsLocked signals every transport registered for the session. The
+// close is cheap and never blocks, and the watchers it wakes cancel an ffmpeg
+// rather than calling back into the manager, so it is safe to do under the lock.
+func (m *SessionManager) stopTransportsLocked(sessionID string) {
+	watchers, ok := m.transportStops[sessionID]
+	if !ok {
+		return
+	}
+	delete(m.transportStops, sessionID)
+	for stop := range watchers {
+		close(stop)
+	}
+}
+
+// StopSession removes a session from the manager and interrupts any media
+// transport it is still serving.
 func (m *SessionManager) StopSession(sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1374,6 +1536,7 @@ func (m *SessionManager) StopSession(sessionID string) error {
 	}
 
 	delete(m.sessions, sessionID)
+	m.stopTransportsLocked(sessionID)
 	return nil
 }
 

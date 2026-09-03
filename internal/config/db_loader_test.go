@@ -35,6 +35,17 @@ func TestLoadFromDBMetadataPresignExpiryRejectsInvalidDuration(t *testing.T) {
 	}
 }
 
+func TestLoadFromDBRejectsInvalidSegmentRetention(t *testing.T) {
+	for _, value := range []string{"-1", "119", "86401"} {
+		t.Run(value, func(t *testing.T) {
+			_, err := LoadFromDB(map[string]string{playbackSegmentRetentionSettingKey: value})
+			if err == nil || !strings.Contains(err.Error(), playbackSegmentRetentionSettingKey) {
+				t.Fatalf("LoadFromDB() error = %v, want retention bounds error", err)
+			}
+		})
+	}
+}
+
 func TestLoadFromDBDownloadArtifactDirRequiresAbsolutePath(t *testing.T) {
 	cfg, err := LoadFromDB(map[string]string{downloadArtifactDirSettingKey: "/mnt/silo-downloads"})
 	if err != nil {
@@ -198,6 +209,16 @@ func TestYAMLToSettingsMapJellyfinCompatEnabledDefaultsToLegacyListener(t *testi
 	}
 	if got := m["jellyfin_compat.listen"]; got == "" {
 		t.Fatal("jellyfin_compat.listen is empty, want default listener")
+	}
+}
+
+func TestYAMLToSettingsMapPreservesExplicitlyDisabledSegmentRetention(t *testing.T) {
+	m := yamlSettingsMapFromString(t, `
+playback:
+  segment_retention_seconds: 0
+`)
+	if got := m[playbackSegmentRetentionSettingKey]; got != "0" {
+		t.Fatalf("segment retention = %q, want explicit disable", got)
 	}
 }
 

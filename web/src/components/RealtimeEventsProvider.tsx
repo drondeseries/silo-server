@@ -486,6 +486,7 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
   const pageActivity = usePageActivity();
   const location = useLocation();
   const authenticatedUserID = user?.id ?? null;
+  const isForegroundPlaybackRoute = location.pathname.startsWith("/watch/");
   const isDashboardRoute = location.pathname === "/admin" || location.pathname === "/admin/";
   const allowDashboardRealtimeUpdates = !isDashboardRoute || pageActivity.canPollDashboard;
   const [connectionState, setConnectionState] = useState<RealtimeConnectionState>("connecting");
@@ -770,13 +771,27 @@ export function RealtimeEventsProvider({ children }: { children: ReactNode }) {
     if (!shouldCatchUpOnFocusRef.current) {
       return;
     }
+    // The foreground player covers the routed app and owns everything it
+    // needs for uninterrupted playback. Refetching every active query here
+    // used to reload profiles, capabilities, theme/settings, branding, and
+    // watch detail together whenever a hidden playback tab became visible.
+    // Keep the catch-up pending until the watch route exits; the underlying
+    // screen will then refresh before it becomes useful again.
+    if (isForegroundPlaybackRoute) {
+      return;
+    }
 
     shouldCatchUpOnFocusRef.current = false;
     void queryClient.refetchQueries({
       type: "active",
       predicate: (query) => !isDashboardQueryKey(query.queryKey),
     });
-  }, [authenticatedUserID, pageActivity.canApplyRealtimeUpdates, queryClient]);
+  }, [
+    authenticatedUserID,
+    isForegroundPlaybackRoute,
+    pageActivity.canApplyRealtimeUpdates,
+    queryClient,
+  ]);
 
   useEffect(() => {
     if (!authenticatedUserID || !pageActivity.canApplyRealtimeUpdates) {

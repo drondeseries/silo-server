@@ -138,6 +138,10 @@ func (s *webhookSender) send(ctx context.Context, hook *Webhook, row DeliveryRow
 	if err != nil {
 		return webhookSendResult{Message: "webhook URL could not be decrypted"}
 	}
+	if row.PosterPath == "" && isRequestLifecycleType(row.Type) {
+		flags := parseRequestFlags(row.ReasonFlags)
+		row.PosterPath = flags.PosterPath
+	}
 	if hook.Type == WebhookTypeDiscord && s.posterURL != nil {
 		row.PosterURL = s.posterURL(ctx, row.PosterPath, row.PosterSourcePath)
 	}

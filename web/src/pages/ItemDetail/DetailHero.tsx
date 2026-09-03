@@ -103,7 +103,7 @@ export default function DetailHero({
         <div
           className="hero-backdrop-artwork absolute inset-0 h-full w-full"
           style={{
-            ...(backdropPlaceholder && !backdropLoaded
+            ...(backdropPlaceholder
               ? {
                   backgroundImage: `url(${backdropPlaceholder})`,
                   backgroundSize: "cover",
@@ -148,7 +148,9 @@ export default function DetailHero({
             !isCompact && aside ? "lg:grid-cols-[minmax(0,1fr)_280px] lg:items-end" : ""
           }`}
         >
-          <div className={`flex flex-col gap-6 ${!hidePoster ? "lg:flex-row lg:items-end" : ""}`}>
+          <div
+            className={`detail-hero-primary-content flex flex-col gap-6 ${!hidePoster ? "lg:flex-row lg:items-end" : ""}`}
+          >
             {/* Poster */}
             {!hidePoster && (
               <div
@@ -210,7 +212,7 @@ export default function DetailHero({
                     src={logoUrl}
                     alt=""
                     decoding="async"
-                    className="mb-4 max-h-20 max-w-[420px] object-contain object-left lg:max-h-28 lg:max-w-[480px]"
+                    className="mb-4 h-20 w-full max-w-[420px] object-contain object-left lg:h-28 lg:max-w-[480px]"
                   />
                 </>
               ) : (

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"unicode"
@@ -71,7 +72,7 @@ func TestSessionsCapabilitiesAdvertisesActivityFields(t *testing.T) {
 		t.Fatalf("decode capabilities: %v", err)
 	}
 	if !resp.EffectivePlayMethod || !resp.IsJellyfinClient || !resp.TranscodeHWAccel || !resp.ToneMapMode ||
-		!resp.ClientBuild || !resp.ClientChannel || !resp.TargetAudioChannels {
+		!resp.ClientBuild || !resp.ClientChannel || !resp.TargetAudioChannels || !resp.NodeRouting {
 		t.Fatalf("capabilities must advertise every additive field: %+v", resp)
 	}
 	want := []string{"direct", "remux", "transcode", "audio"}
@@ -85,6 +86,28 @@ func TestSessionsCapabilitiesAdvertisesActivityFields(t *testing.T) {
 	}
 	if got, wantToneMap := resp.ToneMapModeValues, []string{"hardware", "software"}; len(got) != len(wantToneMap) || got[0] != wantToneMap[0] || got[1] != wantToneMap[1] {
 		t.Fatalf("tone-map vocabulary = %v, want %v", got, wantToneMap)
+	}
+}
+
+func TestPlaybackRoutingCapabilitiesAdvertisePolicyVocabulary(t *testing.T) {
+	rr := httptest.NewRecorder()
+	(&AdminHandler{}).HandleGetPlaybackRoutingCapabilities(rr,
+		httptest.NewRequest(http.MethodGet, "/admin/playback-routing/capabilities", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	var response playbackRoutingCapabilitiesResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Features) != 1 || response.Features[0] != "playback_node_routing_v1" {
+		t.Fatalf("features = %v", response.Features)
+	}
+	if len(response.Workloads) != 3 || len(response.ExecutionPreferences) != 5 || len(response.EgressPreferences) != 4 {
+		t.Fatalf("capabilities = %+v", response)
+	}
+	if !slices.Contains(response.ExecutionPreferences, "prefer_transcode") {
+		t.Fatalf("execution preferences = %v, want prefer_transcode", response.ExecutionPreferences)
 	}
 }
 

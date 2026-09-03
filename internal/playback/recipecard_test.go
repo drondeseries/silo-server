@@ -2,6 +2,7 @@ package playback
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
@@ -132,6 +133,41 @@ func TestRecipeCardUsesCanonicalInputForReconstruction(t *testing.T) {
 		t.Fatalf("reconstructed opts input = %q/%q, want %q", opts.InputPath, opts.CanonicalInputPath, card.InputPath)
 	}
 }
+
+func TestRecipeCardPreservesCopyVideoMPEGTS(t *testing.T) {
+	card := NewRecipeCard(42, "profile-1", 77, "", TranscodeOpts{
+		SessionID: "copy-ts", TargetCodecVideo: "copy", TargetCodecAudio: "copy", CopyVideoMPEGTS: true,
+	})
+	if !card.TranscodeOpts(t.TempDir(), "/usr/bin/ffmpeg", nil).CopyVideoMPEGTS {
+		t.Fatal("stored recipe lost copy-video MPEG-TS selection")
+	}
+	if back := RecipeCardFromClaims(ptr(card.ToClaims())); !back.CopyVideoMPEGTS {
+		t.Fatal("stream-token recipe lost copy-video MPEG-TS selection")
+	}
+}
+
+func TestRecipeCardPreservesRoutingNodeIDs(t *testing.T) {
+	card := NewDirectRecipeCard("route-bound", 42, "profile-1", 77)
+	card.RoutingWorkload = "direct_play"
+	card.RoutingExecution = "none"
+	card.RoutingExecutionNodeID = 7
+	card.RoutingEgress = "proxy"
+	card.RoutingEgressNodeID = 11
+
+	claims := card.ToClaims()
+	if claims.RoutingExecutionNodeID != 7 {
+		t.Fatalf("claims execution node ID = %d, want 7", claims.RoutingExecutionNodeID)
+	}
+	if claims.RoutingEgressNodeID != 11 {
+		t.Fatalf("claims egress node ID = %d, want 11", claims.RoutingEgressNodeID)
+	}
+	back := RecipeCardFromClaims(&claims)
+	if back.RoutingExecutionNodeID != 7 || back.RoutingEgressNodeID != 11 {
+		t.Fatalf("round-trip node IDs = execution %d, egress %d; want 7 and 11", back.RoutingExecutionNodeID, back.RoutingEgressNodeID)
+	}
+}
+
+func ptr[T any](value T) *T { return &value }
 
 func TestRecipeCardPlayMethodConstructors(t *testing.T) {
 	if c := NewRecipeCard(1, "p", 2, "", TranscodeOpts{SessionID: "t"}); c.PlayMethod != PlayTranscode {
@@ -312,6 +348,9 @@ func TestRecipeCardClaimsRoundTrip(t *testing.T) {
 		TotalDuration:          7200,
 		FastStart:              true,
 	})
+	card.RoutingWorkload = "video_transcode"
+	card.RoutingExecution = "transcode"
+	card.RoutingEgress = "proxy"
 
 	claims := card.ToClaims()
 	got := RecipeCardFromClaims(&claims)
@@ -319,7 +358,8 @@ func TestRecipeCardClaimsRoundTrip(t *testing.T) {
 	// Identity + routing.
 	if got.SessionID != card.SessionID || got.UserID != card.UserID ||
 		got.ProfileID != card.ProfileID || got.MediaFileID != card.MediaFileID ||
-		got.TranscodeNodeURL != card.TranscodeNodeURL || got.PlayMethod != card.PlayMethod {
+		got.TranscodeNodeURL != card.TranscodeNodeURL || got.PlayMethod != card.PlayMethod ||
+		got.RoutingWorkload != card.RoutingWorkload || got.RoutingExecution != card.RoutingExecution || got.RoutingEgress != card.RoutingEgress {
 		t.Fatalf("identity/routing lost: %+v", got)
 	}
 	// Byte-affecting encode parameters.
@@ -353,14 +393,22 @@ func TestReconstructSessionRestoresSourceAudioChannels(t *testing.T) {
 		SessionID: "source-audio", InputPath: "/media/movie.mkv",
 		TargetCodecAudio: "aac", SourceAudioChannels: 6, TargetAudioChannels: 2,
 	})
+	card.RoutingWorkload = "remux"
+	card.RoutingExecution = "proxy"
+	card.RoutingEgress = "proxy"
+	card.RoutingEgressNodeID = 11
 
 	claims := card.ToClaims()
 	if claims.SourceAudioChannels != 6 || claims.AudioChannels != 0 {
 		t.Fatalf("source audio claim = %d, legacy ambiguous claim = %d", claims.SourceAudioChannels, claims.AudioChannels)
 	}
 	reconstructed := tm.ReconstructSession(t.Context(), card.SessionID, card.UserID, RecipeCardFromClaims(&claims))
-	if reconstructed == nil || reconstructed.SourceAudioChannels != 6 {
-		t.Fatalf("reconstructed session = %#v, want six source channels", reconstructed)
+	if reconstructed == nil || reconstructed.SourceAudioChannels != 6 ||
+		reconstructed.RoutingWorkload != card.RoutingWorkload ||
+		reconstructed.RoutingExecution != card.RoutingExecution ||
+		reconstructed.RoutingEgress != card.RoutingEgress ||
+		reconstructed.RoutingEgressNodeID != card.RoutingEgressNodeID {
+		t.Fatalf("reconstructed session = %#v, want source channels and route assignment restored", reconstructed)
 	}
 
 	legacy := RecipeCardFromClaims(&streamtoken.Claims{SessionID: "legacy", UserID: 42, MediaFileID: 77})
@@ -478,5 +526,38 @@ func TestOrdinaryTranscodeRecipeClaimsKeepLegacyMethod(t *testing.T) {
 	claims := (RecipeCard{PlayMethod: PlayTranscode}).ToClaims()
 	if got := claims.PlayMethod; got != string(PlayTranscode) {
 		t.Fatalf("ordinary transcode token method = %q, want %q", got, PlayTranscode)
+	}
+}
+
+func TestCopyFMP4RecipeCardsFailClosedAcrossReaderGenerations(t *testing.T) {
+	card := NewRecipeCard(1, "profile-1", 2, "http://node", TranscodeOpts{
+		SessionID: "copy-fmp4", TargetCodecVideo: "copy", SegmentDuration: 2,
+	})
+	if card.CopyFMP4RecipeVersion != CopyFMP4RecipeVersion {
+		t.Fatalf("stored copy recipe version = %q, want %q", card.CopyFMP4RecipeVersion, CopyFMP4RecipeVersion)
+	}
+	if card.PlayMethod == PlayTranscode || card.PlayMethod == "" {
+		t.Fatalf("stored copy recipe method = %q, want a method rejected by old readers", card.PlayMethod)
+	}
+	if err := ValidateCopyFMP4RecipeCard(card); err != nil {
+		t.Fatalf("current stored copy recipe rejected: %v", err)
+	}
+
+	claims := card.ToClaims()
+	if claims.PlayMethod != streamtoken.PlayMethodCopyFMP4Transcode || claims.CopyFMP4RecipeVersion != CopyFMP4RecipeVersion {
+		t.Fatalf("copy token discriminator/version = %q/%q", claims.PlayMethod, claims.CopyFMP4RecipeVersion)
+	}
+	roundTrip := RecipeCardFromClaims(&claims)
+	if err := ValidateCopyFMP4RecipeCard(roundTrip); err != nil {
+		t.Fatalf("round-tripped copy recipe rejected: %v", err)
+	}
+
+	legacy := RecipeCard{SessionID: "legacy-copy", PlayMethod: PlayTranscode, TargetCodecVideo: "copy", SegmentDuration: 2}
+	if err := ValidateCopyFMP4RecipeCard(legacy); !errors.Is(err, ErrCopyFMP4RecipeVersionMismatch) {
+		t.Fatalf("legacy copy recipe error = %v, want version mismatch", err)
+	}
+	ordinary := RecipeCard{SessionID: "encoded", PlayMethod: PlayTranscode, TargetCodecVideo: "h264", SegmentDuration: 2}
+	if err := ValidateCopyFMP4RecipeCard(ordinary); err != nil {
+		t.Fatalf("ordinary encoded recipe rejected: %v", err)
 	}
 }

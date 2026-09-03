@@ -168,7 +168,7 @@ the initial sync run.
 Built-in templates ship with poster artwork under
 `web/public/images/collection-templates/`. Poster filenames match template IDs, for example
 `tmdb_popular_movies.jpg`; raw generated plates live in
-`web/public/images/collection-templates/raw/` so typography can be regenerated without
+`web/assets-source/collection-templates/raw/` so typography can be regenerated without
 re-running image generation.
 
 The poster style is intentionally close to Kometa/Plex collection posters:
@@ -196,7 +196,7 @@ Generate the raw plate with an image-generation tool, then add deterministic typ
    original art with no readable text, logos, watermarks, real posters,
    recognizable actors, franchise characters, or provider branding.
 2. Copy the generated PNG into
-   `web/public/images/collection-templates/raw/{template_id}.png`, resizing and
+   `web/assets-source/collection-templates/raw/{template_id}.png`, resizing and
    center-cropping to `1024x1536`.
 3. Create the final poster at
    `web/public/images/collection-templates/{template_id}.jpg`, resizing and

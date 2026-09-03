@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { Dispatch, SetStateAction } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import type { AdminJob, Library, LibraryCollection, LibraryCollectionGroup } from "@/api/types";
@@ -12,6 +13,7 @@ import {
 import {
   useAdminCollections,
   useDeleteAdminCollection,
+  useDeleteAdminCollections,
   useSyncAdminCollection,
   useTemplateBundleApplyJobs,
 } from "@/hooks/queries/admin/collections";
@@ -43,7 +45,9 @@ import {
   Trash2,
 } from "lucide-react";
 import { CollectionTemplateGallery } from "@/components/CollectionTemplateGallery";
-import { buildAdminCollectionEditorPath } from "./adminCollectionsShared";
+import { BulkSelectionCheckbox } from "@/components/BulkSelectionCheckbox";
+import { updateCheckboxSelection } from "@/lib/checkboxSelection";
+import { buildAdminCollectionEditorPath, collectionsInAdminScope } from "./adminCollectionsShared";
 
 export default function AdminCollections() {
   const queryClient = useQueryClient();
@@ -62,6 +66,9 @@ export default function AdminCollections() {
   const [confirmDeleteCollection, setConfirmDeleteCollection] = useState<LibraryCollection | null>(
     null,
   );
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
+  const [confirmDeleteSelected, setConfirmDeleteSelected] = useState(false);
+  const [selectedCollectionIds, setSelectedCollectionIds] = useState<Set<string>>(new Set());
 
   const allCollections = useAdminCollections();
   const libraryCounts = useMemo(
@@ -69,7 +76,12 @@ export default function AdminCollections() {
     [libraries, allCollections.data],
   );
 
+  function clearCollectionSelection() {
+    setSelectedCollectionIds(new Set());
+  }
+
   const setSelectedLibraryId = (libraryId: number | null) => {
+    clearCollectionSelection();
     setSearchParams((current) => {
       const next = new URLSearchParams(current);
       if (libraryId) {
@@ -82,16 +94,25 @@ export default function AdminCollections() {
   };
 
   const board = useAdminCollectionsBoard(selectedLibraryId ?? undefined);
+  const collectionsInScope = useMemo(
+    () => collectionsInAdminScope(allCollections.data ?? [], board.data, selectedLibraryId),
+    [allCollections.data, board.data, selectedLibraryId],
+  );
+  const selectedCollections = useMemo(
+    () => collectionsInScope.filter((collection) => selectedCollectionIds.has(collection.id)),
+    [collectionsInScope, selectedCollectionIds],
+  );
   const createGroup = useCreateCollectionGroup(selectedLibraryId ?? 0);
   const updateGroup = useUpdateCollectionGroup(selectedLibraryId ?? 0);
   const deleteGroup = useDeleteCollectionGroup(selectedLibraryId ?? 0);
   const deleteCollection = useDeleteAdminCollection();
+  const deleteCollections = useDeleteAdminCollections();
   const syncCollection = useSyncAdminCollection();
   const isAllLibraries = selectedLibraryId === null;
   const applyJobs = useTemplateBundleApplyJobs();
   useEventChannel("jobs");
   const latestApplyJob = applyJobs.data?.[0] ?? null;
-  const activeApplyJob = latestApplyJob ? isActiveTemplateBundleApplyJob(latestApplyJob) : false;
+  const activeApplyJob = latestApplyJob !== null && isActiveTemplateBundleApplyJob(latestApplyJob);
   const lastInvalidatedJobID = useRef<string | null>(null);
 
   useEffect(() => {
@@ -102,6 +123,21 @@ export default function AdminCollections() {
     void invalidateAdminCollectionQueries(queryClient);
     void queryClient.invalidateQueries({ queryKey: sectionKeys.all });
   }, [activeApplyJob, latestApplyJob, queryClient]);
+
+  useEffect(() => {
+    const clearSelection = (event: KeyboardEvent) => {
+      if (
+        event.key === "Escape" &&
+        confirmDeleteCollection === null &&
+        !confirmDeleteSelected &&
+        !confirmDeleteAll
+      ) {
+        setSelectedCollectionIds(new Set());
+      }
+    };
+    window.addEventListener("keydown", clearSelection);
+    return () => window.removeEventListener("keydown", clearSelection);
+  }, [confirmDeleteAll, confirmDeleteCollection, confirmDeleteSelected]);
 
   if (allCollections.isLoading && libraries.length === 0) {
     return (
@@ -130,9 +166,35 @@ export default function AdminCollections() {
     board.data &&
     boardCollectionCount === 0 &&
     !hasRegularBoardGroups;
+  const selectedLibrary = libraries.find((library) => library.id === selectedLibraryId) ?? null;
+  const collectionDeletionNotice =
+    "Silo will keep collections that are still used by home or library sections. This action cannot be undone.";
+  const deleteAllDescription = selectedLibrary
+    ? `Delete all ${collectionsInScope.length} collections shown for ${selectedLibrary.name}? Shared collections will also be removed from their other libraries. ${collectionDeletionNotice}`
+    : `Delete all ${collectionsInScope.length} server collections? ${collectionDeletionNotice}`;
+  const deleteSelectedDescription = `Delete ${selectedCollections.length} selected collection${selectedCollections.length === 1 ? "" : "s"}? ${collectionDeletionNotice}`;
+  const deleteProgressLabel = `Deleting ${deleteCollections.progress?.completed ?? 0} of ${deleteCollections.progress?.total ?? collectionsInScope.length} collections`;
+
+  function handleDeleteSelected() {
+    if (!activeApplyJob && selectedCollections.length > 0) {
+      deleteCollections.mutate(selectedCollections.map((collection) => collection.id));
+    }
+    setConfirmDeleteSelected(false);
+  }
+
+  function handleDeleteAll() {
+    if (!activeApplyJob && collectionsInScope.length > 0) {
+      deleteCollections.mutate(collectionsInScope.map((collection) => collection.id));
+    }
+    setConfirmDeleteAll(false);
+  }
 
   return (
-    <div className="space-y-6">
+    <div
+      className="space-y-6"
+      aria-busy={deleteCollections.isPending}
+      inert={deleteCollections.isPending ? true : undefined}
+    >
       <ConfirmDialog
         open={confirmDeleteCollection !== null}
         onOpenChange={(open) => {
@@ -151,6 +213,26 @@ export default function AdminCollections() {
           }
           setConfirmDeleteCollection(null);
         }}
+      />
+
+      <ConfirmDialog
+        open={confirmDeleteSelected}
+        onOpenChange={setConfirmDeleteSelected}
+        title="Delete selected collections"
+        description={deleteSelectedDescription}
+        confirmLabel="Delete selected"
+        variant="destructive"
+        onConfirm={handleDeleteSelected}
+      />
+
+      <ConfirmDialog
+        open={confirmDeleteAll}
+        onOpenChange={setConfirmDeleteAll}
+        title="Delete all collections"
+        description={deleteAllDescription}
+        confirmLabel="Delete all"
+        variant="destructive"
+        onConfirm={handleDeleteAll}
       />
 
       <div className="page-header gap-5">
@@ -177,6 +259,37 @@ export default function AdminCollections() {
           <Button size="sm" variant="outline" onClick={() => setGalleryOpen(true)}>
             <Sparkles className="mr-1 h-4 w-4" /> Browse Templates
           </Button>
+          {selectedCollections.length > 0 ? (
+            <>
+              <Badge variant="secondary">{selectedCollections.length} selected</Badge>
+              <Button size="sm" variant="ghost" onClick={clearCollectionSelection}>
+                Clear
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive"
+                disabled={deleteCollections.isPending || activeApplyJob}
+                onClick={() => setConfirmDeleteSelected(true)}
+              >
+                <Trash2 data-icon="inline-start" /> Delete Selected
+              </Button>
+            </>
+          ) : null}
+          {collectionsInScope.length > 0 ? (
+            <Button
+              size="sm"
+              variant="destructive"
+              disabled={deleteCollections.isPending || activeApplyJob}
+              onClick={() => setConfirmDeleteAll(true)}
+            >
+              {deleteCollections.isPending ? (
+                <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+              ) : (
+                <Trash2 className="mr-1 h-4 w-4" />
+              )}
+              {deleteCollections.isPending ? `${deleteProgressLabel}…` : "Delete All"}
+            </Button>
+          ) : null}
           <Button
             size="sm"
             onClick={() => navigate(buildAdminCollectionEditorPath("new", selectedLibraryId))}
@@ -200,6 +313,8 @@ export default function AdminCollections() {
           libraries={libraries}
           collections={allCollections.data ?? []}
           isLoading={allCollections.isLoading}
+          selectedIds={selectedCollectionIds}
+          setSelectedIds={setSelectedCollectionIds}
           syncingCollectionID={syncCollection.variables?.id ?? null}
           onEdit={(collection, libraryId) =>
             navigate(buildAdminCollectionEditorPath(collection.id, libraryId))
@@ -241,6 +356,8 @@ export default function AdminCollections() {
               libraryId: selectedLibraryId,
             })
           }
+          selectedIds={selectedCollectionIds}
+          setSelectedIds={setSelectedCollectionIds}
           syncingCollectionID={syncCollection.variables?.id ?? null}
         />
       )}
@@ -433,6 +550,8 @@ function AllLibraryCollectionsOverview({
   libraries,
   collections,
   isLoading,
+  selectedIds,
+  setSelectedIds,
   syncingCollectionID,
   onEdit,
   onDelete,
@@ -443,6 +562,8 @@ function AllLibraryCollectionsOverview({
   libraries: Library[];
   collections: LibraryCollection[];
   isLoading: boolean;
+  selectedIds: Set<string>;
+  setSelectedIds: Dispatch<SetStateAction<Set<string>>>;
   syncingCollectionID: string | null;
   onEdit: (collection: LibraryCollection, libraryId: number) => void;
   onDelete: (collection: LibraryCollection) => void;
@@ -454,6 +575,40 @@ function AllLibraryCollectionsOverview({
     () => buildAllLibrarySections(libraries, collections),
     [libraries, collections],
   );
+  const selectionRows = useMemo(
+    () =>
+      sections.flatMap((section) =>
+        section.collections.map((collection) => ({
+          rowId: `${section.library.id}:${collection.id}`,
+          collectionId: collection.id,
+        })),
+      ),
+    [sections],
+  );
+  const selectionOrder = useMemo(() => selectionRows.map((row) => row.rowId), [selectionRows]);
+  const collectionIdByRow = useMemo(
+    () => new Map(selectionRows.map((row) => [row.rowId, row.collectionId])),
+    [selectionRows],
+  );
+  const selectionAnchorRef = useRef<string | null>(null);
+
+  const updateSelection = (rowId: string, checked: boolean, extendRange: boolean) => {
+    const anchorId = extendRange && selectedIds.size > 0 ? selectionAnchorRef.current : null;
+    setSelectedIds((previous) =>
+      updateCheckboxSelection(
+        previous,
+        selectionOrder,
+        anchorId,
+        rowId,
+        checked,
+        extendRange,
+        (selectedRowId) => collectionIdByRow.get(selectedRowId) ?? selectedRowId,
+      ),
+    );
+    if (anchorId === null || !selectionOrder.includes(anchorId)) {
+      selectionAnchorRef.current = rowId;
+    }
+  };
 
   if (isLoading) {
     return (
@@ -499,18 +654,25 @@ function AllLibraryCollectionsOverview({
             </Badge>
           </div>
           <div className="divide-y">
-            {section.collections.map((collection) => (
-              <AllLibraryCollectionRow
-                key={`${section.library.id}:${collection.id}`}
-                collection={collection}
-                libraries={libraries}
-                libraryId={section.library.id}
-                isSyncing={syncingCollectionID === collection.id}
-                onEdit={() => onEdit(collection, section.library.id)}
-                onDelete={() => onDelete(collection)}
-                onSync={() => onSync(collection, section.library.id)}
-              />
-            ))}
+            {section.collections.map((collection) => {
+              const rowId = `${section.library.id}:${collection.id}`;
+              return (
+                <AllLibraryCollectionRow
+                  key={rowId}
+                  collection={collection}
+                  libraries={libraries}
+                  libraryId={section.library.id}
+                  selected={selectedIds.has(collection.id)}
+                  isSyncing={syncingCollectionID === collection.id}
+                  onSelectionChange={(checked, extendRange) =>
+                    updateSelection(rowId, checked, extendRange)
+                  }
+                  onEdit={() => onEdit(collection, section.library.id)}
+                  onDelete={() => onDelete(collection)}
+                  onSync={() => onSync(collection, section.library.id)}
+                />
+              );
+            })}
           </div>
         </section>
       ))}
@@ -522,7 +684,9 @@ function AllLibraryCollectionRow({
   collection,
   libraries,
   libraryId,
+  selected,
   isSyncing,
+  onSelectionChange,
   onEdit,
   onDelete,
   onSync,
@@ -530,7 +694,9 @@ function AllLibraryCollectionRow({
   collection: LibraryCollection;
   libraries: Library[];
   libraryId: number;
+  selected: boolean;
   isSyncing: boolean;
+  onSelectionChange: (checked: boolean, extendRange: boolean) => void;
   onEdit: () => void;
   onDelete: () => void;
   onSync: () => void;
@@ -539,9 +705,16 @@ function AllLibraryCollectionRow({
   const collectionLibraries = collectionLibraryIDs(collection)
     .map((id) => libraries.find((library) => library.id === id)?.name ?? `Library ${id}`)
     .join(", ");
+  const rowLibraryName =
+    libraries.find((library) => library.id === libraryId)?.name ?? `library ${libraryId}`;
 
   return (
     <div className="flex items-center gap-3 px-4 py-3">
+      <BulkSelectionCheckbox
+        label={`Select ${collection.title} in ${rowLibraryName}`}
+        selected={selected}
+        onSelectionChange={onSelectionChange}
+      />
       {collection.poster_url ? (
         <img src={collection.poster_url} alt="" className="h-12 w-8 rounded object-cover" />
       ) : (

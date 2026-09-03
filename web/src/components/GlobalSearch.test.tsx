@@ -43,13 +43,15 @@ vi.mock("@/components/RequestToAddSection", () => ({
     variant,
     query,
     libraryHadHits,
+    libraryResultsKnown,
   }: {
     variant: string;
     query: string;
     libraryHadHits: boolean;
+    libraryResultsKnown?: boolean;
   }) => (
     <div data-testid="request-section">
-      {`variant="${variant}" query="${query}" libraryHadHits="${String(libraryHadHits)}"`}
+      {`variant="${variant}" query="${query}" libraryHadHits="${String(libraryHadHits)}" libraryResultsKnown="${String(libraryResultsKnown)}"`}
     </div>
   ),
 }));
@@ -217,6 +219,23 @@ describe("GlobalSearch", () => {
       enabled: boolean;
     };
     expect(lastCall.enabled).toBe(false);
+  });
+
+  it("opens global search with Ctrl+K", () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <GlobalSearch />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.queryByTestId("dialog")).toBeNull();
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    expect(screen.getByTestId("dialog")).toBeInTheDocument();
   });
 
   it("encodes picked item IDs before navigating", async () => {
@@ -428,6 +447,7 @@ describe("GlobalSearch + RequestToAddSection wiring", () => {
 
     expect(markup).toContain('data-testid="request-section"');
     expect(markup).toContain("libraryHadHits=&quot;true&quot;");
+    expect(markup).toContain("libraryResultsKnown=&quot;true&quot;");
     expect(markup).toContain("variant=&quot;dialog&quot;");
   });
 
@@ -463,6 +483,43 @@ describe("GlobalSearch + RequestToAddSection wiring", () => {
     const markup = renderSearchMarkup({ defaultOpen: true, initialQuery: "ThisDoesNotExist" });
 
     expect(markup).toContain("libraryHadHits=&quot;false&quot;");
+    expect(markup).toContain("libraryResultsKnown=&quot;true&quot;");
+  });
+
+  it("marks library results unknown while the local preview is still pending", () => {
+    mocks.useCanRequest.mockReturnValue({
+      discoveryEnabled: true,
+      isResolving: false,
+      submitDisabledReason: null,
+    });
+    mocks.useQuery.mockReturnValue({
+      data: undefined,
+      isFetching: true,
+      isError: false,
+    });
+    mocks.useRequestSearch.mockReturnValue({
+      data: {
+        page: 1,
+        total_pages: 1,
+        total_results: 1,
+        results: [
+          {
+            media_type: "movie",
+            tmdb_id: 1,
+            title: "X",
+            availability: "missing",
+            request: { requestable: true },
+          },
+        ],
+      },
+      isLoading: false,
+      isError: false,
+    });
+
+    const markup = renderSearchMarkup({ defaultOpen: true, initialQuery: "Dune" });
+
+    expect(markup).toContain("libraryHadHits=&quot;false&quot;");
+    expect(markup).toContain("libraryResultsKnown=&quot;false&quot;");
   });
 
   it("does not call useRequestSearch with enabled=true when discoveryEnabled is false", () => {
@@ -478,6 +535,8 @@ describe("GlobalSearch + RequestToAddSection wiring", () => {
       enabled: false,
       requireProfile: true,
       staleTime: 5 * 60 * 1000,
+      gcTime: 30_000,
+      retry: false,
     });
   });
 

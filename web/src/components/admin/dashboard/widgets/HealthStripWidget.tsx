@@ -27,6 +27,8 @@ export function HealthStripWidget() {
 
   const status = statusQuery.data;
   const health = status?.health;
+  const buildNumber = buildQuery.data?.build_number ?? 0;
+  const versionDisplay = buildQuery.data?.display || "unknown";
   // Only a successful response may claim "none": while the node list is
   // loading or failed, node status is unknown, and "this server transcodes"
   // would be an invented answer.
@@ -60,7 +62,7 @@ export function HealthStripWidget() {
         <HealthCell
           icon={Tag}
           label="Version"
-          value={buildQuery.data?.display || "unknown"}
+          value={buildNumber > 0 ? `${buildNumber} · ${versionDisplay}` : versionDisplay}
           detail={buildQuery.data?.dirty ? "dirty build" : undefined}
         />
         <HealthCell

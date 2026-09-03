@@ -256,9 +256,7 @@ func buildRemuxArgsWithAudioV3(filePath, outputFormat string, seekSeconds float6
 			"-ac", strconv.Itoa(channels),
 			"-b:a", strconv.Itoa(bitrateKbps)+"k",
 		)
-		if IsAudioToAACStereoDownmixV3(sourceAudioChannels, "aac", targetAudioChannels) {
-			args = appendStereoDownmixBoostArgs(args, sourceAudioChannels, channels)
-		}
+		args = appendAACEncodeFilterArgs(args, sourceAudioChannels, "aac", targetAudioChannels, channels)
 	} else {
 		args = append(args, "-c", "copy")
 	}
@@ -376,6 +374,13 @@ func (s *RemuxSession) Read(p []byte) (int, error) {
 	return s.outputPipe.Read(p)
 }
 
+func (s *RemuxSession) Abort() {
+	if s == nil || s.cancel == nil {
+		return
+	}
+	s.cancel()
+}
+
 // Close stops the ffmpeg process and cleans up all resources.
 // It is safe to call Close multiple times.
 func (s *RemuxSession) Close() error {
@@ -424,6 +429,12 @@ type RemuxServeOptions struct {
 	SourceAudioChannels    int
 	TargetAudioChannels    int
 	TargetAudioBitrateKbps int
+	// Abort ends the response early when it is closed. A progressive remux is
+	// one long response, so without it the only thing that can stop the stream
+	// is the client itself — a server-initiated session stop cannot withdraw a
+	// route the client is still being fed. Callers that serve a session pass
+	// SessionManager.WatchTransportStop's channel.
+	Abort <-chan struct{}
 }
 
 // RemuxContentType returns the override required for an audio-only fMP4.
@@ -455,7 +466,8 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 	mode, ffmpegPath := opts.DVMode, opts.FFmpegPath
 	// Remux output streams for the length of the title; roll the write
 	// deadline with progress instead of the server's absolute WriteTimeout.
-	w = httpstream.NewRollingDeadlineWriter(w)
+	streamWriter := httpstream.NewRollingDeadlineWriter(w)
+	w = streamWriter
 	// Local files get the usual preflight. Remote inputs (resolved provider
 	// URLs and the loopback relay) are opened by FFmpeg directly; os.Stat on an
 	// HTTP URL would incorrectly return ENOENT and break every virtual remux.
@@ -478,6 +490,26 @@ func ServeRemuxWithOptions(w http.ResponseWriter, r *http.Request, filePath, out
 		return err
 	}
 	defer func() { _ = session.Close() }()
+
+	if opts.Abort != nil {
+		// Deferred after session.Close, so it runs before it: the watcher is
+		// gone by the time the owner drains and reaps the process.
+		served := make(chan struct{})
+		watcherDone := make(chan struct{})
+		defer func() {
+			close(served)
+			<-watcherDone
+		}()
+		go func() {
+			defer close(watcherDone)
+			select {
+			case <-opts.Abort:
+				_ = streamWriter.Abort()
+				session.Abort()
+			case <-served:
+			}
+		}()
+	}
 
 	buf := make([]byte, 32*1024) // 32 KB buffer
 	// Do not commit 200 until FFmpeg produces media bytes. A relay/provider

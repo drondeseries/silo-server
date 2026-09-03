@@ -209,6 +209,7 @@ func YAMLToSettingsMap(path string) (map[string]string, error) {
 	// Playback
 	setIfNonEmpty(m, "playback.ffmpeg_path", raw.Playback.FFmpegPath)
 	setIfNonEmpty(m, playbackTranscodeDirSettingKey, raw.Playback.TranscodeDir)
+	m[playbackSegmentRetentionSettingKey] = strconv.Itoa(raw.Playback.SegmentRetentionSeconds)
 	setIfNonEmpty(m, "playback.hw_accel", raw.Playback.HWAccel)
 	setIfNonEmpty(m, "playback.software_fallback", raw.Playback.SoftwareFallback)
 	if raw.Playback.ChapterThumbnailWorkers != 0 {

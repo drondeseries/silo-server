@@ -84,6 +84,13 @@ type playbackSessionRow struct {
 	AudioDecision            string `json:"audio_decision,omitempty"`
 	EffectivePlayMethod      string `json:"effective_play_method,omitempty"`
 	IsJellyfinClient         bool   `json:"is_jellyfin_client,omitempty"`
+	RoutingWorkload          string `json:"routing_workload,omitempty"`
+	RoutingExecution         string `json:"routing_execution,omitempty"`
+	RoutingExecutionNodeID   *int   `json:"routing_execution_node_id,omitempty"`
+	RoutingExecutionNodeName string `json:"routing_execution_node_name,omitempty"`
+	RoutingEgress            string `json:"routing_egress,omitempty"`
+	RoutingEgressNodeID      *int   `json:"routing_egress_node_id,omitempty"`
+	RoutingEgressNodeName    string `json:"routing_egress_node_name,omitempty"`
 	CompatOrigin             bool   `json:"-"`
 }
 
@@ -113,6 +120,9 @@ type playbackSessionsCapabilitiesResponse struct {
 	// TargetAudioChannels reports that rows carry the encoded output channel
 	// count the transcode actually produces.
 	TargetAudioChannels bool `json:"target_audio_channels"`
+	// NodeRouting reports that rows may carry workload/execution/egress route
+	// assignment fields when the active session has resolved them.
+	NodeRouting bool `json:"node_routing"`
 }
 
 // HandleGetSessionsCapabilities exposes additive feature support for the live
@@ -128,6 +138,25 @@ func (h *AdminHandler) HandleGetSessionsCapabilities(w http.ResponseWriter, _ *h
 		ClientBuild:               true,
 		ClientChannel:             true,
 		TargetAudioChannels:       true,
+		NodeRouting:               true,
+	})
+}
+
+type playbackRoutingCapabilitiesResponse struct {
+	Features             []string `json:"features"`
+	Workloads            []string `json:"workloads"`
+	ExecutionPreferences []string `json:"execution_preferences"`
+	EgressPreferences    []string `json:"egress_preferences"`
+}
+
+// HandleGetPlaybackRoutingCapabilities exposes the stable enum vocabulary
+// used by the atomic admin settings API.
+func (h *AdminHandler) HandleGetPlaybackRoutingCapabilities(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, playbackRoutingCapabilitiesResponse{
+		Features:             []string{"playback_node_routing_v1"},
+		Workloads:            []string{"direct_play", "remux", "video_transcode"},
+		ExecutionPreferences: []string{"prefer_worker", "prefer_transcode", "worker_only", "prefer_api", "api_only"},
+		EgressPreferences:    []string{"prefer_proxy", "proxy_only", "prefer_api", "api_only"},
 	})
 }
 
@@ -235,7 +264,14 @@ func (l *PlaybackSessionsLoader) Load(
 			COALESCE(mf.audio_tracks::text, '[]'),
 			COALESCE(requested_mf.codec_video, ''),
 			COALESCE(requested_mf.resolution, ''),
-			COALESCE(s.compat_origin, FALSE)
+			COALESCE(s.compat_origin, FALSE),
+			COALESCE(s.routing_workload, ''),
+			COALESCE(s.routing_execution, ''),
+			s.routing_execution_node_id,
+			COALESCE(execution_node.name, ''),
+			COALESCE(s.routing_egress, ''),
+			s.routing_egress_node_id,
+			COALESCE(egress_node.name, '')
 		 FROM playback_sessions_sync s
 		 LEFT JOIN users u ON u.id = s.user_id
 		 LEFT JOIN media_files mf ON mf.id = s.media_file_id
@@ -243,7 +279,9 @@ func (l *PlaybackSessionsLoader) Load(
 		 LEFT JOIN media_items mi ON mi.content_id = mf.content_id
 		 LEFT JOIN episodes e ON e.content_id = mf.episode_id
 		 LEFT JOIN media_items series_mi ON series_mi.content_id = e.series_id
-		 LEFT JOIN stream_nodes remote_node ON remote_node.url = s.transcode_node_url`
+		 LEFT JOIN stream_nodes remote_node ON remote_node.url = s.transcode_node_url
+		 LEFT JOIN stream_nodes execution_node ON execution_node.id = s.routing_execution_node_id
+		 LEFT JOIN stream_nodes egress_node ON egress_node.id = s.routing_egress_node_id`
 
 	var args []any
 	if query.UserID > 0 {
@@ -280,7 +318,8 @@ func (l *PlaybackSessionsLoader) Load(
 			&targetAudioChannels, &targetBitrateKbps,
 			&s.TranscodeHWAccel, &s.ToneMapMode, &s.SourceContainer, &sourceBitrateKbps, &s.SourceVideoCodec, &s.SourceVideoResolution,
 			&s.SourceAudioCodec, &sourceAudioChannels, &audioTracksJSON, &s.RequestedVideoCodec, &s.RequestedVideoResolution,
-			&s.CompatOrigin,
+			&s.CompatOrigin, &s.RoutingWorkload, &s.RoutingExecution, &s.RoutingExecutionNodeID,
+			&s.RoutingExecutionNodeName, &s.RoutingEgress, &s.RoutingEgressNodeID, &s.RoutingEgressNodeName,
 		); err != nil {
 			return nil, fmt.Errorf("scanning playback session: %w", err)
 		}

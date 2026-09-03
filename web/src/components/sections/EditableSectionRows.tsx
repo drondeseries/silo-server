@@ -9,6 +9,7 @@ import { Eye, EyeOff, GripVertical, Pencil, Star, Trash2 } from "lucide-react";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { TableCell, TableRow } from "@/components/ui/table";
+import { BulkSelectionCheckbox } from "@/components/BulkSelectionCheckbox";
 
 export interface EditableSectionViewModel {
   id: string;
@@ -130,6 +131,9 @@ export function SortableSectionTableRow({
   libraries,
   collectionLabels,
   catalog,
+  selected,
+  selectionLabel,
+  onSelectionChange,
   onEdit,
   onDelete,
 }: {
@@ -138,6 +142,9 @@ export function SortableSectionTableRow({
   libraries: Library[];
   collectionLabels: Map<string, string>;
   catalog?: RecipeCatalogResponse;
+  selected: boolean;
+  selectionLabel: string;
+  onSelectionChange: (checked: boolean, extendRange: boolean) => void;
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -152,7 +159,14 @@ export function SortableSectionTableRow({
   };
 
   return (
-    <TableRow ref={setNodeRef} style={style}>
+    <TableRow ref={setNodeRef} style={style} data-state={selected ? "selected" : undefined}>
+      <TableCell className="w-10">
+        <BulkSelectionCheckbox
+          label={selectionLabel}
+          selected={selected}
+          onSelectionChange={onSelectionChange}
+        />
+      </TableCell>
       <TableCell>
         {canReorder ? (
           <button

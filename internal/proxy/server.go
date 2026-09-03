@@ -20,24 +20,38 @@ import (
 	"github.com/go-chi/cors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/downloadprepare"
 	"github.com/Silo-Server/silo-server/internal/downloads"
+	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/nodeconfig"
 	"github.com/Silo-Server/silo-server/internal/nodemetrics"
+	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/nodesessions"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
+	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
 )
 
 // Server is the HTTP handler for proxy mode.
 type Server struct {
-	watcher              *nodeconfig.Watcher
-	telemetry            *streamtelemetry.Registry
-	tracker              *nodesessions.Tracker
+	watcher *nodeconfig.Watcher
+	tracker *nodesessions.Tracker
+	// nodeRowID resolves this proxy's stable stream_nodes identity. Production
+	// uses the config watcher; tests replace it to model sibling proxies.
+	nodeRowID            func() (int, bool)
 	httpClient           *http.Client
 	artifactMissReporter remoteArtifactMissReporter
-	egress               *egressMeter
+	// grants and loginSessions back the credential-free /stream/v3 routes: the
+	// grant says what to serve, the login-session validator says whether the
+	// caller may still have it. Both nil in a deployment that predates the
+	// mode, which is why those routes answer 503 rather than assuming either.
+	grants        proxyGrantLookup
+	loginSessions loginSessionValidator
+	egress        *egressMeter
+	clientIP      *clientip.Resolver
+	telemetry     *streamtelemetry.Registry
 	// subCache stores full-track PGS (.sup) extracts under the transcode dir
 	// so repeat selections skip the whole-file ffmpeg demux.
 	subCache *playback.SubtitleCache
@@ -76,7 +90,7 @@ type remoteArtifactMissReporter interface {
 // NewServer creates a new proxy server backed by a config watcher and session
 // tracker.
 func NewServer(watcher *nodeconfig.Watcher, tracker *nodesessions.Tracker) *Server {
-	return &Server{
+	server := &Server{
 		watcher: watcher,
 		tracker: tracker,
 		// No overall timeout — stream bodies are long-lived. Hung nodes are
@@ -92,6 +106,21 @@ func NewServer(watcher *nodeconfig.Watcher, tracker *nodesessions.Tracker) *Serv
 			return watcher.Config().Playback.TranscodeDir
 		}),
 	}
+	if watcher != nil {
+		server.nodeRowID = watcher.NodeRowID
+	}
+	return server
+}
+
+// SetMediaGrantAuthority wires the two dependencies the credential-free
+// /stream/v3 routes need: the store central writes a session's recipe to, and
+// the live login-session validator this proxy re-checks every request against.
+// It must be called during construction, before the server begins handling
+// requests. Either argument may be nil, which leaves those routes unavailable
+// (503) while the token routes keep working unchanged.
+func (s *Server) SetMediaGrantAuthority(grants proxyGrantLookup, sessions loginSessionValidator) {
+	s.grants = grants
+	s.loginSessions = sessions
 }
 
 // SetRemoteArtifactMissReporter wires the authoritative database transition
@@ -101,6 +130,18 @@ func (s *Server) SetRemoteArtifactMissReporter(reporter remoteArtifactMissReport
 	s.artifactMissReporter = reporter
 }
 
+// SetClientIPResolver wires trusted-proxy client IP resolution. It must be
+// called during construction, before the server begins handling requests.
+func (s *Server) SetClientIPResolver(resolver *clientip.Resolver) {
+	s.clientIP = resolver
+}
+
+// SetStreamTelemetry wires local stream observation. A nil registry is a
+// complete no-op.
+func (s *Server) SetStreamTelemetry(registry *streamtelemetry.Registry) {
+	s.telemetry = registry
+}
+
 // newStreamTransport tunes the proxy→transcode-node connection pool. Many
 // concurrent viewers fan their segment fetches through one proxy→node pair,
 // and Go's default of 2 idle connections per host causes constant connection
@@ -108,11 +149,7 @@ func (s *Server) SetRemoteArtifactMissReporter(reporter remoteArtifactMissReport
 // bounds requests to a hung node; the longest legitimate server-side wait is
 // the 30s manifest-readiness poll on the transcode node.
 func newStreamTransport() *http.Transport {
-	base, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		base = &http.Transport{}
-	}
-	t := base.Clone()
+	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.MaxIdleConns = 128
 	t.MaxIdleConnsPerHost = 32
 	t.ResponseHeaderTimeout = 60 * time.Second
@@ -120,12 +157,12 @@ func newStreamTransport() *http.Transport {
 }
 
 // Handler returns the chi.Router with all proxy routes mounted.
-func (s *Server) SetStreamTelemetry(registry *streamtelemetry.Registry) {
-	s.telemetry = registry
-}
-
 func (s *Server) Handler() http.Handler {
+	declareProxyMediaRoutes()
 	r := chi.NewRouter()
+	if s.clientIP != nil {
+		r.Use(clientip.Middleware(s.clientIP))
+	}
 	// hls.js uses XHR for manifest/segment fetches which are subject to
 	// CORS when the proxy runs on a different origin than the web app.
 	r.Use(cors.Handler(cors.Options{
@@ -156,19 +193,27 @@ func (s *Server) Handler() http.Handler {
 	r.Group(func(r chi.Router) {
 		// Streaming and download bytes count toward the node's measured egress.
 		r.Use(s.meterEgress)
-		r.Head("/stream/direct/{token}", s.handleDirectPlay)
-		r.Get("/stream/direct/{token}", s.handleDirectPlay)
+		r.Head("/stream/direct/{token}", observeProxy(s.telemetry, http.MethodHead, "/stream/direct/{token}", s.handleDirectPlay))
+		r.Get("/stream/direct/{token}", observeProxy(s.telemetry, http.MethodGet, "/stream/direct/{token}", s.handleDirectPlay))
 		r.Head("/stream/remux/{token}", observeProxy(s.telemetry, http.MethodHead, "/stream/remux/{token}", s.handleRemux))
 		r.Get("/stream/remux/{token}", observeProxy(s.telemetry, http.MethodGet, "/stream/remux/{token}", s.handleRemux))
 		r.Head("/stream/remux/audio-v2/{token}", observeProxy(s.telemetry, http.MethodHead, "/stream/remux/audio-v2/{token}", s.handleAudioV2Remux))
 		r.Get("/stream/remux/audio-v2/{token}", observeProxy(s.telemetry, http.MethodGet, "/stream/remux/audio-v2/{token}", s.handleAudioV2Remux))
-		r.Head("/stream/transcode/{token}/master.m3u8", s.handleTranscodeManifest)
-		r.Get("/stream/transcode/{token}/master.m3u8", s.handleTranscodeManifest)
-		r.Get("/stream/transcode/{token}/segment/{name}", s.handleTranscodeSegment)
-		r.Get("/stream/subtitles/{token}/{track}/fonts", s.handleSubtitleFonts)
-		r.Get("/stream/subtitles/{token}/{track}", s.handleSubtitle)
-		r.Head("/downloads/file/{token}", s.handleDownloadFile)
-		r.Get("/downloads/file/{token}", s.handleDownloadFile)
+		r.Head("/stream/transcode/{token}/master.m3u8", observeProxy(s.telemetry, http.MethodHead, "/stream/transcode/{token}/master.m3u8", s.handleTranscodeManifest))
+		r.Get("/stream/transcode/{token}/master.m3u8", observeProxy(s.telemetry, http.MethodGet, "/stream/transcode/{token}/master.m3u8", s.handleTranscodeManifest))
+		r.Get("/stream/transcode/{token}/segment/{name}", observeProxy(s.telemetry, http.MethodGet, "/stream/transcode/{token}/segment/{name}", s.handleTranscodeSegment))
+		// Credential-free grant routes (authorized_media_origins_v1). Same media
+		// bytes as the token routes above, addressed by session id and
+		// authorized by the caller's own Authorization header.
+		r.Head("/stream/v3/{session_id}", observeProxy(s.telemetry, http.MethodHead, "/stream/v3/{session_id}", s.handleGrantIdentity))
+		r.Get("/stream/v3/{session_id}", observeProxy(s.telemetry, http.MethodGet, "/stream/v3/{session_id}", s.handleGrantIdentity))
+		r.Head("/stream/v3/{session_id}/master.m3u8", observeProxy(s.telemetry, http.MethodHead, "/stream/v3/{session_id}/master.m3u8", s.handleGrantTranscodeManifest))
+		r.Get("/stream/v3/{session_id}/master.m3u8", observeProxy(s.telemetry, http.MethodGet, "/stream/v3/{session_id}/master.m3u8", s.handleGrantTranscodeManifest))
+		r.Get("/stream/v3/{session_id}/segment/{name}", observeProxy(s.telemetry, http.MethodGet, "/stream/v3/{session_id}/segment/{name}", s.handleGrantTranscodeSegment))
+		r.Get("/stream/subtitles/{token}/{track}/fonts", observeProxy(s.telemetry, http.MethodGet, "/stream/subtitles/{token}/{track}/fonts", s.handleSubtitleFonts))
+		r.Get("/stream/subtitles/{token}/{track}", observeProxy(s.telemetry, http.MethodGet, "/stream/subtitles/{token}/{track}", s.handleSubtitle))
+		r.Head("/downloads/file/{token}", observeProxy(s.telemetry, http.MethodHead, "/downloads/file/{token}", s.handleDownloadFile))
+		r.Get("/downloads/file/{token}", observeProxy(s.telemetry, http.MethodGet, "/downloads/file/{token}", s.handleDownloadFile))
 	})
 
 	// Admin routes — bearer-auth protected.
@@ -243,10 +288,9 @@ func (s *Server) buildCapabilitySnapshotLocked(ctx context.Context) (playback.HW
 	// Hardware acceleration is not probed here, and the report says so rather
 	// than leaving the fields unset by accident. A proxy relays streams and runs
 	// identity/remux recipes on ffmpeg; it never executes a hardware transcode,
-	// and the only field anything reads off this report is Transformations —
-	// planIdentityProxySessionV3 filters proxies by their advertised
-	// transformations and consults nothing else. So there is no inventory to
-	// report and nothing a GPU smoke-encode matrix could tell the planner.
+	// and the only fields planning reads off this report are Transformations and
+	// TransportFeatures. So there is no hardware inventory to report and nothing
+	// a GPU smoke-encode matrix could tell the planner.
 	//
 	// The consequence worth stating: the hash now tracks only what this proxy
 	// can *do*. A reboot, a renumbered render node, or a card appearing on the
@@ -276,6 +320,7 @@ func (s *Server) buildCapabilitySnapshotLocked(ctx context.Context) (playback.HW
 		return playback.HWAccelInfo{}, err
 	}
 	info.Transformations = registry.Advertised()
+	info.TransportFeatures = []string{playback.TransportFeatureProgressiveRemuxRelayV1}
 	// Advertised before the hash is taken, because it is part of what the hash
 	// covers: a build that needs longer reaches the sweep rather than sitting
 	// behind an unchanged identity.
@@ -369,7 +414,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	}
 	snapshot := s.metrics.Snapshot().RedactPaths()
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(healthResponse{
+	json.NewEncoder(w).Encode(healthResponse{
 		Status:           "ok",
 		ActiveJobs:       activeJobs,
 		EgressKbps:       s.egress.RateKbps(),
@@ -435,12 +480,169 @@ func (s *Server) verifyToken(w http.ResponseWriter, r *http.Request) *streamtoke
 	return claims
 }
 
-func (s *Server) handleDirectPlay(w http.ResponseWriter, r *http.Request) {
+func (s *Server) verifyPlaybackToken(w http.ResponseWriter, r *http.Request) *streamtoken.Claims {
 	claims := s.verifyToken(w, r)
 	if claims == nil {
-		return
+		return nil
+	}
+	nodeID, nodeIDKnown := s.currentNodeRowID()
+	if status := proxyEgressStatusV3(
+		claims.RoutingWorkload, claims.RoutingExecution, claims.RoutingEgress,
+		claims.RoutingEgressNodeID, nodeID, nodeIDKnown,
+	); status != 0 {
+		writeProxyRouteStatusV3(w, status)
+		return nil
+	}
+	return claims
+}
+
+// proxyEgressStatusV3 enforces the media origin frozen into a routed playback
+// artifact. An entirely empty tuple predates node routing and remains usable
+// until its bounded token/grant lifetime expires; a partial tuple is an
+// uncommitted route and must not fail open on any proxy media endpoint.
+func proxyEgressStatusV3(
+	workload, execution, egress string,
+	egressNodeID, currentNodeID int,
+	currentNodeIDKnown bool,
+) int {
+	workload = strings.TrimSpace(workload)
+	execution = strings.TrimSpace(execution)
+	egress = strings.TrimSpace(egress)
+	if workload == "" && execution == "" && egress == "" && egressNodeID == 0 {
+		return 0
+	}
+	if workload == "" || execution == "" || egress == "" || egressNodeID < 0 {
+		return http.StatusConflict
+	}
+	if egress != string(noderouting.EgressProxy) {
+		return http.StatusServiceUnavailable
+	}
+	if egressNodeID == 0 {
+		return http.StatusConflict
+	}
+	if !currentNodeIDKnown || currentNodeID <= 0 || egressNodeID != currentNodeID {
+		return http.StatusServiceUnavailable
+	}
+	return 0
+}
+
+func (s *Server) currentNodeRowID() (int, bool) {
+	if s == nil || s.nodeRowID == nil {
+		return 0, false
+	}
+	return s.nodeRowID()
+}
+
+type proxyPlaybackEndpointV3 uint8
+
+const (
+	proxyPlaybackEndpointDirectV3 proxyPlaybackEndpointV3 = iota
+	proxyPlaybackEndpointRemuxV3
+	proxyPlaybackEndpointTranscodeV3
+	proxyPlaybackEndpointIdentityV3
+	proxyPlaybackEndpointAuxiliaryV3
+)
+
+// proxyPlaybackEndpointStatusV3 binds a valid proxy artifact to the serving
+// recipe family. A signed direct-play token is not authority to start remux or
+// transcode work merely because every endpoint shares the same signing key.
+func proxyPlaybackEndpointStatusV3(claims *streamtoken.Claims, endpoint proxyPlaybackEndpointV3) int {
+	if claims == nil {
+		return http.StatusServiceUnavailable
+	}
+	direct := claims.RoutingWorkload == string(noderouting.WorkloadDirectPlay) &&
+		claims.RoutingExecution == string(noderouting.ExecutionNone) &&
+		claims.RoutingEgress == string(noderouting.EgressProxy) &&
+		claims.PlayMethod == string(playback.PlayDirect)
+	remuxExecution := claims.RoutingExecution == string(noderouting.ExecutionProxy) ||
+		claims.RoutingExecution == string(noderouting.ExecutionTranscode)
+	remux := claims.RoutingWorkload == string(noderouting.WorkloadRemux) &&
+		remuxExecution &&
+		claims.RoutingEgress == string(noderouting.EgressProxy) &&
+		proxyRemuxPlayMethodV3(claims.PlayMethod)
+	transcode := (claims.RoutingWorkload == string(noderouting.WorkloadRemux) ||
+		claims.RoutingWorkload == string(noderouting.WorkloadVideoTranscode)) &&
+		claims.RoutingExecution == string(noderouting.ExecutionTranscode) &&
+		claims.RoutingEgress == string(noderouting.EgressProxy) &&
+		proxyTranscodePlayMethodV3(claims.PlayMethod)
+
+	// Tokens from the released pre-routing server have no tuple. They retain
+	// only their original method authority during the bounded token lifetime.
+	legacy := claims.RoutingWorkload == "" && claims.RoutingExecution == "" &&
+		claims.RoutingEgress == "" && claims.RoutingEgressNodeID == 0
+	if legacy {
+		direct = claims.PlayMethod == string(playback.PlayDirect)
+		remux = proxyRemuxPlayMethodV3(claims.PlayMethod)
+		transcode = proxyTranscodePlayMethodV3(claims.PlayMethod)
 	}
 
+	allowed := false
+	switch endpoint {
+	case proxyPlaybackEndpointDirectV3:
+		allowed = direct
+	case proxyPlaybackEndpointRemuxV3:
+		allowed = remux
+	case proxyPlaybackEndpointTranscodeV3:
+		allowed = transcode
+	case proxyPlaybackEndpointIdentityV3:
+		allowed = direct || remux
+	case proxyPlaybackEndpointAuxiliaryV3:
+		allowed = direct || remux || transcode
+	}
+	if !allowed {
+		return http.StatusServiceUnavailable
+	}
+	return 0
+}
+
+func proxyRemuxPlayMethodV3(method string) bool {
+	return method == string(playback.PlayRemux) || method == streamtoken.PlayMethodAudioDownmixRemux
+}
+
+func proxyTranscodePlayMethodV3(method string) bool {
+	switch method {
+	case "", string(playback.PlayTranscode), streamtoken.PlayMethodToneMapTranscode,
+		streamtoken.PlayMethodAudioDownmixTranscode, streamtoken.PlayMethodCopyFMP4Transcode:
+		return true
+	default:
+		return false
+	}
+}
+
+func requireProxyPlaybackEndpointV3(w http.ResponseWriter, claims *streamtoken.Claims, endpoint proxyPlaybackEndpointV3) bool {
+	status := proxyPlaybackEndpointStatusV3(claims, endpoint)
+	if status != 0 {
+		writeProxyRouteStatusV3(w, status)
+		return false
+	}
+	return true
+}
+
+func writeProxyRouteStatusV3(w http.ResponseWriter, status int) {
+	switch status {
+	case http.StatusConflict:
+		http.Error(w, "playback route unbound", status)
+	default:
+		http.Error(w, "routing policy unsatisfied", status)
+	}
+}
+
+func (s *Server) handleDirectPlay(w http.ResponseWriter, r *http.Request) {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointDirectV3) {
+		return
+	}
+	s.serveDirectPlayClaims(w, r, claims)
+}
+
+// serveDirectPlayClaims serves a direct-play session from an already-authorized
+// recipe. The token routes reach it with claims they verified; the grant routes
+// reach it with the same claims projected from a grant they authorized against
+// the caller's login session — the serving behavior must not differ.
+func (s *Server) serveDirectPlayClaims(w http.ResponseWriter, r *http.Request, claims *streamtoken.Claims) {
+	// Attach here rather than at the call sites so both the token routes and the
+	// grant routes attribute their bytes to the viewer.
+	attachStream(r.Context(), claims)
 	info := sessionInfo(s.tracker, claims, "direct_play")
 	s.tracker.Track(r.Context(), info)
 	defer s.tracker.Remove(r.Context(), claims.SessionID)
@@ -465,6 +667,9 @@ func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 		(attestedRemote && (!remoteArtifact || claims.DownloadArtifactSize <= 0 || strings.TrimSpace(claims.DownloadExecutionFingerprint) == "")) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
+	}
+	if !remoteArtifact {
+		attachTransfer(r.Context(), claims)
 	}
 
 	// HEAD is a capability/path preflight, not an active transfer. Counting it
@@ -509,6 +714,7 @@ func (s *Server) relayDownloadArtifact(w http.ResponseWriter, r *http.Request, c
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	attachTransfer(r.Context(), claims)
 	cfg := s.watcher.Config()
 	if cfg == nil || strings.TrimSpace(cfg.Auth.JWTSecret) == "" {
 		http.Error(w, "download unavailable", http.StatusServiceUnavailable)
@@ -589,11 +795,72 @@ func (s *Server) downloadBandwidthManager() *downloads.BandwidthManager {
 }
 
 func (s *Server) handleRemux(w http.ResponseWriter, r *http.Request) {
-	claims := s.verifyToken(w, r)
-	if claims == nil {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointRemuxV3) {
 		return
 	}
+	// A boosted recipe must use the versioned route below. Keeping it off the
+	// legacy route makes the URL itself part of rolling-upgrade negotiation: a
+	// pre-v2 proxy has no matching endpoint and therefore cannot silently run
+	// the old quiet downmix after a stale capability probe.
+	if claims.PlayMethod == streamtoken.PlayMethodAudioDownmixRemux {
+		http.NotFound(w, r)
+		return
+	}
+	if remuxRunsOnTranscodeNodeV3(claims) {
+		s.relayProgressiveRemux(w, r, claims, chi.URLParam(r, "token"))
+		return
+	}
+	s.serveRemuxClaims(w, r, claims)
+}
 
+func (s *Server) handleAudioV2Remux(w http.ResponseWriter, r *http.Request) {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointRemuxV3) {
+		return
+	}
+	// The endpoint attests the audio_to_aac v2 execution contract, not merely a
+	// second spelling of the legacy route. Reject an ordinary or internally
+	// inconsistent token before FFmpeg opens the source.
+	if !validAudioV2RemuxClaims(claims) {
+		http.NotFound(w, r)
+		return
+	}
+	if remuxRunsOnTranscodeNodeV3(claims) {
+		s.relayProgressiveRemux(w, r, claims, chi.URLParam(r, "token"))
+		return
+	}
+	s.serveRemuxClaims(w, r, claims)
+}
+
+func remuxRunsOnTranscodeNodeV3(claims *streamtoken.Claims) bool {
+	return claims != nil && claims.RoutingExecution == string(noderouting.ExecutionTranscode)
+}
+
+func (s *Server) relayProgressiveRemux(w http.ResponseWriter, r *http.Request, claims *streamtoken.Claims, forwardToken string) {
+	attachStream(r.Context(), claims)
+	info := sessionInfo(s.tracker, claims, "remux")
+	s.tracker.Track(r.Context(), info)
+	defer s.tracker.Remove(r.Context(), claims.SessionID)
+	s.proxyToTranscodeNode(w, r, claims, "/remux/"+transcodeTransportIDFromClaims(claims), forwardToken)
+}
+
+// validAudioV2RemuxClaims proves the complete shape consumed by the proxy's
+// fixed AAC remux path. The versioned URL is not a general remux alias.
+func validAudioV2RemuxClaims(claims *streamtoken.Claims) bool {
+	return claims != nil &&
+		claims.PlayMethod == streamtoken.PlayMethodAudioDownmixRemux &&
+		claims.TranscodeAudio &&
+		playback.IsAudioToAACStereoDownmixV3(claims.SourceAudioChannels, claims.TargetCodecAudio, claims.TargetAudioChannels) &&
+		claims.TargetAudioChannels == 2
+}
+
+// serveRemuxClaims serves a progressive remux from an already-authorized
+// recipe, shared by the token routes and the grant routes for the same reason
+// serveDirectPlayClaims is.
+func (s *Server) serveRemuxClaims(w http.ResponseWriter, r *http.Request, claims *streamtoken.Claims) {
+	// See serveDirectPlayClaims: shared by the token and grant routes.
+	attachStream(r.Context(), claims)
 	info := sessionInfo(s.tracker, claims, "remux")
 	s.tracker.Track(r.Context(), info)
 	defer s.tracker.Remove(r.Context(), claims.SessionID)
@@ -619,22 +886,24 @@ func (s *Server) handleRemux(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTranscodeManifest(w http.ResponseWriter, r *http.Request) {
-	claims := s.verifyToken(w, r)
-	if claims == nil {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointTranscodeV3) {
 		return
 	}
+	attachStream(r.Context(), claims)
 	s.touchTranscodeSession(r, claims)
-	s.proxyToTranscodeNode(w, r, claims, "/transcode/"+transcodeTransportIDFromClaims(claims)+"/master.m3u8")
+	s.proxyToTranscodeNode(w, r, claims, "/transcode/"+transcodeTransportIDFromClaims(claims)+"/master.m3u8", chi.URLParam(r, "token"))
 }
 
 func (s *Server) handleTranscodeSegment(w http.ResponseWriter, r *http.Request) {
-	claims := s.verifyToken(w, r)
-	if claims == nil {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointTranscodeV3) {
 		return
 	}
+	attachStream(r.Context(), claims)
 	s.touchTranscodeSession(r, claims)
 	name := chi.URLParam(r, "name")
-	s.proxyToTranscodeNode(w, r, claims, "/transcode/"+transcodeTransportIDFromClaims(claims)+"/segment/"+name)
+	s.proxyToTranscodeNode(w, r, claims, "/transcode/"+transcodeTransportIDFromClaims(claims)+"/segment/"+name, chi.URLParam(r, "token"))
 }
 
 func transcodeTransportIDFromClaims(claims *streamtoken.Claims) string {
@@ -677,10 +946,11 @@ func sessionInfo(tr *nodesessions.Tracker, claims *streamtoken.Claims, kind stri
 }
 
 func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
-	claims := s.verifyToken(w, r)
-	if claims == nil {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointAuxiliaryV3) {
 		return
 	}
+	attachStream(r.Context(), claims)
 	cfg := s.watcher.Config()
 	trackParam := chi.URLParam(r, "track")
 	trackIndex, requestedFormat, err := playback.ParseSubtitleTrackParam(trackParam)
@@ -750,10 +1020,11 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSubtitleFonts(w http.ResponseWriter, r *http.Request) {
-	claims := s.verifyToken(w, r)
-	if claims == nil {
+	claims := s.verifyPlaybackToken(w, r)
+	if claims == nil || !requireProxyPlaybackEndpointV3(w, claims, proxyPlaybackEndpointAuxiliaryV3) {
 		return
 	}
+	attachStream(r.Context(), claims)
 	cfg := s.watcher.Config()
 	trackParam := chi.URLParam(r, "track")
 	trackIndex, _, err := playback.ParseSubtitleTrackParam(trackParam)
@@ -776,8 +1047,11 @@ func (s *Server) handleSubtitleFonts(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// proxyToTranscodeNode forwards the request to the transcode node specified in the claims.
-func (s *Server) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, claims *streamtoken.Claims, path string) {
+// proxyToTranscodeNode forwards the request to the transcode node specified in
+// the claims. forwardToken is the stream token handed to the node out of band
+// (never to the client): the client's own token on a token route, a
+// proxy-minted one on a grant route.
+func (s *Server) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, claims *streamtoken.Claims, path, forwardToken string) {
 	cfg := s.watcher.Config()
 	if claims.TranscodeNode == "" {
 		http.Error(w, "no transcode node in token", http.StatusBadRequest)
@@ -785,6 +1059,9 @@ func (s *Server) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, cl
 	}
 
 	targetURL := claims.TranscodeNode + path
+	isSegmentRoute := strings.Contains(path, "/segment/")
+	_, segmentParseErr := playback.ParseSegmentNumber(filepath.Base(path))
+	isMediaSegment := segmentParseErr == nil
 	if rawQuery := r.URL.RawQuery; rawQuery != "" {
 		targetURL = fmt.Sprintf("%s?%s", targetURL, rawQuery)
 	}
@@ -795,13 +1072,16 @@ func (s *Server) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, cl
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Auth.JWTSecret)
+	if isSegmentRoute {
+		transcodeproxy.PrepareRequest(req, r)
+	}
 	// Forward the verified stream token so the transcode node can self-reconstruct
 	// a lost session after its OWN restart: the token carries the full byte-affecting
 	// recipe, so the node can re-spawn ffmpeg seeked to the requested segment instead
 	// of 404ing (the integrated server already does this from the same token). The
 	// node re-verifies the token independently before trusting it.
-	if token := chi.URLParam(r, "token"); token != "" {
-		req.Header.Set("X-Silo-Stream-Token", token)
+	if forwardToken != "" {
+		req.Header.Set("X-Silo-Stream-Token", forwardToken)
 	}
 
 	resp, err := s.httpClient.Do(req)
@@ -812,14 +1092,19 @@ func (s *Server) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, cl
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Copy response headers
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
+	generation := resp.Header.Get(transcodeproxy.GenerationHeader)
+	transcodeproxy.CopyResponseHeaders(w.Header(), resp.Header)
+	sw := httpstream.NewRollingDeadlineWriter(w)
+	sw.WriteHeader(resp.StatusCode)
+	if _, copyErr := io.Copy(sw, resp.Body); copyErr != nil {
+		return
+	}
+	if isMediaSegment && generation != "" && r.Method == http.MethodGet &&
+		sw.CompletedFullResponse(transcodeproxy.FullRepresentationSize(resp)) {
+		if ackErr := transcodeproxy.Acknowledge(r.Context(), s.httpClient, claims.TranscodeNode+path, cfg.Auth.JWTSecret, generation); ackErr != nil {
+			slog.WarnContext(r.Context(), "acknowledge transcode segment completion", "component", "proxy", "error", ackErr, "playback_session_id", claims.SessionID)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
 }
 
 // handleReloadConfig re-reads this proxy's configuration. A proxy's force
@@ -854,59 +1139,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	snapshot := s.metrics.Snapshot()
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(statusResponse{
+	json.NewEncoder(w).Encode(statusResponse{
 		ActiveSessions: activeSessions,
 		System:         snapshot.System,
 		GPU:            snapshot.GPU,
-	})
-}
-
-func (s *Server) handleAudioV2Remux(w http.ResponseWriter, r *http.Request) {
-	claims := s.verifyToken(w, r)
-	if claims == nil {
-		return
-	}
-	// The endpoint attests the audio_to_aac v2 execution contract, not merely a
-	// second spelling of the legacy route. Reject an ordinary or internally
-	// inconsistent token before FFmpeg opens the source.
-	if !validAudioV2RemuxClaims(claims) {
-		http.NotFound(w, r)
-		return
-	}
-	s.serveRemuxClaims(w, r, claims)
-}
-
-func validAudioV2RemuxClaims(claims *streamtoken.Claims) bool {
-	return claims != nil &&
-		claims.PlayMethod == streamtoken.PlayMethodAudioDownmixRemux &&
-		claims.TranscodeAudio &&
-		playback.IsAudioToAACStereoDownmixV3(claims.SourceAudioChannels, claims.TargetCodecAudio, claims.TargetAudioChannels) &&
-		claims.TargetAudioChannels == 2
-}
-
-func (s *Server) serveRemuxClaims(w http.ResponseWriter, r *http.Request, claims *streamtoken.Claims) {
-	// See serveDirectPlayClaims: shared by the token and grant routes.
-	attachStream(r.Context(), claims)
-	info := sessionInfo(s.tracker, claims, "remux")
-	s.tracker.Track(r.Context(), info)
-	defer s.tracker.Remove(r.Context(), claims.SessionID)
-
-	seekSeconds := 0.0
-	if seekStr := r.URL.Query().Get("seek"); seekStr != "" {
-		if v, err := strconv.ParseFloat(seekStr, 64); err == nil {
-			seekSeconds = v
-		}
-	}
-	// Honor the Dolby Vision mode frozen in the token (empty decodes as the
-	// legacy auto behavior for old tokens), mirroring how the integrated
-	// server's stream handler serves the same claims.
-	_ = playback.ServeRemuxWithOptions(w, r, claims.MediaPath, "mp4", seekSeconds, claims.TranscodeAudio, claims.AudioTrackIndex, claims.DVProfile, playback.RemuxServeOptions{
-		DVMode:                 playback.RemuxDVMode(claims.RemuxDVMode),
-		FFmpegPath:             s.watcher.Config().Playback.FFmpegPath,
-		ContentType:            playback.RemuxContentType(claims.AudioOnly),
-		AudioOnly:              claims.AudioOnly,
-		SourceAudioChannels:    claims.SourceAudioChannels,
-		TargetAudioChannels:    claims.TargetAudioChannels,
-		TargetAudioBitrateKbps: claims.TargetAudioBitrateKbps,
 	})
 }

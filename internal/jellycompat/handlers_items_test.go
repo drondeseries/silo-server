@@ -744,6 +744,72 @@ func TestHandleUpcoming_MissingSeriesId_ReturnsEmptyNot404(t *testing.T) {
 	}
 }
 
+// TestHandleEpisodes_AuthoritativeSeasonID verifies that Swiftfin's call shape
+// GET /Shows/{seasonID}/Episodes?seasonId={seasonID} (where the path {id} segment
+// holds an EncodedIDSeason ID) treats seasonId as authoritative, resolves the owning
+// series, and returns the season's episodes without a 404 series-decode failure.
+func TestHandleEpisodes_AuthoritativeSeasonID(t *testing.T) {
+	codec := NewResourceIDCodec()
+	seriesContentID := "series-1"
+	seasonContentID := "season-1"
+	encodedSeasonID := codec.EncodeStringID(EncodedIDSeason, seasonContentID)
+
+	contentSvc := &countingContentService{
+		seasons: []upstreamSeason{
+			{ContentID: seasonContentID, SeasonNumber: 1, Title: "Season 1", EpisodeCount: 2},
+		},
+	}
+	episodeRepo := &fakeSeasonEpisodeRepo{bySeason: map[string][]*models.Episode{
+		episodeBySeasonKey(seriesContentID, 1): {
+			{ContentID: "ep-1", SeriesID: seriesContentID, SeasonID: seasonContentID, SeasonNumber: 1, EpisodeNumber: 1, Title: "E1"},
+			{ContentID: "ep-2", SeriesID: seriesContentID, SeasonID: seasonContentID, SeasonNumber: 1, EpisodeNumber: 2, Title: "E2"},
+		},
+	}}
+	h := &ItemsHandler{
+		content:     contentSvc,
+		userData:    &mockUserDataService{},
+		codec:       codec,
+		mapper:      newMapper(codec, &config.Config{}),
+		images:      NewImageCache(time.Hour, time.Now),
+		episodeRepo: episodeRepo,
+		seasonRepo: &fakeSeasonByIDRepo{seasons: map[string]*models.Season{
+			seasonContentID: {ContentID: seasonContentID, SeriesID: seriesContentID, SeasonNumber: 1},
+		}},
+	}
+
+	result := performEpisodesRequest(t, h, "/Shows/"+encodedSeasonID+"/Episodes?SeasonId="+encodedSeasonID, encodedSeasonID)
+	if result.TotalRecordCount != 2 || len(result.Items) != 2 {
+		t.Fatalf("expected 2 episodes for Swiftfin seasonId query, got total=%d items=%+v", result.TotalRecordCount, result.Items)
+	}
+	if result.Items[0].Name != "E1" || result.Items[1].Name != "E2" {
+		t.Fatalf("unexpected episode names: %+v", result.Items)
+	}
+}
+
+// TestHandleEpisodes_UnknownSeasonIDReturnsNotFound verifies that an unresolvable
+// seasonId query parameter returns 404 NotFound.
+func TestHandleEpisodes_UnknownSeasonIDReturnsNotFound(t *testing.T) {
+	codec := NewResourceIDCodec()
+	unknownSeasonID := codec.EncodeStringID(EncodedIDSeason, "missing-season")
+	h := &ItemsHandler{
+		codec:      codec,
+		seasonRepo: &fakeSeasonByIDRepo{seasons: map[string]*models.Season{}},
+	}
+
+	req := httptest.NewRequest("GET", "/Shows/anything/Episodes?SeasonId="+unknownSeasonID, nil)
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("id", unknownSeasonID)
+	ctx := context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx)
+	ctx = context.WithValue(ctx, compatSessionKey, &Session{StreamAppUserID: 1, ProfileID: "profile-1"})
+
+	rec := httptest.NewRecorder()
+	h.HandleEpisodes(rec, req.WithContext(ctx))
+
+	if rec.Code != 404 {
+		t.Fatalf("expected status 404 for unknown SeasonId; got %d, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestHandleUpcoming_InvalidSeriesId_ReturnsEmptyNot404 — same contract for
 // undecodable IDs. Decode failure must NOT 404 for the same reason.
 func TestHandleUpcoming_InvalidSeriesId_ReturnsEmptyNot404(t *testing.T) {

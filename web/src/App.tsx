@@ -144,6 +144,7 @@ const CardOverlaySettings = lazy(() => import("@/pages/settings/CardOverlaySetti
 const PersonalizeSettings = lazy(() => import("@/pages/settings/PersonalizeSettings"));
 const ConnectAppsSettings = lazy(() => import("@/pages/settings/ConnectAppsSettings"));
 const InterfaceSettings = lazy(() => import("@/pages/settings/InterfaceSettings"));
+const AccountSettings = lazy(() => import("@/pages/settings/AccountSettings"));
 const WatchTogetherJoin = lazy(() => import("@/pages/WatchTogetherJoin"));
 const WatchTogetherRoomPage = lazy(() => import("@/pages/WatchTogetherRoomPage"));
 const WatchRoute = lazy(() => import("@/pages/WatchRoute"));
@@ -547,7 +548,20 @@ function AppRoutes() {
                   <Route path="stats" element={<Navigate to="/admin" replace />} />
                   <Route path="*" element={<Navigate to="/admin" replace />} />
                 </Route>
-                {/* Settings area — own layout, requires profile */}
+                {/* Account credentials are reachable by admins before profile selection. */}
+                <Route
+                  path="/settings/account"
+                  element={
+                    <RequirePrimaryOrAdmin>
+                      <UICustomizedLayout>
+                        <SettingsLayout />
+                      </UICustomizedLayout>
+                    </RequirePrimaryOrAdmin>
+                  }
+                >
+                  <Route index element={<AccountSettings />} />
+                </Route>
+                {/* Remaining settings use profile-scoped values and require a profile. */}
                 <Route
                   path="/settings/*"
                   element={

@@ -3,6 +3,7 @@ package playback
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,10 +23,11 @@ import (
 // internal/playback does not import internal/config (avoiding an import cycle);
 // each embedding handler adapts its own config snapshot into this shape.
 type TranscodeRuntimeConfig struct {
-	TranscodeDir string
-	FFmpegPath   string
-	HWAccel      string
-	HWDevice     string
+	TranscodeDir            string
+	FFmpegPath              string
+	HWAccel                 string
+	HWDevice                string
+	SegmentRetentionSeconds int
 }
 
 // sessionReconstructor is the SessionManager capability used to re-register a
@@ -237,7 +239,16 @@ func (m *TranscodeManager) SwapTranscodeSessionIf(
 // leaves the local live-map entry untouched for an atomic remote-to-local v3
 // replacement.
 func (m *TranscodeManager) StopRemoteTranscode(sessionID, transcodeNodeURL string) {
-	m.deleteRemoteTranscode(sessionID, transcodeNodeURL)
+	if err := m.deleteRemoteTranscode(context.Background(), sessionID, transcodeNodeURL); err != nil {
+		slog.Warn("remote transcode delete failed", "error", err, "session", sessionID, "node", transcodeNodeURL, "playback_session_id", sessionID)
+	}
+}
+
+// CancelRemoteTranscode synchronously confirms that a remote process no longer
+// exists. User-visible stop paths use this before removing the playback session
+// so a node partition leaves a live session the caller can retry stopping.
+func (m *TranscodeManager) CancelRemoteTranscode(ctx context.Context, sessionID, transcodeNodeURL string) error {
+	return m.deleteRemoteTranscode(ctx, sessionID, transcodeNodeURL)
 }
 
 // LockSessionLifecycle acquires the per-session lifecycle mutex and returns a
@@ -284,6 +295,26 @@ func (m *TranscodeManager) RestartSessionLocked(ctx context.Context, sessionID s
 	return m.restartSessionLocked(sessionID, ts, func() error {
 		return ts.Restart(ctx, seekSeconds, startSegment)
 	})
+}
+
+// RestartSegmentLocked resolves and restarts one missing HLS segment under the
+// per-session lifecycle lock. Copy-video resolution reads the current manifest,
+// so keeping resolution and restart inside the same lock preserves the mapping
+// it observed.
+func (m *TranscodeManager) RestartSegmentLocked(
+	ctx context.Context,
+	sessionID string,
+	ts *TranscodeSession,
+	segNum int,
+) (SegmentRecoveryTarget, bool, error) {
+	var target SegmentRecoveryTarget
+	var ok bool
+	err := m.restartSessionLocked(sessionID, ts, func() error {
+		var restartErr error
+		target, ok, restartErr = ts.RestartSegment(ctx, segNum)
+		return restartErr
+	})
+	return target, ok, err
 }
 
 func (m *TranscodeManager) restartSessionLocked(sessionID string, ts *TranscodeSession, restart func() error) error {
@@ -588,6 +619,11 @@ func (m *TranscodeManager) reconstructSession(ctx context.Context, sessionID str
 		// a forged or stale request.
 		return nil, nil, false
 	}
+	if err := ValidateCopyFMP4RecipeCard(card); err != nil {
+		slog.WarnContext(ctx, "transcode reconstruct copy recipe rejected", "component", "playback",
+			"session", sessionID, "playback_session_id", sessionID, "error", err)
+		return nil, nil, false
+	}
 	// Re-bind ownership to the card owner. A zero caller is allowed (the authless
 	// transcode delivery routes — HLS master.m3u8 / segment — treat the session
 	// UUID as the bearer credential when auth is optional); a non-zero caller that
@@ -603,7 +639,7 @@ func (m *TranscodeManager) reconstructSession(ctx context.Context, sessionID str
 	// An empty PlayMethod is a card written before direct/remux were
 	// reconstructable; treat it as a transcode (the only kind then persisted).
 	method := card.PlayMethod
-	if method == "" {
+	if method == "" || method == playMethodCopyFMP4V1 {
 		method = PlayTranscode
 	}
 
@@ -621,6 +657,10 @@ func (m *TranscodeManager) reconstructSession(ctx context.Context, sessionID str
 		BasePlayMethod:         method,
 		TranscodeNodeURL:       card.TranscodeNodeURL,
 		TranscodeTransportID:   card.TranscodeTransportID,
+		RoutingWorkload:        card.RoutingWorkload,
+		RoutingExecution:       card.RoutingExecution,
+		RoutingEgress:          card.RoutingEgress,
+		RoutingEgressNodeID:    card.RoutingEgressNodeID,
 		AudioTrackIndex:        card.AudioTrackIndex,
 		TranscodeAudio:         card.TranscodeAudio,
 		RemuxDVMode:            card.RemuxDVMode,
@@ -789,8 +829,11 @@ func (m *TranscodeManager) doReconstructTranscode(ctx context.Context, sessionID
 	// direct/remux card ID cannot accidentally spawn an encode. An empty
 	// PlayMethod is back-compat for a token minted before the discriminator
 	// (transcode).
-	if card.PlayMethod != "" && card.PlayMethod != PlayTranscode {
+	if !card.IsTranscodeRecipe() {
 		return nil, nil
+	}
+	if err := ValidateCopyFMP4RecipeCard(card); err != nil {
+		return nil, err
 	}
 
 	// Mark in-flight for the whole rebuild so a concurrent cleanup never reaps the
@@ -832,6 +875,7 @@ func (m *TranscodeManager) doReconstructTranscode(ctx context.Context, sessionID
 	// operator config change applies to reconstructed sessions too.
 	opts.HWAccel = cfg.HWAccel
 	opts.HWDevice = cfg.HWDevice
+	opts.SegmentRetentionSeconds = cfg.SegmentRetentionSeconds
 
 	// Serialize before taking a global pacing slot. A reconstruct stalled behind
 	// another start for this session must not consume capacity needed by unrelated
@@ -994,7 +1038,7 @@ func (m *TranscodeManager) CloseTranscodeSession(sessionID, transcodeNodeURL str
 		_ = session.Close()
 	}
 
-	m.deleteRemoteTranscode(sessionID, transcodeNodeURL)
+	m.StopRemoteTranscode(sessionID, transcodeNodeURL)
 }
 
 // CloseTranscodeSessionIf tears down a transcode session only when the live map
@@ -1027,7 +1071,7 @@ func (m *TranscodeManager) CloseTranscodeSessionIf(sessionID string, expected *T
 		_ = expected.Close()
 	}
 
-	m.deleteRemoteTranscode(sessionID, transcodeNodeURL)
+	m.StopRemoteTranscode(sessionID, transcodeNodeURL)
 	return true
 }
 
@@ -1047,36 +1091,39 @@ func (m *TranscodeManager) CloseTranscodeSessionIfLocked(sessionID string, expec
 		_ = expected.Close()
 	}
 
-	m.deleteRemoteTranscode(sessionID, transcodeNodeURL)
+	m.StopRemoteTranscode(sessionID, transcodeNodeURL)
 	return true
 }
 
-// deleteRemoteTranscode sends DELETE to the assigned transcode node if any
-// (synchronous with timeout). A no-op for local/integrated sessions.
-func (m *TranscodeManager) deleteRemoteTranscode(sessionID, transcodeNodeURL string) {
-	if transcodeNodeURL != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		deleteURL := transcodeNodeURL + "/transcode/" + sessionID
-		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, deleteURL, nil)
-		if err != nil {
-			slog.Error("remote transcode delete: build request", "error", err, "session", sessionID, "playback_session_id", sessionID)
-			return
-		}
-		req.Header.Set("Authorization", "Bearer "+m.jwtSecret())
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			slog.Warn("remote transcode delete failed", "error", err, "session", sessionID, "node", transcodeNodeURL, "playback_session_id", sessionID)
-			return
-		}
-		_ = resp.Body.Close()
-		if resp.StatusCode >= http.StatusMultipleChoices {
-			slog.Warn("remote transcode delete returned non-success status",
-				"status", resp.StatusCode, "session", sessionID, "node", transcodeNodeURL, "playback_session_id", sessionID)
-		}
+// deleteRemoteTranscode sends DELETE to the assigned transcode node with a
+// bounded timeout. A missing process is already canceled and therefore
+// succeeds; other transport and HTTP failures remain retryable by the caller.
+func (m *TranscodeManager) deleteRemoteTranscode(ctx context.Context, sessionID, transcodeNodeURL string) error {
+	if transcodeNodeURL == "" {
+		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	deleteURL := transcodeNodeURL + "/transcode/" + sessionID
+	req, err := http.NewRequestWithContext(deleteCtx, http.MethodDelete, deleteURL, nil)
+	if err != nil {
+		return fmt.Errorf("build remote transcode delete request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+m.jwtSecret())
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send remote transcode delete: %w", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode >= http.StatusMultipleChoices && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("remote transcode delete returned status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // CleanupOrphanedTranscodes removes stale per-session temp directories for

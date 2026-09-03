@@ -1,4 +1,5 @@
-import { createContext, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useContext, useRef, useState } from "react";
+import type { Dispatch, SetStateAction } from "react";
 import {
   DndContext,
   DragOverlay,
@@ -17,6 +18,7 @@ import {
 } from "@/hooks/queries/admin/collectionGroups";
 import { GroupCard } from "./GroupCard";
 import { UngroupedSection } from "./UngroupedSection";
+import { updateCheckboxSelection } from "@/lib/checkboxSelection";
 
 // ---------------------------------------------------------------------------
 // Selection context
@@ -30,8 +32,6 @@ interface AnchorRef {
 }
 
 export interface SelectionContextValue {
-  selectedIds: Set<string>;
-  selectionKind: SelectionKind | null;
   isSelected: (id: string) => boolean;
   selectOnly: (id: string, kind: SelectionKind, groupID: string) => void;
   toggleOne: (id: string, kind: SelectionKind, groupID: string) => void;
@@ -40,8 +40,8 @@ export interface SelectionContextValue {
     kind: SelectionKind,
     groupID: string,
     groupCollectionIDs: string[],
+    checked?: boolean,
   ) => void;
-  clear: () => void;
 }
 
 export const SelectionContext = createContext<SelectionContextValue | null>(null);
@@ -71,6 +71,8 @@ export interface GroupsBoardProps {
   onEditCollection: (collection: LibraryCollection) => void;
   onDeleteCollection: (collection: LibraryCollection) => void;
   onSyncCollection: (collection: LibraryCollection) => void;
+  selectedIds: Set<string>;
+  setSelectedIds: Dispatch<SetStateAction<Set<string>>>;
   syncingCollectionID?: string | null;
 }
 
@@ -87,27 +89,35 @@ export function GroupsBoard({
   onEditCollection,
   onDeleteCollection,
   onSyncCollection,
+  selectedIds,
+  setSelectedIds,
   syncingCollectionID = null,
 }: GroupsBoardProps) {
   // --- selection state ---
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [selectionKind, setSelectionKind] = useState<SelectionKind | null>(null);
+  const selectionKindRef = useRef<SelectionKind | null>(null);
   const anchorRef = useRef<AnchorRef | null>(null);
 
   const isSelected = (id: string) => selectedIds.has(id);
 
-  const selectOnly = (id: string, kind: SelectionKind, groupID: string) => {
-    setSelectedIds(new Set([id]));
-    setSelectionKind(kind);
+  const setSelectionAnchor = (id: string, kind: SelectionKind, groupID: string) => {
+    selectionKindRef.current = kind;
     anchorRef.current = { id, groupID };
   };
 
+  const selectOnly = (id: string, kind: SelectionKind, groupID: string) => {
+    setSelectedIds(new Set([id]));
+    setSelectionAnchor(id, kind, groupID);
+  };
+
   const toggleOne = (id: string, kind: SelectionKind, groupID: string) => {
-    if (selectionKind !== null && kind !== selectionKind) {
+    if (
+      selectedIds.size > 0 &&
+      selectionKindRef.current !== null &&
+      kind !== selectionKindRef.current
+    ) {
       // cross-kind: replace with just this item
       setSelectedIds(new Set([id]));
-      setSelectionKind(kind);
-      anchorRef.current = { id, groupID };
+      setSelectionAnchor(id, kind, groupID);
       return;
     }
     setSelectedIds((prev) => {
@@ -119,8 +129,7 @@ export function GroupsBoard({
       }
       return next;
     });
-    setSelectionKind(kind);
-    anchorRef.current = { id, groupID };
+    setSelectionAnchor(id, kind, groupID);
   };
 
   const selectRange = (
@@ -128,59 +137,49 @@ export function GroupsBoard({
     kind: SelectionKind,
     groupID: string,
     groupCollectionIDs: string[],
+    checked = true,
   ) => {
     const anchor = anchorRef.current;
     if (
+      selectedIds.size === 0 ||
       !anchor ||
       anchor.groupID !== groupID ||
-      (selectionKind !== null && kind !== selectionKind)
+      !groupCollectionIDs.includes(anchor.id) ||
+      !groupCollectionIDs.includes(id) ||
+      (selectionKindRef.current !== null && kind !== selectionKindRef.current)
     ) {
-      // No valid anchor in this group — fall back to selectOnly
-      selectOnly(id, kind, groupID);
+      // Start a new range from this row.
+      if (checked) {
+        setSelectedIds(new Set([id]));
+      } else {
+        setSelectedIds((previous) => {
+          const next = new Set(previous);
+          next.delete(id);
+          return next;
+        });
+      }
+      setSelectionAnchor(id, kind, groupID);
       return;
     }
-    const anchorIdx = groupCollectionIDs.indexOf(anchor.id);
-    const currentIdx = groupCollectionIDs.indexOf(id);
-    if (anchorIdx === -1 || currentIdx === -1) {
-      selectOnly(id, kind, groupID);
-      return;
-    }
-    const lo = Math.min(anchorIdx, currentIdx);
-    const hi = Math.max(anchorIdx, currentIdx);
-    const rangeIds = groupCollectionIDs.slice(lo, hi + 1);
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      for (const rid of rangeIds) next.add(rid);
-      return next;
-    });
-    setSelectionKind(kind);
+    setSelectedIds((previous) =>
+      updateCheckboxSelection(previous, groupCollectionIDs, anchor.id, id, checked, true),
+    );
+    selectionKindRef.current = kind;
     // anchor stays unchanged on range extends
   };
 
-  const clear = () => {
+  const clearSelection = () => {
     setSelectedIds(new Set());
-    setSelectionKind(null);
+    selectionKindRef.current = null;
     anchorRef.current = null;
   };
 
   const selection: SelectionContextValue = {
-    selectedIds,
-    selectionKind,
     isSelected,
     selectOnly,
     toggleOne,
     selectRange,
-    clear,
   };
-
-  // --- Escape key to clear selection ---
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") clear();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
 
   // --- dnd state ---
   const sensors = useSensors(
@@ -210,7 +209,7 @@ export function GroupsBoard({
         setDraggedIds(flattenedSelectionInVisualOrder(groups, ungrouped, selectedIds));
       } else {
         // Dragging an unselected row — clear selection, drag just this one
-        clear();
+        clearSelection();
         setDraggedIds([aData.id]);
       }
     } else {
@@ -311,7 +310,7 @@ export function GroupsBoard({
       });
 
       // Clear selection after successful drop
-      clear();
+      clearSelection();
     }
 
     setDraggedIds([]);

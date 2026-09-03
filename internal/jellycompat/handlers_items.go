@@ -1566,10 +1566,37 @@ func (h *ItemsHandler) HandleEpisodes(w http.ResponseWriter, r *http.Request) {
 	}
 	query := parseItemsQuery(r, h.codec)
 
-	seriesID, err := h.codec.DecodeStringID(EncodedIDItem, chi.URLParam(r, "id"))
-	if err != nil {
-		writeError(w, http.StatusNotFound, "NotFound", "Series not found")
-		return
+	var seriesID string
+	var requestedSeasonID string
+
+	if rawSeasonID := strings.TrimSpace(newCaseInsensitiveQuery(r.URL.Query()).Get("SeasonId")); rawSeasonID != "" {
+		decodedSeasonID, decodeErr := h.codec.DecodeStringID(EncodedIDSeason, rawSeasonID)
+		if decodeErr != nil {
+			writeError(w, http.StatusNotFound, "NotFound", "Season not found")
+			return
+		}
+		requestedSeasonID = decodedSeasonID
+		if h.seasonRepo != nil {
+			season, seasonErr := h.seasonRepo.GetByID(r.Context(), requestedSeasonID)
+			if seasonErr != nil && !errors.Is(seasonErr, catalog.ErrSeasonNotFound) {
+				writeError(w, http.StatusInternalServerError, "InternalServerError", "Database error")
+				return
+			}
+			if season != nil {
+				seriesID = season.SeriesID
+			}
+		}
+		if seriesID == "" {
+			writeError(w, http.StatusNotFound, "NotFound", "Season not found")
+			return
+		}
+	} else {
+		id, err := h.codec.DecodeStringID(EncodedIDItem, chi.URLParam(r, "id"))
+		if err != nil {
+			writeError(w, http.StatusNotFound, "NotFound", "Series not found")
+			return
+		}
+		seriesID = id
 	}
 
 	// AdjacentTo (Wholphin autoplay/skip) only needs the requested episode plus
@@ -1578,16 +1605,6 @@ func (h *ItemsHandler) HandleEpisodes(w http.ResponseWriter, r *http.Request) {
 	if query.adjacentTo != "" {
 		h.writeAdjacentEpisodesResponse(w, r, session, query, seriesID)
 		return
-	}
-
-	var requestedSeasonID string
-	if rawSeasonID := strings.TrimSpace(newCaseInsensitiveQuery(r.URL.Query()).Get("SeasonId")); rawSeasonID != "" {
-		decodedSeasonID, decodeErr := h.codec.DecodeStringID(EncodedIDSeason, rawSeasonID)
-		if decodeErr != nil {
-			writeError(w, http.StatusNotFound, "NotFound", "Season not found")
-			return
-		}
-		requestedSeasonID = decodedSeasonID
 	}
 
 	h.writeSeriesEpisodesResponse(w, r, session, query, seriesID, requestedSeasonID, false)

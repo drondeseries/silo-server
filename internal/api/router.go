@@ -467,6 +467,7 @@ func NewRouter(deps Dependencies) chi.Router {
 			profileTokenService,
 		)
 		authHandler = handlers.NewAuthHandler(authService, jwtService, deviceLoginService)
+		authHandler.SetPrimaryProfileChecker(checkPrimaryProfile)
 		if accessGroupStore != nil {
 			authHandler.SetAccessGroupProvider(accessGroupStore)
 		}
@@ -2305,6 +2306,19 @@ func NewRouter(deps Dependencies) chi.Router {
 						r.Get("/me", authHandler.HandleMe)
 						r.Get("/sessions", authHandler.HandleListSessions)
 						r.Delete("/sessions/{id}", authHandler.HandleDeleteSession)
+						r.With(optionalProfileViewerAccess(viewerAccessMiddleware)).
+							Get("/account/capability", authHandler.HandleAccountPasswordCapability)
+						passwordChangeMiddlewares := []func(http.Handler) http.Handler{
+							optionalProfileViewerAccess(viewerAccessMiddleware),
+						}
+						if deps.RateLimitMW != nil {
+							passwordChangeMiddlewares = append(
+								passwordChangeMiddlewares,
+								deps.RateLimitMW.AuthEndpointHandler("password_change"),
+							)
+						}
+						r.With(passwordChangeMiddlewares...).
+							Post("/account/password", authHandler.HandleChangePassword)
 						r.Post("/device/approve", authHandler.HandleDeviceApprove)
 						r.Post("/device/deny", authHandler.HandleDeviceDeny)
 					})
@@ -3259,6 +3273,7 @@ func NewRouter(deps Dependencies) chi.Router {
 
 							r.Get("/sessions", adminHandler.HandleListSessions)
 							r.Get("/sessions/capabilities", adminHandler.HandleGetSessionsCapabilities)
+							r.Get("/playback-routing/capabilities", adminHandler.HandleGetPlaybackRoutingCapabilities)
 							r.Get("/playback-history", adminHandler.HandleListPlaybackHistory)
 							r.Get("/unmatched", adminHandler.HandleListUnmatched)
 							r.Get("/stats", adminHandler.HandleGetStats)

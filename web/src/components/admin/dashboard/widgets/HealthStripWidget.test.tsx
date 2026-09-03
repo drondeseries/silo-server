@@ -97,7 +97,7 @@ describe("HealthStripWidget", () => {
     mocks.useAdminServerStatus.mockReset();
     mocks.useBuildInfo.mockReset();
     mocks.useAdminNodes.mockReset();
-    mocks.useBuildInfo.mockReturnValue({ data: { display: "v0.9.1" } });
+    mocks.useBuildInfo.mockReturnValue({ data: { display: "v0.9.1", build_number: 411 } });
     mocks.useAdminNodes.mockReturnValue({
       data: [],
       isLoading: false,
@@ -123,13 +123,26 @@ describe("HealthStripWidget", () => {
 
     renderStrip();
 
-    expect(screen.getByText("v0.9.1")).toBeTruthy();
+    expect(screen.getByText("411 · v0.9.1")).toBeTruthy();
     expect(screen.getByText("3h")).toBeTruthy();
     expect(screen.getByText("1.42 ms")).toBeTruthy();
     expect(screen.getByText("0.31 ms")).toBeTruthy();
     expect(screen.getByText("1/2")).toBeTruthy();
     expect(screen.getByText("4")).toBeTruthy();
     expect(screen.getByText("12 warnings")).toBeTruthy();
+  });
+
+  it("falls back to the version when no ordered build number is available", () => {
+    mocks.useAdminServerStatus.mockReturnValue({
+      data: status(),
+      isLoading: false,
+      error: null,
+    });
+    mocks.useBuildInfo.mockReturnValue({ data: { display: "v0.9.1" } });
+
+    renderStrip();
+
+    expect(screen.getByText("v0.9.1")).toBeTruthy();
   });
 
   it("separates an unconfigured dependency from a broken one", () => {

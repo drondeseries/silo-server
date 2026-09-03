@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { Library, PageSectionConfig } from "@/api/types";
 import {
   useAdminSections,
@@ -6,6 +6,7 @@ import {
   useCreateSection,
   useUpdateSection,
   useDeleteSection,
+  useDeleteSections,
   useReorderSections,
   useRestoreDefaultSections,
 } from "@/hooks/queries/sections";
@@ -18,6 +19,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useAdminCollections, useImportTraktCollection } from "@/hooks/queries/admin/collections";
 import { useAdminLibraries } from "@/hooks/queries/admin/libraries";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -37,7 +39,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Plus, RotateCcw } from "lucide-react";
+import { Loader2, Plus, RotateCcw, Trash2 } from "lucide-react";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { toast } from "sonner";
 import { buildSectionReorderEntries } from "./adminSectionOrder";
@@ -60,6 +62,7 @@ import type { DragStartEvent, DragEndEvent } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy, arrayMove } from "@dnd-kit/sortable";
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import type { LibraryCollection } from "@/api/types";
+import { updateCheckboxSelection } from "@/lib/checkboxSelection";
 
 function formatCollectionOptionLabel(
   collection: { title: string; library_id: number },
@@ -182,7 +185,12 @@ export default function AdminSections() {
   const [orderedSections, setOrderedSections] = useState<PageSectionConfig[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [confirmDeleteSection, setConfirmDeleteSection] = useState<PageSectionConfig | null>(null);
+  const [confirmDeleteSelected, setConfirmDeleteSelected] = useState(false);
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
+  const [selectedSectionIds, setSelectedSectionIds] = useState<Set<string>>(new Set());
+  const selectionAnchorRef = useRef<string | null>(null);
   const deleteMutation = useDeleteSection();
+  const deleteSectionsMutation = useDeleteSections();
   const reorderMutation = useReorderSections();
   const restoreDefaultsMutation = useRestoreDefaultSections();
   const [confirmRestoreOpen, setConfirmRestoreOpen] = useState(false);
@@ -199,9 +207,18 @@ export default function AdminSections() {
   const updateMutation = useUpdateSection();
 
   const sections = useMemo(() => data?.sections ?? [], [data?.sections]);
+  const orderedSectionIds = useMemo(
+    () => orderedSections.map((section) => section.id),
+    [orderedSections],
+  );
+  const selectedSections = useMemo(
+    () => orderedSections.filter((section) => selectedSectionIds.has(section.id)),
+    [orderedSections, selectedSectionIds],
+  );
   const isHomeScope = scope === "home";
-  const canManageLibrarySections = librariesList.length > 0 && selectedLibraryId !== null;
-  const canDrag = !reorderMutation.isPending && (isHomeScope || canManageLibrarySections);
+  const canManageCurrentScope =
+    isHomeScope || (librariesList.length > 0 && selectedLibraryId !== null);
+  const canDrag = !reorderMutation.isPending && canManageCurrentScope;
 
   useEffect(() => {
     if (librariesList.length === 0) {
@@ -225,6 +242,54 @@ export default function AdminSections() {
   useEffect(() => {
     setOrderedSections(sections);
   }, [sections]);
+
+  useEffect(() => {
+    const clearSelection = (event: KeyboardEvent) => {
+      if (
+        event.key === "Escape" &&
+        confirmDeleteSection === null &&
+        !confirmDeleteSelected &&
+        !confirmDeleteAll
+      ) {
+        setSelectedSectionIds(new Set());
+        selectionAnchorRef.current = null;
+      }
+    };
+    window.addEventListener("keydown", clearSelection);
+    return () => window.removeEventListener("keydown", clearSelection);
+  }, [confirmDeleteAll, confirmDeleteSection, confirmDeleteSelected]);
+
+  function clearSectionSelection() {
+    setSelectedSectionIds(new Set());
+    selectionAnchorRef.current = null;
+  }
+
+  function handleScopeChange(nextScope: string) {
+    clearSectionSelection();
+    setScope(nextScope);
+  }
+
+  function handleLibraryChange(libraryId: number) {
+    clearSectionSelection();
+    setSelectedLibraryId(libraryId);
+  }
+
+  function updateSectionSelection(sectionId: string, checked: boolean, extendRange: boolean) {
+    const anchorId = extendRange && selectedSectionIds.size > 0 ? selectionAnchorRef.current : null;
+    setSelectedSectionIds((previous) =>
+      updateCheckboxSelection(
+        previous,
+        orderedSectionIds,
+        anchorId,
+        sectionId,
+        checked,
+        extendRange,
+      ),
+    );
+    if (anchorId === null || !orderedSectionIds.includes(anchorId)) {
+      selectionAnchorRef.current = sectionId;
+    }
+  }
 
   function handleDelete(section: PageSectionConfig) {
     setConfirmDeleteSection(section);
@@ -263,6 +328,29 @@ export default function AdminSections() {
   }
 
   const activeSection = activeId ? (orderedSections.find((s) => s.id === activeId) ?? null) : null;
+  const selectedLibraryName = librariesList.find((library) => library.id === activeLibraryId)?.name;
+  const sectionScopeLabel = isHomeScope ? "home" : `${selectedLibraryName ?? "library"} library`;
+  const sectionDeletionNotice =
+    "Silo will also try to remove section-managed collections that are no longer referenced. This action cannot be undone.";
+  const deleteAllDescription = isHomeScope
+    ? `Delete all ${orderedSections.length} home sections? ${sectionDeletionNotice}`
+    : `Delete all ${orderedSections.length} sections shown for ${selectedLibraryName ?? "this library"}? ${sectionDeletionNotice}`;
+  const deleteSelectedDescription = `Delete ${selectedSections.length} selected section${selectedSections.length === 1 ? "" : "s"}? ${sectionDeletionNotice}`;
+  const deleteProgressLabel = `Deleting ${deleteSectionsMutation.progress?.completed ?? 0} of ${deleteSectionsMutation.progress?.total ?? orderedSections.length} sections`;
+
+  function handleDeleteSelectedSections() {
+    if (canManageCurrentScope && selectedSections.length > 0) {
+      deleteSectionsMutation.mutate(selectedSections.map((section) => section.id));
+    }
+    setConfirmDeleteSelected(false);
+  }
+
+  function handleDeleteAllSections() {
+    if (canManageCurrentScope && orderedSections.length > 0) {
+      deleteSectionsMutation.mutate(orderedSections.map((section) => section.id));
+    }
+    setConfirmDeleteAll(false);
+  }
 
   function normalizeLibraryIDs(ids: number[] | undefined): number[] {
     if (!ids || ids.length === 0) return [];
@@ -381,20 +469,42 @@ export default function AdminSections() {
   if (isLoading) return <div className="p-4">Loading sections...</div>;
 
   return (
-    <div className="space-y-6">
+    <div
+      className="space-y-6"
+      aria-busy={deleteSectionsMutation.isPending}
+      inert={deleteSectionsMutation.isPending ? true : undefined}
+    >
       <ConfirmDialog
         open={confirmDeleteSection !== null}
         onOpenChange={(open) => {
           if (!open) setConfirmDeleteSection(null);
         }}
         title="Delete section"
-        description={`Delete section "${confirmDeleteSection?.title}"? This action cannot be undone.`}
+        description={`Delete section "${confirmDeleteSection?.title}"? Silo will also try to remove any section-managed collection that is no longer referenced. This action cannot be undone.`}
         confirmLabel="Delete"
         variant="destructive"
         onConfirm={() => {
           if (confirmDeleteSection) deleteMutation.mutate(confirmDeleteSection.id);
           setConfirmDeleteSection(null);
         }}
+      />
+      <ConfirmDialog
+        open={confirmDeleteSelected}
+        onOpenChange={setConfirmDeleteSelected}
+        title="Delete selected sections"
+        description={deleteSelectedDescription}
+        confirmLabel="Delete selected"
+        variant="destructive"
+        onConfirm={handleDeleteSelectedSections}
+      />
+      <ConfirmDialog
+        open={confirmDeleteAll}
+        onOpenChange={setConfirmDeleteAll}
+        title="Delete all sections"
+        description={deleteAllDescription}
+        confirmLabel="Delete all"
+        variant="destructive"
+        onConfirm={handleDeleteAllSections}
       />
       <Dialog
         open={confirmRestoreOpen}
@@ -466,13 +576,11 @@ export default function AdminSections() {
         <div className="space-y-3">
           <h1 className="page-title text-[clamp(2rem,4vw,3rem)]">Sections</h1>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             size="sm"
             variant="outline"
-            disabled={
-              (!isHomeScope && !canManageLibrarySections) || restoreDefaultsMutation.isPending
-            }
+            disabled={!canManageCurrentScope || restoreDefaultsMutation.isPending}
             onClick={() => setConfirmRestoreOpen(true)}
           >
             <RotateCcw className="mr-1 h-4 w-4" /> Restore Defaults
@@ -480,14 +588,14 @@ export default function AdminSections() {
           <Button
             size="sm"
             variant="outline"
-            disabled={!isHomeScope && !canManageLibrarySections}
+            disabled={!canManageCurrentScope}
             onClick={() => setGalleryOpen(true)}
           >
             <Plus className="mr-1 h-4 w-4" /> Add from Gallery
           </Button>
           <Button
             size="sm"
-            disabled={!isHomeScope && !canManageLibrarySections}
+            disabled={!canManageCurrentScope}
             onClick={() => {
               setEditingSection(null);
               setDialogOpen(true);
@@ -495,10 +603,45 @@ export default function AdminSections() {
           >
             <Plus className="mr-1 h-4 w-4" /> Add Section
           </Button>
+          {selectedSections.length > 0 ? (
+            <>
+              <Badge variant="secondary">{selectedSections.length} selected</Badge>
+              <Button size="sm" variant="ghost" onClick={clearSectionSelection}>
+                Clear
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive"
+                disabled={deleteSectionsMutation.isPending || !canManageCurrentScope}
+                onClick={() => setConfirmDeleteSelected(true)}
+              >
+                <Trash2 data-icon="inline-start" /> Delete Selected
+              </Button>
+            </>
+          ) : null}
+          {orderedSections.length > 0 ? (
+            <Button
+              size="sm"
+              variant="destructive"
+              disabled={
+                deleteSectionsMutation.isPending ||
+                restoreDefaultsMutation.isPending ||
+                !canManageCurrentScope
+              }
+              onClick={() => setConfirmDeleteAll(true)}
+            >
+              {deleteSectionsMutation.isPending ? (
+                <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+              ) : (
+                <Trash2 className="mr-1 h-4 w-4" />
+              )}
+              {deleteSectionsMutation.isPending ? `${deleteProgressLabel}…` : "Delete All"}
+            </Button>
+          ) : null}
         </div>
       </div>
 
-      <Tabs value={scope} onValueChange={setScope}>
+      <Tabs value={scope} onValueChange={handleScopeChange}>
         <TabsList>
           <TabsTrigger value="home">Home</TabsTrigger>
           <TabsTrigger value="library">Library</TabsTrigger>
@@ -512,7 +655,7 @@ export default function AdminSections() {
             <LibraryPicker
               libraries={librariesList}
               value={selectedLibraryId}
-              onChange={setSelectedLibraryId}
+              onChange={handleLibraryChange}
             />
           ) : (
             <p className="text-muted-foreground text-sm">
@@ -539,6 +682,9 @@ export default function AdminSections() {
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-10">
+                  <span className="sr-only">Select</span>
+                </TableHead>
                 <TableHead className="w-8"></TableHead>
                 <TableHead>Title</TableHead>
                 <TableHead>Type</TableHead>
@@ -561,13 +707,18 @@ export default function AdminSections() {
                     libraries={librariesList}
                     collectionLabels={collectionLabels}
                     catalog={recipeCatalog}
+                    selected={selectedSectionIds.has(section.id)}
+                    selectionLabel={`Select ${section.title} ${sectionScopeLabel} section`}
+                    onSelectionChange={(checked, extendRange) =>
+                      updateSectionSelection(section.id, checked, extendRange)
+                    }
                     onEdit={() => handleEdit(section)}
                     onDelete={() => handleDelete(section)}
                   />
                 ))}
                 {orderedSections.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={7} className="text-muted-foreground py-8 text-center">
+                    <TableCell colSpan={8} className="text-muted-foreground py-8 text-center">
                       No sections configured for {scope} scope.
                     </TableCell>
                   </TableRow>

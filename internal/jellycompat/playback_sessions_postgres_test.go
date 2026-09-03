@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,6 +37,17 @@ func TestMarshalPlaybackSessionStripsNestedNUL(t *testing.T) {
 	}
 	if got.MediaSources[0].Version.EditionRaw != wantLiteral {
 		t.Fatalf("literal escape changed: %q", got.MediaSources[0].Version.EditionRaw)
+	}
+}
+
+func TestNegotiatedPlaybackScopeIsPostgresSafeAndUnambiguous(t *testing.T) {
+	left := negotiatedPlaybackScope("ab", "c\x00", "d")
+	right := negotiatedPlaybackScope("a", "bc", "d")
+	if strings.ContainsRune(left, '\x00') {
+		t.Fatalf("scope contains PostgreSQL-invalid NUL: %q", left)
+	}
+	if left == right {
+		t.Fatalf("scope aliases distinct field tuples: %q", left)
 	}
 }
 

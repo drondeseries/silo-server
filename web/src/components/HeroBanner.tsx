@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, type MouseEvent } from "react";
+import { memo, useState, useEffect, useCallback, useMemo, type MouseEvent } from "react";
 import { Link } from "react-router";
 import { Info, ChevronLeft, ChevronRight, Play, Pause, BookOpen } from "lucide-react";
 import { decodeThumbhash } from "@/lib/thumbhash";
@@ -48,6 +48,62 @@ interface HeroBannerProps {
  * `prefers-reduced-motion`, which is what keeps this accessible.
  */
 const KEN_BURNS_ANIMATIONS = ["var(--animate-ken-burns-a)", "var(--animate-ken-burns-b)"] as const;
+const HERO_BACKDROP_FADE_MS = 1000;
+
+function shouldKeepOutgoingBackdropMotion(): boolean {
+  return !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+const HeroBackdropSlide = memo(function HeroBackdropSlide({
+  slide,
+  index,
+  isActive,
+  keepsMotion,
+}: {
+  slide: SectionItem;
+  index: number;
+  isActive: boolean;
+  keepsMotion: boolean;
+}) {
+  const [loaded, setLoaded] = useState(false);
+  const thumbhash = slide.backdrop_thumbhash ? decodeThumbhash(slide.backdrop_thumbhash) : "";
+
+  return (
+    <div
+      aria-roledescription="slide"
+      className={`bg-muted absolute inset-0 transition-opacity duration-1000 ease-in-out ${isActive ? "opacity-100" : "opacity-0"}`}
+      style={
+        thumbhash
+          ? {
+              backgroundImage: `url(${thumbhash})`,
+              backgroundSize: "cover",
+              backgroundPosition: "center 20%",
+            }
+          : undefined
+      }
+    >
+      {slide.backdrop_url && (
+        <img
+          src={slide.backdrop_url}
+          alt=""
+          className={cn(
+            "h-full w-full object-cover object-[center_20%] transition-opacity duration-(--duration-slow)",
+            isActive && "will-change-transform",
+            loaded ? "opacity-100" : "opacity-0",
+          )}
+          style={{
+            animation: keepsMotion
+              ? KEN_BURNS_ANIMATIONS[index % KEN_BURNS_ANIMATIONS.length]
+              : "none",
+            filter:
+              "brightness(var(--hero-backdrop-brightness, 0.78)) saturate(var(--hero-backdrop-saturate, 0.95))",
+          }}
+          onLoad={() => setLoaded(true)}
+        />
+      )}
+    </div>
+  );
+});
 
 function heroPlayLabel(item: SectionItem, activeAudiobookPlaying?: boolean | null): string {
   if (item.type === "ebook") {
@@ -82,8 +138,10 @@ export default function HeroBanner({
   libraryId,
 }: HeroBannerProps) {
   const slides = useMemo(() => items.slice(0, maxSlides), [items, maxSlides]);
-  const [activeIndex, setActiveIndex] = useState(0);
-  const [loaded, setLoaded] = useState<Record<number, boolean>>({});
+  const [{ activeIndex, outgoingIndex }, setBackdropState] = useState({
+    activeIndex: 0,
+    outgoingIndex: null as number | null,
+  });
   const [paused, setPaused] = useState(false);
   const audiobookPlayback = useAudiobookPlaybackController();
   // Bumped whenever auto-advance restarts a fresh 8s cycle — after the slide
@@ -95,12 +153,28 @@ export default function HeroBanner({
   const [playCycle, setPlayCycle] = useState(0);
 
   const next = useCallback(() => {
-    setActiveIndex((i) => (i + 1) % slides.length);
+    setBackdropState(({ activeIndex: current }) => ({
+      activeIndex: (current + 1) % slides.length,
+      outgoingIndex: shouldKeepOutgoingBackdropMotion() ? current : null,
+    }));
   }, [slides.length]);
 
   const prev = useCallback(() => {
-    setActiveIndex((i) => (i - 1 + slides.length) % slides.length);
+    setBackdropState(({ activeIndex: current }) => ({
+      activeIndex: (current - 1 + slides.length) % slides.length,
+      outgoingIndex: shouldKeepOutgoingBackdropMotion() ? current : null,
+    }));
   }, [slides.length]);
+
+  useEffect(() => {
+    if (outgoingIndex === null) return;
+    const timer = window.setTimeout(() => {
+      setBackdropState((current) =>
+        current.outgoingIndex === outgoingIndex ? { ...current, outgoingIndex: null } : current,
+      );
+    }, HERO_BACKDROP_FADE_MS);
+    return () => window.clearTimeout(timer);
+  }, [outgoingIndex]);
 
   // Pause/play helpers. Unpausing bumps playCycle so the rail animation
   // restarts at scaleX(0) in sync with the fresh 8s interval started below.
@@ -175,39 +249,15 @@ export default function HeroBanner({
       }}
     >
       {/* Backdrop layers – all stacked, crossfade via opacity */}
-      {slides.map((slide, i) => {
-        const thumbhash = slide.backdrop_thumbhash ? decodeThumbhash(slide.backdrop_thumbhash) : "";
-        const isActive = i === activeIndex;
-        return (
-          <div
-            key={slide.content_id ?? i}
-            aria-roledescription="slide"
-            className={`bg-muted absolute inset-0 transition-opacity duration-1000 ease-in-out ${isActive ? "opacity-100" : "opacity-0"}`}
-            style={
-              thumbhash
-                ? {
-                    backgroundImage: `url(${thumbhash})`,
-                    backgroundSize: "cover",
-                    backgroundPosition: "center 20%",
-                  }
-                : undefined
-            }
-          >
-            {slide.backdrop_url && (
-              <img
-                src={slide.backdrop_url}
-                alt=""
-                className={`h-full w-full object-cover object-[center_20%] transition-opacity duration-(--duration-slow) will-change-transform ${loaded[i] ? "opacity-100" : "opacity-0"}`}
-                style={{
-                  animation: KEN_BURNS_ANIMATIONS[i % KEN_BURNS_ANIMATIONS.length],
-                  filter: `brightness(var(--hero-backdrop-brightness, 0.78)) saturate(var(--hero-backdrop-saturate, 0.95))`,
-                }}
-                onLoad={() => setLoaded((prev) => ({ ...prev, [i]: true }))}
-              />
-            )}
-          </div>
-        );
-      })}
+      {slides.map((slide, i) => (
+        <HeroBackdropSlide
+          key={slide.content_id ?? i}
+          slide={slide}
+          index={i}
+          isActive={i === activeIndex}
+          keepsMotion={i === activeIndex || i === outgoingIndex}
+        />
+      ))}
 
       {/* Gradient overlays */}
       {bleed && <div className="hero-top-scrim" />}

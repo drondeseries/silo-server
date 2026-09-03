@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ApiClientError, api } from "@/api/client";
@@ -24,6 +25,7 @@ import type {
 } from "@/lib/collectionTemplates";
 import { adminKeys, catalogKeys, sectionKeys } from "../keys";
 import { invalidateAdminCollectionQueries } from "../collectionSurfaceRefresh";
+import { runBulkDelete, type BulkDeleteProgress } from "../bulkDelete";
 
 const ADMIN_STALE_TIME = 30_000;
 
@@ -264,6 +266,64 @@ export function useDeleteAdminCollection() {
       toast.error(error instanceof Error ? error.message : "Failed to delete");
     },
   });
+}
+
+export function useDeleteAdminCollections() {
+  const queryClient = useQueryClient();
+  const [progress, setProgress] = useState<BulkDeleteProgress | null>(null);
+
+  const mutation = useMutation({
+    onMutate: (ids) => {
+      setProgress({ completed: 0, total: new Set(ids).size });
+    },
+    mutationFn: (ids: string[]) =>
+      runBulkDelete(
+        ids,
+        (id) =>
+          api<void>(`/admin/collections/${encodeURIComponent(id)}`, {
+            method: "DELETE",
+          }),
+        (error) => {
+          if (error instanceof ApiClientError && error.status === 404) {
+            return "deleted";
+          }
+          if (
+            error instanceof ApiClientError &&
+            error.status === 409 &&
+            error.code === "collection_in_use"
+          ) {
+            return "kept";
+          }
+          return "failed";
+        },
+        setProgress,
+      ),
+    onSuccess: async ({ requested, deleted, kept, failed, firstError }) => {
+      const keptDescription = `Kept ${kept} collection${kept === 1 ? "" : "s"} in use by home or library sections`;
+
+      if (failed === 0 && kept === 0) {
+        toast.success(`Deleted ${deleted} collection${deleted === 1 ? "" : "s"}`);
+      } else if (failed === 0) {
+        toast.warning(`Deleted ${deleted} collection${deleted === 1 ? "" : "s"}`, {
+          description: keptDescription,
+        });
+      } else if (deleted > 0 || kept > 0) {
+        toast.warning(`Deleted ${deleted} of ${requested} collections`, {
+          description: [kept > 0 ? keptDescription : "", firstError].filter(Boolean).join(". "),
+        });
+      } else {
+        toast.error(`Failed to delete ${failed} collection${failed === 1 ? "" : "s"}`, {
+          description: firstError,
+        });
+      }
+      await invalidateAdminCollectionQueries(queryClient);
+    },
+    onSettled: () => {
+      setProgress(null);
+    },
+  });
+
+  return { ...mutation, progress };
 }
 
 export interface ReorderAdminCollectionsArgs {

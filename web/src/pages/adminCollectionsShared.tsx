@@ -95,6 +95,25 @@ export function buildAdminCollectionsReturnPath(libraryId?: number | null) {
   return libraryId ? `/admin/collections?libraryId=${libraryId}` : "/admin/collections";
 }
 
+interface AdminCollectionsBoardSnapshot {
+  groups: Array<{ collections: LibraryCollection[] }>;
+  ungrouped: LibraryCollection[];
+}
+
+export function collectionsInAdminScope(
+  allCollections: LibraryCollection[],
+  board: AdminCollectionsBoardSnapshot | undefined,
+  selectedLibraryId: number | null,
+): LibraryCollection[] {
+  let collections = allCollections;
+  if (selectedLibraryId !== null) {
+    if (!board) return [];
+    collections = [...board.ungrouped, ...board.groups.flatMap((group) => group.collections)];
+  }
+
+  return [...new Map(collections.map((collection) => [collection.id, collection])).values()];
+}
+
 export function toAdminCollectionBuilderValue(
   collection: LibraryCollection | null,
   initialLibraryId: number | null,

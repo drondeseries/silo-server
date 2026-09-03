@@ -121,7 +121,7 @@ func (p *NodeAwarePreparer) LocalFallbackAllowed(ctx context.Context) bool {
 		slog.WarnContext(ctx, "load local transcode fallback setting failed", "component", "downloads", "error", err)
 		return false
 	}
-	return !strings.EqualFold(values[config.PlaybackLocalTranscodeFallbackSettingKey], "false")
+	return !strings.EqualFold(values[config.DownloadLocalTranscodeFallbackSettingKey], "false")
 }
 
 // prepareLocally enforces the live local-fallback policy before delegating to

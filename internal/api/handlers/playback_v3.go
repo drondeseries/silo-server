@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +30,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/logredact"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
+	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/settingsresolve"
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
@@ -67,14 +70,18 @@ const (
 	playbackStartSideEffectsQueueSizeV3 = 256
 	playbackCapabilityWarmupWorkersV3   = 4
 	requestIDLogKeyV3                   = "request_id"
+	bandwidthEstimateLogKeyV3           = "bandwidth_estimate_kbps"
+	linkDownstreamLogKeyV3              = "link_downstream_kbps"
 	playbackLogValueV3                  = "playback"
 	playbackRemoteOutcomeFailedV3       = "failed"
+	routeCapabilityUnavailableReasonV3  = "route_capability_unavailable"
 )
 
 var errSubtitleStoreUnavailableV3 = errors.New("subtitle store unavailable")
 
 type v3NodeCapabilityCache struct {
 	transformations     []playback.TransformationV3
+	transportFeatures   []string
 	toneMapCapabilities tonemap.Capabilities
 	err                 error
 	expiresAt           time.Time
@@ -86,8 +93,16 @@ type preparedTransportV3 struct {
 	transportID        string
 	hwAccel            string
 	toneMapMode        tonemap.Mode
+	routingWorkload    noderouting.Workload
+	routingExecution   noderouting.Execution
+	routingExecutorID  int
+	routingExecutorURL string
+	routingEgress      noderouting.Egress
+	routingEgressID    int
+	routingEgressURL   string
 	commit             func()
 	rollback           func()
+	rollbackRequired   func() error
 	applySession       func() (func() error, error)
 	afterDurableCommit func()
 }
@@ -343,6 +358,13 @@ func (h *PlaybackHandler) coldNodeProbeTimeoutV3(nodeURL string) time.Duration {
 			node = found
 		}
 	}
+	if node == nil {
+		if lookup, ok := h.NodePlanner.(proxyNodeLookupV3); ok {
+			if found, ok := lookup.ProxyNodeByURL(nodeURL); ok {
+				node = found
+			}
+		}
+	}
 	return playback.ColdCapabilityRequestTimeout(
 		node.StoredCapabilities(),
 		node.EffectiveHWAccel(cfg.HWAccel),
@@ -357,6 +379,10 @@ func (h *PlaybackHandler) coldNodeProbeTimeoutV3(nodeURL string) time.Duration {
 // to the cluster-wide setting. *nodepool.Planner implements it.
 type transcodeNodeLookupV3 interface {
 	TranscodeNodeByURL(nodeURL string) (*nodepool.Node, bool)
+}
+
+type proxyNodeLookupV3 interface {
+	ProxyNodeByURL(nodeURL string) (*nodepool.Node, bool)
 }
 
 // rememberNodeProbeBudgetV3 records what a node says its capability read costs.
@@ -483,6 +509,7 @@ func (h *PlaybackHandler) lookupRemoteCapabilitiesV3(ctx context.Context, nodeUR
 	}
 	entry = v3NodeCapabilityCache{
 		transformations:     append([]playback.TransformationV3(nil), info.Transformations...),
+		transportFeatures:   append([]string(nil), info.TransportFeatures...),
 		toneMapCapabilities: append(tonemap.Capabilities(nil), info.ToneMapCapabilities...),
 		expiresAt:           completedAt.Add(v3NodeCapabilityTTL),
 	}
@@ -744,11 +771,9 @@ func (h *PlaybackHandler) localHLSExecutionRegistryWithInputsV3(
 	return local
 }
 
-// hlsPlanningRegistryV3 returns the registry HLS deliveries plan against: the
-// local execution registry plus every pooled transcode node's advertised
-// transformations. Only availability of locally-defined specs widens (name
-// and recipe version pinned by this server), so node-only capabilities remain
-// unavailable when transport falls back to the API process.
+// hlsPlanningRegistryV3 returns the video-transcode registry. Playback planning
+// uses workload-specific registries so remux and video policy cannot leak
+// executor capabilities into one another.
 func (h *PlaybackHandler) hlsPlanningRegistryV3(ctx context.Context) *playback.TransformationRegistryV3 {
 	settings := h.plannerSettingsV3(ctx)
 	inventory := hlsToneMapCapabilityInventoryV3{}
@@ -766,35 +791,227 @@ func (h *PlaybackHandler) hlsPlanningRegistryWithInputsV3(
 	settings playback.PlannerSettingsV3,
 	inventory hlsToneMapCapabilityInventoryV3,
 ) *playback.TransformationRegistryV3 {
+	return h.hlsPlanningRegistryWithInputsForWorkloadV3(ctx, settings, inventory, noderouting.WorkloadVideoTranscode)
+}
+
+// progressiveRemuxPlanningRegistryWithInputsV3 reports only the remux
+// transformations executable by policy-eligible progressive routes. The API
+// proxy, and transcode pools are admitted only when policy leaves a legal
+// progressive route through that executor.
+func (h *PlaybackHandler) progressiveRemuxPlanningRegistryWithInputsV3(
+	ctx context.Context,
+	local *playback.TransformationRegistryV3,
+	proxyAllowed bool,
+) *playback.TransformationRegistryV3 {
+	local = local.OnlyAdvertised(progressiveRemuxTransformationsV3(local.Advertised()))
+	localAllowed, proxyExecutionAllowed, transcodeExecutionAllowed := progressiveRemuxExecutorAvailabilityV3(
+		h.playbackRoutingPolicyForContextV3(ctx), proxyAllowed,
+	)
+	var merged []playback.TransformationV3
+	if proxyExecutionAllowed {
+		if enumerator, ok := h.NodePlanner.(proxyNodeEnumeratorV3); ok {
+			for _, transformations := range h.pooledNodeTransformationsV3(ctx, enumerator.ProxyNodeURLs()) {
+				merged = append(merged, progressiveRemuxTransformationsV3(transformations)...)
+			}
+		}
+	}
+	if transcodeExecutionAllowed && h.NodeRecipeStore != nil && h.NodeRecipeStore.Enabled() &&
+		h.progressiveRemuxRelayAvailableV3(ctx) {
+		if enumerator, ok := h.NodePlanner.(transcodeNodeEnumeratorV3); ok {
+			for _, entry := range h.pooledNodeCapabilitiesV3(ctx, enumerator.TranscodeNodeURLs()) {
+				if slices.Contains(entry.transportFeatures, playback.TransportFeatureProgressiveRemuxExecutionV1) {
+					merged = append(merged, progressiveRemuxTransformationsV3(entry.transformations)...)
+				}
+			}
+		}
+	}
+	if !localAllowed {
+		return local.OnlyAdvertised(merged)
+	}
+	return local.WithAdvertised(merged)
+}
+
+func (h *PlaybackHandler) progressiveRemuxRelayAvailableV3(ctx context.Context) bool {
+	enumerator, ok := h.NodePlanner.(proxyNodeEnumeratorV3)
+	if !ok {
+		return false
+	}
+	for _, entry := range h.pooledNodeCapabilitiesV3(ctx, enumerator.ProxyNodeURLs()) {
+		if slices.Contains(entry.transportFeatures, playback.TransportFeatureProgressiveRemuxRelayV1) {
+			return true
+		}
+	}
+	return false
+}
+
+func progressiveRemuxTransformationsV3(transformations []playback.TransformationV3) []playback.TransformationV3 {
+	result := make([]playback.TransformationV3, 0, len(transformations))
+	for _, transformation := range transformations {
+		name := strings.TrimSpace(transformation.Name)
+		if strings.EqualFold(name, playback.TransformationAudioToAACV3) ||
+			strings.EqualFold(name, playback.TransformationServerDV7HDR10V3) {
+			result = append(result, transformation)
+		}
+	}
+	return result
+}
+
+func progressiveRemuxExecutorAvailabilityV3(policy config.PlaybackRoutingPolicy, proxyAllowed bool) (bool, bool, bool) {
+	routes, err := noderouting.Candidates(noderouting.Request{
+		Workload: noderouting.WorkloadRemux, Delivery: noderouting.DeliveryProgressiveRemux,
+		Policy: policy, ProxyAllowed: proxyAllowed,
+	})
+	if err != nil {
+		return false, false, false
+	}
+	var localAllowed, proxyExecutionAllowed, transcodeExecutionAllowed bool
+	for _, candidate := range routes.Candidates {
+		localAllowed = localAllowed || candidate.Execution == noderouting.ExecutionAPI
+		proxyExecutionAllowed = proxyExecutionAllowed || candidate.Execution == noderouting.ExecutionProxy
+		transcodeExecutionAllowed = transcodeExecutionAllowed || candidate.Execution == noderouting.ExecutionTranscode
+	}
+	return localAllowed, proxyExecutionAllowed, transcodeExecutionAllowed
+}
+
+// hlsCapabilityRegistryWithInputsV3 reports the union of transformations that
+// can execute on any admitted playback workload. The capability contract is
+// not workload-scoped, while planning must keep these registries separate.
+func (h *PlaybackHandler) hlsCapabilityRegistryWithInputsV3(
+	ctx context.Context,
+	settings playback.PlannerSettingsV3,
+	inventory hlsToneMapCapabilityInventoryV3,
+) *playback.TransformationRegistryV3 {
 	local := h.localHLSExecutionRegistryWithInputsV3(ctx, settings, inventory)
+	progressive := h.progressiveRemuxPlanningRegistryWithInputsV3(
+		ctx, local, h.JWTSecret != "" || h.proxyEgressOriginsAvailableV3(),
+	)
+	remux := h.hlsPlanningRegistryWithInputsForWorkloadV3(
+		ctx, settings, hlsToneMapCapabilityInventoryV3{}, noderouting.WorkloadRemux,
+	)
+	video := h.hlsPlanningRegistryWithInputsForWorkloadV3(
+		ctx, settings, inventory, noderouting.WorkloadVideoTranscode,
+	)
+	return progressive.WithAdvertised(remux.Advertised()).WithAdvertised(video.Advertised())
+}
+
+// hlsPlanningRegistryWithInputsForWorkloadV3 keeps transformation
+// availability inside the hard execution boundary for one HLS workload.
+func (h *PlaybackHandler) hlsPlanningRegistryWithInputsForWorkloadV3(
+	ctx context.Context,
+	settings playback.PlannerSettingsV3,
+	inventory hlsToneMapCapabilityInventoryV3,
+	workload noderouting.Workload,
+) *playback.TransformationRegistryV3 {
+	return h.hlsPlanningRegistryWithInputsForClientV3(ctx, settings, inventory, workload, true)
+}
+
+// hlsPlanningRegistryWithInputsForClientV3 keeps transformation availability
+// inside both the workload's execution boundary and this client's admitted
+// egress boundary. The unscoped capability document uses proxyAllowed=true;
+// one playback attempt supplies the client's actual proxy support.
+func (h *PlaybackHandler) hlsPlanningRegistryWithInputsForClientV3(
+	ctx context.Context,
+	settings playback.PlannerSettingsV3,
+	inventory hlsToneMapCapabilityInventoryV3,
+	workload noderouting.Workload,
+	proxyAllowed bool,
+) *playback.TransformationRegistryV3 {
+	local := h.localHLSExecutionRegistryWithInputsV3(ctx, settings, inventory)
+	routingPolicy := h.playbackRoutingPolicyForContextV3(ctx)
+	localAllowed, workerAllowed := hlsRouteExecutorAvailabilityForClientV3(workload, routingPolicy, proxyAllowed)
+	if !workerAllowed {
+		if !localAllowed {
+			return local.OnlyAdvertised(nil)
+		}
+		return local
+	}
 	enumerator, ok := h.NodePlanner.(transcodeNodeEnumeratorV3)
 	if !ok {
+		if !localAllowed {
+			return local.OnlyAdvertised(nil)
+		}
 		return local
 	}
 	nodeURLs := enumerator.TranscodeNodeURLs()
 	if len(nodeURLs) == 0 {
+		if !localAllowed {
+			return local.OnlyAdvertised(nil)
+		}
 		return local
 	}
 	var merged []playback.TransformationV3
 	for _, transformations := range h.pooledNodeTransformationsV3(ctx, nodeURLs) {
 		merged = append(merged, transformations...)
 	}
+	if !localAllowed {
+		return local.OnlyAdvertised(merged)
+	}
 	return local.WithAdvertised(merged)
 }
 
 func (h *PlaybackHandler) localHLSToneMapCapabilitiesForTransportV3(ctx context.Context) (bool, tonemap.Capabilities, error) {
-	localFallbackAllowed := h.NodePlanner == nil || nodepool.LocalTranscodeFallbackAllowed(ctx, h.SettingsRepo)
-	if !localFallbackAllowed {
+	if !localHLSVideoRouteAllowedV3(h.playbackRoutingPolicyForContextV3(ctx)) {
 		return false, nil, nil
 	}
 	capabilities, err := h.localToneMapCapabilitiesForTransportV3(ctx)
 	return true, capabilities, err
 }
 
+func localHLSVideoRouteAllowedV3(policy config.PlaybackRoutingPolicy) bool {
+	return localHLSRouteAllowedV3(noderouting.WorkloadVideoTranscode, policy)
+}
+
+func localHLSRouteAllowedV3(workload noderouting.Workload, policy config.PlaybackRoutingPolicy) bool {
+	localAllowed, _ := hlsRouteExecutorAvailabilityV3(workload, policy)
+	return localAllowed
+}
+
+func hlsRouteExecutorAvailabilityV3(workload noderouting.Workload, policy config.PlaybackRoutingPolicy) (bool, bool) {
+	return hlsRouteExecutorAvailabilityForClientV3(workload, policy, true)
+}
+
+func hlsRouteExecutorAvailabilityForClientV3(
+	workload noderouting.Workload,
+	policy config.PlaybackRoutingPolicy,
+	proxyAllowed bool,
+) (bool, bool) {
+	var delivery noderouting.Delivery
+	switch workload {
+	case noderouting.WorkloadRemux:
+		delivery = noderouting.DeliveryHLSRemux
+	case noderouting.WorkloadVideoTranscode:
+		delivery = noderouting.DeliveryHLSVideo
+	default:
+		return false, false
+	}
+	routes, err := noderouting.Candidates(noderouting.Request{
+		Workload: workload, Delivery: delivery, Policy: policy, ProxyAllowed: proxyAllowed,
+	})
+	if err != nil {
+		return false, false
+	}
+	var localAllowed, workerAllowed bool
+	for _, candidate := range routes.Candidates {
+		localAllowed = localAllowed || candidate.Execution == noderouting.ExecutionAPI
+		workerAllowed = workerAllowed || candidate.NeedsTranscodeNode()
+	}
+	return localAllowed, workerAllowed
+}
+
 // hlsToneMapCapabilityInventoryV3 snapshots local and pooled-node tone-map
 // capabilities for a single planning operation.
 func (h *PlaybackHandler) hlsToneMapCapabilityInventoryV3(ctx context.Context) (hlsToneMapCapabilityInventoryV3, error) {
-	localAllowed := h.NodePlanner == nil || nodepool.LocalTranscodeFallbackAllowed(ctx, h.SettingsRepo)
+	return h.hlsToneMapCapabilityInventoryForClientV3(ctx, true)
+}
+
+func (h *PlaybackHandler) hlsToneMapCapabilityInventoryForClientV3(
+	ctx context.Context,
+	proxyAllowed bool,
+) (hlsToneMapCapabilityInventoryV3, error) {
+	routingPolicy := h.playbackRoutingPolicyForContextV3(ctx)
+	localAllowed, workerAllowed := hlsRouteExecutorAvailabilityForClientV3(
+		noderouting.WorkloadVideoTranscode, routingPolicy, proxyAllowed,
+	)
 	fetchCtx, cancel := context.WithTimeout(ctx, h.toneMapPlanningTimeoutV3(localAllowed))
 	defer cancel()
 
@@ -813,7 +1030,7 @@ func (h *PlaybackHandler) hlsToneMapCapabilityInventoryV3(ctx context.Context) (
 	}
 
 	var nodeURLs []string
-	if enumerator, ok := h.NodePlanner.(transcodeNodeEnumeratorV3); ok {
+	if enumerator, ok := h.NodePlanner.(transcodeNodeEnumeratorV3); ok && workerAllowed {
 		nodeURLs = enumerator.TranscodeNodeURLs()
 	}
 	results := make([]capabilityResult, len(nodeURLs))
@@ -862,42 +1079,75 @@ func (h *PlaybackHandler) hlsToneMapCapabilitiesV3(ctx context.Context) tonemap.
 }
 
 type hlsPlanningSnapshotV3 struct {
-	handler   *PlaybackHandler
-	ctx       context.Context
-	settings  playback.PlannerSettingsV3
-	once      sync.Once
-	registry  *playback.TransformationRegistryV3
-	inventory hlsToneMapCapabilityInventoryV3
-	err       error
-	resolved  bool
+	handler             *PlaybackHandler
+	ctx                 context.Context
+	settings            playback.PlannerSettingsV3
+	localRegistry       *playback.TransformationRegistryV3
+	proxyAllowed        bool
+	progressiveOnce     sync.Once
+	progressiveRegistry *playback.TransformationRegistryV3
+	remuxOnce           sync.Once
+	remuxRegistry       *playback.TransformationRegistryV3
+	videoOnce           sync.Once
+	videoRegistry       *playback.TransformationRegistryV3
+	inventoryOnce       sync.Once
+	inventory           hlsToneMapCapabilityInventoryV3
+	inventoryErr        error
+	inventoryResolved   bool
 }
 
-func (snapshot *hlsPlanningSnapshotV3) resolve() {
-	snapshot.once.Do(func() {
-		snapshot.resolved = true
+func (snapshot *hlsPlanningSnapshotV3) progressiveRemuxRegistry() *playback.TransformationRegistryV3 {
+	snapshot.progressiveOnce.Do(func() {
+		snapshot.progressiveRegistry = snapshot.handler.progressiveRemuxPlanningRegistryWithInputsV3(
+			snapshot.ctx, snapshot.localRegistry, snapshot.proxyAllowed,
+		)
+	})
+	return snapshot.progressiveRegistry
+}
+
+func (snapshot *hlsPlanningSnapshotV3) resolveInventory() {
+	snapshot.inventoryOnce.Do(func() {
+		snapshot.inventoryResolved = true
 		policy := tonemap.NewPolicy(snapshot.settings.HardwareToneMapEnabled, snapshot.settings.SoftwareToneMapEnabled)
 		if policy != tonemap.PolicyNone {
-			snapshot.inventory, snapshot.err = snapshot.handler.hlsToneMapCapabilityInventoryV3(snapshot.ctx)
+			snapshot.inventory, snapshot.inventoryErr = snapshot.handler.hlsToneMapCapabilityInventoryForClientV3(
+				snapshot.ctx, snapshot.proxyAllowed,
+			)
 		}
-		snapshot.registry = snapshot.handler.hlsPlanningRegistryWithInputsV3(snapshot.ctx, snapshot.settings, snapshot.inventory)
 	})
 }
 
-func (snapshot *hlsPlanningSnapshotV3) hlsRegistry() *playback.TransformationRegistryV3 {
-	snapshot.resolve()
-	return snapshot.registry
+func (snapshot *hlsPlanningSnapshotV3) hlsRemuxRegistry() *playback.TransformationRegistryV3 {
+	snapshot.remuxOnce.Do(func() {
+		snapshot.remuxRegistry = snapshot.handler.hlsPlanningRegistryWithInputsForClientV3(
+			snapshot.ctx, snapshot.settings, hlsToneMapCapabilityInventoryV3{}, noderouting.WorkloadRemux,
+			snapshot.proxyAllowed,
+		)
+	})
+	return snapshot.remuxRegistry
+}
+
+func (snapshot *hlsPlanningSnapshotV3) hlsVideoRegistry() *playback.TransformationRegistryV3 {
+	snapshot.videoOnce.Do(func() {
+		snapshot.resolveInventory()
+		snapshot.videoRegistry = snapshot.handler.hlsPlanningRegistryWithInputsForClientV3(
+			snapshot.ctx, snapshot.settings, snapshot.inventory, noderouting.WorkloadVideoTranscode,
+			snapshot.proxyAllowed,
+		)
+	})
+	return snapshot.videoRegistry
 }
 
 func (snapshot *hlsPlanningSnapshotV3) toneMapCapabilities() tonemap.Capabilities {
-	snapshot.resolve()
+	snapshot.resolveInventory()
 	return snapshot.inventory.union
 }
 
 func (snapshot *hlsPlanningSnapshotV3) capabilityError() error {
-	if !snapshot.resolved {
+	if !snapshot.inventoryResolved {
 		return nil
 	}
-	return snapshot.err
+	return snapshot.inventoryErr
 }
 
 func retryIncompleteToneMapPlanningV3(result playback.PlannerResultV3, capabilityErr error) playback.PlannerResultV3 {
@@ -938,8 +1188,14 @@ func retryIncompletePlaybackSettingsV3(result playback.PlannerResultV3, settings
 }
 
 func (h *PlaybackHandler) planPlaybackWithCapabilitiesV3(ctx context.Context, input playback.PlannerInputV3) (playback.PlannerResultV3, error) {
-	snapshot := &hlsPlanningSnapshotV3{handler: h, ctx: ctx, settings: input.Settings}
-	input.HLSRegistry = snapshot.hlsRegistry
+	mode := headerAuthenticatedMediaV3(input.Request.ClientFeatures)
+	proxyAllowed := !mode.headerAuth && h.JWTSecret != "" || mode.proxyEgress && h.proxyEgressOriginsAvailableV3()
+	snapshot := &hlsPlanningSnapshotV3{
+		handler: h, ctx: ctx, settings: input.Settings, localRegistry: input.Registry, proxyAllowed: proxyAllowed,
+	}
+	input.ProgressiveRemuxRegistry = snapshot.progressiveRemuxRegistry
+	input.HLSRemuxRegistry = snapshot.hlsRemuxRegistry
+	input.HLSVideoRegistry = snapshot.hlsVideoRegistry
 	input.HLSToneMapCapabilities = snapshot.toneMapCapabilities
 	result := playback.PlanPlaybackV3(input)
 	if result.Terminal != nil {
@@ -957,91 +1213,200 @@ func (h *PlaybackHandler) planPlaybackWithCapabilitiesV3(ctx context.Context, in
 // contribute nothing (their failures are negatively cached), so planning
 // degrades toward the local registry instead of blocking the start path.
 func (h *PlaybackHandler) pooledNodeTransformationsV3(ctx context.Context, nodeURLs []string) map[string][]playback.TransformationV3 {
+	capabilities := h.pooledNodeCapabilitiesV3(ctx, nodeURLs)
+	byURL := make(map[string][]playback.TransformationV3, len(capabilities))
+	for nodeURL, entry := range capabilities {
+		byURL[nodeURL] = append([]playback.TransformationV3(nil), entry.transformations...)
+	}
+	return byURL
+}
+
+func (h *PlaybackHandler) pooledNodeCapabilitiesV3(ctx context.Context, nodeURLs []string) map[string]v3NodeCapabilityCache {
 	fetchCtx, cancel := context.WithTimeout(ctx, v3NodeCapabilityPlanTimeout)
 	defer cancel()
-	results := make([][]playback.TransformationV3, len(nodeURLs))
+	results := make([]v3NodeCapabilityCache, len(nodeURLs))
+	available := make([]bool, len(nodeURLs))
 	var wg sync.WaitGroup
 	for i, nodeURL := range nodeURLs {
 		wg.Add(1)
 		go func(i int, nodeURL string) {
 			defer wg.Done()
-			transformations, err := h.remoteTransformationsPlanningV3(fetchCtx, nodeURL)
+			entry, err := h.lookupRemoteCapabilitiesV3(fetchCtx, nodeURL, true)
 			if err != nil {
 				slog.DebugContext(ctx, "protocol v3 node capability unavailable for planning", "component", "api", "node", logredact.SanitizeURL(nodeURL), "error", err)
 				return
 			}
-			results[i] = transformations
+			results[i] = entry
+			available[i] = true
 		}(i, nodeURL)
 	}
 	wg.Wait()
-	byURL := make(map[string][]playback.TransformationV3, len(nodeURLs))
-	for i, transformations := range results {
-		if transformations != nil {
-			byURL[nodeURLs[i]] = transformations
+	byURL := make(map[string]v3NodeCapabilityCache, len(nodeURLs))
+	for i, entry := range results {
+		if available[i] {
+			byURL[nodeURLs[i]] = entry
 		}
 	}
 	return byURL
 }
 
-// capabilitySessionPlannerV3 is implemented by *nodepool.Planner; it lets the
-// transport layer restrict node selection to nodes that can execute the
-// plan's server transformations.
-type capabilitySessionPlannerV3 interface {
+// planNodeSessionV3 remains as a focused test seam. Production starts resolve
+// the complete policy in resolveHLSRouteV3 below; this wrapper asks that same
+// resolver for a hard worker route with the requested egress.
+func (h *PlaybackHandler) planNodeSessionV3(ctx context.Context, session *playback.Session, result playback.PlannerResultV3, localEgress bool) nodepool.Plan {
+	return h.planNodeSessionExcludingV3(ctx, session, result, localEgress, nil)
+}
+
+// planNodeSessionExcludingV3 is planNodeSessionV3 with a set of node URLs the
+// caller has already exhausted. The tone-map software fallback uses it so a
+// second attempt cannot land back on the node that just refused the recipe.
+func (h *PlaybackHandler) planNodeSessionExcludingV3(ctx context.Context, session *playback.Session, result playback.PlannerResultV3, localEgress bool, excluded map[string]struct{}) nodepool.Plan {
+	workload, _, ok := routingClassV3(result)
+	if !ok {
+		return nodepool.Plan{}
+	}
+	egress := config.PlaybackEgressPreferProxy
+	if localEgress {
+		egress = config.PlaybackEgressAPIOnly
+	}
+	policy := config.DefaultPlaybackRoutingPolicy()
+	if workload == noderouting.WorkloadRemux {
+		policy.RemuxExecution = config.PlaybackExecutionWorkerOnly
+		policy.RemuxEgress = egress
+	} else {
+		policy.VideoTranscodeExecution = config.PlaybackExecutionWorkerOnly
+		policy.VideoTranscodeEgress = egress
+	}
+	return h.resolveHLSRouteWithPolicyV3(ctx, session, result, policy, true, excluded, nil).Plan
+}
+
+func routingClassV3(result playback.PlannerResultV3) (noderouting.Workload, noderouting.Delivery, bool) {
+	if result.Plan == nil {
+		return "", "", false
+	}
+	switch result.Plan.Delivery {
+	case playback.DeliveryOriginalHTTPV3:
+		return noderouting.WorkloadDirectPlay, noderouting.DeliveryDirect, true
+	case playback.DeliveryRemuxProgressiveV3:
+		return noderouting.WorkloadRemux, noderouting.DeliveryProgressiveRemux, true
+	case playback.DeliveryRemuxHLSV3:
+		return noderouting.WorkloadRemux, noderouting.DeliveryHLSRemux, true
+	case playback.DeliveryTranscodeHLSV3:
+		return noderouting.WorkloadVideoTranscode, noderouting.DeliveryHLSVideo, true
+	default:
+		return "", "", false
+	}
+}
+
+func routingWorkloadV3(result playback.PlannerResultV3) noderouting.Workload {
+	workload, _, _ := routingClassV3(result)
+	return workload
+}
+
+func (h *PlaybackHandler) playbackRoutingPolicyV3() config.PlaybackRoutingPolicy {
+	return config.EffectivePlaybackRoutingPolicy(h.playbackConfig().Routing)
+}
+
+type playbackRoutingPolicySnapshotKeyV3 struct{}
+
+func withPlaybackRoutingPolicySnapshotV3(ctx context.Context, policy config.PlaybackRoutingPolicy) context.Context {
+	return context.WithValue(ctx, playbackRoutingPolicySnapshotKeyV3{}, config.EffectivePlaybackRoutingPolicy(policy))
+}
+
+func (h *PlaybackHandler) playbackRoutingPolicyForContextV3(ctx context.Context) config.PlaybackRoutingPolicy {
+	if ctx != nil {
+		if policy, ok := ctx.Value(playbackRoutingPolicySnapshotKeyV3{}).(config.PlaybackRoutingPolicy); ok {
+			return policy
+		}
+	}
+	return h.playbackRoutingPolicyV3()
+}
+
+func (h *PlaybackHandler) resolveHLSRouteWithPolicyV3(
+	ctx context.Context,
+	session *playback.Session,
+	result playback.PlannerResultV3,
+	policy config.PlaybackRoutingPolicy,
+	proxyAllowed bool,
+	excludedNodes map[string]struct{},
+	excludedShapes map[string]struct{},
+) noderouting.Decision {
+	workload, delivery, ok := routingClassV3(result)
+	if !ok || session == nil {
+		return noderouting.Decision{Outcome: noderouting.OutcomePolicyUnsatisfied}
+	}
+	eligible := h.transcodeEligibilityV3(ctx, result, excludedNodes)
+	decision, err := noderouting.Resolve(noderouting.AdaptSessionPlanner(h.NodePlanner), noderouting.ResolveRequest{
+		Request: noderouting.Request{
+			Workload: workload, Delivery: delivery, Policy: policy, ProxyAllowed: proxyAllowed,
+		},
+		SessionID: session.ID, CurrentTranscodeURL: session.TranscodeNodeURL,
+		EstimatedBitrateKbps: result.TargetBitrateKbps,
+		TranscodeEligible:    eligible, ExcludedShapeIDs: excludedShapes,
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "compile playback node route", "component", "noderouting", "error", err)
+		return noderouting.Decision{Outcome: noderouting.OutcomePolicyUnsatisfied}
+	}
+	return decision
+}
+
+// predicateSessionPlannerV3 is the legacy planner seam that accepts an
+// eligibility predicate without implementing the exact-route contract.
+type predicateSessionPlannerV3 interface {
 	PlanSessionWith(sessionID, currentTranscodeURL string, needsTranscode bool, estBitrateKbps int, eligible func(*nodepool.Node) bool) nodepool.Plan
 }
 
-// planNodeSessionV3 selects transcode/proxy nodes for the session. Plans that
-// carry server transformations restrict selection to nodes whose advertised
-// capabilities validate against the plan, so load balancing in a
-// heterogeneous pool cannot land a recipe on a node that would reject it when
-// a capable sibling exists. Capability-blind selection remains for
-// transformation-free plans and non-enumerating planners.
-// planNodeSessionV3 accepts upstream's localEgress flag for signature parity;
-// this fork serves no proxy egress, so the flag is ignored.
-func (h *PlaybackHandler) planNodeSessionV3(ctx context.Context, session *playback.Session, result playback.PlannerResultV3, localEgress bool) nodepool.Plan {
-	_ = localEgress
-	return h.planNodeSessionExcludingV3(ctx, session, result, nil)
-}
-
-func (h *PlaybackHandler) planNodeSessionExcludingV3(ctx context.Context, session *playback.Session, result playback.PlannerResultV3, excluded map[string]struct{}) nodepool.Plan {
-	selector, selectable := h.NodePlanner.(capabilitySessionPlannerV3)
-	enumerator, enumerable := h.NodePlanner.(transcodeNodeEnumeratorV3)
-	if !selectable || !enumerable || !planRequiresServerTransformationsV3(result.Plan) {
-		plan := h.NodePlanner.PlanSession(session.ID, session.TranscodeNodeURL, true, result.TargetBitrateKbps)
-		if plan.TranscodeNode != nil {
-			if _, skip := excluded[plan.TranscodeNode.URL]; skip {
-				if releaser, ok := h.NodePlanner.(sessionReservationReleaserV3); ok {
-					releaser.ReleaseSession(session.ID)
-				}
-				plan.TranscodeNode = nil
-			}
-		}
-		return plan
-	}
-	capable := make(map[string]struct{})
-	for nodeURL, advertised := range h.pooledNodeTransformationsV3(ctx, enumerator.TranscodeNodeURLs()) {
-		if validateAdvertisedTransformationsV3(result.Plan, advertised) != nil {
-			continue
-		}
-		if planRequiresToneMapV3(result.Plan) {
-			capabilities, err := h.remoteToneMapCapabilitiesV3(ctx, nodeURL, true)
-			if err != nil || !capabilities.Supports(result.ToneMapMode, result.ToneMapSourceKind) {
+// transcodeEligibilityV3 builds the node predicate the route resolver applies
+// before it reserves. Plans that carry server transformations restrict
+// selection to nodes whose advertised capabilities validate against the plan,
+// so load balancing in a heterogeneous pool cannot land a recipe on a node that
+// would reject it when a capable sibling exists. A nil predicate means every
+// pooled node is acceptable.
+func (h *PlaybackHandler) transcodeEligibilityV3(ctx context.Context, result playback.PlannerResultV3, excluded map[string]struct{}) func(*nodepool.Node) bool {
+	// The per-node capability fan-out only pays for itself when a planner can
+	// actually consume the predicate it produces. A planner that implements
+	// neither the exact route contract nor the predicate seam would spend a
+	// round of capability lookups on a filter nothing reads.
+	_, exactPlanner := h.NodePlanner.(nodepool.RoutePlanner)
+	_, predicatePlanner := h.NodePlanner.(predicateSessionPlannerV3)
+	requiresProgressiveRemux := result.Plan != nil && result.Plan.Delivery == playback.DeliveryRemuxProgressiveV3
+	if enumerator, ok := h.NodePlanner.(transcodeNodeEnumeratorV3); ok && (exactPlanner || predicatePlanner) &&
+		(planRequiresServerTransformationsV3(result.Plan) || requiresProgressiveRemux) {
+		capable := make(map[string]struct{})
+		for nodeURL, entry := range h.pooledNodeCapabilitiesV3(ctx, enumerator.TranscodeNodeURLs()) {
+			if requiresProgressiveRemux && !slices.Contains(entry.transportFeatures, playback.TransportFeatureProgressiveRemuxExecutionV1) {
 				continue
 			}
+			if validateAdvertisedTransformationsV3(result.Plan, entry.transformations) != nil {
+				continue
+			}
+			capable[nodeURL] = struct{}{}
 		}
-		capable[nodeURL] = struct{}{}
+		// The predicate runs under the planner lock: a set lookup only.
+		return func(node *nodepool.Node) bool {
+			if node == nil {
+				return false
+			}
+			if _, skip := excluded[node.URL]; skip {
+				return false
+			}
+			_, found := capable[node.URL]
+			return found
+		}
 	}
-	// The predicate runs under the planner lock: a set lookup only.
-	return selector.PlanSessionWith(session.ID, session.TranscodeNodeURL, true, result.TargetBitrateKbps, func(node *nodepool.Node) bool {
+	if len(excluded) == 0 {
+		return nil
+	}
+	// No capability filter applies to this plan, but an exhausted node must
+	// still be kept out of the selection.
+	return func(node *nodepool.Node) bool {
 		if node == nil {
 			return false
 		}
-		if _, skip := excluded[node.URL]; skip {
-			return false
-		}
-		_, ok := capable[node.URL]
-		return ok
-	})
+		_, skip := excluded[node.URL]
+		return !skip
+	}
 }
 
 // planRequiresToneMapV3 reports whether a plan contains the server-owned HDR
@@ -1114,7 +1479,7 @@ func (h *PlaybackHandler) HandlePlaybackCapabilityV3(w http.ResponseWriter, r *h
 	if policy != tonemap.PolicyNone {
 		inventory, _ = h.hlsToneMapCapabilityInventoryV3(r.Context())
 	}
-	registry := h.hlsPlanningRegistryWithInputsV3(r.Context(), settings, inventory)
+	registry := h.hlsCapabilityRegistryWithInputsV3(r.Context(), settings, inventory)
 	toneMapAvailable := false
 	if policy != tonemap.PolicyNone {
 		for _, capability := range inventory.union {
@@ -1135,6 +1500,7 @@ func (h *PlaybackHandler) HandlePlaybackCapabilityV3(w http.ResponseWriter, r *h
 
 // handleStartPlaybackV3 validates, plans, and starts a protocol-v3 request.
 func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.Request, body []byte) {
+	r = r.WithContext(withPlaybackRoutingPolicySnapshotV3(r.Context(), h.playbackRoutingPolicyV3()))
 	timings := newPlaybackStartTimingsV3()
 	var req playback.StartRequestV3
 	defer func() { timings.log(r.Context(), req.PlaybackAttemptID) }()
@@ -1383,26 +1749,7 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 	}
 	result = escalated
 	timings.mark("remux_escalation")
-	// One line per plan decision so route selection is reconstructible from
-	// server logs alone (finding a mis-planned route previously required
-	// correlating client logcat, ffmpeg commands, and session rows).
-	slog.InfoContext(r.Context(), "playback plan decided", append([]any{
-		logComponentKey, playbackLogValueV3,
-		requestIDLogKeyV3, chimw.GetReqID(r.Context()),
-		"outcome", "plan",
-		"decision_reason", result.Plan.DecisionReason,
-		"delivery", result.Plan.Delivery,
-		"play_method", string(result.PlayMethod),
-		"requested_file_id", requestedFile.ID,
-		"effective_file_id", effectiveFile.ID,
-		"dv_profile", result.Plan.Source.DVProfile,
-		"dynamic_range", result.Plan.Source.DynamicRange,
-		"target_resolution", result.TargetResolution,
-		"target_bitrate_kbps", result.TargetBitrateKbps,
-		"quality_preference", req.QualityPreference,
-		"bandwidth_estimate_kbps", intOrZeroHandlerV3(req.BandwidthEstimateKbps),
-	}, clientInfo.LogAttrs()...)...)
-	result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, warnings...)
+	appendStartWarningsV3(&result, warnings)
 	response, statusErr := h.startPlannedPlaybackV3(r, userID, profileID, req, requestDigests, requestedFile, effectiveFile, audioIndex, result, clientInfo)
 	timings.mark("session_transport_commit")
 	if statusErr != nil {
@@ -1592,6 +1939,15 @@ func (d playbackStartRequestDigestsV3) matches(stored string) bool {
 	return stored == "" || stored == d.current || stored == d.legacy
 }
 
+func appendStartWarningsV3(result *playback.PlannerResultV3, warnings []playback.DegradationWarningV3) {
+	if result == nil || len(warnings) == 0 {
+		return
+	}
+	if result.Plan != nil {
+		result.Plan.DegradationWarnings = append(result.Plan.DegradationWarnings, warnings...)
+	}
+}
+
 // startPlannedPlaybackV3 creates a session and transport for an accepted plan.
 func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, profileID string, req playback.StartRequestV3, requestDigests playbackStartRequestDigestsV3, requestedFile, effectiveFile *models.MediaFile, audioIndex int, result playback.PlannerResultV3, clientInfo playback.ClientInfo) (playback.DecisionResponseV3, *transportErrorV3) {
 	if result.Plan == nil {
@@ -1606,6 +1962,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 			return playback.DecisionResponseV3{}, &transportErrorV3{reason: reason, message: "The selected server adaptation is disabled for this user."}
 		}
 	}
+	mode := headerAuthenticatedMediaV3(req.ClientFeatures)
 	ctx := playback.WithClientInfo(r.Context(), clientInfo)
 	session, err := h.sessionMgr.StartSessionWithFilesContext(ctx, userID, profileID, effectiveFile.ID, requestedFile.ID, result.PlayMethod, result.TranscodeAudio)
 	if err != nil {
@@ -1637,11 +1994,29 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "Failed to load the initialized playback session.", cause: err}
 	}
 	result.Plan.SessionID = session.ID
-	transport, transportErr := h.prepareTransportV3(r, session, effectiveFile, result, headerAuthenticatedMediaV3(req.ClientFeatures))
+	transport, transportErr := h.prepareTransportV3(r, session, effectiveFile, result, mode)
 	if transportErr != nil {
 		abort()
 		return playback.DecisionResponseV3{}, transportErr
 	}
+	// One line per final plan decision so route selection is reconstructible
+	// from server logs.
+	slog.InfoContext(r.Context(), "playback plan decided", append([]any{
+		logComponentKey, playbackLogValueV3,
+		requestIDLogKeyV3, chimw.GetReqID(r.Context()),
+		"outcome", "plan",
+		"decision_reason", result.Plan.DecisionReason,
+		"delivery", result.Plan.Delivery,
+		"play_method", string(result.PlayMethod),
+		"requested_file_id", requestedFile.ID,
+		"effective_file_id", effectiveFile.ID,
+		"dv_profile", result.Plan.Source.DVProfile,
+		"dynamic_range", result.Plan.Source.DynamicRange,
+		"target_resolution", result.TargetResolution,
+		"target_bitrate_kbps", result.TargetBitrateKbps,
+		"quality_preference", req.QualityPreference,
+		bandwidthEstimateLogKeyV3, intOrZeroHandlerV3(req.BandwidthEstimateKbps),
+	}, clientInfo.LogAttrs()...)...)
 	applyTransportToneMapModeV3(&result, transport)
 	frozenRecipe, frozenErr := h.freezeExecutableRecipeV3(r.Context(), effectiveFile, result)
 	if frozenErr != nil {
@@ -1657,7 +2032,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	}
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: playback.ServerFeaturesV3(), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
 	record := playback.AttemptRecordV3{PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, UserID: userID, ProfileID: profileID, RequestedMediaFileID: requestedFile.ID, EffectiveMediaFileID: effectiveFile.ID, CurrentPlanID: result.Plan.PlanID, CurrentPlan: *result.Plan, FrozenRecipe: frozenRecipe, NormalizedRequest: req, StartResponse: response, RequestDigest: requestDigests.current, ExpiresAt: time.Now().Add(playback.MaxTokenTTL)}
-	if err := h.updateV3SessionState(r.Context(), session, effectiveFile, result, transport, headerAuthenticatedMediaV3(req.ClientFeatures)); err != nil {
+	if err := h.updateV3SessionState(r.Context(), session, effectiveFile, result, transport, mode); err != nil {
 		transport.rollback()
 		abort()
 		return playback.DecisionResponseV3{}, &transportErrorV3{reason: "internal_error", message: "Failed to commit the live playback session.", cause: err}
@@ -1855,73 +2230,159 @@ func (h *PlaybackHandler) persistCurrentAudioPreferenceV3(ctx context.Context, s
 
 // prepareTransportV3 selects and prepares the local, remote, or identity transport.
 func (h *PlaybackHandler) prepareTransportV3(r *http.Request, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, mode mediaAuthModeV3) (preparedTransportV3, *transportErrorV3) {
+	return h.prepareTransportWithPolicyV3(r, session, file, result, mode, h.playbackRoutingPolicyForContextV3(r.Context()))
+}
+
+func (h *PlaybackHandler) prepareTransportWithPolicyV3(r *http.Request, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, mode mediaAuthModeV3, policy config.PlaybackRoutingPolicy) (preparedTransportV3, *transportErrorV3) {
+	return h.prepareTransportWithPolicyAndExclusionsV3(r, session, file, result, mode, policy, nil)
+}
+
+func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
+	r *http.Request,
+	session *playback.Session,
+	file *models.MediaFile,
+	result playback.PlannerResultV3,
+	mode mediaAuthModeV3,
+	policy config.PlaybackRoutingPolicy,
+	initialExcludedShapes map[string]struct{},
+) (preparedTransportV3, *transportErrorV3) {
+	if !shouldUsePooledPlaybackNodeV3(file) {
+		policy.RemuxExecution = config.PlaybackExecutionAPIOnly
+		policy.VideoTranscodeExecution = config.PlaybackExecutionAPIOnly
+		policy.RemuxEgress = config.PlaybackEgressAPIOnly
+		policy.VideoTranscodeEgress = config.PlaybackEgressAPIOnly
+		policy.DirectPlayEgress = config.PlaybackEgressAPIOnly
+	}
 	timeline, timelineErr := h.prepareTransportTimelineV3(r.Context(), session, file, result)
 	if timelineErr != nil {
 		return preparedTransportV3{}, timelineErr
 	}
 	if result.Plan.Delivery != playback.DeliveryTranscodeHLSV3 && result.Plan.Delivery != playback.DeliveryRemuxHLSV3 {
-		return h.prepareIdentityTransportV3(r, session, file, result, timeline, mode)
+		return h.prepareIdentityTransportV3(r, session, file, result, timeline, mode, policy, initialExcludedShapes)
 	}
-	if h.NodePlanner != nil && shouldUsePooledPlaybackNodeV3(file) {
-		plan := h.planNodeSessionV3(r.Context(), session, result, mode.headerAuth && !mode.proxyEgress)
-		if plan.TranscodeNode == nil && !nodepool.LocalTranscodeFallbackAllowed(r.Context(), h.SettingsRepo) {
-			if fallback, attempted, fallbackErr := h.prepareSoftwareToneMapFallbackV3(r, session, file, result, timeline, mode); attempted {
-				return fallback, fallbackErr
+	proxyAllowed := mode.proxyEgress || (!mode.headerAuth && h.JWTSecret != "")
+	excludedNodes := make(map[string]struct{})
+	excludedShapes := make(map[string]struct{}, len(initialExcludedShapes))
+	for shapeID := range initialExcludedShapes {
+		excludedShapes[shapeID] = struct{}{}
+	}
+	var lastErr *transportErrorV3
+	for attempts := 0; attempts < 32; attempts++ {
+		decision := h.resolveHLSRouteWithPolicyV3(r.Context(), session, result, policy, proxyAllowed, excludedNodes, excludedShapes)
+		if !decision.Selected() {
+			if fallback, attempted, fallbackErr := h.prepareSoftwareToneMapFallbackWithPolicyV3(r, session, file, result, mode, policy); attempted {
+				if fallbackErr == nil {
+					return fallback, nil
+				}
+				return fallback, combineTransportErrorsV3(lastErr, fallbackErr)
+			}
+			if lastErr != nil {
+				return preparedTransportV3{}, lastErr
+			}
+			retryable := decision.Outcome == noderouting.OutcomeCapacityUnavailable
+			return preparedTransportV3{}, &transportErrorV3{
+				reason: string(decision.Outcome), message: "No playback route satisfies the configured policy and current node availability.", retryable: retryable,
 			}
 		}
-		if plan.TranscodeNode != nil {
-			transformations, err := h.remoteTransformationsV3(r.Context(), plan.TranscodeNode.URL)
-			if err == nil {
-				err = validateAdvertisedTransformationsV3(result.Plan, transformations)
+
+		if decision.Shape.Execution == noderouting.ExecutionAPI {
+			if capabilityErr := h.validateLocalTransportCapabilitiesV3(r.Context(), result); capabilityErr != nil {
+				lastErr = combineTransportErrorsV3(lastErr, capabilityErr)
+				excludedShapes[decision.Shape.ID] = struct{}{}
+				continue
 			}
-			if err == nil && planRequiresToneMapV3(result.Plan) {
-				capabilities, capabilityErr := h.remoteToneMapCapabilitiesV3(r.Context(), plan.TranscodeNode.URL, false)
-				if capabilityErr != nil {
-					err = capabilityErr
-				} else {
-					err = validateToneMapExecutorV3(result, capabilities)
-				}
+			transport, transportErr := h.prepareLocalTransportV3(r, session, file, result, timeline, mode)
+			if transportErr == nil {
+				return transport, nil
 			}
-			if err == nil {
-				transport, transportErr := h.prepareRemoteTransportV3(r, session, file, result, plan, timeline, mode)
-				if transportErr == nil {
-					return transport, nil
-				}
-				if releaser, ok := h.NodePlanner.(sessionReservationReleaserV3); ok {
-					releaser.ReleaseSession(session.ID)
-				}
-				if fallback, attempted, fallbackErr := h.prepareSoftwareToneMapFallbackV3(r, session, file, result, timeline, mode); attempted {
-					if fallbackErr != nil {
-						fallbackErr = combineTransportErrorsV3(transportErr, fallbackErr)
-					}
-					return fallback, fallbackErr
-				}
-				return preparedTransportV3{}, transportErr
+			lastErr = combineTransportErrorsV3(lastErr, transportErr)
+			excludedShapes[decision.Shape.ID] = struct{}{}
+			continue
+		}
+
+		plan := decision.Plan
+		nodeURL := plan.TranscodeNode.URL
+		transformations, capabilityErr := h.remoteTransformationsV3(r.Context(), nodeURL)
+		if capabilityErr == nil {
+			capabilityErr = validateAdvertisedTransformationsV3(result.Plan, transformations)
+		}
+		if capabilityErr == nil && planRequiresToneMapV3(result.Plan) {
+			capabilities, err := h.remoteToneMapCapabilitiesV3(r.Context(), nodeURL, false)
+			if err != nil {
+				capabilityErr = err
+			} else {
+				capabilityErr = validateToneMapExecutorV3(result, capabilities)
 			}
-			slog.WarnContext(r.Context(), "protocol v3 transcode node capability mismatch", "node", logredact.SanitizeURL(plan.TranscodeNode.URL), "error", err)
+		}
+		if capabilityErr != nil {
+			slog.WarnContext(r.Context(), "protocol v3 transcode node capability mismatch", "node", logredact.SanitizeURL(nodeURL), "error", capabilityErr)
 			if releaser, ok := h.NodePlanner.(sessionReservationReleaserV3); ok {
 				releaser.ReleaseSession(session.ID)
 			}
-			if fallback, attempted, fallbackErr := h.prepareSoftwareToneMapFallbackV3(r, session, file, result, timeline, mode); attempted {
-				return fallback, fallbackErr
+			excludedNodes[nodeURL] = struct{}{}
+			lastErr = combineTransportErrorsV3(lastErr, &transportErrorV3{reason: routeCapabilityUnavailableReasonV3, message: "No available worker can execute the selected playback recipe.", retryable: true, cause: capabilityErr})
+		}
+
+		transport, transportErr := h.prepareRemoteTransportV3(r, session, file, result, plan, timeline, mode)
+		proxyAuthorityFailed := false
+		if transportErr == nil {
+			// URL construction is part of route preparation. A proxy route that
+			// could not establish its authority must retry a legal API-egress shape,
+			// never silently mutate the selected topology.
+			if decision.Shape.Egress != noderouting.EgressProxy || strings.HasPrefix(transport.url, "http") {
+				return transport, nil
 			}
-			if !nodepool.LocalTranscodeFallbackAllowed(r.Context(), h.SettingsRepo) {
-				return preparedTransportV3{}, &transportErrorV3{reason: "transcode_node_capability_unavailable", message: "No transcode node can execute the selected playback recipe.", retryable: true, cause: err}
+			apiEgressAllowed := false
+			switch decision.Shape.Workload {
+			case noderouting.WorkloadRemux:
+				apiEgressAllowed = policy.RemuxEgress != config.PlaybackEgressProxyOnly
+			case noderouting.WorkloadVideoTranscode:
+				apiEgressAllowed = policy.VideoTranscodeEgress != config.PlaybackEgressProxyOnly
 			}
+			if apiEgressAllowed {
+				// prepareRemoteTransportV3 already released only the unused proxy
+				// half. Keep the running executor and publish its API relay rather
+				// than stopping and restarting an identical generation.
+				return transport, nil
+			}
+			transport.rollback()
+			transportErr = &transportErrorV3{reason: "route_preparation_failed", message: "The selected proxy could not establish playback authority.", retryable: true}
+			proxyAuthorityFailed = true
+		}
+		if releaser, ok := h.NodePlanner.(sessionReservationReleaserV3); ok {
+			releaser.ReleaseSession(session.ID)
+		}
+		if proxyAuthorityFailed {
+			excludedShapes[decision.Shape.ID] = struct{}{}
+		} else {
+			excludedNodes[nodeURL] = struct{}{}
+		}
+		lastErr = combineTransportErrorsV3(lastErr, transportErr)
+	}
+	return preparedTransportV3{}, &transportErrorV3{reason: "route_preparation_failed", message: "Playback route preparation exhausted every candidate.", retryable: true, cause: lastErr}
+}
+
+func (h *PlaybackHandler) checkReplacementAdmissionV3(
+	ctx context.Context,
+	session *playback.Session,
+	result playback.PlannerResultV3,
+) *transportErrorV3 {
+	if session == nil {
+		return &transportErrorV3{reason: "internal_error", message: "Playback route admission has no live session."}
+	}
+	if checker, ok := h.sessionMgr.(replacementAdmissionCheckerV3); ok {
+		if err := checker.CheckReplacementAllowed(ctx, session.ID, result.PlayMethod, result.TranscodeAudio); err != nil {
+			return sessionStartErrorV3(err)
+		}
+		return nil
+	}
+	if checker, ok := h.sessionMgr.(transcodePermissionChecker); ok &&
+		(result.PlayMethod == playback.PlayTranscode || result.TranscodeAudio) {
+		if err := checker.CheckTranscodingAllowed(ctx, session.UserID, result.PlayMethod == playback.PlayTranscode); err != nil {
+			return sessionStartErrorV3(err)
 		}
 	}
-	if h.NodePlanner != nil && shouldUsePooledPlaybackNodeV3(file) && !nodepool.LocalTranscodeFallbackAllowed(r.Context(), h.SettingsRepo) {
-		return preparedTransportV3{}, &transportErrorV3{reason: "capacity_unavailable", message: "No transcode node is available and local fallback is disabled.", retryable: true}
-	}
-	// Capability-union planning may select transformations only pooled nodes
-	// can execute; the local binary must prove it carries the recipe before
-	// this fallback spawns an ffmpeg that would fail at runtime. Retryable:
-	// a capable node freeing up satisfies the same plan. Transformation-free
-	// plans skip the check (and the local probe behind it) entirely.
-	if capabilityErr := h.validateLocalTransportCapabilitiesV3(r.Context(), result); capabilityErr != nil {
-		return preparedTransportV3{}, capabilityErr
-	}
-	return h.prepareLocalTransportV3(r, session, file, result, timeline, mode)
+	return nil
 }
 
 // canRetrySoftwareToneMapV3 permits a software retry only for an initial
@@ -1933,46 +2394,20 @@ func canRetrySoftwareToneMapV3(result playback.PlannerResultV3) bool {
 
 // prepareSoftwareToneMapFallbackV3 retries an eligible failed hardware recipe
 // on a software-capable remote node or, when allowed, on the API host.
-func (h *PlaybackHandler) prepareSoftwareToneMapFallbackV3(r *http.Request, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, timeline preparedTimelineV3, mode mediaAuthModeV3) (preparedTransportV3, bool, *transportErrorV3) {
+func (h *PlaybackHandler) prepareSoftwareToneMapFallbackV3(r *http.Request, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, mode mediaAuthModeV3) (preparedTransportV3, bool, *transportErrorV3) {
+	return h.prepareSoftwareToneMapFallbackWithPolicyV3(r, session, file, result, mode, h.playbackRoutingPolicyForContextV3(r.Context()))
+}
+
+// prepareSoftwareToneMapFallbackWithPolicyV3 re-enters route preparation with a
+// software tone-map recipe, so the retry re-derives its own timeline rather than
+// inheriting the failed attempt's.
+func (h *PlaybackHandler) prepareSoftwareToneMapFallbackWithPolicyV3(r *http.Request, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, mode mediaAuthModeV3, policy config.PlaybackRoutingPolicy) (preparedTransportV3, bool, *transportErrorV3) {
 	if !canRetrySoftwareToneMapV3(result) {
 		return preparedTransportV3{}, false, nil
 	}
 	fallbackResult := result
 	fallbackResult.ToneMapMode = tonemap.ModeSoftware
-	excluded := make(map[string]struct{})
-	var lastRemoteErr *transportErrorV3
-	for {
-		fallbackPlan := h.planNodeSessionExcludingV3(r.Context(), session, fallbackResult, excluded)
-		if fallbackPlan.TranscodeNode == nil {
-			break
-		}
-		nodeURL := fallbackPlan.TranscodeNode.URL
-		if _, repeated := excluded[nodeURL]; repeated {
-			break
-		}
-		fallback, fallbackErr := h.prepareRemoteTransportV3(r, session, file, fallbackResult, fallbackPlan, timeline, mode)
-		if fallbackErr == nil {
-			return fallback, true, nil
-		}
-		if releaser, ok := h.NodePlanner.(sessionReservationReleaserV3); ok {
-			releaser.ReleaseSession(session.ID)
-		}
-		excluded[nodeURL] = struct{}{}
-		lastRemoteErr = combineTransportErrorsV3(lastRemoteErr, fallbackErr)
-	}
-	if !nodepool.LocalTranscodeFallbackAllowed(r.Context(), h.SettingsRepo) {
-		if lastRemoteErr != nil {
-			return preparedTransportV3{}, true, lastRemoteErr
-		}
-		return preparedTransportV3{}, false, nil
-	}
-	if capabilityErr := h.validateLocalTransportCapabilitiesV3(r.Context(), fallbackResult); capabilityErr != nil {
-		return preparedTransportV3{}, true, capabilityErr
-	}
-	fallback, fallbackErr := h.prepareLocalTransportV3(r, session, file, fallbackResult, timeline, mode)
-	if fallbackErr != nil && lastRemoteErr != nil {
-		fallbackErr = combineTransportErrorsV3(lastRemoteErr, fallbackErr)
-	}
+	fallback, fallbackErr := h.prepareTransportWithPolicyV3(r, session, file, fallbackResult, mode, policy)
 	return fallback, true, fallbackErr
 }
 
@@ -1996,6 +2431,19 @@ func (h *PlaybackHandler) validateLocalTransportCapabilitiesV3(ctx context.Conte
 	}
 	if err := validateToneMapExecutorV3(result, capabilities); err != nil {
 		return &transportErrorV3{reason: "transcode_node_capability_unavailable", message: "No available transcode executor can run the selected tone-map recipe.", retryable: true, cause: err}
+	}
+	return nil
+}
+
+func (h *PlaybackHandler) validateLocalProgressiveCapabilitiesV3(ctx context.Context, result playback.PlannerResultV3) *transportErrorV3 {
+	if !planRequiresServerTransformationsV3(result.Plan) {
+		return nil
+	}
+	if err := validateAdvertisedTransformationsV3(result.Plan, h.transformationRegistryV3(ctx).Advertised()); err != nil {
+		return &transportErrorV3{
+			reason: routeCapabilityUnavailableReasonV3, message: "The API server cannot execute the selected progressive-remux recipe.",
+			retryable: true, cause: err,
+		}
 	}
 	return nil
 }
@@ -2100,7 +2548,111 @@ func planRequiresServerTransformationsV3(plan *playback.PlanV3) bool {
 	return false
 }
 
-func (h *PlaybackHandler) prepareIdentityTransportV3(r *http.Request, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, timeline preparedTimelineV3, mode mediaAuthModeV3) (preparedTransportV3, *transportErrorV3) {
+func (h *PlaybackHandler) prepareIdentityTransportV3(r *http.Request, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, timeline preparedTimelineV3, mode mediaAuthModeV3, policy config.PlaybackRoutingPolicy, excludedShapes map[string]struct{}) (preparedTransportV3, *transportErrorV3) {
+	// The shared resolver removes proxy shapes when this client cannot address
+	// an authorized origin, then applies the same policy ordering as every HLS
+	// path. Legacy and authorized-origin attempts differ only in URL authority.
+	decision, routeErr := h.resolveIdentityRouteV3(r, session.ID, result, mode, policy, excludedShapes)
+	if routeErr != nil {
+		return preparedTransportV3{}, routeErr
+	}
+	proxyNode := decision.Plan.ProxyNode
+	transcodeNode := decision.Plan.TranscodeNode
+	releaseReservation := func() {
+		if releaser, ok := h.NodePlanner.(sessionReservationReleaserV3); ok {
+			releaser.ReleaseSession(session.ID)
+		}
+	}
+	var unlockLifecycle func()
+	releaseLifecycle := func() {
+		if unlockLifecycle == nil {
+			return
+		}
+		unlockLifecycle()
+		unlockLifecycle = nil
+	}
+	fallbackFromSelectedRoute := func(routeErr *transportErrorV3) (preparedTransportV3, *transportErrorV3) {
+		releaseLifecycle()
+		releaseReservation()
+		fallbackExclusions := maps.Clone(excludedShapes)
+		if fallbackExclusions == nil {
+			fallbackExclusions = make(map[string]struct{})
+		}
+		fallbackExclusions[decision.Shape.ID] = struct{}{}
+		fallback, fallbackErr := h.prepareIdentityTransportV3(r, session, file, result, timeline, mode, policy, fallbackExclusions)
+		if fallbackErr == nil {
+			return fallback, nil
+		}
+		return preparedTransportV3{}, combineTransportErrorsV3(routeErr, fallbackErr)
+	}
+	if transcodeNode != nil {
+		transcodeCapabilities, capabilityErr := h.lookupRemoteCapabilitiesV3(r.Context(), transcodeNode.URL, false)
+		if capabilityErr != nil || !slices.Contains(transcodeCapabilities.transportFeatures, playback.TransportFeatureProgressiveRemuxExecutionV1) {
+			return fallbackFromSelectedRoute(&transportErrorV3{
+				reason: routeCapabilityUnavailableReasonV3, message: "The selected transcode node cannot execute a progressive remux.",
+				retryable: true, cause: capabilityErr,
+			})
+		}
+	}
+	if transcodeNode != nil && proxyNode != nil {
+		proxyCapabilities, capabilityErr := h.lookupRemoteCapabilitiesV3(r.Context(), proxyNode.URL, false)
+		if capabilityErr != nil || !slices.Contains(proxyCapabilities.transportFeatures, playback.TransportFeatureProgressiveRemuxRelayV1) {
+			return fallbackFromSelectedRoute(&transportErrorV3{
+				reason: routeCapabilityUnavailableReasonV3, message: "The selected proxy cannot relay a progressive remux from a transcode node.",
+				retryable: true, cause: capabilityErr,
+			})
+		}
+	}
+	var executorNode *nodepool.Node
+	switch decision.Shape.Execution {
+	case noderouting.ExecutionProxy:
+		executorNode = proxyNode
+	case noderouting.ExecutionTranscode:
+		executorNode = transcodeNode
+	}
+	if executorNode != nil && planRequiresServerTransformationsV3(result.Plan) {
+		advertised, capabilityErr := h.remoteTransformationsV3(r.Context(), executorNode.URL)
+		if capabilityErr == nil {
+			capabilityErr = validateAdvertisedTransformationsV3(result.Plan, advertised)
+		}
+		if capabilityErr != nil {
+			return fallbackFromSelectedRoute(&transportErrorV3{
+				reason: routeCapabilityUnavailableReasonV3, message: "The selected node cannot execute the progressive-remux recipe.",
+				retryable: true, cause: capabilityErr,
+			})
+		}
+	}
+
+	// A stop and a replacement must agree on the exact moment a progressive
+	// authority becomes externally usable. Re-read the session after entering
+	// their shared lifecycle boundary: if stop won, fail before publishing the
+	// successor recipe or proxy grant; if replacement won, stop waits until its
+	// commit or rollback has made that authority match the live session.
+	if h.beforeIdentityLifecycleLockV3 != nil {
+		h.beforeIdentityLifecycleLockV3()
+	}
+	unlockLifecycle = h.tm.LockSessionLifecycle(session.ID)
+	// Accepted start/replan plans always carry their live session ID. Low-level
+	// transport tests deliberately omit it so they can exercise route assembly
+	// without reconstructing the surrounding request transaction.
+	if result.Plan.SessionID != "" {
+		if result.Plan.SessionID != session.ID {
+			releaseLifecycle()
+			releaseReservation()
+			return preparedTransportV3{}, &transportErrorV3{
+				reason: "internal_error", message: "The playback plan does not belong to the session being prepared.",
+			}
+		}
+		currentSession, err := h.sessionMgr.GetSession(session.ID)
+		if err != nil {
+			releaseLifecycle()
+			releaseReservation()
+			return preparedTransportV3{}, &transportErrorV3{
+				reason: "session_expired", message: "The playback session ended before its route could be prepared.", retryable: true, cause: err,
+			}
+		}
+		session = currentSession
+	}
 	routeSession := *session
 	// The URL builders below refuse to mint a stream token for a session that
 	// requires media authorization. The live session only learns the mode when
@@ -2116,27 +2668,45 @@ func (h *PlaybackHandler) prepareIdentityTransportV3(r *http.Request, session *p
 	routeSession.TargetAudioChannels = result.TargetAudioChannels
 	routeSession.TargetAudioBitrateKbps = result.TargetAudioBitrateKbps
 	routeSession.RemuxDVMode = remuxDVModeForPlanV3(result.Plan)
-
-	var proxyNode *nodepool.Node
-	if mode.headerAuth && !mode.proxyEgress {
-		// The legacy proxy identity routes authenticate with a signed token in
-		// the URL path. Without authorized origins this mode keeps everything on
-		// the authenticated API origin instead, so no client-visible URL can
-		// carry or disclose that credential.
-		//
-		// A remux that must run ffmpeg here has already been escalated onto an
-		// HLS delivery (or refused outright) before the session started; this
-		// call only refuses the residual cases.
-		if localErr := h.refuseLocalIdentityWorkV3(r, result); localErr != nil {
-			return preparedTransportV3{}, localErr
+	// A replan starts without an egress identity. Do not let the previous
+	// proxy's row or internal URL leak into an API-served replacement route.
+	routeSession.RoutingEgressNodeID = 0
+	routeSession.RoutingEgressNodeURL = ""
+	routeSession.RoutingWorkload = string(routingWorkloadV3(result))
+	routeSession.RoutingExecution = string(decision.Shape.Execution)
+	routeSession.RoutingEgress = string(decision.Shape.Egress)
+	routeSession.RoutingExecutionNodeID = 0
+	routeSession.RoutingExecutionNodeURL = ""
+	if executorNode != nil {
+		routeSession.RoutingExecutionNodeID = executorNode.ID
+		routeSession.RoutingExecutionNodeURL = executorNode.URL
+	}
+	if proxyNode != nil {
+		routeSession.RoutingEgressNodeID = proxyNode.ID
+		routeSession.RoutingEgressNodeURL = proxyNode.URL
+	}
+	transportID := ""
+	routeSession.TranscodeNodeURL = ""
+	routeSession.TranscodeTransportID = ""
+	if transcodeNode != nil {
+		transportID = transportGenerationV3(session.ID, result.Plan.PlanID)
+		routeSession.TranscodeNodeURL = transcodeNode.URL
+		routeSession.TranscodeTransportID = transportID
+	}
+	if transcodeNode != nil {
+		card := identityRecipeCard(&routeSession)
+		card.InputPath = file.FilePath
+		card.DVProfile = file.PrimaryDVProfile()
+		card.AudioOnly = file.IsAudioOnly()
+		if isVirtualPlaybackFile(file) {
+			card.VirtualSourceOwnerInstallationID = file.VirtualOwnerInstallationID
 		}
-	} else if !isVirtualPlaybackFile(file) {
-		// Fork: virtual sources resolve through the plugin relay on the local
-		// path; planning a proxy for them would bypass the relay contract.
-		var proxyErr *transportErrorV3
-		proxyNode, proxyErr = h.planIdentityProxyV3(r, session.ID, result, mode)
-		if proxyErr != nil {
-			return preparedTransportV3{}, proxyErr
+		if err := h.putRequiredNodeRecipeV3(r.Context(), transportID, card); err != nil {
+			h.deleteNodeRecipeV3(r.Context(), transportID)
+			authorityErr := &transportErrorV3{
+				reason: string(noderouting.OutcomeCapacityUnavailable), message: "The transcode remux authority is temporarily unavailable.", retryable: true, cause: err,
+			}
+			return fallbackFromSelectedRoute(authorityErr)
 		}
 	}
 	streamURL := fmt.Sprintf("/stream/%s", routeSession.ID)
@@ -2152,11 +2722,7 @@ func (h *PlaybackHandler) prepareIdentityTransportV3(r *http.Request, session *p
 	case mode.proxyEgress:
 		streamURL, servedByProxy, priorGrant = h.identityGrantStreamURLV3(r.Context(), &routeSession, file, proxyNode)
 	}
-	releaseProxyReservation := func() {
-		if releaser, ok := h.NodePlanner.(sessionReservationReleaserV3); ok {
-			releaser.ReleaseSession(session.ID)
-		}
-	}
+	reservationReleased := false
 	if proxyNode != nil && !servedByProxy {
 		// A planned proxy that could not be addressed (no signable token, no
 		// file record, no writable grant) falls back to the local path, so its
@@ -2168,52 +2734,137 @@ func (h *PlaybackHandler) prepareIdentityTransportV3(r *http.Request, session *p
 		// remux whose grant could not be written must not quietly spawn the
 		// ffmpeg the operator disabled. Start-time escalation cannot cover this
 		// case — it was legitimately skipped because the pool does offer a proxy.
-		releaseProxyReservation()
-		if err := h.refuseLocalIdentityWorkV3(r, result); err != nil {
-			return preparedTransportV3{}, err
+		//
+		// The pool did offer one, so the policy is satisfiable and only this
+		// attempt's authority write failed. That is transient infrastructure, and
+		// it is reported as such: the HLS path classifies the identical
+		// proxy-authority failure retryable, and a non-retryable answer would
+		// make a client give up on a route the next attempt can take.
+		reservationReleased = true
+		if transcodeNode != nil {
+			h.deleteNodeRecipeV3(r.Context(), transportID)
+			grantErr := &transportErrorV3{
+				reason: string(noderouting.OutcomeCapacityUnavailable), message: "The transcode-to-proxy remux route is temporarily unavailable.", retryable: true,
+			}
+			return fallbackFromSelectedRoute(grantErr)
+		}
+		releaseReservation()
+		if !identityLocalFallbackAllowedV3(result, policy) || h.validateLocalProgressiveCapabilitiesV3(r.Context(), result) != nil {
+			releaseLifecycle()
+			return preparedTransportV3{}, &transportErrorV3{
+				reason:    string(noderouting.OutcomeCapacityUnavailable),
+				message:   "The proxy egress route is temporarily unavailable.",
+				retryable: true,
+			}
 		}
 	}
 
 	previousNodeURL := session.TranscodeNodeURL
 	previousTransportID := remoteTransportID(session)
-	unlock := h.tm.LockSessionLifecycle(session.ID)
 	committed := false
 	if result.Plan != nil && result.Plan.Delivery == playback.DeliveryRemuxProgressiveV3 {
 		if seek := timeline.seekSeconds; seek > 0 {
 			streamURL = appendPlaybackQueryV3(streamURL, "seek", strconv.FormatFloat(seek, 'f', -1, 64))
 		}
 	}
+	workload := routingWorkloadV3(result)
+	routingExecution := decision.Shape.Execution
+	routingEgress := noderouting.EgressAPI
+	egressNodeID := 0
+	egressNodeURL := ""
+	if servedByProxy {
+		routingEgress = decision.Shape.Egress
+		egressNodeID = proxyNode.ID
+		egressNodeURL = proxyNode.URL
+	} else {
+		transcodeNode = nil
+		transportID = ""
+		if workload == noderouting.WorkloadRemux {
+			routingExecution = noderouting.ExecutionAPI
+		} else {
+			routingExecution = noderouting.ExecutionNone
+		}
+	}
+	// Only a proxy that actually runs the remux is this route's executor. Direct
+	// play executes nothing, so naming the proxy there would report an execution
+	// node for a workload with no execution at all — the same distinction
+	// jellycompat draws when it records its identity assignment.
+	executorID := 0
+	executorURL := ""
+	if routingExecution == noderouting.ExecutionProxy {
+		executorID = egressNodeID
+		executorURL = egressNodeURL
+	} else if routingExecution == noderouting.ExecutionTranscode && transcodeNode != nil {
+		executorID = transcodeNode.ID
+		executorURL = transcodeNode.URL
+	}
+	nodeURL := ""
+	if transcodeNode != nil {
+		nodeURL = transcodeNode.URL
+	}
+	adoptSuccessor := func() {
+		h.tm.CloseTranscodeSession(session.ID, "")
+		if previousNodeURL != "" {
+			h.tm.StopRemoteTranscode(previousTransportID, previousNodeURL)
+			h.deleteNodeRecipeV3(r.Context(), previousTransportID)
+		}
+		h.revokeStaleProxyGrantOnCommitV3(r.Context(), session.ID, mode, servedByProxy)
+		h.applyRemoteTransportMarkV3(r.Context(), session.ID, servedByProxy)
+	}
+	rollbackTransport := func(requireCancellation bool) error {
+		if committed {
+			return nil
+		}
+		if requireCancellation && nodeURL != "" && transportID != "" {
+			if err := h.tm.CancelRemoteTranscode(r.Context(), transportID, nodeURL); err != nil {
+				// applySession has already made this the live route. Keep its
+				// authority and reservation intact so a later stop can retry the
+				// cancellation instead of orphaning an admitted remote stream.
+				committed = true
+				adoptSuccessor()
+				releaseLifecycle()
+				return err
+			}
+		}
+		committed = true
+		if !requireCancellation && nodeURL != "" && transportID != "" {
+			h.tm.StopRemoteTranscode(transportID, nodeURL)
+		}
+		// The session never reached the client, so a proxy admitted for it
+		// must not keep consuming that node's job/bandwidth budget until the
+		// reservation ages out — nor keep an egress grant for a transport
+		// that was never committed.
+		if servedByProxy && !reservationReleased {
+			releaseReservation()
+			h.restoreProxyGrantV3(r.Context(), session.ID, priorGrant)
+		}
+		h.deleteNodeRecipeV3(r.Context(), transportID)
+		releaseLifecycle()
+		return nil
+	}
 	return preparedTransportV3{
-		url: streamURL,
+		url:                streamURL,
+		nodeURL:            nodeURL,
+		transportID:        transportID,
+		routingWorkload:    workload,
+		routingExecution:   routingExecution,
+		routingExecutorID:  executorID,
+		routingExecutorURL: executorURL,
+		routingEgress:      routingEgress,
+		routingEgressID:    egressNodeID,
+		routingEgressURL:   egressNodeURL,
 		commit: func() {
 			if committed {
 				return
 			}
 			committed = true
-			h.tm.CloseTranscodeSession(session.ID, "")
-			if previousNodeURL != "" {
-				h.tm.StopRemoteTranscode(previousTransportID, previousNodeURL)
-				h.deleteNodeRecipeV3(r.Context(), previousTransportID)
-			}
-			h.revokeStaleProxyGrantOnCommitV3(r.Context(), session.ID, mode, servedByProxy)
-			h.applyRemoteTransportMarkV3(r.Context(), session.ID, servedByProxy)
-			unlock()
+			adoptSuccessor()
+			releaseLifecycle()
 		},
 		rollback: func() {
-			if committed {
-				return
-			}
-			committed = true
-			// The session never reached the client, so a proxy admitted for it
-			// must not keep consuming that node's job/bandwidth budget until the
-			// reservation ages out — nor keep an egress grant for a transport
-			// that was never committed.
-			if servedByProxy {
-				releaseProxyReservation()
-				h.restoreProxyGrantV3(r.Context(), session.ID, priorGrant)
-			}
-			unlock()
+			_ = rollbackTransport(false)
 		},
+		rollbackRequired: func() error { return rollbackTransport(true) },
 	}, nil
 }
 
@@ -2249,6 +2900,7 @@ func (h *PlaybackHandler) identityGrantStreamURLV3(ctx context.Context, s *playb
 	card.InputPath = file.FilePath
 	card.DVProfile = file.PrimaryDVProfile()
 	card.AudioOnly = file.IsAudioOnly()
+	card.RoutingEgressNodeID = proxyNode.ID
 	prior, stored := h.putProxyGrantV3(ctx, s.ID, card)
 	if !stored {
 		return h.playbackStreamURL(s), false, nil
@@ -2345,6 +2997,20 @@ func (h *PlaybackHandler) putNodeRecipeV3(ctx context.Context, transportID strin
 	}
 }
 
+// putRequiredNodeRecipeV3 persists the active authority for a progressive
+// remux executed by a transcode node. Unlike the reconstruction-only write
+// above, this one is part of route admission: the node checks the record before
+// every new remux request, and stop deletes it, so a still-valid stream token
+// cannot resurrect FFmpeg after a node replacement.
+func (h *PlaybackHandler) putRequiredNodeRecipeV3(ctx context.Context, transportID string, card playback.RecipeCard) error {
+	if h == nil || h.NodeRecipeStore == nil || !h.NodeRecipeStore.Enabled() || transportID == "" {
+		return errors.New("node recipe store unavailable")
+	}
+	putCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nodeRecipeWriteTimeoutV3)
+	defer cancel()
+	return h.NodeRecipeStore.Put(putCtx, transportID, card)
+}
+
 // deleteNodeRecipeV3 drops a transport's stored recipe so a buffered or retrying
 // request cannot resurrect a transcode the server has replaced or ended. The
 // store's TTL is only the backstop for the paths that never run (a crashed API
@@ -2359,33 +3025,94 @@ func (h *PlaybackHandler) deleteNodeRecipeV3(ctx context.Context, transportID st
 	}
 }
 
-// planIdentityProxyV3 selects the proxy node that will serve a direct-play or
-// progressive-remux session. These deliveries need no transcode node — the
-// bytes are either the source file or a single remux pipe — so the planner is
-// asked for a proxy alone, exactly as the Jellyfin-compat transport does.
-//
-// A nil node (no planner, no signing secret, or no eligible proxy) means the
-// API server serves the stream itself, which is both the single-node case and
-// the correct degradation when every proxy is unhealthy or at capacity. The one
-// exception is a remux that must run ffmpeg: that is transcode work, so it
-// honors the same local-fallback gate as the HLS routes rather than quietly
-// spawning an encoder on an API-only node.
-func (h *PlaybackHandler) planIdentityProxyV3(r *http.Request, sessionID string, result playback.PlannerResultV3, mode mediaAuthModeV3) (*nodepool.Node, *transportErrorV3) {
-	// A legacy attempt addresses its proxy with a signed token, so an unset
-	// signing secret rules the whole pool out. An authorized-origin attempt
-	// addresses it by session id against a server-side grant and needs no
-	// signing secret of its own.
-	if h.NodePlanner == nil || (h.JWTSecret == "" && !mode.proxyEgress) {
-		return nil, h.refuseLocalIdentityWorkV3(r, result)
+// deleteRequiredProgressiveRemuxAuthorityV3 makes a user-visible stop durable
+// before the session and its retry path disappear. A progressive remux token
+// can remain valid for 24 hours, so an unavailable authority store is a failed
+// stop, not a best-effort cleanup: the caller must retain the session and let
+// the client retry.
+func (h *PlaybackHandler) deleteRequiredProgressiveRemuxAuthorityV3(ctx context.Context, session *playback.Session) error {
+	if !requiresProgressiveRemuxAuthorityV3(session) {
+		return nil
 	}
-	// Reserve against the session id the rest of the transport uses, so a
-	// re-plan replaces its own reservation instead of double-counting, and the
-	// rollback path can release it.
-	plan := h.planIdentityProxySessionV3(r.Context(), sessionID, result)
-	if plan.ProxyNode == nil {
-		return nil, h.refuseLocalIdentityWorkV3(r, result)
+	if h == nil || h.NodeRecipeStore == nil || !h.NodeRecipeStore.Enabled() {
+		return errors.New("node recipe store unavailable")
 	}
-	return plan.ProxyNode, nil
+	deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), nodeRecipeWriteTimeoutV3)
+	defer cancel()
+	return h.NodeRecipeStore.Delete(deleteCtx, session.TranscodeTransportID)
+}
+
+func requiresProgressiveRemuxAuthorityV3(session *playback.Session) bool {
+	return session != nil && session.TranscodeTransportID != "" && session.TranscodeNodeURL != "" &&
+		session.RoutingWorkload == string(noderouting.WorkloadRemux) &&
+		session.RoutingExecution == string(noderouting.ExecutionTranscode)
+}
+
+// resolveIdentityRouteV3 resolves direct and progressive routes through the
+// same policy compiler as HLS, including the transcode-execution/proxy-egress
+// progressive route.
+func (h *PlaybackHandler) resolveIdentityRouteV3(r *http.Request, sessionID string, result playback.PlannerResultV3, mode mediaAuthModeV3, policy config.PlaybackRoutingPolicy, initialExcludedShapes map[string]struct{}) (noderouting.Decision, *transportErrorV3) {
+	workload, delivery, ok := routingClassV3(result)
+	if !ok {
+		return noderouting.Decision{}, &transportErrorV3{reason: string(noderouting.OutcomePolicyUnsatisfied), message: "The playback delivery has no legal node route.", retryable: false}
+	}
+	proxyAllowed := mode.proxyEgress || (!mode.headerAuth && h.JWTSecret != "")
+	excludedShapes := maps.Clone(initialExcludedShapes)
+	if excludedShapes == nil {
+		excludedShapes = make(map[string]struct{})
+	}
+	if result.Plan != nil && result.Plan.Delivery == playback.DeliveryRemuxProgressiveV3 &&
+		h.validateLocalProgressiveCapabilitiesV3(r.Context(), result) != nil {
+		excludedShapes[noderouting.ShapeProgressiveRemuxAPI] = struct{}{}
+	}
+	if delivery == noderouting.DeliveryProgressiveRemux &&
+		(h.NodeRecipeStore == nil || !h.NodeRecipeStore.Enabled()) {
+		// A signed stream token can outlive a transcode-node process by 24 hours.
+		// Without durable active-transport authority, a stopped remux could be
+		// replayed after that node restarts and start FFmpeg again.
+		excludedShapes[noderouting.ShapeProgressiveRemuxTranscodeProxy] = struct{}{}
+	}
+	var relayEligible func(*nodepool.Node) bool
+	if delivery == noderouting.DeliveryProgressiveRemux {
+		relayEligible = h.identityProxyRelayEligibilityV3(r.Context())
+	}
+	decision, err := noderouting.Resolve(noderouting.AdaptSessionPlanner(h.NodePlanner), noderouting.ResolveRequest{
+		Request: noderouting.Request{
+			Workload: workload, Delivery: delivery,
+			Policy: policy, ProxyAllowed: proxyAllowed,
+		},
+		SessionID: sessionID, EstimatedBitrateKbps: identityStreamBitrateKbpsV3(result),
+		TranscodeEligible: h.transcodeEligibilityV3(r.Context(), result, nil), ProxyEligible: relayEligible,
+		ProxyExecutionEligible: h.identityProxyEligibilityV3(r.Context(), result), ExcludedShapeIDs: excludedShapes,
+	})
+	if err != nil {
+		return noderouting.Decision{}, &transportErrorV3{reason: string(noderouting.OutcomePolicyUnsatisfied), message: "The playback routing policy is invalid.", retryable: false, cause: err}
+	}
+	if !decision.Selected() {
+		retryable := decision.Outcome == noderouting.OutcomeCapacityUnavailable
+		return noderouting.Decision{}, &transportErrorV3{reason: string(decision.Outcome), message: "No playback route satisfies the configured policy and current node availability.", retryable: retryable}
+	}
+	return decision, nil
+}
+
+func (h *PlaybackHandler) identityProxyRelayEligibilityV3(ctx context.Context) func(*nodepool.Node) bool {
+	enumerator, ok := h.NodePlanner.(proxyNodeEnumeratorV3)
+	if !ok {
+		return func(*nodepool.Node) bool { return false }
+	}
+	capable := make(map[string]struct{})
+	for nodeURL, entry := range h.pooledNodeCapabilitiesV3(ctx, enumerator.ProxyNodeURLs()) {
+		if slices.Contains(entry.transportFeatures, playback.TransportFeatureProgressiveRemuxRelayV1) {
+			capable[nodeURL] = struct{}{}
+		}
+	}
+	return func(node *nodepool.Node) bool {
+		if node == nil {
+			return false
+		}
+		_, supported := capable[node.URL]
+		return supported
+	}
 }
 
 // applyRemoteTransportMarkV3 records whether the committed route's media bytes
@@ -2404,23 +3131,22 @@ func (h *PlaybackHandler) applyRemoteTransportMarkV3(ctx context.Context, sessio
 	}
 }
 
-// planIdentityProxySessionV3 asks the planner for a proxy, narrowing selection
-// to proxies that can execute the plan's frozen recipe when one is required.
+// identityProxyEligibilityV3 narrows proxy selection to proxies that can
+// execute the plan's frozen recipe when one is required. A nil predicate means
+// any healthy proxy will do.
 //
 // The narrowing happens before selection rather than after, mirroring how HLS
 // filters transcode nodes: rejecting a single round-robin pick would abandon
 // the whole pool, so a capable sibling with free capacity would sit unused
-// while playback fell back to the API — or was refused outright when local
-// fallback is disabled.
+// while playback fell back to the API — or was refused outright when policy
+// forbids API execution.
 //
 // Direct play copies bytes and needs no recipe, so it skips the probe entirely
 // and any healthy proxy serves it.
-func (h *PlaybackHandler) planIdentityProxySessionV3(ctx context.Context, sessionID string, result playback.PlannerResultV3) nodepool.Plan {
-	estBitrate := identityStreamBitrateKbpsV3(result)
-	selector, selectable := h.NodePlanner.(capabilitySessionPlannerV3)
+func (h *PlaybackHandler) identityProxyEligibilityV3(ctx context.Context, result playback.PlannerResultV3) func(*nodepool.Node) bool {
 	enumerator, enumerable := h.NodePlanner.(proxyNodeEnumeratorV3)
-	if !selectable || !enumerable || !planRequiresServerTransformationsV3(result.Plan) {
-		return h.NodePlanner.PlanSession(sessionID, "", false, estBitrate)
+	if !enumerable || !planRequiresServerTransformationsV3(result.Plan) {
+		return nil
 	}
 
 	capable := make(map[string]struct{})
@@ -2434,34 +3160,32 @@ func (h *PlaybackHandler) planIdentityProxySessionV3(ctx context.Context, sessio
 			"component", "api", "delivery", result.Plan.Delivery)
 	}
 	// The predicate runs under the planner lock: a set lookup only.
-	return selector.PlanSessionWith(sessionID, "", false, estBitrate, func(node *nodepool.Node) bool {
+	return func(node *nodepool.Node) bool {
 		if node == nil {
 			return false
 		}
 		_, ok := capable[node.URL]
 		return ok
-	})
+	}
 }
 
-// refuseLocalIdentityWorkV3 enforces playback.local_transcode_fallback for the
-// identity deliveries. Direct play moves bytes and always falls back locally;
-// a progressive remux that must convert audio is ffmpeg work, so on an API-only
-// node it is refused for the same reason the HLS routes refuse it, instead of
-// silently spawning an encoder the operator disabled.
-func (h *PlaybackHandler) refuseLocalIdentityWorkV3(r *http.Request, result playback.PlannerResultV3) *transportErrorV3 {
-	if result.Plan == nil || result.Plan.Delivery != playback.DeliveryRemuxProgressiveV3 ||
-		!planRequiresServerTransformationsV3(result.Plan) ||
-		nodepool.LocalTranscodeFallbackAllowed(r.Context(), h.SettingsRepo) {
-		return nil
+func identityLocalFallbackAllowedV3(result playback.PlannerResultV3, policy config.PlaybackRoutingPolicy) bool {
+	workload, _, ok := routingClassV3(result)
+	if !ok {
+		return false
 	}
-	return &transportErrorV3{reason: "capacity_unavailable", message: "No proxy node is available and local fallback is disabled.", retryable: true}
+	if workload == noderouting.WorkloadDirectPlay {
+		return policy.DirectPlayEgress != config.PlaybackEgressProxyOnly
+	}
+	return policy.RemuxExecution != config.PlaybackExecutionWorkerOnly &&
+		policy.RemuxEgress != config.PlaybackEgressProxyOnly
 }
 
 // plannerInputV3 assembles the planner input for one route decision. The
 // escalation below re-plans with the same inputs the original decision used,
-// plus the refused route's attempt key. HLSRegistry and HLSToneMapCapabilities
-// are deliberately left unset: planPlaybackWithCapabilitiesV3 installs its own
-// lazily-memoized snapshot of both, so the two can never disagree.
+// plus the refused route's attempt key. The HLS registries and tone-map
+// capabilities are deliberately left unset: planPlaybackWithCapabilitiesV3
+// installs its own lazily memoized snapshot, so the inputs can never disagree.
 func (h *PlaybackHandler) plannerInputV3(ctx context.Context, req playback.StartRequestV3, requestedFile, effectiveFile *models.MediaFile, audioIndex int, attemptedKeys []string) playback.PlannerInputV3 {
 	return playback.PlannerInputV3{
 		Request:             req,
@@ -2482,12 +3206,15 @@ func (h *PlaybackHandler) plannerInputV3(ctx context.Context, req playback.Start
 //
 // Without authorized media origins that mode bypasses the proxy identity routes
 // (a proxy authenticates from the signed URL token this mode exists to remove),
-// so a remux carrying server transformations is ffmpeg work with nowhere to run
-// once playback.local_transcode_fallback is off — refuseLocalIdentityWorkV3 turns it
-// into a retryable capacity_unavailable that nothing will ever satisfy. HLS is
-// the same recipe on a delivery the API can relay from a pooled transcode node,
-// so plan it here rather than making the client discover the refusal and
-// recover through a replan round trip.
+// so any remux left on the API is work with nowhere to run once policy forbids
+// API execution — the route resolver turns it into a terminal routing conflict
+// that nothing will ever satisfy. remux_execution=worker_only refuses the
+// container-only copy exactly as it refuses one carrying server
+// transformations, so both escalate: what decides is whether the resolver
+// leaves this attempt any progressive route at all, not how heavy the recipe
+// is. HLS is the same recipe on a delivery the API can relay from a pooled
+// transcode node, so plan it here rather than making the client discover the
+// refusal and recover through a replan round trip.
 //
 // A client that cannot execute an HLS delivery has no such alternative: it gets
 // a non-retryable error naming the policy, because retrying is exactly what it
@@ -2503,11 +3230,9 @@ func (h *PlaybackHandler) plannerInputV3(ctx context.Context, req playback.Start
 // settings resolution and a downloaded-subtitle listing, which the overwhelming
 // majority of starts must not pay for a route they never take.
 func (h *PlaybackHandler) escalateRefusedProgressiveRemuxV3(ctx context.Context, mode mediaAuthModeV3, plannerInput func() playback.PlannerInputV3, result playback.PlannerResultV3) (playback.PlannerResultV3, *transportErrorV3) {
-	if !mode.headerAuth || (mode.proxyEgress && h.proxyEgressOriginsAvailableV3()) ||
-		result.Terminal != nil || result.Plan == nil ||
+	if result.Terminal != nil || result.Plan == nil ||
 		result.Plan.Delivery != playback.DeliveryRemuxProgressiveV3 ||
-		!planRequiresServerTransformationsV3(result.Plan) ||
-		nodepool.LocalTranscodeFallbackAllowed(ctx, h.SettingsRepo) {
+		h.progressiveRemuxRouteAvailableV3(ctx, mode) {
 		return result, nil
 	}
 	input := plannerInput()
@@ -2551,6 +3276,38 @@ func (h *PlaybackHandler) escalateRefusedProgressiveRemuxV3(ctx context.Context,
 	return escalated, nil
 }
 
+// progressiveRemuxRouteAvailableV3 reports whether policy leaves this attempt
+// any progressive-remux route it could actually reach: an API-egress shape the
+// API may execute, or a proxy-egress shape whose proxies this client can
+// address. It gates the escalation above, so a false answer means the delivery
+// is refused for every candidate, not merely that the preferred one is busy.
+func (h *PlaybackHandler) progressiveRemuxRouteAvailableV3(ctx context.Context, mode mediaAuthModeV3) bool {
+	proxyAllowed := mode.proxyEgress || (!mode.headerAuth && h.JWTSecret != "")
+	compiled, err := noderouting.Candidates(noderouting.Request{
+		Workload: noderouting.WorkloadRemux, Delivery: noderouting.DeliveryProgressiveRemux,
+		Policy: h.playbackRoutingPolicyForContextV3(ctx), ProxyAllowed: proxyAllowed,
+	})
+	if err != nil {
+		return false
+	}
+	for _, shape := range compiled.Candidates {
+		if shape.Egress == noderouting.EgressAPI {
+			return true
+		}
+		if mode.headerAuth {
+			if h.proxyEgressOriginsAvailableV3() {
+				return true
+			}
+			continue
+		}
+		enumerator, ok := h.NodePlanner.(proxyNodeEnumeratorV3)
+		if ok && h.JWTSecret != "" && len(enumerator.ProxyNodeURLs()) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // identityStreamBitrateKbpsV3 estimates the bitrate a proxy will egress for an
 // identity delivery, so bandwidth-capped proxies admit it accurately. The plan's
 // effective recipe is authoritative (a remux that downmixes audio egresses less
@@ -2586,6 +3343,7 @@ func (h *PlaybackHandler) identityStreamURLV3(s *playback.Session, file *models.
 	}
 	card := identityRecipeCard(s)
 	card.InputPath = file.FilePath
+	card.RoutingEgressNodeID = proxyNode.ID
 	claims := card.ToClaims()
 	claims.DVProfile = file.PrimaryDVProfile()
 	claims.AudioOnly = file.IsAudioOnly()
@@ -2839,26 +3597,55 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 	sourceProfile, sourceBitDepth := sourceVideoTranscodeFactsV3(file, result)
 	unlock := h.tm.LockSessionLifecycle(session.ID)
 	opts := playback.TranscodeOpts{
-		InputPath: file.FilePath, MediaFileID: file.ID, VirtualSourceOwnerInstallationID: file.VirtualOwnerInstallationID,
-		OutputDir: outputDir, OutputSubdir: outputSubdir, SessionID: session.ID,
-		SourceVideoCodec: sourceMetadata.VideoCodec, SourceAudioChannels: result.SourceAudioChannels, SourceVideoProfile: sourceProfile, SourceVideoBitDepth: sourceBitDepth,
-		SoftwareVideoDecode: sourceMetadata.SoftwareVideoDecode, ToneMapPolicy: result.ToneMapPolicy, ToneMapMode: result.ToneMapMode,
-		ToneMapSourceKind: result.ToneMapSourceKind, ToneMapRecipeVersion: result.ToneMapRecipeVersion, ToneMapPreflightRequired: result.ToneMapPreflightRequired,
-		ToneMapSourceRevision: result.ToneMapSourceRevision, VideoBitstreamFilter: videoBitstreamFilterForPlanV3(result.Plan), VideoSampleEntry: videoSampleEntryForPlanV3(result.Plan),
-		SeekSeconds: timeline.seekSeconds, StreamOriginSeconds: timeline.streamOriginSeconds, CopySeekAnchorResolved: timeline.copySeekAnchorResolved,
-		StartSegmentNumber: timeline.startSegmentNumber, TargetResolution: result.TargetResolution, TargetCodecVideo: videoCodec,
-		TargetCodecAudio: result.TargetAudioCodec, TargetAudioChannels: result.TargetAudioChannels, TargetAudioBitrateKbps: result.TargetAudioBitrateKbps,
-		TargetBitrateKbps: result.TargetBitrateKbps, SegmentDuration: playback.DefaultSegmentDuration, FFmpegPath: cfg.FFmpegPath, HWAccel: cfg.HWAccel,
-		HWDevice: cfg.HWDevice, AudioTrackIndex: plannedAudioTrackIndexV3(result, session.AudioTrackIndex),
-		SubtitleTrackIndex: result.SubtitleTransportTrackIndex, SubtitleBurnIn: result.SubtitleBurnIn, SubtitleCodec: result.SubtitleCodec,
-		TotalDuration: sourceMetadata.DurationSeconds, FastStart: true, NodeType: playbackNodeIntegratedV3, ExecutionMode: playbackNodeIntegratedV3,
-		FFmpegLogSink: h.FFmpegLogSink,
+		InputPath:                         file.FilePath,
+		MediaFileID:                       file.ID,
+		VirtualSourceOwnerInstallationID: file.VirtualOwnerInstallationID,
+		OutputDir:                         outputDir,
+		OutputSubdir:                      outputSubdir,
+		SessionID:                         session.ID,
+		SourceVideoCodec:                  sourceMetadata.VideoCodec,
+		SourceVideoProfile:                sourceProfile,
+		SourceVideoBitDepth:               sourceBitDepth,
+		SourceAudioChannels:               result.SourceAudioChannels,
+		SoftwareVideoDecode:               sourceMetadata.SoftwareVideoDecode,
+		ToneMapPolicy:                     result.ToneMapPolicy,
+		ToneMapMode:                       result.ToneMapMode,
+		ToneMapSourceKind:                 result.ToneMapSourceKind,
+		ToneMapRecipeVersion:              result.ToneMapRecipeVersion,
+		ToneMapPreflightRequired:          result.ToneMapPreflightRequired,
+		ToneMapSourceRevision:             result.ToneMapSourceRevision,
+		VideoBitstreamFilter:              videoBitstreamFilterForPlanV3(result.Plan),
+		VideoSampleEntry:                  videoSampleEntryForPlanV3(result.Plan),
+		SeekSeconds:                       timeline.seekSeconds,
+		StreamOriginSeconds:               timeline.streamOriginSeconds,
+		CopySeekAnchorResolved:            timeline.copySeekAnchorResolved,
+		StartSegmentNumber:                timeline.startSegmentNumber,
+		TargetResolution:                  result.TargetResolution,
+		TargetCodecVideo:                  videoCodec,
+		TargetCodecAudio:                  result.TargetAudioCodec,
+		TargetAudioChannels:               result.TargetAudioChannels,
+		TargetAudioBitrateKbps:            result.TargetAudioBitrateKbps,
+		TargetBitrateKbps:                 result.TargetBitrateKbps,
+		SegmentDuration:                   playback.DefaultSegmentDuration,
+		SegmentRetentionSeconds:           cfg.SegmentRetentionSeconds,
+		FFmpegPath:                        cfg.FFmpegPath,
+		HWAccel:                           cfg.HWAccel,
+		HWDevice:                          cfg.HWDevice,
+		AudioTrackIndex:                   plannedAudioTrackIndexV3(result, session.AudioTrackIndex),
+		SubtitleTrackIndex:                result.SubtitleTransportTrackIndex,
+		SubtitleBurnIn:                    result.SubtitleBurnIn,
+		SubtitleCodec:                     result.SubtitleCodec,
+		TotalDuration:                     sourceMetadata.DurationSeconds,
+		FastStart:                         true,
+		NodeType:                          playbackNodeIntegratedV3,
+		ExecutionMode:                     playbackNodeIntegratedV3,
+		FFmpegLogSink:                     h.FFmpegLogSink,
 	}
-	opts.ToneMapDVConfigPresent = sourceMetadata.ToneMapDVConfigPresent
-	opts.ToneMapDVBLCompatIDPresent = sourceMetadata.ToneMapDVBLCompatIDPresent
-	opts.ToneMapDVBLPresent = sourceMetadata.ToneMapDVBLPresent
-	opts.ToneMapDVRPUPresent = sourceMetadata.ToneMapDVRPUPresent
 	if opts.ToneMapMode != "" {
+		opts.ToneMapDVConfigPresent = sourceMetadata.ToneMapDVConfigPresent
+		opts.ToneMapDVBLCompatIDPresent = sourceMetadata.ToneMapDVBLCompatIDPresent
+		opts.ToneMapDVBLPresent = sourceMetadata.ToneMapDVBLPresent
+		opts.ToneMapDVRPUPresent = sourceMetadata.ToneMapDVRPUPresent
 		capabilities, capabilityErr := h.localToneMapCapabilitiesForTransportV3(r.Context())
 		if capabilityErr != nil {
 			unlock()
@@ -2945,21 +3732,25 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 		cardOpts.CanonicalInputPath = file.FilePath
 		cardOpts.VirtualSourceOwnerInstallationID = file.VirtualOwnerInstallationID
 	}
-	var url string
+	url := fmt.Sprintf("/playback/transcode/%s/master.m3u8", session.ID)
 	if !mode.headerAuth {
 		card := playback.NewRecipeCard(session.UserID, session.ProfileID, file.ID, "", cardOpts)
 		card.OriginalStartedAt = session.StartedAt
-		url = appendStreamToken(fmt.Sprintf("/playback/transcode/%s/master.m3u8", session.ID), h.signSessionToken(card, mode.headerAuth))
-	} else {
-		url = fmt.Sprintf("/playback/transcode/%s/master.m3u8", session.ID)
+		card.RoutingWorkload = string(routingWorkloadV3(result))
+		card.RoutingExecution = string(noderouting.ExecutionAPI)
+		card.RoutingEgress = string(noderouting.EgressAPI)
+		url = appendStreamToken(url, h.signSessionToken(card, mode.headerAuth))
 	}
 	committed := false
 	previousNodeURL := session.TranscodeNodeURL
 	previousTransportID := remoteTransportID(session)
 	return preparedTransportV3{
-		url:         url,
-		hwAccel:     ts.Opts().HWAccel,
-		toneMapMode: ts.Opts().ToneMapMode,
+		url:              url,
+		hwAccel:          ts.Opts().HWAccel,
+		toneMapMode:      ts.Opts().ToneMapMode,
+		routingWorkload:  routingWorkloadV3(result),
+		routingExecution: noderouting.ExecutionAPI,
+		routingEgress:    noderouting.EgressAPI,
 		commit: func() {
 			if committed {
 				return
@@ -3050,6 +3841,9 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		}
 	}
 	req := transcodenode.TranscodeStartRequest{SessionID: transportID, InputPath: file.FilePath, SourceVideoCodec: sourceMetadata.VideoCodec, SourceVideoProfile: sourceProfile, SourceVideoBitDepth: sourceBitDepth, SourceAudioChannels: result.SourceAudioChannels, SoftwareVideoDecode: sourceMetadata.SoftwareVideoDecode, ToneMapPolicy: result.ToneMapPolicy, ToneMapMode: result.ToneMapMode, ToneMapSourceKind: result.ToneMapSourceKind, ToneMapRecipeVersion: result.ToneMapRecipeVersion, ToneMapPreflightRequired: result.ToneMapPreflightRequired, ToneMapSourceRevision: result.ToneMapSourceRevision, VideoBitstreamFilter: videoBitstreamFilterForPlanV3(result.Plan), VideoSampleEntry: videoSampleEntryForPlanV3(result.Plan), SeekSeconds: timeline.seekSeconds, StreamOriginSeconds: timeline.streamOriginSeconds, CopySeekAnchorResolved: timeline.copySeekAnchorResolved, StartSegmentNumber: timeline.startSegmentNumber, TargetResolution: result.TargetResolution, TargetCodecVideo: videoCodec, TargetCodecAudio: result.TargetAudioCodec, TargetAudioChannels: result.TargetAudioChannels, TargetAudioBitrateKbps: result.TargetAudioBitrateKbps, TargetBitrateKbps: result.TargetBitrateKbps, SegmentDuration: playback.DefaultSegmentDuration, HWAccel: hwAccel, AudioTrackIndex: plannedAudioTrackIndexV3(result, session.AudioTrackIndex), SubtitleTrackIndex: result.SubtitleTransportTrackIndex, SubtitleBurnIn: result.SubtitleBurnIn, SubtitleCodec: result.SubtitleCodec, TotalDuration: sourceMetadata.DurationSeconds, RequireReady: true}
+	if strings.EqualFold(videoCodec, "copy") {
+		req.CopyFMP4RecipeVersion = playback.CopyFMP4RecipeVersion
+	}
 	if playback.IsAudioToAACStereoDownmixV3(req.SourceAudioChannels, req.TargetCodecAudio, req.TargetAudioChannels) {
 		// Remote attestation uses the explicit effective layout even though zero
 		// means stereo to the local AAC argument builder.
@@ -3060,10 +3854,12 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		// for ordinary encodes so they cannot be mistaken for partial v2 work.
 		req.SourceAudioChannels = 0
 	}
-	req.ToneMapDVConfigPresent = sourceMetadata.ToneMapDVConfigPresent
-	req.ToneMapDVBLCompatIDPresent = sourceMetadata.ToneMapDVBLCompatIDPresent
-	req.ToneMapDVBLPresent = sourceMetadata.ToneMapDVBLPresent
-	req.ToneMapDVRPUPresent = sourceMetadata.ToneMapDVRPUPresent
+	if req.ToneMapMode != "" {
+		req.ToneMapDVConfigPresent = sourceMetadata.ToneMapDVConfigPresent
+		req.ToneMapDVBLCompatIDPresent = sourceMetadata.ToneMapDVBLCompatIDPresent
+		req.ToneMapDVBLPresent = sourceMetadata.ToneMapDVBLPresent
+		req.ToneMapDVRPUPresent = sourceMetadata.ToneMapDVRPUPresent
+	}
 	remoteStartAt := time.Now()
 	nodeResp, status, err := h.startRemotePlaybackTransport(r.Context(), node.URL, req)
 	remoteOutcome := "ready"
@@ -3101,6 +3897,10 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		h.tm.StopRemoteTranscode(transportID, node.URL)
 		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node did not confirm the audio recipe.", retryable: true, cause: err}
 	}
+	if err := transcodenode.ValidateCopyFMP4RecipeAttestation(req, nodeResp); err != nil {
+		h.tm.StopRemoteTranscode(transportID, node.URL)
+		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node did not confirm the copy-video recipe.", retryable: true, cause: err}
+	}
 	if req.ToneMapMode != "" && nodeResp.ToneMapMode != req.ToneMapMode {
 		h.tm.StopRemoteTranscode(transportID, node.URL)
 		return preparedTransportV3{}, &transportErrorV3{reason: transcodeStartFailedReasonV3, message: "The selected transcode node did not confirm the tone-map recipe.", retryable: true}
@@ -3110,6 +3910,13 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		confirmedToneMapMode = nodeResp.ToneMapMode
 	}
 	card := remoteTranscodeRecipeCardV3(session, file, node.URL, transportID, req, nodeResp, toneMapFilter)
+	card.RoutingWorkload = string(routingWorkloadV3(result))
+	card.RoutingExecution = string(noderouting.ExecutionTranscode)
+	card.RoutingEgress = string(noderouting.EgressAPI)
+	if nodePlan.ProxyNode != nil {
+		card.RoutingEgress = string(noderouting.EgressProxy)
+		card.RoutingEgressNodeID = nodePlan.ProxyNode.ID
+	}
 	confirmedHWAccel := card.HWAccel
 	// Fork: keep the provider-neutral virtual source identity on the stored
 	// recipe so a node/central restart resolves the same release.
@@ -3144,11 +3951,15 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 	previousNodeURL := session.TranscodeNodeURL
 	previousTransportID := remoteTransportID(session)
 	unlock := h.tm.LockSessionLifecycle(session.ID)
-	return preparedTransportV3{url: url, nodeURL: node.URL, transportID: transportID, hwAccel: confirmedHWAccel, toneMapMode: confirmedToneMapMode, commit: func() {
-		if committed {
-			return
-		}
-		committed = true
+	routingEgress := noderouting.EgressAPI
+	egressNodeID := 0
+	egressNodeURL := ""
+	if servedByProxy {
+		routingEgress = noderouting.EgressProxy
+		egressNodeID = nodePlan.ProxyNode.ID
+		egressNodeURL = nodePlan.ProxyNode.URL
+	}
+	adoptSuccessor := func() {
 		h.tm.CloseTranscodeSession(session.ID, "")
 		if previousNodeURL != "" {
 			h.tm.StopRemoteTranscode(previousTransportID, previousNodeURL)
@@ -3156,13 +3967,25 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 		}
 		h.revokeStaleProxyGrantOnCommitV3(r.Context(), session.ID, mode, servedByProxy)
 		h.applyRemoteTransportMarkV3(r.Context(), session.ID, servedByProxy)
-		unlock()
-	}, rollback: func() {
+	}
+	rollbackTransport := func(requireCancellation bool) error {
 		if committed {
-			return
+			return nil
+		}
+		if requireCancellation {
+			if err := h.tm.CancelRemoteTranscode(r.Context(), transportID, node.URL); err != nil {
+				// Preserve the admitted successor route for a retryable stop. Its
+				// live session, authority, and reservation must continue to agree.
+				committed = true
+				adoptSuccessor()
+				unlock()
+				return err
+			}
+		} else {
+			h.tm.StopRemoteTranscode(transportID, node.URL)
 		}
 		committed = true
-		h.tm.StopRemoteTranscode(transportID, node.URL)
+		// The node job this recipe rebuilds is gone, so the recipe must go too.
 		h.deleteNodeRecipeV3(r.Context(), transportID)
 		if releaser, ok := h.NodePlanner.(sessionReservationReleaserV3); ok {
 			releaser.ReleaseSession(session.ID)
@@ -3171,7 +3994,24 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 			h.restoreProxyGrantV3(r.Context(), session.ID, priorGrant)
 		}
 		unlock()
-	}}, nil
+		return nil
+	}
+	var rollbackRequired func() error
+	if routingWorkloadV3(result) == noderouting.WorkloadRemux {
+		rollbackRequired = func() error { return rollbackTransport(true) }
+	}
+	return preparedTransportV3{url: url, nodeURL: node.URL, transportID: transportID, hwAccel: confirmedHWAccel, toneMapMode: confirmedToneMapMode,
+		routingWorkload: routingWorkloadV3(result), routingExecution: noderouting.ExecutionTranscode, routingExecutorID: node.ID, routingExecutorURL: node.URL,
+		routingEgress: routingEgress, routingEgressID: egressNodeID, routingEgressURL: egressNodeURL, commit: func() {
+			if committed {
+				return
+			}
+			committed = true
+			adoptSuccessor()
+			unlock()
+		}, rollback: func() {
+			_ = rollbackTransport(false)
+		}, rollbackRequired: rollbackRequired}, nil
 }
 
 // remoteTranscodeRecipeCardV3 captures the byte-affecting recipe of a started
@@ -3209,6 +4049,7 @@ func (h *PlaybackHandler) grantManifestURLV3(ctx context.Context, card playback.
 	if proxyNode == nil {
 		return localURL, false, nil
 	}
+	card.RoutingEgressNodeID = proxyNode.ID
 	prior, stored := h.putProxyGrantV3(ctx, card.SessionID, card)
 	if !stored {
 		return localURL, false, nil
@@ -3284,6 +4125,13 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		TranscodeNodeURL:          transport.nodeURL,
 		TranscodeTransportID:      transport.transportID,
 		TranscodeRouteSet:         true,
+		RoutingWorkload:           string(transport.routingWorkload),
+		RoutingExecution:          string(transport.routingExecution),
+		RoutingExecutionNodeID:    transport.routingExecutorID,
+		RoutingExecutionNodeURL:   transport.routingExecutorURL,
+		RoutingEgress:             string(transport.routingEgress),
+		RoutingEgressNodeID:       transport.routingEgressID,
+		RoutingEgressNodeURL:      transport.routingEgressURL,
 		RequireMediaAuthorization: mode.headerAuth,
 		MediaAuthorizationSet:     true,
 		ClientIP:                  clientip.FromContext(ctx),
@@ -3647,23 +4495,24 @@ func (h *PlaybackHandler) HandleReplanPlaybackV3(w http.ResponseWriter, r *http.
 		var err error
 		rollbackSession, err = transport.applySession()
 		if err != nil {
-			transport.rollback()
+			if rollbackErr, _ := rollbackFailedReplanV3(transport, nil); rollbackErr != nil {
+				slog.ErrorContext(r.Context(), "protocol v3 unapplied replacement transport cancellation failed", "session", sessionID, "error", rollbackErr)
+				writeError(w, http.StatusInternalServerError, "internal_error", "Failed to cancel the unapplied replacement transport")
+				return
+			}
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to commit the live replacement session")
 			return
 		}
 	}
 	if err := h.PlanStoreV3.CompleteReplan(r.Context(), sessionID, req.ReplanRequestID, lease.LeaseToken, record.CurrentReplanRequestID, encoded, updated); err != nil {
-		rollbackFailed := false
-		if rollbackSession != nil {
-			if rollbackErr := rollbackSession(); rollbackErr != nil {
-				rollbackFailed = true
-				slog.ErrorContext(r.Context(), "protocol v3 replacement rollback failed", "session", sessionID, "error", rollbackErr)
-			}
+		transportRollbackErr, sessionRollbackErr := rollbackFailedReplanV3(transport, rollbackSession)
+		if transportRollbackErr != nil {
+			slog.ErrorContext(r.Context(), "protocol v3 replacement transport cancellation failed", "session", sessionID, "error", transportRollbackErr)
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to cancel the replacement transport")
+			return
 		}
-		if transport != nil {
-			transport.rollback()
-		}
-		if rollbackFailed {
+		if sessionRollbackErr != nil {
+			slog.ErrorContext(r.Context(), "protocol v3 replacement rollback failed", "session", sessionID, "error", sessionRollbackErr)
 			_ = h.stopPlaybackSessionByID(context.WithoutCancel(r.Context()), sessionID, false)
 		}
 		if errors.Is(err, playback.ErrReplanSupersededV3) {
@@ -3681,6 +4530,36 @@ func (h *PlaybackHandler) HandleReplanPlaybackV3(w http.ResponseWriter, r *http.
 		}
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// rollbackFailedReplanV3 cancels a remotely admitted replacement before it
+// restores the predecessor session. If cancellation cannot be confirmed, the
+// successor remains live and authoritative so a later stop can retry it.
+func rollbackFailedReplanV3(transport *preparedTransportV3, rollbackSession func() error) (transportErr, sessionErr error) {
+	if transport != nil {
+		if transport.rollbackRequired != nil {
+			if err := transport.rollbackRequired(); err != nil {
+				return err, nil
+			}
+		} else {
+			transport.rollback()
+		}
+	}
+	if rollbackSession != nil {
+		return nil, rollbackSession()
+	}
+	return nil, nil
+}
+
+// raceCopySafetyV3 resolves an unknown H.264 copy-safety verdict behind a plan
+// that stream-copies video. It is called after the durable commit on both the
+// start and replan paths, so the scan only ever chases a route a client was
+// actually handed, and it returns immediately — no response waits on it.
+func (h *PlaybackHandler) raceCopySafetyV3(fileID int, plan *playback.PlanV3) {
+	if h == nil || h.CopySafetyRacer == nil || fileID <= 0 || plan == nil {
+		return
+	}
+	h.CopySafetyRacer.RaceScanForPlan(fileID, plan)
 }
 
 type candidateFailureStage string
@@ -3984,6 +4863,7 @@ func (h *PlaybackHandler) evaluateReplanCandidateV3(
 
 // executeReplanV3 prepares an atomic replacement for a failed playback route.
 func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.AttemptRecordV3, req playback.ReplanRequestV3) (playback.DecisionResponseV3, playback.AttemptRecordV3, *preparedTransportV3, *transportErrorV3) {
+	r = r.WithContext(withPlaybackRoutingPolicySnapshotV3(r.Context(), h.playbackRoutingPolicyV3()))
 	reservationHeld := false
 	reservationHandedOff := false
 	cancelReservation := func() {
@@ -4140,7 +5020,6 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if !ok {
 		return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{reason: "internal_error", message: "The live session manager does not support atomic replacement."}
 	}
-
 	virtualRehydrationFailed := false
 	var virtualRehydrationErr error
 	if isVirtualPlaybackFile(currentEffectiveFile) {
@@ -4448,81 +5327,24 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		"quality_preference", start.QualityPreference,
 		"bandwidth_estimate_kbps", intOrZeroHandlerV3(start.BandwidthEstimateKbps),
 	}, clientInfo.LogAttrs()...)...)
-	var transport preparedTransportV3
-	transportReused := false
-	if transportPrepared && preparedTransport != nil {
-		transport = *preparedTransport
-	} else {
-		if checker, ok := h.sessionMgr.(replacementAdmissionCheckerV3); ok {
-			if err := checker.CheckReplacementAllowed(r.Context(), session.ID, result.PlayMethod, result.TranscodeAudio); err != nil {
-				mapped := sessionStartErrorV3(err)
-				return playback.DecisionResponseV3{}, *record, nil, mapped
-			}
-			_, reservationHeld = h.sessionMgr.(replacementReservationCancellerV3)
+	mode := headerAuthenticatedMediaV3(start.ClientFeatures)
+	_, reservationHeld = h.sessionMgr.(replacementReservationCancellerV3)
+	result.Plan.SessionID = session.ID
+	artifactRecipe = record.FrozenRecipe
+	if !seekReanchor {
+		frozenRecipe, frozenErr := h.freezeExecutableRecipeV3(r.Context(), effectiveFile, result)
+		if frozenErr != nil {
+			return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Failed to freeze the selected subtitle identity.", frozenErr)
 		}
-		if checker, ok := h.sessionMgr.(transcodePermissionChecker); ok && (result.PlayMethod == playback.PlayTranscode || result.TranscodeAudio) {
-			if err := checker.CheckTranscodingAllowed(r.Context(), session.UserID, result.PlayMethod == playback.PlayTranscode); err != nil {
-				mapped := sessionStartErrorV3(err)
-				return playback.DecisionResponseV3{}, *record, nil, mapped
-			}
-		}
-		result.Plan.SessionID = session.ID
-		artifactRecipe = record.FrozenRecipe
-		if !seekReanchor {
-			frozenRecipe, frozenErr := h.freezeExecutableRecipeV3(r.Context(), effectiveFile, result)
-			if frozenErr != nil {
-				return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Failed to freeze the selected subtitle identity.", frozenErr)
-			}
-			artifactRecipe = frozenRecipe
-		}
-		if trackChange && h.hasActiveHLSTransportV3(session) {
-			if reusedRecipe, ok := sidecarOnlyHLSReplanV3(record, result.Plan, artifactRecipe, req.ClientPlaybackContext.Output.OutputContextID); ok {
-				artifactRecipe = reusedRecipe
-				result.ToneMapMode = reusedRecipe.ToneMapMode
-				transportReused = true
-			}
-		}
-		if transportReused {
-			// A sidecar selection changes the plan and subtitle artifact, but it does
-			// not change the bytes FFmpeg produces. Keep the active HLS generation and
-			// its transport window so a client remount cannot strand itself between
-			// the killed old window and a replacement window that starts elsewhere.
-			// The requested source position still belongs to this replan: translate it
-			// onto the reused window instead of rewinding to the previous plan's start.
-			result.Plan.Stream = record.CurrentPlan.Stream
-			reusedTimeline := record.CurrentPlan.Timeline
-			reusedTimeline.SourceStartSeconds = result.Plan.Timeline.SourceStartSeconds
-			reusedTimeline.PlayerStartSeconds = max(0, reusedTimeline.SourceStartSeconds-reusedTimeline.StreamOriginSeconds)
-			result.Plan.Timeline = reusedTimeline
-			result.Plan.ExpiresAt = record.CurrentPlan.ExpiresAt
-			transport = reusedHLSTransportV3(session, record.CurrentPlan.Stream.URL)
-			slog.InfoContext(r.Context(), "protocol v3 replan reused active HLS A/V transport",
-				logComponentKey, playbackLogValueV3,
-				"playback_session_id", session.ID,
-				"previous_plan_id", record.CurrentPlanID,
-				"plan_id", result.Plan.PlanID,
-			)
-		} else {
-			var transportErr *transportErrorV3
-			transport, transportErr = h.prepareTransportV3(r, session, effectiveFile, result, headerAuthenticatedMediaV3(req.ClientFeatures))
-			if transportErr != nil {
-				return playback.DecisionResponseV3{}, *record, nil, transportErr
-			}
-			applyTransportToneMapModeV3(&result, transport)
-			if !seekReanchor {
-				frozenRecipe, frozenErr := h.freezeExecutableRecipeV3(r.Context(), effectiveFile, result)
-				if frozenErr != nil {
-					transport.rollback()
-					return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Failed to freeze the selected subtitle identity.", frozenErr)
-				}
-				artifactRecipe = frozenRecipe
-			}
-		}
-		result.Plan.Stream.URL = transport.url
-		if err := h.attachSubtitleArtifactV3(r.Context(), session.ID, effectiveFile, result.Plan, result.SubtitleTrackIndex, &artifactRecipe); err != nil {
-			transport.rollback()
-			return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Failed to prepare the selected subtitle artifact.", err)
-		}
+		artifactRecipe = frozenRecipe
+	}
+	// Resolve every fallible subtitle and frozen-route check before transport
+	// preparation publishes a stable proxy grant. An existing client can issue
+	// a GET against that grant immediately, even though this replan response has
+	// not returned yet, so errors after publication would require canceling an
+	// already admitted successor.
+	if err := h.attachSubtitleArtifactV3(r.Context(), session.ID, effectiveFile, result.Plan, result.SubtitleTrackIndex, &artifactRecipe); err != nil {
+		return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Failed to prepare the selected subtitle artifact.", err)
 	}
 	if seekReanchor {
 		if err := validateSeekReanchorPlanV3(record, result.Plan); err != nil {
@@ -4532,13 +5354,60 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				"playback_attempt_id", record.PlaybackAttemptID,
 				"changed_fields", changedFields,
 			)
-			transport.rollback()
 			return playback.DecisionResponseV3{}, *record, nil, &transportErrorV3{
 				reason:  "seek_reanchor_route_changed",
 				message: err.Error(),
 			}
 		}
 	}
+	transportReused := false
+	if trackChange && h.hasActiveHLSTransportV3(session) {
+		proxyAllowed := mode.proxyEgress || (!mode.headerAuth && h.JWTSecret != "")
+		policy := h.playbackRoutingPolicyForContextV3(r.Context())
+		if reusedRecipe, ok := sidecarOnlyHLSReplanV3(record, result.Plan, artifactRecipe, req.ClientPlaybackContext.Output.OutputContextID); ok &&
+			reusedHLSRouteAllowedV3(session, result, policy, proxyAllowed) {
+			artifactRecipe = reusedRecipe
+			result.ToneMapMode = reusedRecipe.ToneMapMode
+			transportReused = true
+		}
+	}
+	var transport preparedTransportV3
+	if transportPrepared && preparedTransport != nil {
+		transport = *preparedTransport
+	} else if transportReused {
+		// A sidecar selection changes the plan and subtitle artifact, but it does
+		// not change the bytes FFmpeg produces. Keep the active HLS generation and
+		// its transport window so a client remount cannot strand itself between
+		// the killed old window and a replacement window that starts elsewhere.
+		// The requested source position still belongs to this replan: translate it
+		// onto the reused window instead of rewinding to the previous plan's start.
+		result.Plan.Stream = record.CurrentPlan.Stream
+		reusedTimeline := record.CurrentPlan.Timeline
+		reusedTimeline.SourceStartSeconds = result.Plan.Timeline.SourceStartSeconds
+		reusedTimeline.PlayerStartSeconds = max(0, reusedTimeline.SourceStartSeconds-reusedTimeline.StreamOriginSeconds)
+		result.Plan.Timeline = reusedTimeline
+		result.Plan.ExpiresAt = record.CurrentPlan.ExpiresAt
+		transport = reusedHLSTransportV3(session, record.CurrentPlan.Stream.URL)
+		slog.InfoContext(r.Context(), "protocol v3 replan reused active HLS A/V transport",
+			logComponentKey, playbackLogValueV3,
+			"playback_session_id", session.ID,
+			"previous_plan_id", record.CurrentPlanID,
+			"plan_id", result.Plan.PlanID,
+		)
+	} else {
+		var transportErr *transportErrorV3
+		transport, transportErr = h.prepareTransportV3(r, session, effectiveFile, result, mode)
+		if transportErr != nil {
+			return playback.DecisionResponseV3{}, *record, nil, transportErr
+		}
+		applyTransportToneMapModeV3(&result, transport)
+		// Transport preparation can only attest the executor's tone-map mode;
+		// every other frozen identity field was validated above. Copy that one
+		// receipt into the already validated recipe instead of rerunning a
+		// fallible subtitle-identity freeze after authority publication.
+		artifactRecipe.ToneMapMode = result.ToneMapMode
+	}
+	result.Plan.Stream.URL = transport.url
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: playback.ServerFeaturesV3(), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
 	updated := *record
 	updated.CurrentPlanID = result.Plan.PlanID
@@ -4561,6 +5430,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		}
 	}
 	originalRollback := transport.rollback
+	originalRollbackRequired := transport.rollbackRequired
 	replacement := playback.SessionReplacement{
 		EffectiveMediaFileID: effectiveFile.ID,
 		StreamState:          h.v3SessionStreamState(r.Context(), session, effectiveFile, result, transport, headerAuthenticatedMediaV3(req.ClientFeatures)),
@@ -4600,6 +5470,15 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	transport.rollback = func() {
 		originalRollback()
 		cancelReservation()
+	}
+	if originalRollbackRequired != nil {
+		transport.rollbackRequired = func() error {
+			if err := originalRollbackRequired(); err != nil {
+				return err
+			}
+			cancelReservation()
+			return nil
+		}
 	}
 	reservationHandedOff = true
 	return response, updated, &transport, nil
@@ -4792,6 +5671,7 @@ func seekReanchorIdentityChangesV3(record *playback.AttemptRecordV3, candidate *
 	add("mime_type", candidate.Stream.MIMEType != current.Stream.MIMEType)
 	add("header_refresh", candidate.Stream.HeaderRefresh != current.Stream.HeaderRefresh)
 	add("video_codec", candidate.EffectiveRecipe.VideoCodec != current.EffectiveRecipe.VideoCodec)
+	add("video_sample_entry", candidate.EffectiveRecipe.VideoSampleEntry != current.EffectiveRecipe.VideoSampleEntry)
 	add("audio_codec", candidate.EffectiveRecipe.AudioCodec != current.EffectiveRecipe.AudioCodec)
 	add("resolution", !optionalIntEqualV3(candidate.EffectiveRecipe.Width, current.EffectiveRecipe.Width) || !optionalIntEqualV3(candidate.EffectiveRecipe.Height, current.EffectiveRecipe.Height))
 	add("frame_rate", !optionalFloatEqualV3(candidate.EffectiveRecipe.FrameRate, current.EffectiveRecipe.FrameRate))
@@ -4986,6 +5866,13 @@ func sameEffectiveAVRecipeV3(left, right playback.EffectiveRecipeV3) bool {
 func reusedHLSTransportV3(session *playback.Session, streamURL string) preparedTransportV3 {
 	transport := preparedTransportV3{url: streamURL}
 	if session != nil {
+		transport.routingWorkload = noderouting.Workload(session.RoutingWorkload)
+		transport.routingExecution = noderouting.Execution(session.RoutingExecution)
+		transport.routingExecutorID = session.RoutingExecutionNodeID
+		transport.routingExecutorURL = session.RoutingExecutionNodeURL
+		transport.routingEgress = noderouting.Egress(session.RoutingEgress)
+		transport.routingEgressID = session.RoutingEgressNodeID
+		transport.routingEgressURL = session.RoutingEgressNodeURL
 		transport.nodeURL = session.TranscodeNodeURL
 		transport.transportID = session.TranscodeTransportID
 		transport.hwAccel = session.TranscodeHWAccel
@@ -4994,6 +5881,31 @@ func reusedHLSTransportV3(session *playback.Session, streamURL string) preparedT
 	transport.commit = func() {}
 	transport.rollback = func() {}
 	return transport
+}
+
+// reusedHLSRouteAllowedV3 checks the running transport against the routing
+// snapshot for this replan. Soft preferences do not interrupt healthy bytes,
+// but a hard execution/egress boundary or client-incompatible proxy route must
+// force normal replacement preparation.
+func reusedHLSRouteAllowedV3(session *playback.Session, result playback.PlannerResultV3, policy config.PlaybackRoutingPolicy, proxyAllowed bool) bool {
+	workload, delivery, ok := routingClassV3(result)
+	if !ok || session == nil {
+		return false
+	}
+	compiled, err := noderouting.Candidates(noderouting.Request{
+		Workload: workload, Delivery: delivery, Policy: policy, ProxyAllowed: proxyAllowed,
+	})
+	if err != nil {
+		return false
+	}
+	for _, shape := range compiled.Candidates {
+		if shape.Workload == noderouting.Workload(session.RoutingWorkload) &&
+			shape.Execution == noderouting.Execution(session.RoutingExecution) &&
+			shape.Egress == noderouting.Egress(session.RoutingEgress) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *PlaybackHandler) hasActiveHLSTransportV3(session *playback.Session) bool {
@@ -5554,7 +6466,9 @@ func sessionStartErrorV3(err error) *transportErrorV3 {
 	switch {
 	case errors.Is(err, playback.ErrTooManyStreams), errors.Is(err, playback.ErrTooManyTranscodes):
 		return &transportErrorV3{reason: "capacity_unavailable", message: "Playback capacity is currently unavailable.", retryable: true}
-	case errors.Is(err, playback.ErrTranscodingDisabled), errors.Is(err, playback.ErrAudioTranscodingDisabled):
+	case errors.Is(err, playback.ErrAudioTranscodingDisabled):
+		return &transportErrorV3{reason: "audio_transcoding_disabled", message: "The selected audio adaptation is disabled."}
+	case errors.Is(err, playback.ErrTranscodingDisabled):
 		return &transportErrorV3{reason: "transcoding_disabled", message: "The selected server adaptation is disabled."}
 	case errors.Is(err, playback.ErrPlaybackNotAllowed):
 		return &transportErrorV3{reason: "policy_denied", message: "Playback is denied by server policy."}
@@ -5795,6 +6709,24 @@ func videoBitstreamFilterForPlanV3(plan *playback.PlanV3) string {
 	return ""
 }
 
+func videoSampleEntryForPlanV3(plan *playback.PlanV3) string {
+	if plan == nil || plan.Delivery != playback.DeliveryRemuxHLSV3 {
+		return ""
+	}
+	if plan.EffectiveRecipe.VideoSampleEntry != "" {
+		return plan.EffectiveRecipe.VideoSampleEntry
+	}
+	for _, transformation := range plan.Transformations {
+		if transformation.Name == playback.TransformationServerDV7HDR10V3 {
+			return playback.VideoSampleEntryHVC1
+		}
+	}
+	if plan.EffectiveRecipe.DynamicRange == playback.DynamicRangeDolbyVisionV3 &&
+		(plan.Source.DVProfile == 5 || plan.Source.DVProfile == 8) {
+		return playback.VideoSampleEntryDVH1
+	}
+	return ""
+}
 // lazyDVRPUStrippableV3 defers (and memoizes) the per-source RPU probe so the
 // planner only shells out to ffmpeg when a Dolby Vision strip route is
 // genuinely on the table; every other start never touches it.
@@ -5878,7 +6810,7 @@ var diagnosticKeysV3 = map[string]struct{}{
 	"audio_output_mode": {}, "audio_mime": {}, "audio_channels": {}, "audio_decoder_name": {},
 	"correction_id": {}, "correction_stage": {},
 	"network_transport": {}, "network_metered": {}, "network_validated": {},
-	"bandwidth_estimate_kbps": {}, "link_downstream_kbps": {},
+	bandwidthEstimateLogKeyV3: {}, linkDownstreamLogKeyV3: {},
 	"target_source_position_seconds": {}, "reason": {},
 }
 
@@ -5948,13 +6880,6 @@ func optionalFloatEqualV3(left, right *float64) bool {
 	return *left == *right
 }
 
-func (h *PlaybackHandler) raceCopySafetyV3(fileID int, plan *playback.PlanV3) {
-	if h == nil || h.CopySafetyRacer == nil || fileID <= 0 || plan == nil {
-		return
-	}
-	h.CopySafetyRacer.RaceScanForPlan(fileID, plan)
-}
-
 func (h *PlaybackHandler) proxyEgressOriginsAvailableV3() bool {
 	if h == nil || h.NodePlanner == nil {
 		return false
@@ -5964,22 +6889,6 @@ func (h *PlaybackHandler) proxyEgressOriginsAvailableV3() bool {
 	}
 	enumerator, ok := h.NodePlanner.(proxyNodeEnumeratorV3)
 	return ok && len(enumerator.ProxyNodeURLs()) > 0
-}
-
-func videoSampleEntryForPlanV3(plan *playback.PlanV3) string {
-	if plan == nil || plan.Delivery != playback.DeliveryRemuxHLSV3 {
-		return ""
-	}
-	for _, transformation := range plan.Transformations {
-		if transformation.Name == playback.TransformationServerDV7HDR10V3 {
-			return playback.VideoSampleEntryHVC1
-		}
-	}
-	if plan.EffectiveRecipe.DynamicRange == playback.DynamicRangeDolbyVisionV3 &&
-		(plan.Source.DVProfile == 5 || plan.Source.DVProfile == 8) {
-		return playback.VideoSampleEntryDVH1
-	}
-	return ""
 }
 
 // sessionProxyReservationReleaserV3 gives back only the proxy half of a node

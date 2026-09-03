@@ -42,16 +42,23 @@ type SessionSync struct {
 	// TargetAudioChannels is the encoded output channel count when audio is
 	// re-encoded; 0 means the node did not report one. Admin views must not
 	// substitute the source count for it.
-	TargetAudioChannels int
-	TargetBitrateKbps   int
-	TranscodeHWAccel    string
-	ToneMapMode         string
-	StartedAt           time.Time
-	UpdatedAt           time.Time
-	PositionSeconds     float64
-	IsPaused            bool
-	HasWebSocket        bool
-	IsJellyfinCompat    bool
+	TargetAudioChannels     int
+	TargetBitrateKbps       int
+	TranscodeHWAccel        string
+	ToneMapMode             string
+	RoutingWorkload         string
+	RoutingExecution        string
+	RoutingExecutionNodeID  int
+	RoutingExecutionNodeURL string
+	RoutingEgress           string
+	RoutingEgressNodeID     int
+	RoutingEgressNodeURL    string
+	StartedAt               time.Time
+	UpdatedAt               time.Time
+	PositionSeconds         float64
+	IsPaused                bool
+	HasWebSocket            bool
+	IsJellyfinCompat        bool
 }
 
 // AggregateData represents the aggregate counts for a single user that are
@@ -162,8 +169,11 @@ func (r *Reconciler) ReconcileNodeSessions(ctx context.Context, reportingNode st
 				 audio_track_index, transcode_audio, stream_bitrate_kbps, transcode_node_url,
 				 target_resolution, target_video_codec, target_audio_codec, target_audio_channels,
 				 target_bitrate_kbps,
-				 transcode_hw_accel, tone_map_mode, position_seconds, is_paused, has_websocket, compat_origin)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10::inet, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+				 transcode_hw_accel, tone_map_mode,
+				 routing_workload, routing_execution, routing_execution_node_id, routing_execution_node_url,
+				 routing_egress, routing_egress_node_id, routing_egress_node_url,
+				 position_seconds, is_paused, has_websocket, compat_origin)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), $10::inet, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37)
 			ON CONFLICT (session_id) DO UPDATE SET
 				user_id             = EXCLUDED.user_id,
 				profile_id          = EXCLUDED.profile_id,
@@ -189,6 +199,13 @@ func (r *Reconciler) ReconcileNodeSessions(ctx context.Context, reportingNode st
 				target_bitrate_kbps = EXCLUDED.target_bitrate_kbps,
 				transcode_hw_accel  = EXCLUDED.transcode_hw_accel,
 				tone_map_mode       = EXCLUDED.tone_map_mode,
+				routing_workload    = EXCLUDED.routing_workload,
+				routing_execution   = EXCLUDED.routing_execution,
+				routing_execution_node_id = EXCLUDED.routing_execution_node_id,
+				routing_execution_node_url = EXCLUDED.routing_execution_node_url,
+				routing_egress      = EXCLUDED.routing_egress,
+				routing_egress_node_id = EXCLUDED.routing_egress_node_id,
+				routing_egress_node_url = EXCLUDED.routing_egress_node_url,
 				position_seconds    = EXCLUDED.position_seconds,
 				is_paused           = EXCLUDED.is_paused,
 				has_websocket       = EXCLUDED.has_websocket,
@@ -202,7 +219,9 @@ func (r *Reconciler) ReconcileNodeSessions(ctx context.Context, reportingNode st
 			nullableString(s.TargetResolution), nullableString(s.TargetVideoCodec),
 			nullableString(s.TargetAudioCodec), nullableInt(s.TargetAudioChannels),
 			nullableInt(s.TargetBitrateKbps),
-			nullableString(s.TranscodeHWAccel), nullableString(s.ToneMapMode), normalizePositionSeconds(s.PositionSeconds),
+			nullableString(s.TranscodeHWAccel), nullableString(s.ToneMapMode),
+			nullableString(s.RoutingWorkload), nullableString(s.RoutingExecution), nullableInt(s.RoutingExecutionNodeID), nullableString(s.RoutingExecutionNodeURL),
+			nullableString(s.RoutingEgress), nullableInt(s.RoutingEgressNodeID), nullableString(s.RoutingEgressNodeURL), normalizePositionSeconds(s.PositionSeconds),
 			s.IsPaused, s.HasWebSocket, s.IsJellyfinCompat)
 		if err != nil {
 			return fmt.Errorf("upserting session %s: %w", s.SessionID, err)
@@ -285,6 +304,13 @@ func loadNodeSessionsSnapshot(ctx context.Context, tx pgx.Tx, reportingNode stri
 			COALESCE(target_bitrate_kbps, 0),
 			COALESCE(transcode_hw_accel, ''),
 			COALESCE(tone_map_mode, ''),
+			COALESCE(routing_workload, ''),
+			COALESCE(routing_execution, ''),
+			COALESCE(routing_execution_node_id, 0),
+			COALESCE(routing_execution_node_url, ''),
+			COALESCE(routing_egress, ''),
+			COALESCE(routing_egress_node_id, 0),
+			COALESCE(routing_egress_node_url, ''),
 			started_at,
 			updated_at,
 			COALESCE(position_seconds, 0),
@@ -327,6 +353,13 @@ func loadNodeSessionsSnapshot(ctx context.Context, tx pgx.Tx, reportingNode stri
 			&s.TargetBitrateKbps,
 			&s.TranscodeHWAccel,
 			&s.ToneMapMode,
+			&s.RoutingWorkload,
+			&s.RoutingExecution,
+			&s.RoutingExecutionNodeID,
+			&s.RoutingExecutionNodeURL,
+			&s.RoutingEgress,
+			&s.RoutingEgressNodeID,
+			&s.RoutingEgressNodeURL,
 			&s.StartedAt,
 			&s.UpdatedAt,
 			&s.PositionSeconds,
@@ -388,6 +421,13 @@ func sessionSnapshotsEqual(left, right []SessionSync) bool {
 			left[i].TargetBitrateKbps != right[i].TargetBitrateKbps ||
 			left[i].TranscodeHWAccel != right[i].TranscodeHWAccel ||
 			left[i].ToneMapMode != right[i].ToneMapMode ||
+			left[i].RoutingWorkload != right[i].RoutingWorkload ||
+			left[i].RoutingExecution != right[i].RoutingExecution ||
+			left[i].RoutingExecutionNodeID != right[i].RoutingExecutionNodeID ||
+			left[i].RoutingExecutionNodeURL != right[i].RoutingExecutionNodeURL ||
+			left[i].RoutingEgress != right[i].RoutingEgress ||
+			left[i].RoutingEgressNodeID != right[i].RoutingEgressNodeID ||
+			left[i].RoutingEgressNodeURL != right[i].RoutingEgressNodeURL ||
 			!left[i].StartedAt.Equal(right[i].StartedAt) ||
 			!left[i].UpdatedAt.Equal(right[i].UpdatedAt) ||
 			normalizePositionSeconds(left[i].PositionSeconds) != normalizePositionSeconds(right[i].PositionSeconds) ||

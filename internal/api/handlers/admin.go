@@ -2425,6 +2425,8 @@ func validateProspectiveAdminSettings(values map[string]string, redisBootstrapAv
 var adminSettingDependencyGroups = [][]string{
 	{"auth.access_token_expiry", "auth.refresh_token_expiry"},
 	{"playback.watched_threshold", "playback.min_resume_threshold"},
+	{config.PlaybackRoutingRemuxExecutionSettingKey, config.PlaybackRoutingRemuxEgressSettingKey},
+	{config.PlaybackRoutingVideoTranscodeExecutionSettingKey, config.PlaybackRoutingVideoTranscodeEgressSettingKey},
 	{"s3.public_endpoint", "s3.public_bucket"},
 	{"s3.public_access_key", "s3.public_secret_key"},
 	{"s3.private_endpoint", "s3.private_bucket"},
@@ -2446,11 +2448,24 @@ var adminSettingDependencyGroups = [][]string{
 	},
 }
 
+func isPlaybackRoutingPairSetting(key string) bool {
+	switch key {
+	case config.PlaybackRoutingRemuxExecutionSettingKey,
+		config.PlaybackRoutingRemuxEgressSettingKey,
+		config.PlaybackRoutingVideoTranscodeExecutionSettingKey,
+		config.PlaybackRoutingVideoTranscodeEgressSettingKey:
+		return true
+	default:
+		return false
+	}
+}
+
 // adminSettingsValidationSnapshot validates exactly the requested changes and
 // the current values they depend on. The legacy single-key endpoint predates
 // cross-field validation, so any relationship (or catalog value) can already
 // be invalid in storage. Untouched legacy state must not poison an unrelated
-// batch, while touching any member pulls the complete dependency group into the
+// batch or the routing-pair checks that protect restartable configuration,
+// while touching any member pulls the complete dependency group into the
 // snapshot so a new or still-invalid relationship is rejected.
 func adminSettingsValidationSnapshot(
 	prospective map[string]string,
@@ -2965,11 +2980,20 @@ func (h *AdminHandler) HandleUpdateSetting(w http.ResponseWriter, r *http.Reques
 		func(stored map[string]string) (map[string]string, error) {
 			prospective := maps.Clone(stored)
 			prospective[key] = req.Value
+			if isPlaybackRoutingPairSetting(key) {
+				changed := map[string]string{key: req.Value}
+				validationSnapshot := adminSettingsValidationSnapshot(h.activeAdminSettings(prospective), changed)
+				if err := validateProspectiveAdminSettings(validationSnapshot, h.RedisBootstrapAvailable); err != nil {
+					validationErr = err
+					validationCode = "invalid_settings"
+					return nil, err
+				}
+			}
 			// This legacy route can only change one key, so enforcing every
 			// cross-field invariant would make paired settings impossible to
 			// establish or clear one write at a time. Per-key validation above
-			// remains strict; the durable prerequisites are the exception — a
-			// single-key write may not break them.
+			// remains strict; restart-fatal routing pairs and durable prerequisites
+			// are the exceptions — a single-key write may not break them.
 			if key == "redis.url" {
 				if err := config.ValidateRedisRateLimitTransport(
 					h.activeAdminSettings(prospective),

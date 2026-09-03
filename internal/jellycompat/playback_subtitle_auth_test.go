@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,8 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/noderouting"
+	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
@@ -129,6 +133,9 @@ func TestHandlePlaybackInfo_AuthenticatesSubtitleDeliveryURLs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse subtitle URL %q: %v", rawURL, err)
 		}
+		if parsed.IsAbs() || parsed.Host != "" || !strings.HasPrefix(parsed.Path, "/Videos/") {
+			t.Fatalf("subtitle URL %q is not API-relative", rawURL)
+		}
 		query := parsed.Query()
 		if got := query.Get("api_key"); got != "token-1" {
 			t.Fatalf("api_key for %q = %q, want token-1", rawURL, got)
@@ -136,5 +143,69 @@ func TestHandlePlaybackInfo_AuthenticatesSubtitleDeliveryURLs(t *testing.T) {
 		if got := query.Get("PlaySessionId"); got != resp.PlaySessionID {
 			t.Fatalf("PlaySessionId for %q = %q, want %q", rawURL, got, resp.PlaySessionID)
 		}
+	}
+}
+
+func TestHandleSubtitleStreamAllowsAPIAuxiliaryResourceForProxyRoutedSession(t *testing.T) {
+	const subtitleBody = "1\n00:00:00,000 --> 00:00:01,000\nHello\n"
+	subtitlePath := filepath.Join(t.TempDir(), "movie.en.srt")
+	if err := os.WriteFile(subtitlePath, []byte(subtitleBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	file := &models.MediaFile{
+		ID:                42,
+		ContentID:         "movie-1",
+		FilePath:          "/media/movie.mkv",
+		ExternalSubtitles: []models.ExternalSubtitle{{Path: subtitlePath, Language: "eng", Format: "srt"}},
+	}
+	source := PlaybackMediaSource{ID: "source-42", FileID: file.ID}
+
+	for _, route := range []struct {
+		name      string
+		method    string
+		workload  noderouting.Workload
+		execution noderouting.Execution
+	}{
+		{name: "direct play", method: "direct", workload: noderouting.WorkloadDirectPlay, execution: noderouting.ExecutionNone},
+		{name: "progressive remux", method: "remux", workload: noderouting.WorkloadRemux, execution: noderouting.ExecutionProxy},
+	} {
+		t.Run(route.name, func(t *testing.T) {
+			assignment := playback.NodeRoutingAssignment{
+				Workload:  string(route.workload),
+				Execution: string(route.execution),
+				Egress:    string(noderouting.EgressProxy),
+			}
+			store := NewPlaybackSessionStore(time.Hour, nil)
+			store.Put(PlaybackSession{
+				ID: "play-1", CompatToken: "token-1", RouteItemID: "item-1",
+				UpstreamSessionID: "upstream-1", UpstreamPlayMethod: route.method,
+				MediaSources: []PlaybackMediaSource{source}, RoutingAssignment: &assignment,
+			})
+			handler := &PlaybackHandler{
+				playbackStore: store,
+				fileResolver:  testCompatFileResolver{file: file},
+			}
+
+			request := httptest.NewRequest(
+				http.MethodGet,
+				"/Videos/item-1/source-42/Subtitles/1/stream.srt?PlaySessionId=play-1&api_key=token-1",
+				nil,
+			)
+			routeCtx := chi.NewRouteContext()
+			routeCtx.URLParams.Add("routeItemId", "item-1")
+			routeCtx.URLParams.Add("routeMediaSourceId", source.ID)
+			routeCtx.URLParams.Add("routeIndex", "1")
+			routeCtx.URLParams.Add("routeFormat", "srt")
+			ctx := context.WithValue(t.Context(), chi.RouteCtxKey, routeCtx)
+			ctx = context.WithValue(ctx, compatSessionKey, &Session{Token: "token-1", StreamAppUserID: 7})
+			recorder := httptest.NewRecorder()
+
+			handler.HandleSubtitleStream(recorder, request.WithContext(ctx))
+
+			if recorder.Code != http.StatusOK || recorder.Body.String() != subtitleBody {
+				t.Fatalf("response = %d %q, want API-origin subtitle", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }

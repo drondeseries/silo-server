@@ -44,6 +44,22 @@ func TestItemDetailToUpstreamUsesMovieReleaseDateForPremiereDate(t *testing.T) {
 	}
 }
 
+func TestItemDetailToUpstreamOrdersVideoVersionsLikeJellyfin(t *testing.T) {
+	input := &catalog.ItemDetail{Versions: []catalog.FileVersion{
+		{FileID: 1080, VideoTracks: []models.VideoTrack{{Width: 1920, Height: 1080}}},
+		{FileID: 2160, VideoTracks: []models.VideoTrack{{Width: 3840, Height: 2160}}},
+	}}
+
+	detail := itemDetailToUpstream(input)
+
+	if got := []int{detail.Versions[0].FileID, detail.Versions[1].FileID}; !slices.Equal(got, []int{2160, 1080}) {
+		t.Fatalf("Jellyfin version order = %v, want highest width first", got)
+	}
+	if input.Versions[0].FileID != 1080 {
+		t.Fatal("compat conversion mutated the native catalog version order")
+	}
+}
+
 func TestItemEtagIncludesPremiereDate(t *testing.T) {
 	base := upstreamListItem{
 		ContentID: "movie-1",

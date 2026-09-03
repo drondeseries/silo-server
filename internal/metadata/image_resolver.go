@@ -326,16 +326,16 @@ func (r *PluginImageResolver) resolveS3Batch(
 	}
 	// Only the cached-key path walks the ladder: plugin- and http-resolved
 	// images do not live in this bucket and choose their own variant.
-	checker, _ := presigner.(s3ImageExistenceChecker)
+	policy := availabilityPolicy(presigner)
 	now := time.Now()
 	expiresAt := now.Add(ttl)
 
 	// Walk the ladder for the whole batch before presigning any of it. Each walk
-	// can cost a HEAD or two against storage, and a browse page resolves a
-	// hundred images: done one after another that is seconds of latency in front
-	// of the JSON. Presigning itself is local signing work, so only this part is
-	// worth parallelizing.
-	ladderKeys := r.resolveLadderKeys(ctx, checker, presigner.Bucket(), entries)
+	// can cost one or more storage HEADs or public-delivery probes, and a browse
+	// page resolves a hundred images: done one after another that is seconds of
+	// latency in front of the JSON. Presigning itself is local signing work, so
+	// only this part is worth parallelizing.
+	ladderKeys := r.resolveLadderKeys(ctx, policy, presigner.Bucket(), entries)
 
 	for _, entry := range entries {
 		resolvedKey := ladderKeys[entry.originalPath]
@@ -349,6 +349,8 @@ func (r *PluginImageResolver) resolveS3Batch(
 		expiry := expiresAt
 		if fellBack {
 			expiry = fallbackURLExpiry(expiry, now)
+		} else if resolvedKey.revalidateAfter > 0 {
+			expiry = revalidatedURLExpiry(expiry, now, resolvedKey.revalidateAfter)
 		}
 		resolved[entry.originalPath] = catalog.ResolvedImageURL{URL: url, ExpiresAt: &expiry}
 	}

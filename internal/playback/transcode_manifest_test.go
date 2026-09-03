@@ -1,6 +1,7 @@
 package playback
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -578,6 +579,78 @@ func TestRestartSeekTarget_CopyModeUsesManifestTimelineWhenAvailable(t *testing.
 	}
 	if math.Abs(got-20.669) > 0.0001 {
 		t.Fatalf("RestartSeekTarget(10) = %.6f, want 20.669", got)
+	}
+}
+
+func TestResolveSegmentRecoveryTarget_CopyMapsActualAnchorToManifestNumber(t *testing.T) {
+	manifest := strings.Join([]string{
+		"#EXTM3U",
+		"#EXT-X-VERSION:7",
+		"#EXT-X-TARGETDURATION:3",
+		"#EXT-X-MEDIA-SEQUENCE:9",
+		"#EXT-X-MAP:URI=\"init.mp4\"",
+		"#EXTINF:2.669000,",
+		"seg_00009.m4s",
+		"#EXTINF:1.669000,",
+		"seg_00010.m4s",
+		"#EXTINF:1.668000,",
+		"seg_00011.m4s",
+		"",
+	}, "\n")
+
+	tests := []struct {
+		name             string
+		anchorMillis     int
+		wantStartSegment int
+		wantOrigin       float64
+	}{
+		{name: "Matroska pre-roll uses preceding manifest slot", anchorMillis: 18000, wantStartSegment: 9, wantOrigin: 18},
+		{name: "MP4 exact seek keeps requested manifest slot", anchorMillis: 20669, wantStartSegment: 10, wantOrigin: 20.669},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(tempDir, "stream.m3u8"), []byte(manifest), 0o644); err != nil {
+				t.Fatalf("write manifest: %v", err)
+			}
+			ffmpegPath := filepath.Join(tempDir, "ffmpeg")
+			probe := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '#tb 0: 1/1000'\nprintf '%%s\\n' '0, %d, %d, 41, 1024, 0x12345678'\n", tt.anchorMillis, tt.anchorMillis)
+			if err := os.WriteFile(ffmpegPath, []byte(probe), 0o755); err != nil {
+				t.Fatalf("write fake ffmpeg: %v", err)
+			}
+
+			session := &TranscodeSession{
+				outputDir: tempDir,
+				opts: TranscodeOpts{
+					InputPath:              "/media/movie.mkv",
+					FFmpegPath:             ffmpegPath,
+					SeekSeconds:            18.261,
+					StreamOriginSeconds:    18,
+					CopySeekAnchorResolved: true,
+					TargetCodecVideo:       "copy",
+					SegmentDuration:        2,
+					StartSegmentNumber:     9,
+				},
+			}
+
+			target, ok, err := session.ResolveSegmentRecoveryTarget(context.Background(), 10)
+			if err != nil {
+				t.Fatalf("ResolveSegmentRecoveryTarget: %v", err)
+			}
+			if !ok {
+				t.Fatal("ResolveSegmentRecoveryTarget returned ok=false")
+			}
+			if math.Abs(target.SeekSeconds-20.669) > 0.0001 {
+				t.Fatalf("SeekSeconds = %.6f, want 20.669", target.SeekSeconds)
+			}
+			if target.StartSegmentNumber != tt.wantStartSegment {
+				t.Fatalf("StartSegmentNumber = %d, want %d", target.StartSegmentNumber, tt.wantStartSegment)
+			}
+			if math.Abs(target.StreamOriginSeconds-tt.wantOrigin) > 0.0001 || !target.CopySeekAnchorResolved {
+				t.Fatalf("copy anchor = %.6f resolved=%v, want %.6f resolved=true", target.StreamOriginSeconds, target.CopySeekAnchorResolved, tt.wantOrigin)
+			}
+		})
 	}
 }
 

@@ -274,6 +274,132 @@ func TestClientWithKeyPrefixPrefixesCloudflareTokenURL(t *testing.T) {
 	}
 }
 
+func TestClientObjectAvailableUsesExternalDeliveryPath(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu       sync.Mutex
+		requests []recordedRequest
+	)
+	delivery := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, recordedRequest{
+			Method:   r.Method,
+			Path:     r.URL.Path,
+			RawQuery: r.URL.RawQuery,
+			Body:     r.Header.Get("Range"),
+		})
+		mu.Unlock()
+
+		if r.URL.Path == "/silo/dev/poster/w780.webp" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, "x")
+	}))
+	t.Cleanup(delivery.Close)
+
+	client := NewClient(BucketConfig{
+		Endpoint:       "https://s3.example.invalid",
+		PublicEndpoint: delivery.URL,
+		Region:         "us-east-1",
+		Bucket:         "silo",
+		KeyPrefix:      "silo/dev",
+		AccessKey:      "test",
+		SecretKey:      "test",
+		PathStyle:      true,
+		URLAuth:        URLAuthCloudflareToken,
+		TokenSecret:    "secret",
+	})
+
+	available, err := client.ObjectAvailable(t.Context(), client.Bucket(), "poster/w780.webp")
+	if err != nil || available {
+		t.Fatalf("large ObjectAvailable() = %v, %v, want false, nil", available, err)
+	}
+	available, err = client.ObjectAvailable(t.Context(), client.Bucket(), "poster/w500.webp")
+	if err != nil || !available {
+		t.Fatalf("medium ObjectAvailable() = %v, %v, want true, nil", available, err)
+	}
+
+	mu.Lock()
+	gotRequests := append([]recordedRequest(nil), requests...)
+	mu.Unlock()
+	if len(gotRequests) != 2 {
+		t.Fatalf("delivery requests = %#v, want two", gotRequests)
+	}
+	for _, req := range gotRequests {
+		if req.Method != http.MethodGet || req.Body != "bytes=0-0" {
+			t.Errorf("delivery request = %#v, want one-byte GET", req)
+		}
+		if parseQuery(req.RawQuery).Get("verify") == "" {
+			t.Errorf("delivery request = %#v, want Cloudflare auth token", req)
+		}
+	}
+}
+
+func TestClientObjectAvailableUsesStorageWithoutExternalDelivery(t *testing.T) {
+	t.Parallel()
+
+	for _, authMode := range []string{URLAuthPresigned, URLAuthPublic, URLAuthCloudflareToken} {
+		t.Run(authMode, func(t *testing.T) {
+			srv := newS3TestServer(t)
+			client := NewClient(BucketConfig{
+				Endpoint:  srv.URL(),
+				Region:    "us-east-1",
+				Bucket:    "silo",
+				AccessKey: "test",
+				SecretKey: "test",
+				PathStyle: true,
+				URLAuth:   authMode,
+			})
+
+			if client.UsesExternalDelivery() {
+				t.Fatal("UsesExternalDelivery() = true without a public endpoint")
+			}
+			available, err := client.ObjectAvailable(t.Context(), client.Bucket(), "poster.webp")
+			if err != nil || !available {
+				t.Fatalf("ObjectAvailable() = %v, %v, want true, nil", available, err)
+			}
+			requests := srv.Requests()
+			if !containsRequest(requests, http.MethodHead, "/silo/poster.webp", "") {
+				t.Fatalf("requests = %#v, want storage HEAD", requests)
+			}
+			if containsRequest(requests, http.MethodGet, "/silo/poster.webp", "") {
+				t.Fatalf("requests = %#v, do not want a delivery GET without external delivery", requests)
+			}
+		})
+	}
+}
+
+func TestClientObjectAvailableReportsExternalAuthFailureWithoutToken(t *testing.T) {
+	t.Parallel()
+
+	delivery := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(delivery.Close)
+
+	client := NewClient(BucketConfig{
+		Endpoint:       "https://s3.example.invalid",
+		PublicEndpoint: delivery.URL,
+		Region:         "us-east-1",
+		Bucket:         "silo",
+		AccessKey:      "test",
+		SecretKey:      "test",
+		URLAuth:        URLAuthCloudflareToken,
+		TokenSecret:    "do-not-log-this-secret",
+	})
+
+	available, err := client.ObjectAvailable(t.Context(), client.Bucket(), "poster.webp")
+	if err == nil || available {
+		t.Fatalf("ObjectAvailable() = %v, %v, want false and an auth-path error", available, err)
+	}
+	if strings.Contains(err.Error(), "verify=") || strings.Contains(err.Error(), "do-not-log-this-secret") {
+		t.Fatalf("ObjectAvailable() error leaked delivery credentials: %v", err)
+	}
+}
+
 func TestClientEffectivePresignTTLClampsCloudflareTokenTTL(t *testing.T) {
 	t.Parallel()
 

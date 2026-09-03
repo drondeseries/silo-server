@@ -158,10 +158,11 @@ func (c MatcherConfig) TVSeriesRootQueueEnabled() bool {
 
 // PlaybackConfig holds transcoding and playback settings.
 type PlaybackConfig struct {
-	FFmpegPath       string `yaml:"ffmpeg_path"`
-	TranscodeDir     string `yaml:"transcode_dir"`
-	HWAccel          string `yaml:"hw_accel"`
-	SoftwareFallback string `yaml:"software_fallback"`
+	FFmpegPath              string `yaml:"ffmpeg_path"`
+	TranscodeDir            string `yaml:"transcode_dir"`
+	SegmentRetentionSeconds int    `yaml:"segment_retention_seconds"`
+	HWAccel                 string `yaml:"hw_accel"`
+	SoftwareFallback        string `yaml:"software_fallback"`
 	// HWDevice is the GPU render device for hardware transcodes. A single
 	// path pins every GPU workload to that device; a comma-separated list
 	// (e.g. "/dev/dri/renderD128,/dev/dri/renderD129") balances workloads
@@ -174,12 +175,13 @@ type PlaybackConfig struct {
 	// identical paths on every node; devices absent on a node fall out of
 	// that node's rotation. The admin hw-accel endpoint reports each node's
 	// inventory so the UI can flag divergence.
-	HWDevice                     string `yaml:"hw_device"`
-	ChapterThumbnailWorkers      int    `yaml:"chapter_thumbnail_workers"`
-	ChapterThumbnailExecution    string `yaml:"chapter_thumbnail_execution"`
-	ChapterThumbnailNodeCapacity int    `yaml:"chapter_thumbnail_node_capacity"`
-	TranscodeEnabled             bool   `yaml:"transcode_enabled"`
-	MaxVirtualFailoverAttempts   int    `yaml:"max_virtual_failover_attempts"`
+	HWDevice                     string                `yaml:"hw_device"`
+	ChapterThumbnailWorkers      int                   `yaml:"chapter_thumbnail_workers"`
+	ChapterThumbnailExecution    string                `yaml:"chapter_thumbnail_execution"`
+	ChapterThumbnailNodeCapacity int                   `yaml:"chapter_thumbnail_node_capacity"`
+	TranscodeEnabled             bool                  `yaml:"transcode_enabled"`
+	Routing                      PlaybackRoutingPolicy `yaml:"-"`
+	MaxVirtualFailoverAttempts   int                   `yaml:"max_virtual_failover_attempts"`
 }
 
 // RedisConfig holds Redis connection settings.
@@ -502,6 +504,7 @@ func setDefaults() *configRaw {
 		Playback: PlaybackConfig{
 			FFmpegPath:                   "",
 			TranscodeDir:                 DefaultTranscodeDir,
+			SegmentRetentionSeconds:      600,
 			HWAccel:                      "auto",
 			SoftwareFallback:             "allow",
 			ChapterThumbnailWorkers:      1,

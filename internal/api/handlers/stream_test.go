@@ -17,8 +17,10 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
+	"github.com/Silo-Server/silo-server/internal/streamtoken"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
@@ -29,6 +31,15 @@ type hookedSessionManager struct {
 
 type errStreamFileResolver struct {
 	err error
+}
+
+type countingStreamFileResolver struct {
+	calls int
+}
+
+func (r *countingStreamFileResolver) GetByID(context.Context, int) (*models.MediaFile, error) {
+	r.calls++
+	return nil, errors.New("file lookup must not run")
 }
 
 func (r errStreamFileResolver) GetByID(context.Context, int) (*models.MediaFile, error) {
@@ -277,6 +288,93 @@ func TestBindSessionVirtualSourceUsesPinnedURIAndOwner(t *testing.T) {
 	}
 	if file.FilePath != "virtual://movie/catalog?result=old" || file.VirtualOwnerInstallationID != 7 {
 		t.Fatalf("catalog file mutated: %#v", file)
+	}
+}
+
+func TestHandleStreamRejectsCommittedProxyEgressBeforeFileLookup(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			manager := playback.NewSessionManager(0, 0)
+			manager.RegisterReconstructed(&playback.Session{
+				ID: "proxy-stream", UserID: 1, MediaFileID: 42, PlayMethod: playback.PlayDirect,
+				RoutingWorkload: string(noderouting.WorkloadDirectPlay), RoutingExecution: string(noderouting.ExecutionNone),
+				RoutingEgress: string(noderouting.EgressProxy),
+			})
+			resolver := &countingStreamFileResolver{}
+			handler := NewStreamHandler(manager, resolver)
+			recorder := httptest.NewRecorder()
+			handler.HandleStream(recorder, playbackTestRequest(method, "/api/v1/stream/proxy-stream", nil, map[string]string{"session_id": "proxy-stream"}))
+
+			if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"error":"routing_policy_unsatisfied"`) {
+				t.Fatalf("response = %d %s, want proxy-egress refusal", recorder.Code, recorder.Body.String())
+			}
+			if resolver.calls != 0 {
+				t.Fatalf("file resolver calls = %d, want 0", resolver.calls)
+			}
+		})
+	}
+}
+
+func TestHandleStreamRejectsProxyRecipeBeforeSessionReconstruction(t *testing.T) {
+	const secret = "test-secret"
+	card := playback.NewDirectRecipeCard("lost-proxy-stream", 1, "profile-1", 42)
+	card.RoutingWorkload = string(noderouting.WorkloadDirectPlay)
+	card.RoutingExecution = string(noderouting.ExecutionNone)
+	card.RoutingEgress = string(noderouting.EgressProxy)
+	token, err := streamtoken.Sign(card.ToClaims(), secret, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manager := playback.NewSessionManager(0, 0)
+	resolver := &countingStreamFileResolver{}
+	handler := NewStreamHandler(manager, resolver)
+	handler.JWTSecret = secret
+	recorder := httptest.NewRecorder()
+	handler.HandleStream(recorder, playbackTestRequest(
+		http.MethodGet, "/api/v1/stream/lost-proxy-stream?st="+token, nil,
+		map[string]string{"session_id": "lost-proxy-stream"},
+	))
+
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"error":"routing_policy_unsatisfied"`) {
+		t.Fatalf("response = %d %s, want proxy-egress refusal", recorder.Code, recorder.Body.String())
+	}
+	if resolver.calls != 0 {
+		t.Fatalf("file resolver calls = %d, want 0", resolver.calls)
+	}
+	if _, err := manager.GetSession(card.SessionID); !errors.Is(err, playback.ErrSessionNotFound) {
+		t.Fatalf("proxy recipe reconstructed a native session: %v", err)
+	}
+}
+
+func TestHandleStreamLiveAPIRouteOverridesStaleProxyRecipe(t *testing.T) {
+	const secret = "test-secret"
+	filePath := writePlaybackTestMediaFile(t, "movie.mp4")
+	manager := playback.NewSessionManager(0, 0)
+	manager.RegisterReconstructed(&playback.Session{
+		ID: "replanned-stream", UserID: 1, MediaFileID: 42, PlayMethod: playback.PlayDirect,
+		RoutingWorkload: string(noderouting.WorkloadDirectPlay), RoutingExecution: string(noderouting.ExecutionNone),
+		RoutingEgress: string(noderouting.EgressAPI),
+	})
+	stale := playback.NewDirectRecipeCard("replanned-stream", 1, "profile-1", 42)
+	stale.RoutingWorkload = string(noderouting.WorkloadDirectPlay)
+	stale.RoutingExecution = string(noderouting.ExecutionNone)
+	stale.RoutingEgress = string(noderouting.EgressProxy)
+	token, err := streamtoken.Sign(stale.ToClaims(), secret, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewStreamHandler(manager, testPlaybackFileResolver{file: &models.MediaFile{ID: 42, FilePath: filePath}})
+	handler.JWTSecret = secret
+	recorder := httptest.NewRecorder()
+	handler.HandleStream(recorder, playbackTestRequest(
+		http.MethodGet, "/api/v1/stream/replanned-stream?st="+token, nil,
+		map[string]string{"session_id": "replanned-stream"},
+	))
+
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "video" {
+		t.Fatalf("response = %d %q, want live API route", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -775,6 +873,33 @@ func TestHandleSubtitle_ExternalTextHEADDoesNotLoadTheArtifact(t *testing.T) {
 
 	if rr.Code != http.StatusOK || rr.Body.Len() != 0 || !strings.HasPrefix(rr.Header().Get("Content-Type"), "text/vtt") {
 		t.Fatalf("HEAD status=%d type=%q body=%q", rr.Code, rr.Header().Get("Content-Type"), rr.Body.String())
+	}
+}
+
+func TestHandleSubtitleAllowsAPIAuxiliaryResourceForProxyRoutedSession(t *testing.T) {
+	file := &models.MediaFile{
+		ID:                42,
+		ContentID:         "movie-1",
+		FilePath:          "/missing/movie.mkv",
+		ExternalSubtitles: []models.ExternalSubtitle{{Path: "/missing/movie.en.srt", Language: "eng", Format: "srt"}},
+	}
+	manager := playback.NewSessionManager(0, 0)
+	manager.RegisterReconstructed(&playback.Session{
+		ID: "proxy-subtitle", UserID: 1, MediaFileID: file.ID, PlayMethod: playback.PlayDirect,
+		RoutingWorkload: string(noderouting.WorkloadDirectPlay), RoutingExecution: string(noderouting.ExecutionNone),
+		RoutingEgress: string(noderouting.EgressProxy),
+	})
+	handler := NewStreamHandler(manager, testPlaybackFileResolver{file: file})
+	recorder := httptest.NewRecorder()
+	handler.HandleSubtitle(recorder, playbackTestRequest(
+		http.MethodHead,
+		"/api/v1/stream/proxy-subtitle/subtitles/0.vtt",
+		nil,
+		map[string]string{"session_id": "proxy-subtitle", "track": "0.vtt"},
+	))
+
+	if recorder.Code != http.StatusOK || recorder.Body.Len() != 0 || !strings.HasPrefix(recorder.Header().Get("Content-Type"), "text/vtt") {
+		t.Fatalf("HEAD status=%d type=%q body=%q", recorder.Code, recorder.Header().Get("Content-Type"), recorder.Body.String())
 	}
 }
 

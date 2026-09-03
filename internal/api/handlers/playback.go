@@ -27,6 +27,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/markers"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
+	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
@@ -37,6 +38,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
+	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 	"github.com/Silo-Server/silo-server/internal/watchstate"
 	"github.com/Silo-Server/silo-server/internal/watchsync"
@@ -131,7 +133,8 @@ type PlaybackFileVersionFetcher interface {
 }
 
 type PlaybackProbeEnsurer interface {
-	Ensure(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
+	EnsureProbeOnly(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
+	EnsureCopySafetyCached(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
 }
 
 type PlaybackChapterThumbnailQueuer interface {
@@ -275,21 +278,22 @@ type PlaybackHandler struct {
 	// authorized_media_origins_v1 simply stays on the API origin.
 	ProxyGrantStore recipeCardStoreV3
 	// NodeRecipeStore hands a transcode node the recipe it rebuilds a
-	// header-authenticated remote transcode from after its own restart.
-	// Optional and best effort; without it such a session replans instead of
-	// recovering, exactly as before.
-	NodeRecipeStore recipeCardStoreV3
-	ItemAccess      PlaybackItemAccessChecker // optional; enables file authorization checks
-	ItemLookup      PlaybackItemLookup
-	EpisodeLookup   PlaybackEpisodeLookup // optional; resolves episode files to their series
-
+	// header-authenticated remote transcode from after its own restart, keyed by
+	// the transport id the node serves it under. It is also the active authority
+	// for transcode-executed progressive remuxes, whose signed tokens otherwise
+	// outlive a node's in-memory stop fence. Without a usable store those remuxes
+	// use another legal route; tokenless HLS sessions replan instead of recovering.
+	NodeRecipeStore    recipeCardStoreV3
+	ItemAccess         PlaybackItemAccessChecker // optional; enables file authorization checks
+	ItemLookup         PlaybackItemLookup
+	EpisodeLookup      PlaybackEpisodeLookup     // optional; resolves episode files to their series
 	// virtualSticky remembers the last virtual candidate URI that played
 	// successfully per content key, so candidate rotation between equally
 	// ranked releases cannot churn a viewer's session (and invalidate cached
 	// client track identities) while the pinned source stays healthy.
 	virtualStickyMu    sync.Mutex
 	virtualStickyPins  map[string]virtualStickyPin
-	ExtraLookup        PlaybackExtraLookup // optional; resolves extras files to their parent item
+	ExtraLookup        PlaybackExtraLookup       // optional; resolves extras files to their parent item
 	OriginalLangLookup PlaybackOriginalLanguageLookup
 	SettingsRepo       PlaybackSettingsReader     // optional; reads server settings (e.g., allow_4k_transcode)
 	FileVersionFetcher PlaybackFileVersionFetcher // optional; queries sibling file versions for 4K guard
@@ -334,11 +338,14 @@ type PlaybackHandler struct {
 	// hwaccel, transcode dir). Wired to the live config in integrated mode
 	// so admin changes apply to newly started transcodes. Read it through
 	// playbackConfig(), which falls back to defaults when unset.
-	PlaybackConfig    func() config.PlaybackConfig
-	FFmpegLogSink     playback.FFmpegLogSink
-	copySeekAnchor    copySeekAnchorResolver
-	realtimeCommandMu sync.Mutex
-	realtimeCommands  map[string]playbackCommandRecord
+	PlaybackConfig func() config.PlaybackConfig
+	FFmpegLogSink  playback.FFmpegLogSink
+	copySeekAnchor copySeekAnchorResolver
+	// beforeIdentityLifecycleLockV3 is a test seam for proving that identity
+	// route authority remains unpublished until the shared lifecycle boundary.
+	beforeIdentityLifecycleLockV3 func()
+	realtimeCommandMu             sync.Mutex
+	realtimeCommands              map[string]playbackCommandRecord
 	// tm owns the transcode-session lifecycle (live map, recipe cards, and
 	// restart reconstruct) shared with the jellycompat handler. The handler
 	// delegates all transcode-session and recipe operations to it.
@@ -413,10 +420,11 @@ func NewPlaybackHandler(sessionMgr SessionManagerInterface, opts ...FilePathReso
 	h.tm.Config = func() playback.TranscodeRuntimeConfig {
 		c := h.playbackConfig()
 		return playback.TranscodeRuntimeConfig{
-			TranscodeDir: c.TranscodeDir,
-			FFmpegPath:   c.FFmpegPath,
-			HWAccel:      c.HWAccel,
-			HWDevice:     c.HWDevice,
+			TranscodeDir:            c.TranscodeDir,
+			FFmpegPath:              c.FFmpegPath,
+			HWAccel:                 c.HWAccel,
+			HWDevice:                c.HWDevice,
+			SegmentRetentionSeconds: c.SegmentRetentionSeconds,
 		}
 	}
 	h.tm.StartThrottler = func(ctx context.Context, ts *playback.TranscodeSession) {
@@ -494,6 +502,7 @@ func (h *PlaybackHandler) playbackConfig() config.PlaybackConfig {
 	return config.PlaybackConfig{
 		TranscodeEnabled: true,
 		TranscodeDir:     filepath.Join(os.TempDir(), "silo-transcode"),
+		Routing:          config.DefaultPlaybackRoutingPolicy(),
 	}
 }
 
@@ -546,7 +555,7 @@ func (h *PlaybackHandler) ensurePlaybackProbe(ctx context.Context, file *models.
 	if h == nil || h.ProbeEnsurer == nil || file == nil {
 		return file
 	}
-	repaired, err := h.ProbeEnsurer.Ensure(ctx, file)
+	repaired, err := h.ProbeEnsurer.EnsureCopySafetyCached(ctx, file)
 	if err != nil {
 		slog.WarnContext(ctx, "playback probe repair failed", "component", "api", "file_id", file.ID, "path", file.FilePath, "error", err)
 		return file
@@ -582,10 +591,19 @@ func (h *PlaybackHandler) signSessionToken(card playback.RecipeCard, requireMedi
 // RecipeCard does not model (the file's Dolby Vision profile, audio-only flag),
 // which a remote executor cannot look up for itself.
 // PlaybackCopySafetyRacer resolves an unknown H.264 copy-safety verdict out of
-// band behind an already-issued plan. *playback.CopySafetyRace implements it;
-// unused on this fork's wiring (nil), kept for upstream parity.
+// band, after a plan that stream-copies video has already been issued.
+// *playback.CopySafetyRace implements it.
 type PlaybackCopySafetyRacer interface {
 	RaceScanForPlan(fileID int, plan *playback.PlanV3)
+	// RaceScan re-engages the race for a file whose verdict is still open. The
+	// serve paths use it when they revive a stream-copy transport: the replica
+	// that planned it may be gone, and only a race running *here* can withdraw
+	// the route from the session this replica just rebuilt.
+	RaceScan(fileID int)
+	// VideoCopyUnsafeKnown answers, without ffmpeg and without waiting, whether
+	// this replica can already condemn a video stream-copy of the file —
+	// including from a verdict whose write to the row failed.
+	VideoCopyUnsafeKnown(ctx context.Context, file *models.MediaFile) bool
 }
 
 func (h *PlaybackHandler) signStreamClaims(claims streamtoken.Claims) string {
@@ -629,12 +647,24 @@ func (h *PlaybackHandler) loadTranscodeServeSession(r *http.Request, sessionID s
 		if requestUserID != 0 && session.UserID != requestUserID {
 			return nil, playback.SessionForbidden, nil, nil, nil
 		}
+		// A non-API or incomplete route is returned to the handler for the
+		// committed-egress guard below. Do not rebuild a local runtime first:
+		// even discarded output would cross the route's execution boundary.
+		if nativeAPIEgressStatusV3(session.RoutingWorkload, session.RoutingExecution, session.RoutingEgress) != 0 {
+			return session, playback.SessionLoaded, nil, nil, nil
+		}
 		if session.TranscodeNodeURL == "" && h.tm.GetTranscodeSession(sessionID) == nil {
 			// A live session whose runtime died can recover from the client's
 			// recipe token. Tone-mapped cards may back a provisional capability
 			// reconstruction; plain cards just respawn the encode. Either way the
 			// atomic playback+runtime operation is the same front door.
 			card, claims := verifiedStreamCardFromToken(r.URL.Query().Get(streamTokenParam), sessionID, h.JWTSecret)
+			if card != nil && nativeAPIEgressStatusV3(card.RoutingWorkload, card.RoutingExecution, card.RoutingEgress) != 0 {
+				// The live session may have been replanned since this token was
+				// issued. Its API assignment is authoritative; a stale proxy card
+				// cannot revive the old runtime on this origin.
+				return session, playback.SessionLoaded, nil, nil, nil
+			}
 			if card != nil {
 				session, _, status, reconstructErr := h.tm.LoadOrReconstructTranscodeWithError(r.Context(), h.sessionMgr.GetSession, sessionID, requestUserID, requestedSegment, card)
 				return session, status, card, claims, reconstructErr
@@ -648,6 +678,23 @@ func (h *PlaybackHandler) loadTranscodeServeSession(r *http.Request, sessionID s
 	// Genuine miss (e.g. after a restart): now — and only now — pay for the token
 	// decode so the recipe is available for reconstruction.
 	card, claims := verifiedStreamCardFromToken(r.URL.Query().Get(streamTokenParam), sessionID, h.JWTSecret)
+	if card != nil {
+		if routeStatus := nativeAPIEgressStatusV3(card.RoutingWorkload, card.RoutingExecution, card.RoutingEgress); routeStatus != 0 {
+			return nil, playback.SessionUnavailable, card, claims, &nativeRouteBindingErrorV3{status: routeStatus}
+		}
+	}
+	// The copy-safety verdict gates the revival before it happens, not after.
+	// Reconstruction registers the playback session against the user's stream
+	// caps, so a refusal that ran later would leave a session nobody serves
+	// holding an admission slot the client's fresh attempt needs — and a
+	// remote-node recipe never reaches the local transport reconstruct at all
+	// (the serve handlers proxy to the node instead), so a gate down there would
+	// miss it entirely. A revival the verdict does not condemn re-engages the
+	// race here, so the session about to be rebuilt is covered by a race this
+	// replica owns. See playback_copy_safety.go.
+	if videoCopyReconstructRefused(r.Context(), h.fileResolver, h.CopySafetyRacer, card) {
+		return nil, playback.SessionMissing, nil, nil, nil
+	}
 	if card != nil && card.ToneMapMode != "" {
 		session, _, status, reconstructErr := h.tm.LoadOrReconstructTranscodeWithError(r.Context(), h.sessionMgr.GetSession, sessionID, requestUserID, requestedSegment, card)
 		return session, status, card, claims, reconstructErr
@@ -686,6 +733,74 @@ func verifiedStreamCardFromToken(tokenStr, sessionID, secret string) (*playback.
 	return &card, claims
 }
 
+// requireNativeAPIEgressV3 enforces the origin frozen into a v3 playback
+// assignment. Empty assignments predate node routing and remain API-compatible;
+// a partially populated assignment is a failed commit and must not fail open.
+func requireNativeAPIEgressV3(w http.ResponseWriter, workload, execution, egress string) bool {
+	status := nativeAPIEgressStatusV3(workload, execution, egress)
+	if status == 0 {
+		return true
+	}
+	writeNativeRouteStatusV3(w, status)
+	return false
+}
+
+func writeNativeRouteStatusV3(w http.ResponseWriter, status int) {
+	switch status {
+	case http.StatusConflict:
+		writeError(w, status, "playback_route_unbound", "Request a new playback plan before serving media")
+	default:
+		writeError(w, status, string(noderouting.OutcomePolicyUnsatisfied), "The media request does not match the route bound by the playback plan")
+	}
+}
+
+func nativeAPIEgressStatusV3(workload, execution, egress string) int {
+	workload = strings.TrimSpace(workload)
+	execution = strings.TrimSpace(execution)
+	egress = strings.TrimSpace(egress)
+	if workload == "" && execution == "" && egress == "" {
+		return 0
+	}
+	if workload == "" || execution == "" || egress == "" {
+		return http.StatusConflict
+	}
+	if egress != string(noderouting.EgressAPI) {
+		return http.StatusServiceUnavailable
+	}
+	return 0
+}
+
+func requireNativeSessionAPIEgressV3(w http.ResponseWriter, session *playback.Session) bool {
+	if session == nil {
+		return false
+	}
+	return requireNativeAPIEgressV3(w, session.RoutingWorkload, session.RoutingExecution, session.RoutingEgress)
+}
+
+func requireNativeRecipeAPIEgressV3(w http.ResponseWriter, card *playback.RecipeCard) bool {
+	if card == nil {
+		return true
+	}
+	return requireNativeAPIEgressV3(w, card.RoutingWorkload, card.RoutingExecution, card.RoutingEgress)
+}
+
+type nativeRouteBindingErrorV3 struct {
+	status int
+}
+
+func (e *nativeRouteBindingErrorV3) Error() string {
+	return "media request does not match its bound playback route"
+}
+
+func writeNativeRouteBindingErrorV3(w http.ResponseWriter, err error) bool {
+	var routeErr *nativeRouteBindingErrorV3
+	if !errors.As(err, &routeErr) {
+		return false
+	}
+	writeNativeRouteStatusV3(w, routeErr.status)
+	return true
+}
+
 // attachPlaybackSession stamps the stream-telemetry context with the session's
 // identity and start-time provenance for every serve request that reaches it.
 func attachPlaybackSession(ctx context.Context, session *playback.Session, claims *streamtoken.Claims) {
@@ -718,21 +833,6 @@ func attachPlaybackSession(ctx context.Context, session *playback.Session, claim
 		ProfileID: session.ProfileID, SessionID: session.ID, MediaFileID: session.MediaFileID,
 		PlayMethod: string(session.PlayMethod), StartedAt: startedAt, StartedAtSource: startedSource,
 		TokenIssuedAt: tokenIssuedAt, TokenIssuedAtSource: tokenSource})
-}
-
-// reconstructTransportForServe rebuilds a lost local transport from the token
-// recipe for the manifest and segment serve routes. A nil card yields a nil
-// result, which is the caller's not-found: to a client, a recipe it cannot
-// present and a recipe that no longer rebuilds are the same thing.
-//
-// The returned error carries a tone-map execution failure so the serve handler
-// can render it as a 422 instead of a generic not-found; it is nil for every
-// other rebuild outcome, including a plain miss.
-func (h *PlaybackHandler) reconstructTransportForServe(ctx context.Context, sessionID string, requestedSegment int, card *playback.RecipeCard) (*playback.TranscodeSession, error) {
-	if card == nil {
-		return nil, nil
-	}
-	return h.tm.ReconstructTranscodeWithError(ctx, sessionID, requestedSegment, *card)
 }
 
 // appendStreamToken adds the ?st=<token> parameter to a native serve URL.
@@ -788,6 +888,13 @@ func identityRecipeCard(s *playback.Session) playback.RecipeCard {
 		card = playback.NewDirectRecipeCard(s.ID, s.UserID, s.ProfileID, s.MediaFileID)
 	}
 	card.OriginalStartedAt = s.StartedAt
+	card.RoutingWorkload = s.RoutingWorkload
+	card.RoutingExecution = s.RoutingExecution
+	card.RoutingExecutionNodeID = s.RoutingExecutionNodeID
+	card.RoutingEgress = s.RoutingEgress
+	card.RoutingEgressNodeID = s.RoutingEgressNodeID
+	card.TranscodeNodeURL = s.TranscodeNodeURL
+	card.TranscodeTransportID = s.TranscodeTransportID
 	return card
 }
 
@@ -1606,6 +1713,9 @@ func (h *PlaybackHandler) HandleGetTranscodeManifest(w http.ResponseWriter, r *h
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
 		return
 	case playback.SessionUnavailable:
+		if writeNativeRouteBindingErrorV3(w, reconstructErr) {
+			return
+		}
 		if writePlaybackToneMapExecutionError(w, reconstructErr) {
 			return
 		}
@@ -1620,7 +1730,9 @@ func (h *PlaybackHandler) HandleGetTranscodeManifest(w http.ResponseWriter, r *h
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "Transcode session is temporarily unavailable")
 		return
 	}
-
+	if !requireNativeSessionAPIEgressV3(w, session) {
+		return
+	}
 	attachPlaybackSession(r.Context(), session, claims)
 
 	transcodeSession := h.tm.GetTranscodeSession(sessionID)
@@ -1722,6 +1834,9 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
 		return
 	case playback.SessionUnavailable:
+		if writeNativeRouteBindingErrorV3(w, reconstructErr) {
+			return
+		}
 		if writePlaybackToneMapExecutionError(w, reconstructErr) {
 			return
 		}
@@ -1736,7 +1851,9 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "Transcode session is temporarily unavailable")
 		return
 	}
-
+	if !requireNativeSessionAPIEgressV3(w, session) {
+		return
+	}
 	attachPlaybackSession(r.Context(), session, claims)
 
 	transcodeSession := h.tm.GetTranscodeSession(sessionID)
@@ -1764,7 +1881,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	h.touchSessionActivity(sessionID)
 
 	segmentName := chi.URLParam(r, "name")
-	segmentPath, err := transcodeSession.GetSegment(segmentName)
+	segmentLease, err := transcodeSession.OpenSegment(segmentName)
 	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 		segNum, parseErr := playback.ParseSegmentNumber(segmentName)
 		if parseErr == nil {
@@ -1801,7 +1918,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 					"session", sessionID,
 					"playback_session_id", sessionID,
 				)
-				segmentPath, err = transcodeSession.WaitForSegment(segmentName, decision.WaitTimeout)
+				segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
 				if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "api",
 						"segment", segmentName,
@@ -1824,9 +1941,14 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 			// timeline position or return 404 for copy-mode segments outside the
 			// current manifest window.
 			if err != nil && errors.Is(err, playback.ErrSegmentNotFound) && decision.RestartOnTimeout {
-				seekSeconds, ok, seekErr := transcodeSession.RestartSeekTarget(segNum)
-				if seekErr != nil && !errors.Is(seekErr, playback.ErrManifestNotReady) {
-					slog.ErrorContext(r.Context(), "resolve transcode seek target", "component", "api", "error", seekErr, "segment", segmentName, "session", sessionID, "playback_session_id", sessionID)
+				target, ok, restartErr := h.tm.RestartSegmentLocked(
+					r.Context(),
+					sessionID,
+					transcodeSession,
+					segNum,
+				)
+				if restartErr != nil && !errors.Is(restartErr, playback.ErrManifestNotReady) {
+					slog.ErrorContext(r.Context(), "restart transcode at missing segment", "component", "api", "error", restartErr, "segment", segmentName, "session", sessionID, "playback_session_id", sessionID)
 				}
 
 				// Copy-mode with an unresolved seek target (ok=false, no error)
@@ -1835,11 +1957,13 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 				// client retries while the session keeps producing manifest.
 				// Mirrors the transcode-node guard in
 				// internal/transcodenode/server.go.
-				if !ok && seekErr == nil && transcodeSession.IsCopyVideo() {
+				if !ok && restartErr == nil && transcodeSession.IsCopyVideo() {
 					err = playback.ErrSegmentNotFound
 				}
 
-				if ok {
+				if restartErr != nil {
+					err = restartErr
+				} else if ok {
 					slog.InfoContext(r.Context(), "transcode seek restart", "component", "api",
 						"segment", segmentName,
 						"requested_segment", segNum,
@@ -1850,38 +1974,32 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 						"wait_timeout_ms", decision.WaitTimeout.Milliseconds(),
 						"restart_on_timeout", decision.RestartOnTimeout,
 						"reason", decision.Reason,
-						"seek_seconds", seekSeconds,
+						"seek_seconds", target.SeekSeconds,
+						"stream_origin_seconds", target.StreamOriginSeconds,
+						"resolved_start_segment", target.StartSegmentNumber,
 						"session", sessionID,
 						"playback_session_id", sessionID,
 					)
-					if restartErr := h.tm.RestartSessionLocked(
-						r.Context(),
-						sessionID,
-						transcodeSession,
-						seekSeconds,
-						segNum,
-					); restartErr == nil {
-						// Throttler + exit monitor re-arm via the session's
-						// restart hook.
-						segmentPath, err = transcodeSession.WaitForSegment(segmentName, 30*time.Second)
-						if err == nil && strings.EqualFold(transcodeSession.Opts().TargetCodecVideo, "copy") {
-							// Copy-mode seeks can resume as soon as the target segment
-							// exists, but that sometimes leaves the player one segment
-							// away from stalling while FFmpeg catches up. Briefly wait
-							// for a single lookahead fragment when available so the
-							// first resumed playback window is less brittle.
-							nextSegmentName := fmt.Sprintf("seg_%05d.m4s", segNum+1)
-							_, _ = transcodeSession.WaitForSegment(nextSegmentName, 1200*time.Millisecond)
+					// Throttler + exit monitor re-arm via the session's
+					// restart hook.
+					segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, 30*time.Second)
+					if err == nil && strings.EqualFold(transcodeSession.Opts().TargetCodecVideo, "copy") {
+						// Copy-mode seeks can resume as soon as the target segment
+						// exists, but that sometimes leaves the player one segment
+						// away from stalling while FFmpeg catches up. Briefly wait
+						// for a single lookahead fragment when available so the
+						// first resumed playback window is less brittle.
+						nextSegmentName := fmt.Sprintf("seg_%05d%s", segNum+1, filepath.Ext(segmentName))
+						if nextSegment, nextErr := transcodeSession.WaitForOpenSegment(nextSegmentName, 1200*time.Millisecond); nextErr == nil {
+							_ = nextSegment.Close()
 						}
-					} else {
-						err = restartErr
 					}
 				}
 			}
 		} else if transcodeSession.IsRunning() {
 			// Non-numbered segment (e.g., init.mp4 for fMP4 HLS).
 			// Wait briefly — the init segment is written almost immediately.
-			segmentPath, err = transcodeSession.WaitForSegment(segmentName, 10*time.Second)
+			segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, 10*time.Second)
 		}
 	}
 	if err != nil {
@@ -1896,14 +2014,17 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// Report segment download for throttle tracking.
-	if segNum, parseErr := playback.ParseSegmentNumber(segmentName); parseErr == nil {
-		transcodeSession.ReportSegmentDownloaded(segNum)
-	}
-
 	w.Header().Set("Cache-Control", "no-store, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
-	http.ServeFile(w, r, segmentPath)
+	defer func() { _ = segmentLease.Close() }()
+	sw := httpstream.NewRollingDeadlineWriter(w)
+	http.ServeContent(sw, r, segmentLease.Info.Name(), segmentLease.Info.ModTime(), segmentLease.File)
+	if r.Method == http.MethodGet &&
+		sw.CompletedFullResponse(segmentLease.Info.Size()) {
+		if segNum, parseErr := playback.ParseSegmentNumber(segmentName); parseErr == nil {
+			transcodeSession.ReportSegmentDownloadedForGeneration(segNum, segmentLease.Generation)
+		}
+	}
 }
 
 // buildProxyManifestURL signs a stream token carrying the session's full
@@ -1911,11 +2032,12 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 // pick; when nil the URL falls back to the API-local path, where the token rides
 // the ?st= query parameter so the integrated server can reconstruct from it.
 func (h *PlaybackHandler) buildProxyManifestURL(card playback.RecipeCard, proxyNode *nodepool.Node, requireMediaAuth bool) string {
-	token := h.signSessionToken(card, requireMediaAuth)
 	localURL := fmt.Sprintf("/playback/transcode/%s/master.m3u8", card.SessionID)
 	if proxyNode == nil {
-		return appendStreamToken(localURL, token)
+		return appendStreamToken(localURL, h.signSessionToken(card, requireMediaAuth))
 	}
+	card.RoutingEgressNodeID = proxyNode.ID
+	token := h.signSessionToken(card, requireMediaAuth)
 	if token == "" {
 		return localURL
 	}
@@ -1926,6 +2048,9 @@ func (h *PlaybackHandler) buildProxyManifestURL(card playback.RecipeCard, proxyN
 func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, transcodeNodeURL, path string) {
 	sessionID := chi.URLParam(r, "session_id")
 	targetURL := transcodeNodeURL + path
+	isSegmentRoute := strings.Contains(path, "/segment/")
+	_, segmentParseErr := playback.ParseSegmentNumber(filepath.Base(path))
+	isMediaSegment := segmentParseErr == nil
 	// Capture the signed stream token ("st") before stripping it from the URL.
 	// We forward it out-of-band as a header so the node can reconstruct after a
 	// self-restart, while keeping it out of the forwarded/logged URL.
@@ -1945,6 +2070,14 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+h.JWTSecret)
+	if isSegmentRoute {
+		// The node's immediate transport peer is this API process, so receiving a
+		// complete response there does not prove that the browser received it.
+		// Suppress node-local accounting and acknowledge only after the downstream
+		// writer completes. Forward range validators so both hops serve the same
+		// representation.
+		transcodeproxy.PrepareRequest(req, r)
+	}
 	// Best-effort forward of the stream token as a header so the node's
 	// reconstruct path (X-Silo-Stream-Token) can rebuild after a self-restart.
 	// Verify at the API boundary and confirm it belongs to this session; an
@@ -1968,7 +2101,7 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 		http.Error(w, "transcode node unavailable", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// The node strips "st" from the request query (kept out of node URLs/logs),
 	// so the segment/init URIs in the manifest it builds carry no token. Without
@@ -1998,16 +2131,22 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
+	generation := resp.Header.Get(transcodeproxy.GenerationHeader)
+	transcodeproxy.CopyResponseHeaders(w.Header(), resp.Header)
 	// Proxied transcode output can stream past the server's absolute
 	// WriteTimeout; roll the write deadline with progress instead.
 	sw := httpstream.NewRollingDeadlineWriter(w)
 	sw.WriteHeader(resp.StatusCode)
-	io.Copy(sw, resp.Body)
+	if _, copyErr := io.Copy(sw, resp.Body); copyErr != nil {
+		return
+	}
+	fullSize := transcodeproxy.FullRepresentationSize(resp)
+	if isMediaSegment && generation != "" && r.Method == http.MethodGet &&
+		sw.CompletedFullResponse(fullSize) {
+		if ackErr := transcodeproxy.Acknowledge(r.Context(), http.DefaultClient, transcodeNodeURL+path, h.JWTSecret, generation); ackErr != nil {
+			slog.WarnContext(r.Context(), "acknowledge transcode segment completion", "component", "api", "error", ackErr, "playback_session_id", sessionID)
+		}
+	}
 }
 
 // maybeStartThrottler reads throttle settings and starts the throttler if enabled.

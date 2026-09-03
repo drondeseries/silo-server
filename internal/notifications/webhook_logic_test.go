@@ -485,6 +485,33 @@ func TestGenericWebhookPayloadRequestDeclined(t *testing.T) {
 	}
 }
 
+func TestRequestApprovedPreservesPosterPath(t *testing.T) {
+	row := DeliveryRow{
+		Delivery: Delivery{
+			ID:        "01APPROVED",
+			ProfileID: "profile-1",
+			Type:      DeliveryTypeRequestApproved,
+			ReasonFlags: []byte(`{"request_id":"01REQ","tmdb_id":3683,"media_type":"movie",` +
+				`"title":"The Silence of the Lambs","year":1991,"poster_path":"/2nkPrhf4YIyMFelfe4zdOnGRYz5.jpg"}`),
+			CreatedAt: time.Date(2026, 8, 17, 17, 48, 49, 0, time.UTC),
+		},
+	}
+	payload := PayloadForRow(row)
+	if payload.PosterPath != "/2nkPrhf4YIyMFelfe4zdOnGRYz5.jpg" {
+		t.Fatalf("PayloadForRow PosterPath = %q, want /2nkPrhf4YIyMFelfe4zdOnGRYz5.jpg", payload.PosterPath)
+	}
+
+	sys := &System{images: fakePresigner{}}
+	sysPayload := sys.PayloadForRow(t.Context(), row)
+	if sysPayload.PosterPath != "/2nkPrhf4YIyMFelfe4zdOnGRYz5.jpg" {
+		t.Fatalf("System.PayloadForRow PosterPath = %q, want /2nkPrhf4YIyMFelfe4zdOnGRYz5.jpg", sysPayload.PosterPath)
+	}
+	wantURL := "https://image.tmdb.org/t/p/w500/2nkPrhf4YIyMFelfe4zdOnGRYz5.jpg"
+	if sysPayload.PosterURL != wantURL {
+		t.Fatalf("System.PayloadForRow PosterURL = %q, want %q", sysPayload.PosterURL, wantURL)
+	}
+}
+
 func TestBuildDiscordWebhookPayloadTestMarker(t *testing.T) {
 	payload, err := BuildDiscordWebhookPayload(webhookTestRow(), true)
 	if err != nil {

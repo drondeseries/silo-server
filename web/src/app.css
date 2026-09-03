@@ -96,6 +96,8 @@
   --duration-drift: 2000ms;
   /* Sidebar immersion collapse — see `.sidebar-surface`. */
   --duration-sidebar-collapse: 300ms;
+  --duration-sidebar-entry: 340ms;
+  --duration-sidebar-return: 340ms;
 
   /* ── Motion: Easing ────────────────────────────────────────── */
   --ease-default: cubic-bezier(0.4, 0, 0.2, 1);
@@ -320,6 +322,36 @@ html[data-navigation-direction="forward"] {
 html[data-navigation-direction="back"] {
   --nav-slide-shift: 24px;
 }
+
+/* Cold Home entry and return share one perceived speed. Cached entries leave
+   this marker off so their ready detail tree is never held behind this beat. */
+html[data-home-item-entry="true"] {
+  --duration-sidebar-collapse: var(--duration-sidebar-entry);
+}
+html[data-navigation-direction="back"][data-home-item-return="true"] {
+  --duration-sidebar-collapse: var(--duration-sidebar-return);
+}
+
+@keyframes home-item-detail-reveal {
+  from {
+    opacity: 0.35;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* A cold Home item entry uses fixed, solid boxes while the sidebar moves.
+   They never pulse or request artwork, and disappear before the real hero's
+   bounded poster/copy group settles. The page surface itself stays opaque. */
+.home-item-transition-block {
+  background: var(--surface);
+  border-color: var(--border);
+}
+
+html[data-home-item-entry="true"] .detail-hero-primary-content {
+  animation: var(--duration-normal) var(--ease-out) both home-item-detail-reveal;
+}
 html[data-navigation-direction]::view-transition-old(main-content) {
   animation: var(--duration-sidebar-collapse) var(--ease-sidebar-collapse) both nav-slide-out;
 }
@@ -346,11 +378,16 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     --duration-glacial: 0ms;
     --duration-slow: 150ms;
     --duration-sidebar-collapse: 0ms;
+    --duration-sidebar-entry: 0ms;
+    --duration-sidebar-return: 0ms;
     --animate-ken-burns-a: none;
     --animate-ken-burns-b: none;
   }
   .ambient-glow {
     transition: none;
+  }
+  .detail-hero-primary-content {
+    animation: none !important;
   }
   /* Collapsing the sidebar becomes an instant state change: the frame, the
      content under it, and everything cross-fading inside all stop animating. */
@@ -2098,6 +2135,16 @@ html[data-navigation-direction]::view-transition-new(main-content) {
     border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
     border-radius: 1.7rem;
     box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.04);
+  }
+
+  /* Search controls repaint on the hottest route in the app. Keep them on the
+     same opaque paint surface as the page: no backdrop sampling, alpha blend,
+     or blur layer needs to be recomposited while results replace underneath. */
+  .search-paint-surface {
+    background: var(--background);
+    border-color: color-mix(in srgb, var(--border) 72%, transparent);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
   }
 
   /* Panel chrome only once there is a sidebar to enclose. Below this the

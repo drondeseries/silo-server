@@ -57,12 +57,7 @@ func buildWebPushPayload(row DeliveryRow, posterURL string) ([]byte, error) {
 		URL:        display.URL,
 		Tag:        row.ID,
 		DeliveryID: row.ID,
-	}
-	switch row.Type {
-	case DeliveryTypeEpisodeAvailable:
-		payload.Icon = posterURL
-	case DeliveryTypeRequestFulfilled:
-		payload.Icon = posterURL
+		Icon:       posterURL,
 	}
 	return json.Marshal(payload)
 }
