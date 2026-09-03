@@ -151,4 +151,4 @@ require (
 
 replace github.com/zishang520/webtransport-go => ./internal/compat/zishang520-webtransport-go
 
-replace github.com/Silo-Server/silo-plugin-sdk => github.com/drondeseries/silo-plugin-sdk v0.13.2-virtual.2
+replace github.com/Silo-Server/silo-plugin-sdk => github.com/drondeseries/silo-plugin-sdk v0.15.0-virtual.1
