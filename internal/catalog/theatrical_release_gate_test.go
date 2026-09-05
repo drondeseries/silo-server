@@ -33,24 +33,24 @@ func TestTheatricalReleaseGateSkipsTheatricalOnlyMovies(t *testing.T) {
 	gate := newTheatricalReleaseGate(checker)
 	ctx := context.Background()
 
-	if !gate.skipTheatricalMovie(ctx, 100, "Theatrical Movie") {
+	if !gate.skipTheatricalMovie(ctx, 100, "Theatrical Movie", 0, "") {
 		t.Fatal("a theatrical-only movie must be skipped")
 	}
-	if gate.skipTheatricalMovie(ctx, 200, "Digital Movie") {
+	if gate.skipTheatricalMovie(ctx, 200, "Digital Movie", 0, "") {
 		t.Fatal("a digitally released movie must not be skipped")
 	}
 }
 
 func TestTheatricalReleaseGateFailsOpen(t *testing.T) {
 	gate := newTheatricalReleaseGate(&fakeDigitalReleaseChecker{err: errors.New("tmdb down")})
-	if gate.skipTheatricalMovie(context.Background(), 300, "Outage Movie") {
+	if gate.skipTheatricalMovie(context.Background(), 300, "Outage Movie", 0, "") {
 		t.Fatal("a checker failure must fail open (materialize)")
 	}
 
 	var nilChecker *fakeDigitalReleaseChecker
 	failingGate := newTheatricalReleaseGate(nil)
 	_ = nilChecker
-	if failingGate.skipTheatricalMovie(context.Background(), 300, "No Checker") {
+	if failingGate.skipTheatricalMovie(context.Background(), 300, "No Checker", 0, "") {
 		t.Fatal("a nil checker must fail open")
 	}
 }
@@ -58,7 +58,7 @@ func TestTheatricalReleaseGateFailsOpen(t *testing.T) {
 func TestTheatricalReleaseGateSkipsLookupWithoutTMDBID(t *testing.T) {
 	checker := &fakeDigitalReleaseChecker{released: map[int]bool{}}
 	gate := newTheatricalReleaseGate(checker)
-	if gate.skipTheatricalMovie(context.Background(), 0, "No TMDB ID") {
+	if gate.skipTheatricalMovie(context.Background(), 0, "No TMDB ID", 0, "") {
 		t.Fatal("entries without a TMDB ID must fall through to the date gates")
 	}
 	if len(checker.calls) != 0 {
@@ -72,12 +72,37 @@ func TestTheatricalReleaseGateMemoizesLookupsPerRun(t *testing.T) {
 	ctx := context.Background()
 
 	for range 3 {
-		if !gate.skipTheatricalMovie(ctx, 400, "Memoized") {
+		if !gate.skipTheatricalMovie(ctx, 400, "Memoized", 0, "") {
 			t.Fatal("theatrical-only movie must be skipped on every call")
 		}
 	}
 	if checker.calls[400] != 1 {
 		t.Fatalf("checker calls = %d, want 1 (memoized per sync run)", checker.calls[400])
+	}
+}
+
+func TestTheatricalReleaseGateBypassesBacklogMoviesWithoutTMDBQuery(t *testing.T) {
+	checker := &fakeDigitalReleaseChecker{released: map[int]bool{
+		500: false, // would be theatrical-only if checked, but it's a 2010 movie!
+	}}
+	gate := newTheatricalReleaseGate(checker)
+	ctx := context.Background()
+
+	// Year in 2010 (backlog movie) must bypass TMDB and never be skipped
+	if gate.skipTheatricalMovie(ctx, 500, "Inception", 2010, "2010-07-16") {
+		t.Fatal("backlog movie from 2010 must not be skipped as theatrical-only")
+	}
+	if len(checker.calls) != 0 {
+		t.Fatalf("checker calls = %d, want 0 for backlog movie", len(checker.calls))
+	}
+
+	// Release date > 180 days ago must also bypass TMDB
+	oldDate := time.Now().UTC().AddDate(0, 0, -200).Format("2006-01-02")
+	if gate.skipTheatricalMovie(ctx, 500, "Old Movie", 0, oldDate) {
+		t.Fatal("movie older than 180 days must not be skipped as theatrical-only")
+	}
+	if len(checker.calls) != 0 {
+		t.Fatalf("checker calls = %d, want 0 for movie older than 180 days", len(checker.calls))
 	}
 }
 
@@ -227,7 +252,7 @@ func TestTheatricalReleaseGateLookupContextCanceledFailsOpen(t *testing.T) {
 			return false, ctx.Err()
 		},
 	})
-	if gate.skipTheatricalMovie(ctx, 300, "Canceled Context") {
+	if gate.skipTheatricalMovie(ctx, 300, "Canceled Context", 0, "") {
 		t.Fatal("a checker context cancellation must fail open (not skip)")
 	}
 }
@@ -238,7 +263,7 @@ func TestTheatricalReleaseGateNilContextDoesNotPanic(t *testing.T) {
 			return true, nil
 		},
 	})
-	if gate.skipTheatricalMovie(nil, 300, "Nil Context") {
+	if gate.skipTheatricalMovie(nil, 300, "Nil Context", 0, "") {
 		t.Fatal("expected released movie to not be skipped with nil context")
 	}
 }

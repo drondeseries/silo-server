@@ -126,11 +126,50 @@ func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker) *theatricalRele
 	return gate
 }
 
+// isPastTheatricalWindow reports whether a movie's release year or release date
+// definitively places it beyond any plausible theatrical exclusivity window (e.g.
+// older than 180 days or from a prior year), allowing us to skip remote TMDB
+// digital-release queries.
+func isPastTheatricalWindow(year int, releaseDate string) bool {
+	now := time.Now().UTC()
+	currentYear := now.Year()
+
+	rd := strings.TrimSpace(releaseDate)
+	if len(rd) >= 10 {
+		rd = rd[:10]
+	}
+	if rd != "" {
+		if t, err := time.Parse("2006-01-02", rd); err == nil {
+			if now.Sub(t) > 180*24*time.Hour {
+				return true
+			}
+			return false
+		}
+		if len(rd) == 4 && year == 0 {
+			if y, err := strconv.Atoi(rd); err == nil {
+				year = y
+			}
+		}
+	}
+
+	if year > 0 && year < currentYear-1 {
+		return true
+	}
+	if year > 0 && year < currentYear && now.Month() > time.June {
+		return true
+	}
+	return false
+}
+
 // skipTheatricalMovie reports whether a movie entry must be skipped because it
 // is still theatrical-only. Movies without a TMDB ID cannot be checked and
-// fall through to the caller's existing date gates.
-func (g *theatricalReleaseGate) skipTheatricalMovie(ctx context.Context, tmdbID int, title string) bool {
+// fall through to the caller's existing date gates. Backlog and catalog titles
+// whose theatrical window has long closed bypass TMDB calls entirely.
+func (g *theatricalReleaseGate) skipTheatricalMovie(ctx context.Context, tmdbID int, title string, year int, releaseDate string) bool {
 	if g == nil || g.checker == nil || tmdbID <= 0 {
+		return false
+	}
+	if isPastTheatricalWindow(year, releaseDate) {
 		return false
 	}
 	if g.lookup(ctx, tmdbID) {
@@ -595,7 +634,7 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 			if len(pickCandidatesByPriority(lookup, entry, itemType)) > 0 {
 				continue
 			}
-			if itemType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title) {
+			if itemType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title, entry.ReleaseYear, entry.Released) {
 				slog.InfoContext(ctx, "MDBList sync: skipping theatrical-only movie", "component", "catalog", "title", entry.Title, "tmdb_id", entry.ID)
 				continue
 			}
@@ -826,7 +865,7 @@ func (s *LibraryCollectionService) syncTMDBPresetCollection(ctx context.Context,
 			warnings = append(warnings, fmt.Sprintf("Skipped unreleased %s (release: %s)", entry.Title, entry.ReleaseDate))
 			continue
 		}
-		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title) {
+		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title, 0, entry.ReleaseDate) {
 			unmatchedCount++
 			warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
 			continue
@@ -1021,7 +1060,7 @@ func (s *LibraryCollectionService) syncTMDBFranchiseCollection(ctx context.Conte
 			warnings = append(warnings, fmt.Sprintf("Skipped unreleased %s (release: %s)", entry.Title, entry.ReleaseDate))
 			continue
 		}
-		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title) {
+		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title, 0, entry.ReleaseDate) {
 			unmatchedCount++
 			warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
 			continue
@@ -1227,7 +1266,7 @@ func (s *LibraryCollectionService) syncTMDBDiscoverCollection(ctx context.Contex
 			warnings = append(warnings, fmt.Sprintf("Skipped unreleased %s (release: %s)", entry.Title, entry.ReleaseDate))
 			continue
 		}
-		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title) {
+		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title, 0, entry.ReleaseDate) {
 			unmatchedCount++
 			warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
 			continue
@@ -1507,7 +1546,7 @@ func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, c
 			warnings = append(warnings, fmt.Sprintf("Skipped unreleased %s (year: %d)", entry.Title, entry.Year))
 			continue
 		}
-		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.TMDBID, entry.Title) {
+		if entry.MediaType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.TMDBID, entry.Title, entry.Year, "") {
 			unmatchedCount++
 			warnings = append(warnings, fmt.Sprintf("Skipped theatrical-only movie %q (no digital release yet)", entry.Title))
 			continue

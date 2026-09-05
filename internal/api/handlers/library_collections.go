@@ -1602,7 +1602,9 @@ func (h *LibraryCollectionHandler) HandleRemoveAdminCollectionItem(w http.Respon
 
 func (h *LibraryCollectionHandler) HandleSyncAdminCollection(w http.ResponseWriter, r *http.Request) {
 	collectionID := chi.URLParam(r, "id")
-	run, err := h.service.SyncCollection(r.Context(), collectionID)
+	syncCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Minute)
+	defer cancel()
+	run, err := h.service.SyncCollection(syncCtx, collectionID)
 	if err != nil {
 		if errors.Is(err, catalog.ErrLibraryCollectionSyncUnsupported) {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
@@ -2975,13 +2977,15 @@ func (h *LibraryCollectionHandler) HandleImportMDBList(w http.ResponseWriter, r 
 		return
 	}
 
-	run, err := h.service.SyncCollection(r.Context(), collection.ID)
+	syncCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Minute)
+	defer cancel()
+	run, err := h.service.SyncCollection(syncCtx, collection.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to import MDBList collection")
 		return
 	}
 
-	refreshed, err := h.repo.GetByID(r.Context(), collection.ID)
+	refreshed, err := h.repo.GetByID(syncCtx, collection.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load collection")
 		return
@@ -3030,13 +3034,15 @@ func (h *LibraryCollectionHandler) HandleImportTMDBCollection(w http.ResponseWri
 		return
 	}
 
-	run, err := h.service.SyncCollection(r.Context(), collection.ID)
+	syncCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Minute)
+	defer cancel()
+	run, err := h.service.SyncCollection(syncCtx, collection.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to sync TMDB collection")
 		return
 	}
 
-	refreshed, err := h.repo.GetByID(r.Context(), collection.ID)
+	refreshed, err := h.repo.GetByID(syncCtx, collection.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load collection")
 		return
@@ -3145,7 +3151,9 @@ func (h *LibraryCollectionHandler) HandleImportTraktCollection(w http.ResponseWr
 		return
 	}
 
-	run, err := h.service.SyncCollection(r.Context(), collection.ID)
+	syncCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Minute)
+	defer cancel()
+	run, err := h.service.SyncCollection(syncCtx, collection.ID)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "failed to sync imported Trakt collection", "component", "api",
 			"collection_id", collection.ID,
@@ -3159,7 +3167,7 @@ func (h *LibraryCollectionHandler) HandleImportTraktCollection(w http.ResponseWr
 		return
 	}
 
-	refreshed, err := h.repo.GetByID(r.Context(), collection.ID)
+	refreshed, err := h.repo.GetByID(syncCtx, collection.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load collection")
 		return
