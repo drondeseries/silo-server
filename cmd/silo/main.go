@@ -2383,6 +2383,9 @@ func main() {
 			}
 		}
 		collectionService.TMDBCollections = api.NewTMDBCollectionFetcher(cfg.TMDBAPIKey)
+		discoverAdapter := api.NewTMDBDiscoverAdapter(cfg.TMDBAPIKey)
+		collectionService.TMDBDiscovers = discoverAdapter
+		collectionService.TMDBDigitalReleases = discoverAdapter
 		deps.CollectionService = collectionService
 		collectionSyncScheduler = catalog.NewCollectionSyncScheduler(collectionRepo, collectionService, slog.Default())
 

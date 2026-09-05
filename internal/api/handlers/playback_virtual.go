@@ -328,7 +328,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// the candidate set while this request is using that row.
 			if noResult && h.VirtualPlaybackStreamSink != nil {
 				visible := visibleVirtualPlaybackStreams(streams)
-				_ = h.VirtualPlaybackStreamSink(listCtx, file, visible)
+				sinkFn := h.VirtualPlaybackStreamSink
+				sinkFile := *file
+				go func() {
+					sinkCtx, cancel := context.WithTimeout(context.WithoutCancel(listCtx), 15*time.Second)
+					defer cancel()
+					_ = sinkFn(sinkCtx, &sinkFile, visible)
+				}()
 			}
 			filtered := filterVirtualPlaybackStreams(file, streams)
 			if h.BestResultCache != nil && len(filtered) > 0 {
@@ -446,14 +452,92 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			hasCompleteContainerEvidence = completeVirtualContainerEvidenceV3(&transient)
 			skipProbe = hasCompleteVideoEvidence && hasCompleteAudioEvidence && hasCompleteContainerEvidence
 		}
-		if skipProbe || h.VirtualPlaybackSourceProber == nil {
+		if skipProbe {
+			h.pinVirtualSticky(stickyKey, cand.URI)
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: skipProbe,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: true,
+			}, nil
+		}
+		if deferProbe {
+			h.pinVirtualSticky(stickyKey, cand.URI)
+			mergeVirtualCandidateTracks(&transient, cand)
+			if !transient.HDR && cand.HDR != "" {
+				transient.HDR = true
+			}
+			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+			if h.VirtualPlaybackSourceProber != nil {
+				targetID := file.ID
+				if transient.ID > 0 {
+					targetID = transient.ID
+				}
+				prober := h.VirtualPlaybackSourceProber
+				probeURL := streamURL
+				probeTransient := transient
+				if len(transient.VideoTracks) > 0 {
+					probeTransient.VideoTracks = append([]models.VideoTrack(nil), transient.VideoTracks...)
+				}
+				if len(transient.AudioTracks) > 0 {
+					probeTransient.AudioTracks = append([]models.AudioTrack(nil), transient.AudioTracks...)
+				}
+				if len(transient.SubtitleTracks) > 0 {
+					probeTransient.SubtitleTracks = append([]models.SubtitleTrack(nil), transient.SubtitleTracks...)
+				}
+				probeCand := cand
+				expectedRuntimeMinutes := 0
+				if file.EpisodeID != "" && h.EpisodeLookup != nil {
+					if ep, epErr := h.EpisodeLookup.GetByID(r.Context(), file.EpisodeID); epErr == nil && ep != nil {
+						expectedRuntimeMinutes = ep.Runtime
+					}
+				}
+				if expectedRuntimeMinutes == 0 && h.ItemLookup != nil {
+					if item, itemErr := h.ItemLookup.GetByID(r.Context(), file.ContentID); itemErr == nil && item != nil {
+						expectedRuntimeMinutes = item.Runtime
+					}
+				}
+				go func() {
+					bgCtx, bgCancel := context.WithTimeout(context.WithoutCancel(r.Context()), virtualProbeBudget)
+					defer bgCancel()
+					probed, probeErr := prober(bgCtx, probeURL, &probeTransient)
+					if probeErr != nil || probed == nil {
+						slog.WarnContext(bgCtx, "background virtual stream probe failed", "component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
+						h.unpinVirtualSticky(stickyKey, probeCand.URI)
+						return
+					}
+					if !virtualRuntimePlausible(probed.Duration, expectedRuntimeMinutes) {
+						slog.WarnContext(bgCtx, "background virtual probe rejected: probed duration implausible",
+							"component", "api", "candidate_uri", probeCand.URI, "file_id", targetID,
+							"probed_duration_seconds", probed.Duration, "expected_runtime_minutes", expectedRuntimeMinutes)
+						h.unpinVirtualSticky(stickyKey, probeCand.URI)
+						return
+					}
+					if probeTransient.ID > 0 {
+						probed.ID = probeTransient.ID
+						probed.MediaFolderID = probeTransient.MediaFolderID
+					}
+					if probeTransient.Duration > 0 && probed.Duration <= 0 {
+						probed.Duration = probeTransient.Duration
+					}
+					mergeVirtualCandidateTracks(probed, probeCand)
+					h.persistVirtualMetadataBounded(bgCtx, targetID, probed)
+				}()
+			}
+			return &resolvedVirtualPlaybackSource{
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: true,
+			}, nil
+		}
+		if h.VirtualPlaybackSourceProber == nil {
+			mergeVirtualCandidateTracks(&transient, cand)
+			if !transient.HDR && cand.HDR != "" {
+				transient.HDR = true
+			}
+			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
+			return &resolvedVirtualPlaybackSource{
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false,
 			}, nil
 		}
 		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
@@ -902,8 +986,21 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		probed.Bitrate = virtualBitrateFallback(probed.Resolution)
 	}
 
-	// Infer audio channels from the codec when ffprobe didn't detect them.
+	// Ensure probed.CodecAudio is resolved before inferring channels so 5.1/7.1 codecs
+	// are not prematurely downgraded to 2-channel stereo.
+	if probed.CodecAudio == "" {
+		probed.CodecAudio = candidate.CodecAudio
+	}
+	if probed.CodecAudio == "" {
+		probed.CodecAudio = "aac"
+	}
 	channels := inferChannelsFromCodec(probed.CodecAudio)
+	if channels <= 0 {
+		channels = 2
+	}
+	if probed.AudioChannels <= 0 {
+		probed.AudioChannels = channels
+	}
 
 	// Create a basic video track when ffprobe didn't detect any.
 	videoCodec := probed.CodecVideo
@@ -918,6 +1015,7 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 	}
 	isDV, dvProfile := virtualDVMetadata(candidate.HDR)
 	isHDR := probed.HDR || candidate.HDR != ""
+	defaultProfile, defaultLevel, defaultBitDepth := defaultVirtualVideoProfileAndLevel(videoCodec, isHDR, isDV, probed.Resolution)
 	if len(probed.VideoTracks) == 0 {
 		videoRange := "SDR"
 		videoRangeType := "SDR"
@@ -933,10 +1031,12 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		}
 		vt := models.VideoTrack{
 			Codec:          videoCodec,
+			Profile:        defaultProfile,
+			Level:          defaultLevel,
 			Width:          resolutionWidth(probed.Resolution),
 			Height:         resolutionHeight(probed.Resolution),
 			FrameRate:      defaultVirtualFrameRate(candidate.FrameRate),
-			BitDepth:       8,
+			BitDepth:       defaultBitDepth,
 			Bitrate:        probed.Bitrate,
 			VideoRange:     videoRange,
 			VideoRangeType: videoRangeType,
@@ -952,6 +1052,16 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		probed.VideoTracks = append(probed.VideoTracks, vt)
 	}
 	for i := range probed.VideoTracks {
+		if probed.VideoTracks[i].Codec == "" {
+			probed.VideoTracks[i].Codec = videoCodec
+		}
+		trackProf, trackLvl, trackDepth := defaultVirtualVideoProfileAndLevel(probed.VideoTracks[i].Codec, isHDR, isDV, probed.Resolution)
+		if probed.VideoTracks[i].Profile == "" {
+			probed.VideoTracks[i].Profile = trackProf
+		}
+		if probed.VideoTracks[i].Level <= 0 {
+			probed.VideoTracks[i].Level = trackLvl
+		}
 		if probed.VideoTracks[i].Width <= 0 {
 			probed.VideoTracks[i].Width = resolutionWidth(probed.Resolution)
 		}
@@ -962,7 +1072,9 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 			probed.VideoTracks[i].FrameRate = defaultVirtualFrameRate(candidate.FrameRate)
 		}
 		if probed.VideoTracks[i].BitDepth <= 0 {
-			probed.VideoTracks[i].BitDepth = 8
+			probed.VideoTracks[i].BitDepth = trackDepth
+		} else if probed.VideoTracks[i].BitDepth == 8 && (isHDR || isDV || strings.EqualFold(probed.VideoTracks[i].Profile, "main 10")) {
+			probed.VideoTracks[i].BitDepth = 10
 		}
 		if probed.VideoTracks[i].Bitrate <= 0 {
 			probed.VideoTracks[i].Bitrate = probed.Bitrate
@@ -1008,9 +1120,17 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 	// and during playback. Existing probed tracks are never overwritten.
 	mergeVirtualCandidateLanguages(probed, candidate)
 
+	if len(probed.AudioTracks) == 0 {
+		probed.AudioTracks = []models.AudioTrack{{
+			Codec:    probed.CodecAudio,
+			Channels: channels,
+			Default:  true,
+		}}
+	}
+
 	// Fill audio channels and codec on existing tracks that lack them.
 	for i := range probed.AudioTracks {
-		if probed.AudioTracks[i].Codec == "" && probed.CodecAudio != "" {
+		if probed.AudioTracks[i].Codec == "" {
 			probed.AudioTracks[i].Codec = probed.CodecAudio
 		}
 		if probed.AudioTracks[i].Channels == 0 {
@@ -1029,6 +1149,34 @@ func mergeVirtualCandidateTracks(probed *models.MediaFile, candidate VirtualPlay
 		if !hasDefault {
 			probed.AudioTracks[0].Default = true
 		}
+	}
+}
+
+func defaultVirtualVideoProfileAndLevel(codec string, isHDR, isDV bool, res string) (string, int, int) {
+	c := strings.ToLower(strings.TrimSpace(codec))
+	switch c {
+	case "hevc", "h265", "hev1", "hvc1":
+		if isHDR || isDV || strings.EqualFold(res, "2160p") || strings.EqualFold(res, "4k") {
+			return "main 10", 153, 10
+		}
+		return "main", 120, 8
+	case "h264", "avc", "avc1":
+		return "high", 41, 8
+	case "av1", "av01":
+		if isHDR || isDV {
+			return "main", 153, 10
+		}
+		return "main", 153, 8
+	case "vp9":
+		if isHDR || isDV {
+			return "profile 2", 41, 10
+		}
+		return "profile 0", 41, 8
+	default:
+		if isHDR || isDV {
+			return "main 10", 153, 10
+		}
+		return "high", 41, 8
 	}
 
 }

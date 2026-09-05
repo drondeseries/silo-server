@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -350,6 +351,7 @@ type mdblistEntry struct {
 	MediaType   string `json:"mediatype"`
 	Title       string `json:"title"`
 	ReleaseYear int    `json:"release_year"`
+	Released    string `json:"released"`
 }
 
 func sourceEnablesVirtualPlayback(raw json.RawMessage) bool {
@@ -565,7 +567,7 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 		}
 		theatricalGate := newTheatricalReleaseGate(s.TMDBDigitalReleases)
 		for _, entry := range materializeEntries {
-			if isUnreleasedYearOrDate(entry.ReleaseYear, "") {
+			if isUnreleasedYearOrDate(entry.ReleaseYear, entry.Released) {
 				slog.DebugContext(ctx, "MDBList sync: skipping unreleased entry", "component", "catalog", "title", entry.Title, "year", entry.ReleaseYear)
 				continue
 			}
@@ -1830,43 +1832,109 @@ func syncTimestamp() time.Time {
 	return time.Now().UTC().Truncate(time.Microsecond)
 }
 
+var (
+	bracketYearRegex  = regexp.MustCompile(`[([{](19\d\d|20\d\d)[)\]}]`)
+	trailingYearRegex = regexp.MustCompile(`(?:\s+-\s*|\s+)(19\d\d|20\d\d)\s*$`)
+)
+
+func extractTitleYear(title string) int {
+	if m := bracketYearRegex.FindStringSubmatch(title); len(m) > 1 {
+		if y, err := strconv.Atoi(m[1]); err == nil {
+			return y
+		}
+	}
+	if m := trailingYearRegex.FindStringSubmatch(title); len(m) > 1 {
+		if y, err := strconv.Atoi(m[1]); err == nil {
+			return y
+		}
+	}
+	return 0
+}
+
 // tmdbEntryIsUnreleased reports whether a TMDB collection entry should be
 // excluded from collection sync because it has not yet been released. Both
 // movies and TV series are gated: for movies this is the primary_release_date,
 // for TV it is the first_air_date. An empty or unparseable ReleaseDate is
 // treated as unreleased to avoid surfacing placeholder entries that have no
 // confirmed air/release date.
+//
+// When a title includes an explicit future or current release year (e.g. from
+// its title "Fuze (2026)") that postdates a past festival premiere date (e.g.
+// TIFF/Sundance), the entry is gated as unreleased so festival screenings do
+// not bypass release gating.
 func tmdbEntryIsUnreleased(entry TMDBCollectionEntry) bool {
 	rd := strings.TrimSpace(entry.ReleaseDate)
+	if len(rd) >= 10 {
+		rd = rd[:10]
+	}
 	if rd == "" {
 		return true // no release/air date known yet
 	}
-	// Accept YYYY-MM-DD; any well-formed date in the future is unreleased.
 	t, err := time.Parse("2006-01-02", rd)
 	if err != nil {
+		if len(rd) == 4 {
+			if y, yerr := strconv.Atoi(rd); yerr == nil {
+				return y >= time.Now().UTC().Year()
+			}
+		}
 		// Malformed date — treat as unreleased.
 		return true
 	}
-	// Truncate today to date-only for a fair UTC comparison.
 	now := time.Now().UTC().Truncate(24 * time.Hour)
-	return t.After(now)
+	if t.After(now) {
+		return true
+	}
+
+	// Check if the title indicates a future or current theatrical release year
+	// that postdates this premiere date (e.g. TIFF/Sundance festival premiere
+	// in a prior year, or theatrical release later this year/next year).
+	if titleYear := extractTitleYear(entry.Title); titleYear > 0 {
+		if titleYear > now.Year() || (titleYear >= now.Year() && titleYear > t.Year()) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // isUnreleasedYearOrDate reports whether a release year or release date is in
 // the future relative to the server clock. A release date that cannot be
 // parsed falls back to the release year comparison when one is available.
+// If a movie has a release year indicating a current or future theatrical
+// release that postdates a past festival premiere date (e.g. TIFF/Sundance),
+// it is treated as unreleased so early festival screenings do not bypass
+// release gating.
 func isUnreleasedYearOrDate(year int, releaseDate string) bool {
-	if year > time.Now().UTC().Year() {
+	now := time.Now().UTC().Truncate(24 * time.Hour)
+	currentYear := now.Year()
+
+	if year > currentYear {
 		return true
 	}
+
 	rd := strings.TrimSpace(releaseDate)
-	if rd == "" {
-		return false
+	if len(rd) >= 10 {
+		rd = rd[:10]
 	}
-	t, err := time.Parse("2006-01-02", rd)
-	if err != nil {
-		return false
+	if rd != "" {
+		if t, err := time.Parse("2006-01-02", rd); err == nil {
+			if t.After(now) {
+				return true
+			}
+			// Future theatrical movie with past festival premiere date (e.g. TIFF/Sundance):
+			// If the movie's release year is current or future, but the recorded date was from
+			// a prior year, it was an early festival premiere and has not had its general release.
+			if year >= currentYear && year > t.Year() {
+				return true
+			}
+			return false
+		}
+		if len(rd) == 4 {
+			if y, err := strconv.Atoi(rd); err == nil {
+				return y > currentYear
+			}
+		}
 	}
-	now := time.Now().UTC().Truncate(24 * time.Hour)
-	return t.After(now)
+
+	return year > currentYear
 }

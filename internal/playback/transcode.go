@@ -746,17 +746,22 @@ func buildFFmpegArgs(opts TranscodeOpts) []string {
 		args = appendHWAccelArgs(args, opts)
 	}
 
-	// Limit input probing to speed up startup, especially on network storage.
-	// -fflags +genpts generates PTS for files with missing timestamps;
-	// +fastseek enables faster input seeking (matches Jellyfin).
-	args = append(args,
-		"-fflags", "+genpts+fastseek",
-		"-analyzeduration", "3000000", // 3 seconds (default 5s)
-		"-probesize", "5000000", // 5 MB (default 5MB, explicit for clarity)
-	)
-
 	lowerInput := strings.ToLower(strings.TrimSpace(opts.InputPath))
-	if strings.HasPrefix(lowerInput, "http://") || strings.HasPrefix(lowerInput, "https://") {
+	isRemote := strings.HasPrefix(lowerInput, "http://") || strings.HasPrefix(lowerInput, "https://")
+	fflags := "+genpts+fastseek"
+	analyzeDuration := "3000000" // 3 seconds (default 5s)
+	probeSize := "5000000"       // 5 MB (default 5MB, explicit for clarity)
+	if isRemote {
+		fflags = "+genpts+fastseek+nobuffer"
+		analyzeDuration = "1000000" // 1 second for remote streams to avoid WAN stalling
+		probeSize = "1000000"       // 1 MB
+	}
+	args = append(args,
+		"-fflags", fflags,
+		"-analyzeduration", analyzeDuration,
+		"-probesize", probeSize,
+	)
+	if isRemote {
 		args = append(args,
 			"-seekable", "1",
 			"-reconnect", "1",
@@ -1914,13 +1919,13 @@ const minManifestSegments = 3
 // Copying video while transcoding only audio can produce startup files far
 // faster than real-time encoding, so waiting for 3 full segments adds
 // unnecessary latency at playback start.
-const minCopyManifestSegments = 2
+const minCopyManifestSegments = 1
 
 // minFreshHardwareManifestSegments keeps one complete fragment of headroom
 // after the first playable fragment. A fresh hardware encoder produces that
 // window comfortably ahead of real time, while CPU encodes and reconstructed
 // generations retain the larger three-fragment safety margin below.
-const minFreshHardwareManifestSegments = 2
+const minFreshHardwareManifestSegments = 1
 
 func startupSegmentRequirement(opts TranscodeOpts) int {
 	if strings.EqualFold(opts.TargetCodecVideo, "copy") {
@@ -1928,10 +1933,7 @@ func startupSegmentRequirement(opts TranscodeOpts) int {
 	}
 	if opts.FastStart {
 		switch opts.HWAccel {
-		case transcodeHWQSV, transcodeHWVAAPI, transcodeHWNVENC:
-			if bitmapBurnInActive(opts) {
-				return 1
-			}
+		case transcodeHWQSV, transcodeHWVAAPI, transcodeHWNVENC, transcodeHWVideoToolbox:
 			return minFreshHardwareManifestSegments
 		}
 	}

@@ -6417,7 +6417,7 @@ func TestPrepareTransportV3KeepsRemuxLocalWhenProxyLacksTheRecipe(t *testing.T) 
 		&playback.Session{ID: "session-incapable-proxy", UserID: 7, ProfileID: "profile-1"},
 		v3HandlerFixtureFile(t),
 		playback.PlannerResultV3{
-			Plan:           identityProxyPlanV3(playback.DeliveryRemuxProgressiveV3, playback.TransformationV3{Name: playback.TransformationAudioToAACV3, Executor: playback.ExecutorServerV3, RecipeVersion: "1"}),
+			Plan:           identityProxyPlanV3(playback.DeliveryRemuxProgressiveV3, playback.TransformationV3{Name: playback.TransformationAudioToAACV3, Executor: playback.ExecutorServerV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3}),
 			PlayMethod:     playback.PlayRemux,
 			TranscodeAudio: true,
 		},

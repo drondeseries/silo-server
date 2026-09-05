@@ -289,6 +289,7 @@ type releaseDateEntry struct {
 	Certification string `json:"certification"`
 	ReleaseDate   string `json:"release_date"`
 	Type          int    `json:"type"`
+	Note          string `json:"note"`
 }
 
 type contentRatingsResponse struct {

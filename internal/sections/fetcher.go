@@ -2550,6 +2550,8 @@ func buildRecentlyReleasedQuery(s ResolvedSection, libraryID *int, libraryIDs []
 	catalog.ApplySectionAccessFilter("mi", filter, &conditions, &args, &argIdx)
 
 	conditions = append(conditions, catalog.MangaChapterExclusionWhere("mi"))
+	conditions = append(conditions, "(mi.release_date IS NULL OR mi.release_date <= CURRENT_DATE)")
+	conditions = append(conditions, "(mi.year IS NULL OR mi.year <= EXTRACT(YEAR FROM CURRENT_DATE))")
 
 	whereClause := ""
 	if len(conditions) > 0 {

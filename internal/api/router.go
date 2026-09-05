@@ -1870,8 +1870,10 @@ func NewRouter(deps Dependencies) chi.Router {
 			if deps.Config != nil {
 				apiKey = deps.Config.TMDBAPIKey
 			}
-			libraryCollectionService.TMDBDiscovers = &tmdbDiscoverAdapter{
-				client: tmdb.NewClient(apiKey, 40),
+			discoverAdapter := NewTMDBDiscoverAdapter(apiKey)
+			libraryCollectionService.TMDBDiscovers = discoverAdapter
+			if libraryCollectionService.TMDBDigitalReleases == nil {
+				libraryCollectionService.TMDBDigitalReleases = discoverAdapter
 			}
 		}
 		if libraryCollectionService.TMDBDigitalReleases == nil {
@@ -3986,22 +3988,33 @@ func (a *tmdbFranchiseAdapter) GetCollection(ctx context.Context, id int) ([]cat
 	return entries, nil
 }
 
-// tmdbDiscoverAdapter adapts tmdb.Client to catalog.TMDBDiscoverFetcher for
-// the `tmdb_discover` sync mode. Like the preset adapter, it enriches each
+// TMDBDiscoverAdapter adapts tmdb.Client to catalog.TMDBDiscoverFetcher for
+// the `tmdb_discover` sync mode and catalog.TMDBDigitalReleaseChecker for
+// theatrical release gating. Like the preset adapter, it enriches each
 // result with external IDs so the catalog matcher can fall back to IMDb/TVDB
 // when a local item lacks a TMDB ID.
-type tmdbDiscoverAdapter struct {
+type TMDBDiscoverAdapter struct {
 	client *tmdb.Client
+}
+
+type tmdbDiscoverAdapter = TMDBDiscoverAdapter
+
+// NewTMDBDiscoverAdapter creates a TMDBDiscoverAdapter from an API key.
+// Exported so main.go can wire it before background tasks start.
+func NewTMDBDiscoverAdapter(apiKey string) *TMDBDiscoverAdapter {
+	return &TMDBDiscoverAdapter{
+		client: tmdb.NewClient(apiKey, 40),
+	}
 }
 
 // HasDigitalRelease implements catalog.TMDBDigitalReleaseChecker: a movie is
 // digitally released once TMDB records any Digital, Physical, or TV release
 // date in the past. Titles with no release-date data fail open (released).
-func (a *tmdbDiscoverAdapter) HasDigitalRelease(ctx context.Context, tmdbID int) (bool, error) {
+func (a *TMDBDiscoverAdapter) HasDigitalRelease(ctx context.Context, tmdbID int) (bool, error) {
 	return a.client.HasDigitalRelease(ctx, tmdbID)
 }
 
-func (a *tmdbDiscoverAdapter) Discover(ctx context.Context, mediaType string, params catalog.TMDBDiscoverParams, limit int) ([]catalog.TMDBCollectionEntry, error) {
+func (a *TMDBDiscoverAdapter) Discover(ctx context.Context, mediaType string, params catalog.TMDBDiscoverParams, limit int) ([]catalog.TMDBCollectionEntry, error) {
 	results, err := a.client.Discover(ctx, mediaType, tmdb.DiscoverParams{
 		WithGenres:       params.WithGenres,
 		WithoutGenres:    params.WithoutGenres,
