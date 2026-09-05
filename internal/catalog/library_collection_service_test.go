@@ -589,3 +589,19 @@ func TestTraktCandidatesByPriority_MovieUsesTMDBBeforeIMDb(t *testing.T) {
 		}
 	}
 }
+
+func TestMaterializeVirtualPlaybackPropagatesError(t *testing.T) {
+	service := &LibraryCollectionService{
+		VirtualVariants: func(_ context.Context, _, _ string) ([]VirtualPlaybackVariant, error) {
+			return nil, errors.New("plugin connection failure")
+		},
+	}
+	item := &models.MediaItem{Type: "movie", ImdbID: "tt1234567", TmdbID: "100", Title: "Seeking a Friend"}
+	contentID, _ := virtualPlaybackContentID(item)
+	item.ContentID = contentID
+
+	err := service.materializeVirtualPlayback(context.Background(), item, []int{1})
+	if err == nil || !strings.Contains(err.Error(), "getting virtual profile variants: plugin connection failure") {
+		t.Fatalf("expected getting virtual profile variants error, got: %v", err)
+	}
+}

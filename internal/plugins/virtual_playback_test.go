@@ -12,6 +12,8 @@ import (
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/Silo-Server/silo-server/internal/pluginhost"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -983,5 +985,123 @@ func TestResolveVirtualPlaybackDetailedPropagatesHeadersAndExclusions(t *testing
 	}
 	if memoHit.ExpiresAt.IsZero() {
 		t.Fatal("memoHit.ExpiresAt is zero")
+	}
+}
+
+func TestStoreConfiguredVirtualVariantsDoesNotCacheCancellation(t *testing.T) {
+	service := &Service{}
+	service.storeConfiguredVirtualVariants("movie", nil, context.Canceled, time.Now())
+	if _, _, ok := service.cachedConfiguredVirtualVariants("movie", time.Now()); ok {
+		t.Fatal("storeConfiguredVirtualVariants cached context.Canceled error")
+	}
+
+	service.storeConfiguredVirtualVariants("movie", nil, context.DeadlineExceeded, time.Now())
+	if _, _, ok := service.cachedConfiguredVirtualVariants("movie", time.Now()); ok {
+		t.Fatal("storeConfiguredVirtualVariants cached context.DeadlineExceeded error")
+	}
+
+	service.storeConfiguredVirtualVariants("movie", nil, status.Error(codes.Canceled, "grpc canceled"), time.Now())
+	if _, _, ok := service.cachedConfiguredVirtualVariants("movie", time.Now()); ok {
+		t.Fatal("storeConfiguredVirtualVariants cached grpc codes.Canceled error")
+	}
+
+	service.storeConfiguredVirtualVariants("movie", nil, status.Error(codes.DeadlineExceeded, "grpc timeout"), time.Now())
+	if _, _, ok := service.cachedConfiguredVirtualVariants("movie", time.Now()); ok {
+		t.Fatal("storeConfiguredVirtualVariants cached grpc codes.DeadlineExceeded error")
+	}
+
+	service.storeConfiguredVirtualVariants("movie", nil, fmt.Errorf("outer wrap: %w", context.Canceled), time.Now())
+	if _, _, ok := service.cachedConfiguredVirtualVariants("movie", time.Now()); ok {
+		t.Fatal("storeConfiguredVirtualVariants cached wrapped context.Canceled error")
+	}
+
+	sentinelErr := errors.New("provider down")
+	service.storeConfiguredVirtualVariants("movie", nil, sentinelErr, time.Now())
+	if variants, err, ok := service.cachedConfiguredVirtualVariants("movie", time.Now()); !ok || !errors.Is(err, sentinelErr) || variants != nil {
+		t.Fatalf("expected cached ordinary error %v, got variants=%v, err=%v, ok=%v", sentinelErr, variants, err, ok)
+	}
+}
+
+func TestConfiguredVirtualVariantsNilContextDoesNotPanic(t *testing.T) {
+	service := &Service{}
+	variants, err := service.ConfiguredVirtualVariants(nil, "virtual://movie/test", "movie")
+	if err != nil {
+		t.Fatalf("unexpected error with nil context: %v", err)
+	}
+	if len(variants) != 0 {
+		t.Fatalf("expected no variants without installations, got: %v", variants)
+	}
+}
+
+func TestConfiguredVirtualVariantsIsolatesLeaderCancellation(t *testing.T) {
+	manifest := testPluginManifest(t, "test.virtual", "1.0.0")
+	manifest.Capabilities = []*pluginv1.CapabilityDescriptor{{Type: virtualStreamProviderCapabilityType, Id: testVirtualCapabilityID}}
+	installPath := writeInstalledPluginManifest(t, manifest)
+	store := newFakeServiceInstallationStore()
+	store.listCapabilities = []*Capability{{Type: virtualStreamProviderCapabilityType, ID: testVirtualCapabilityID}}
+	host := &fakeVirtualPluginHost{clients: make(map[int]pluginClient)}
+
+	installation := &Installation{ID: 101, PluginID: "test.virtual", Version: "1.0.0", InstallPath: installPath, Enabled: true}
+	store.byID[101] = installation
+	store.byPluginID[installation.PluginID] = []*Installation{installation}
+
+	blockProfiles := make(chan struct{})
+	enteredProfiles := make(chan struct{})
+
+	host.clients[101] = &fakePluginClient{
+		manifest: manifest,
+		virtualStreamClient: pluginhost.NewVirtualStreamProviderClientForTest(&fakeVirtualStreamGRPCClient{
+			profilesFunc: func(ctx context.Context, req *pluginv1.ListVirtualStreamProfilesRequest) (*pluginv1.ListVirtualStreamProfilesResponse, error) {
+				select {
+				case <-enteredProfiles:
+				default:
+					close(enteredProfiles)
+				}
+				<-blockProfiles
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				return &pluginv1.ListVirtualStreamProfilesResponse{
+					Profiles: []*pluginv1.VirtualStreamProfile{
+						{Label: "1080p", Resolution: "1080p"},
+					},
+				}, nil
+			},
+		}, time.Second),
+	}
+
+	service := &Service{installations: store, host: host}
+
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	type result struct {
+		variants []VirtualPlaybackVariant
+		err      error
+	}
+	leaderCh := make(chan result, 1)
+	go func() {
+		v, err := service.ConfiguredVirtualVariants(leaderCtx, "virtual://movie/tt100", "movie")
+		leaderCh <- result{variants: v, err: err}
+	}()
+
+	<-enteredProfiles
+	leaderCancel() // Cancel leader while in flight
+
+	// Follower calls with active context
+	followerCtx := context.Background()
+	followerCh := make(chan result, 1)
+	go func() {
+		v, err := service.ConfiguredVirtualVariants(followerCtx, "virtual://movie/tt100", "movie")
+		followerCh <- result{variants: v, err: err}
+	}()
+
+	// Allow profilesFunc to complete
+	close(blockProfiles)
+
+	fRes := <-followerCh
+	if fRes.err != nil {
+		t.Fatalf("follower failed due to leader cancellation: %v", fRes.err)
+	}
+	if len(fRes.variants) != 1 || fRes.variants[0].Label != "1080p" {
+		t.Fatalf("follower got unexpected variants: %#v", fRes.variants)
 	}
 }

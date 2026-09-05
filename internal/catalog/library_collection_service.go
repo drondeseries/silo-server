@@ -109,7 +109,14 @@ func newTheatricalReleaseGate(checker TMDBDigitalReleaseChecker) *theatricalRele
 		}
 		digital := true // fail open: TMDB outage must not stall a sync
 		if gate.checker != nil {
-			if released, err := gate.checker.HasDigitalRelease(ctx, tmdbID); err == nil {
+			baseCtx := ctx
+			if baseCtx == nil {
+				baseCtx = context.Background()
+			}
+			checkCtx, cancel := context.WithTimeout(baseCtx, 5*time.Second)
+			released, err := gate.checker.HasDigitalRelease(checkCtx, tmdbID)
+			cancel()
+			if err == nil {
 				digital = released
 			}
 		}
@@ -556,6 +563,8 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 		return nil, err
 	}
 
+	warnings := make([]string, 0)
+
 	if sourceEnablesVirtualPlayback(collection.SourceConfig) {
 		// MDBList fetches beyond the configured item limit to compensate for
 		// duplicates and local misses. Do not materialize that entire lookahead
@@ -579,15 +588,15 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 				continue
 			}
 			itemType := mdbListEntryItemType(entry)
-			if itemType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title) {
-				slog.InfoContext(ctx, "MDBList sync: skipping theatrical-only movie", "component", "catalog", "title", entry.Title, "tmdb_id", entry.ID)
-				continue
-			}
 			lookup := movieLookup
 			if itemType == "series" {
 				lookup = seriesLookup
 			}
 			if len(pickCandidatesByPriority(lookup, entry, itemType)) > 0 {
+				continue
+			}
+			if itemType == "movie" && theatricalGate.skipTheatricalMovie(ctx, entry.ID, entry.Title) {
+				slog.InfoContext(ctx, "MDBList sync: skipping theatrical-only movie", "component", "catalog", "title", entry.Title, "tmdb_id", entry.ID)
 				continue
 			}
 			item := &models.MediaItem{
@@ -607,7 +616,17 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 			}
 			item.ContentID = contentID
 			if err := s.materializeVirtualPlayback(ctx, item, collection.LibraryIDs); err != nil {
-				return nil, fmt.Errorf("materializing virtual item %q: %w", entry.Title, err)
+				if ctx.Err() != nil {
+					return nil, fmt.Errorf("materializing virtual item %q: %w", entry.Title, err)
+				}
+				slog.WarnContext(ctx, "failed to materialize virtual playback item for collection entry",
+					"component", "catalog",
+					"collection_id", collection.ID,
+					"title", entry.Title,
+					"error", err,
+				)
+				warnings = append(warnings, fmt.Sprintf("materializing virtual item %q: %v", entry.Title, err))
+				continue
 			}
 			if item.ImdbID != "" {
 				lookup.ByIMDb[item.ImdbID] = contentID
@@ -635,7 +654,6 @@ func (s *LibraryCollectionService) syncMDBListCollection(ctx context.Context, co
 	candidateIDs := make([]string, 0, len(entries))
 	candidateSet := make(map[string]struct{}, len(entries))
 	matchedItems := make([]LibraryCollectionItemInput, 0, len(entries))
-	warnings := make([]string, 0)
 
 	for index, entry := range entries {
 		itemType := mdbListEntryItemType(entry)
@@ -819,9 +837,19 @@ func (s *LibraryCollectionService) syncTMDBPresetCollection(ctx context.Context,
 		}
 		if item == nil {
 			if cfg.VirtualPlayback && virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID) {
-				item, err = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, 0, entry.IMDbID, entry.ID, entry.TVDBID)
-				if err != nil {
-					return nil, err
+				var vErr error
+				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, 0, entry.IMDbID, entry.ID, entry.TVDBID)
+				if vErr != nil {
+					if ctx.Err() != nil {
+						return nil, vErr
+					}
+					slog.WarnContext(ctx, "failed to materialize virtual item for collection entry",
+						"component", "catalog",
+						"collection_id", collection.ID,
+						"title", entry.Title,
+						"error", vErr,
+					)
+					warnings = append(warnings, fmt.Sprintf("materializing virtual item %q: %v", entry.Title, vErr))
 				}
 			}
 		}
@@ -1004,9 +1032,19 @@ func (s *LibraryCollectionService) syncTMDBFranchiseCollection(ctx context.Conte
 		}
 		if item == nil {
 			if cfg.VirtualPlayback && virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID) {
-				item, err = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, 0, entry.IMDbID, entry.ID, entry.TVDBID)
-				if err != nil {
-					return nil, err
+				var vErr error
+				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, 0, entry.IMDbID, entry.ID, entry.TVDBID)
+				if vErr != nil {
+					if ctx.Err() != nil {
+						return nil, vErr
+					}
+					slog.WarnContext(ctx, "failed to materialize virtual item for collection entry",
+						"component", "catalog",
+						"collection_id", collection.ID,
+						"title", entry.Title,
+						"error", vErr,
+					)
+					warnings = append(warnings, fmt.Sprintf("materializing virtual item %q: %v", entry.Title, vErr))
 				}
 			}
 		}
@@ -1200,9 +1238,19 @@ func (s *LibraryCollectionService) syncTMDBDiscoverCollection(ctx context.Contex
 		}
 		if item == nil {
 			if cfg.VirtualPlayback && virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.ID, entry.TVDBID) {
-				item, err = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, 0, entry.IMDbID, entry.ID, entry.TVDBID)
-				if err != nil {
-					return nil, err
+				var vErr error
+				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, 0, entry.IMDbID, entry.ID, entry.TVDBID)
+				if vErr != nil {
+					if ctx.Err() != nil {
+						return nil, vErr
+					}
+					slog.WarnContext(ctx, "failed to materialize virtual item for collection entry",
+						"component", "catalog",
+						"collection_id", collection.ID,
+						"title", entry.Title,
+						"error", vErr,
+					)
+					warnings = append(warnings, fmt.Sprintf("materializing virtual item %q: %v", entry.Title, vErr))
 				}
 			}
 		}
@@ -1470,9 +1518,19 @@ func (s *LibraryCollectionService) completeTraktEntrySync(ctx context.Context, c
 		}
 		if item == nil {
 			if virtualPlayback && virtualPlaybackIdentityAvailable(entry.MediaType, entry.IMDbID, entry.TMDBID, entry.TVDBID) {
-				item, err = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, entry.Year, entry.IMDbID, entry.TMDBID, entry.TVDBID)
-				if err != nil {
-					return nil, err
+				var vErr error
+				item, vErr = s.createVirtualCollectionItem(ctx, collection, entry.MediaType, entry.Title, entry.Year, entry.IMDbID, entry.TMDBID, entry.TVDBID)
+				if vErr != nil {
+					if ctx.Err() != nil {
+						return nil, vErr
+					}
+					slog.WarnContext(ctx, "failed to materialize virtual item for collection entry",
+						"component", "catalog",
+						"collection_id", collection.ID,
+						"title", entry.Title,
+						"error", vErr,
+					)
+					warnings = append(warnings, fmt.Sprintf("materializing virtual item %q: %v", entry.Title, vErr))
 				}
 			}
 		}

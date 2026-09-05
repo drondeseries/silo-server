@@ -15,6 +15,8 @@ import (
 	"time"
 	"unicode"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -1255,7 +1257,13 @@ func (s *Service) ConfiguredVirtualVariants(ctx context.Context, virtualPath, me
 		if variants, cachedErr, ok := s.cachedConfiguredVirtualVariants(key, time.Now()); ok {
 			return virtualVariantsCacheEntry{variants: variants, err: cachedErr}, nil
 		}
-		variants, loadErr := s.configuredVirtualVariantsUncached(ctx, "virtual://movie/placeholder", key)
+		baseCtx := ctx
+		if baseCtx == nil {
+			baseCtx = context.Background()
+		}
+		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(baseCtx), 15*time.Second)
+		defer cancel()
+		variants, loadErr := s.configuredVirtualVariantsUncached(loadCtx, "virtual://movie/placeholder", key)
 		s.storeConfiguredVirtualVariants(key, variants, loadErr, time.Now())
 		return virtualVariantsCacheEntry{variants: variants, err: loadErr}, nil
 	})
@@ -1359,7 +1367,26 @@ func (s *Service) cachedConfiguredVirtualVariants(key string, now time.Time) ([]
 	return append([]VirtualPlaybackVariant(nil), entry.variants...), entry.err, true
 }
 
+func isContextCanceledOrTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if st, ok := status.FromError(err); ok {
+		if st.Code() == codes.Canceled || st.Code() == codes.DeadlineExceeded {
+			return true
+		}
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "context canceled") || strings.Contains(msg, "context deadline exceeded")
+}
+
 func (s *Service) storeConfiguredVirtualVariants(key string, variants []VirtualPlaybackVariant, err error, now time.Time) {
+	if isContextCanceledOrTimeout(err) {
+		return
+	}
 	ttl := virtualProfilesCacheTTL
 	if err != nil {
 		ttl = 10 * time.Second
@@ -1418,7 +1445,13 @@ func (s *Service) configuredVirtualProfiles(
 		if cached := s.cachedVirtualProfiles(key, time.Now()); cached != nil {
 			return cached, nil
 		}
-		response, err := client.ListVirtualStreamProfiles(ctx, &pluginv1.ListVirtualStreamProfilesRequest{
+		baseCtx := ctx
+		if baseCtx == nil {
+			baseCtx = context.Background()
+		}
+		callCtx, cancel := context.WithTimeout(context.WithoutCancel(baseCtx), 15*time.Second)
+		defer cancel()
+		response, err := client.ListVirtualStreamProfiles(callCtx, &pluginv1.ListVirtualStreamProfilesRequest{
 			CapabilityId: capabilityID,
 			MediaType:    mediaType,
 		})

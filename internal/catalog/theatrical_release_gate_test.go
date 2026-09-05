@@ -210,3 +210,35 @@ func TestTMDBEntryIsUnreleased(t *testing.T) {
 		})
 	}
 }
+
+type contextAwareDigitalReleaseChecker struct {
+	hasDigitalRelease func(ctx context.Context, tmdbID int) (bool, error)
+}
+
+func (c *contextAwareDigitalReleaseChecker) HasDigitalRelease(ctx context.Context, tmdbID int) (bool, error) {
+	return c.hasDigitalRelease(ctx, tmdbID)
+}
+
+func TestTheatricalReleaseGateLookupContextCanceledFailsOpen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	gate := newTheatricalReleaseGate(&contextAwareDigitalReleaseChecker{
+		hasDigitalRelease: func(ctx context.Context, tmdbID int) (bool, error) {
+			return false, ctx.Err()
+		},
+	})
+	if gate.skipTheatricalMovie(ctx, 300, "Canceled Context") {
+		t.Fatal("a checker context cancellation must fail open (not skip)")
+	}
+}
+
+func TestTheatricalReleaseGateNilContextDoesNotPanic(t *testing.T) {
+	gate := newTheatricalReleaseGate(&contextAwareDigitalReleaseChecker{
+		hasDigitalRelease: func(ctx context.Context, tmdbID int) (bool, error) {
+			return true, nil
+		},
+	})
+	if gate.skipTheatricalMovie(nil, 300, "Nil Context") {
+		t.Fatal("expected released movie to not be skipped with nil context")
+	}
+}
