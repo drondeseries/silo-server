@@ -1011,3 +1011,80 @@ func TestHandleTransportStartFailure_KeepsSessionForNonMissingError(t *testing.T
 		t.Fatalf("sync calls = %d, want 0", syncer.calls)
 	}
 }
+
+type virtualInheritanceTestResolver struct {
+	files  map[int]*models.MediaFile
+	byPath map[string]*models.MediaFile
+}
+
+func (r virtualInheritanceTestResolver) GetByID(_ context.Context, id int) (*models.MediaFile, error) {
+	if f, ok := r.files[id]; ok {
+		return f, nil
+	}
+	return nil, errors.New("file not found")
+}
+
+func (r virtualInheritanceTestResolver) GetByPath(_ context.Context, p string) (*models.MediaFile, error) {
+	if f, ok := r.byPath[p]; ok {
+		return f, nil
+	}
+	return nil, errors.New("file not found")
+}
+
+func TestHandleSubtitle_VirtualPlaceholderInheritsCandidateTracks(t *testing.T) {
+	placeholderFile := &models.MediaFile{
+		ID:             100,
+		ContentID:      "movie-virtual",
+		FilePath:       "virtual://movie/movie-virtual",
+		Duration:       3600,
+		SubtitleTracks: nil,
+	}
+	candidateFile := &models.MediaFile{
+		ID:        200,
+		ContentID: "movie-virtual",
+		FilePath:  "virtual://movie/movie-virtual?result=selected",
+		Duration:  3600,
+		SubtitleTracks: []models.SubtitleTrack{
+			{Index: 2, Language: "eng", Codec: "subrip"},
+		},
+	}
+
+	resolver := virtualInheritanceTestResolver{
+		files: map[int]*models.MediaFile{
+			100: placeholderFile,
+			200: candidateFile,
+		},
+		byPath: map[string]*models.MediaFile{
+			candidateFile.FilePath: candidateFile,
+		},
+	}
+
+	baseMgr := playback.NewSessionManager(0, 0)
+	session, err := baseMgr.StartSession(1, "profile-1", 100, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := baseMgr.SetVirtualSource(session.ID, candidateFile.FilePath, 0); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+	if err := baseMgr.SetEffectiveMediaFileID(session.ID, 200); err != nil {
+		t.Fatalf("SetEffectiveMediaFileID: %v", err)
+	}
+
+	handler := NewStreamHandler(baseMgr, resolver)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID+"/subtitles/0.vtt?file_id=100", nil)
+	req = req.WithContext(newAuthorizedPlaybackContext())
+	routeCtx := chi.NewRouteContext()
+	routeCtx.URLParams.Add("session_id", session.ID)
+	routeCtx.URLParams.Add("track", "0.vtt")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
+
+	rr := httptest.NewRecorder()
+	handler.HandleSubtitle(rr, req)
+
+	// If tracks were not inherited, HandleSubtitle would 404 with "Embedded subtitle track not found".
+	// Since candidate tracks are inherited, it progresses past track inventory lookup.
+	if rr.Code == http.StatusNotFound && strings.Contains(rr.Body.String(), "Embedded subtitle track not found") {
+		t.Fatalf("Candidate subtitle tracks were not inherited: %s", rr.Body.String())
+	}
+}

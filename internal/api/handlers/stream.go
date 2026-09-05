@@ -100,6 +100,39 @@ func bindSessionVirtualSource(file *models.MediaFile, session *playback.Session)
 	return &bound
 }
 
+// bindSessionVirtualSourceWithTracks binds the session's virtual source and,
+// if the target file lacks embedded subtitle tracks or fonts (e.g. because the
+// catalog placeholder row was requested), inherits the probed tracks and font
+// attachments from the session's active candidate file.
+func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaFile, session *playback.Session, resolver FilePathResolver) *models.MediaFile {
+	bound := bindSessionVirtualSource(file, session)
+	if bound == nil || !isVirtualPlaybackFile(bound) || resolver == nil || len(bound.SubtitleTracks) > 0 {
+		return bound
+	}
+
+	var candidate *models.MediaFile
+	if session.MediaFileID > 0 && session.MediaFileID != file.ID {
+		candidate, _ = resolver.GetByID(ctx, session.MediaFileID)
+	}
+	if (candidate == nil || len(candidate.SubtitleTracks) == 0) && session.VirtualSourceURI != "" {
+		if pathResolver, ok := resolver.(interface {
+			GetByPath(context.Context, string) (*models.MediaFile, error)
+		}); ok {
+			candidate, _ = pathResolver.GetByPath(ctx, session.VirtualSourceURI)
+		}
+	}
+	if candidate != nil && len(candidate.SubtitleTracks) > 0 {
+		boundCopy := *bound
+		boundCopy.SubtitleTracks = candidate.SubtitleTracks
+		if len(boundCopy.ExternalSubtitles) == 0 {
+			boundCopy.ExternalSubtitles = candidate.ExternalSubtitles
+		}
+		return &boundCopy
+	}
+
+	return bound
+}
+
 func hasVirtualMediaResolver(h *StreamHandler) bool {
 	return h != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil)
 }
@@ -393,7 +426,7 @@ func (h *StreamHandler) HandleSubtitle(w http.ResponseWriter, r *http.Request) {
 	// session captured the exact URI that was resolved and probed during
 	// planning. Extracting from a different row would silently switch the
 	// source under an in-flight play.
-	file = bindSessionVirtualSource(file, session)
+	file = bindSessionVirtualSourceWithTracks(r.Context(), file, session, h.fileResolver)
 
 	// trackIndex is a combined ordinal, resolved through the same three
 	// consecutive ranges playback.BuildSubtitleInventoryV3 assigns them from:
@@ -664,6 +697,7 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusNotFound, "not_found", "Media file not found")
 		return
 	}
+	file = bindSessionVirtualSourceWithTracks(r.Context(), file, session, h.fileResolver)
 	if err := preflightPlaybackFile(r.Context(), file, h.MissingMarker, h.EventsHub); err != nil {
 		if isPlaybackFileMissing(err) {
 			h.abortPlaybackSession(r.Context(), session)
@@ -691,7 +725,6 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 
 	inputPath := file.FilePath
 	releaseInput := func() {}
-	file = bindSessionVirtualSource(file, session)
 	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 		inputPath, releaseInput, err = h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID)
 		if err != nil {

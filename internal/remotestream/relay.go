@@ -28,8 +28,11 @@ const (
 	maxRewrittenPlaylistBytes = 8 << 20
 	maxPlaylistRefs           = 8192
 	remoteFirstByteTimeout    = 12 * time.Second
-	remoteBodyIdleTimeout     = 30 * time.Second
-	remoteBodyChunkSize       = 256 << 10
+	// remoteBodyIdleTimeout bounds how long a read from the upstream remote
+	// body may pause before the relay gives up on it. Set generously enough
+	// to tolerate transient Usenet provider latency and Altmount reader timeouts.
+	remoteBodyIdleTimeout = 90 * time.Second
+	remoteBodyChunkSize   = 256 << 10
 	// remoteBodyBufferChunks bounds the per-connection read-ahead between the
 	// upstream pump and the client writer. The channel already provides full
 	// backpressure (the producer blocks when the client stalls, closing the

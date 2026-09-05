@@ -1565,7 +1565,7 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 	// path, which only understands local/HTTP media files.
 	if isVirtualPlaybackFile(requestedFile) {
 		requestedCatalogFileID := requestedFile.ID
-		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, false)
+		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, true)
 		if resolveErr != nil {
 			termFileID := requestedFile.ID
 			if requestedFile.EpisodeID != "" && h.VirtualEpisodeFileLookup != nil {
@@ -2321,6 +2321,7 @@ func (h *PlaybackHandler) prepareTransportWithPolicyAndExclusionsV3(
 			}
 			excludedNodes[nodeURL] = struct{}{}
 			lastErr = combineTransportErrorsV3(lastErr, &transportErrorV3{reason: routeCapabilityUnavailableReasonV3, message: "No available worker can execute the selected playback recipe.", retryable: true, cause: capabilityErr})
+			continue
 		}
 
 		transport, transportErr := h.prepareRemoteTransportV3(r, session, file, result, plan, timeline, mode)
@@ -3597,49 +3598,49 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 	sourceProfile, sourceBitDepth := sourceVideoTranscodeFactsV3(file, result)
 	unlock := h.tm.LockSessionLifecycle(session.ID)
 	opts := playback.TranscodeOpts{
-		InputPath:                         file.FilePath,
-		MediaFileID:                       file.ID,
+		InputPath:                        file.FilePath,
+		MediaFileID:                      file.ID,
 		VirtualSourceOwnerInstallationID: file.VirtualOwnerInstallationID,
-		OutputDir:                         outputDir,
-		OutputSubdir:                      outputSubdir,
-		SessionID:                         session.ID,
-		SourceVideoCodec:                  sourceMetadata.VideoCodec,
-		SourceVideoProfile:                sourceProfile,
-		SourceVideoBitDepth:               sourceBitDepth,
-		SourceAudioChannels:               result.SourceAudioChannels,
-		SoftwareVideoDecode:               sourceMetadata.SoftwareVideoDecode,
-		ToneMapPolicy:                     result.ToneMapPolicy,
-		ToneMapMode:                       result.ToneMapMode,
-		ToneMapSourceKind:                 result.ToneMapSourceKind,
-		ToneMapRecipeVersion:              result.ToneMapRecipeVersion,
-		ToneMapPreflightRequired:          result.ToneMapPreflightRequired,
-		ToneMapSourceRevision:             result.ToneMapSourceRevision,
-		VideoBitstreamFilter:              videoBitstreamFilterForPlanV3(result.Plan),
-		VideoSampleEntry:                  videoSampleEntryForPlanV3(result.Plan),
-		SeekSeconds:                       timeline.seekSeconds,
-		StreamOriginSeconds:               timeline.streamOriginSeconds,
-		CopySeekAnchorResolved:            timeline.copySeekAnchorResolved,
-		StartSegmentNumber:                timeline.startSegmentNumber,
-		TargetResolution:                  result.TargetResolution,
-		TargetCodecVideo:                  videoCodec,
-		TargetCodecAudio:                  result.TargetAudioCodec,
-		TargetAudioChannels:               result.TargetAudioChannels,
-		TargetAudioBitrateKbps:            result.TargetAudioBitrateKbps,
-		TargetBitrateKbps:                 result.TargetBitrateKbps,
-		SegmentDuration:                   playback.DefaultSegmentDuration,
-		SegmentRetentionSeconds:           cfg.SegmentRetentionSeconds,
-		FFmpegPath:                        cfg.FFmpegPath,
-		HWAccel:                           cfg.HWAccel,
-		HWDevice:                          cfg.HWDevice,
-		AudioTrackIndex:                   plannedAudioTrackIndexV3(result, session.AudioTrackIndex),
-		SubtitleTrackIndex:                result.SubtitleTransportTrackIndex,
-		SubtitleBurnIn:                    result.SubtitleBurnIn,
-		SubtitleCodec:                     result.SubtitleCodec,
-		TotalDuration:                     sourceMetadata.DurationSeconds,
-		FastStart:                         true,
-		NodeType:                          playbackNodeIntegratedV3,
-		ExecutionMode:                     playbackNodeIntegratedV3,
-		FFmpegLogSink:                     h.FFmpegLogSink,
+		OutputDir:                        outputDir,
+		OutputSubdir:                     outputSubdir,
+		SessionID:                        session.ID,
+		SourceVideoCodec:                 sourceMetadata.VideoCodec,
+		SourceVideoProfile:               sourceProfile,
+		SourceVideoBitDepth:              sourceBitDepth,
+		SourceAudioChannels:              result.SourceAudioChannels,
+		SoftwareVideoDecode:              sourceMetadata.SoftwareVideoDecode,
+		ToneMapPolicy:                    result.ToneMapPolicy,
+		ToneMapMode:                      result.ToneMapMode,
+		ToneMapSourceKind:                result.ToneMapSourceKind,
+		ToneMapRecipeVersion:             result.ToneMapRecipeVersion,
+		ToneMapPreflightRequired:         result.ToneMapPreflightRequired,
+		ToneMapSourceRevision:            result.ToneMapSourceRevision,
+		VideoBitstreamFilter:             videoBitstreamFilterForPlanV3(result.Plan),
+		VideoSampleEntry:                 videoSampleEntryForPlanV3(result.Plan),
+		SeekSeconds:                      timeline.seekSeconds,
+		StreamOriginSeconds:              timeline.streamOriginSeconds,
+		CopySeekAnchorResolved:           timeline.copySeekAnchorResolved,
+		StartSegmentNumber:               timeline.startSegmentNumber,
+		TargetResolution:                 result.TargetResolution,
+		TargetCodecVideo:                 videoCodec,
+		TargetCodecAudio:                 result.TargetAudioCodec,
+		TargetAudioChannels:              result.TargetAudioChannels,
+		TargetAudioBitrateKbps:           result.TargetAudioBitrateKbps,
+		TargetBitrateKbps:                result.TargetBitrateKbps,
+		SegmentDuration:                  playback.DefaultSegmentDuration,
+		SegmentRetentionSeconds:          cfg.SegmentRetentionSeconds,
+		FFmpegPath:                       cfg.FFmpegPath,
+		HWAccel:                          cfg.HWAccel,
+		HWDevice:                         cfg.HWDevice,
+		AudioTrackIndex:                  plannedAudioTrackIndexV3(result, session.AudioTrackIndex),
+		SubtitleTrackIndex:               result.SubtitleTransportTrackIndex,
+		SubtitleBurnIn:                   result.SubtitleBurnIn,
+		SubtitleCodec:                    result.SubtitleCodec,
+		TotalDuration:                    sourceMetadata.DurationSeconds,
+		FastStart:                        true,
+		NodeType:                         playbackNodeIntegratedV3,
+		ExecutionMode:                    playbackNodeIntegratedV3,
+		FFmpegLogSink:                    h.FFmpegLogSink,
 	}
 	if opts.ToneMapMode != "" {
 		opts.ToneMapDVConfigPresent = sourceMetadata.ToneMapDVConfigPresent
@@ -5122,8 +5123,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		if intentChange && !trackChange {
 			// Prefer returning to the requested edition, but a quality/output/track
 			// change must not abandon a healthy active alternate merely because the
-			// inactive original has gone missing since playback started.
-			if requestedEditionResolved && preflightPlaybackFile(r.Context(), requestedFile, h.MissingMarker, h.EventsHub) == nil {
+			// inactive original has gone missing since playback started. For virtual
+			// sources, the requested file is a catalog placeholder without probed streams;
+			// preserve the probed candidate stream.
+			if !isVirtualPlaybackFile(currentEffectiveFile) && requestedEditionResolved && preflightPlaybackFile(r.Context(), requestedFile, h.MissingMarker, h.EventsHub) == nil {
 				effectiveFile = requestedFile
 			}
 			// Track identities only need remapping when the effective edition
@@ -6727,6 +6730,7 @@ func videoSampleEntryForPlanV3(plan *playback.PlanV3) string {
 	}
 	return ""
 }
+
 // lazyDVRPUStrippableV3 defers (and memoizes) the per-source RPU probe so the
 // planner only shells out to ffmpeg when a Dolby Vision strip route is
 // genuinely on the table; every other start never touches it.
