@@ -27,7 +27,7 @@ const (
 	maxPlaylistBytes          = 4 << 20
 	maxRewrittenPlaylistBytes = 8 << 20
 	maxPlaylistRefs           = 8192
-	remoteFirstByteTimeout    = 12 * time.Second
+	remoteFirstByteTimeout    = 30 * time.Second
 	// remoteBodyIdleTimeout bounds how long a read from the upstream remote
 	// body may pause before the relay gives up on it. Set generously enough
 	// to tolerate transient Usenet provider latency and Altmount reader timeouts.

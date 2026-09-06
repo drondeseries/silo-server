@@ -20,7 +20,9 @@ const SEEK_BACKOFF = 2;
 // a chunk. Extraction streams cues progressively, so a healthy-but-slow
 // ffmpeg keeps resetting the clock; only a genuinely hung one trips it.
 // Without this, one hung fetch blocks every future window for the session.
-const FETCH_STALL_TIMEOUT_MS = 30_000;
+// 60s matches the server relay's first-byte budget (30s) plus headroom for
+// a slow-but-progressing Usenet/altmount extraction.
+const FETCH_STALL_TIMEOUT_MS = 60_000;
 // Wait this long after a failed window fetch before retrying, so a
 // persistently failing extraction doesn't turn timeupdate into a fetch storm.
 const FETCH_RETRY_BACKOFF_MS = 5_000;
