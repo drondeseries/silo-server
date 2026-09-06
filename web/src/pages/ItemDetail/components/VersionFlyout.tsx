@@ -126,8 +126,8 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
             </span>
 
             <span className="min-w-0 flex-1">
-              <span className="text-foreground flex items-center gap-1.5 truncate text-sm font-semibold">
-                <span className="truncate">{qualitySummary}</span>
+              <span className="text-foreground flex flex-wrap items-center gap-1.5 text-sm font-semibold">
+                <span>{qualitySummary}</span>
                 {isVirtual && !isMoreAction && (
                   <Badge
                     variant="secondary"

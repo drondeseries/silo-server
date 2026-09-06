@@ -63,7 +63,7 @@ function VersionDropdown({
         <DetailPopover
           open={editionOpen}
           onOpenChange={setEditionOpen}
-          contentClassName="w-72 p-1.5"
+          contentClassName="w-96 p-1.5"
           trigger={
             <Button
               variant="glass"
@@ -98,9 +98,7 @@ function VersionDropdown({
                 >
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-sm font-medium">{option.label}</div>
-                    {detail && (
-                      <div className="text-muted-foreground truncate text-xs">{detail}</div>
-                    )}
+                    {detail && <div className="text-muted-foreground text-xs">{detail}</div>}
                   </div>
                   {isSelected && <Check className="text-primary size-4 shrink-0" />}
                 </button>
@@ -114,7 +112,7 @@ function VersionDropdown({
         <DetailPopover
           open={versionOpen}
           onOpenChange={setVersionOpen}
-          contentClassName="w-80 p-1.5"
+          contentClassName="w-96 p-1.5"
           trigger={
             <Button
               variant="glass"
@@ -149,8 +147,8 @@ function VersionDropdown({
                   }`}
                 >
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate text-sm font-medium">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-medium">
                         {summary || `Version ${version.file_id}`}
                       </span>
                       {rangeLabel ? (
@@ -160,7 +158,7 @@ function VersionDropdown({
                       ) : null}
                     </div>
                     {detail && (
-                      <span className="text-muted-foreground block truncate text-xs">{detail}</span>
+                      <span className="text-muted-foreground block text-xs">{detail}</span>
                     )}
                   </div>
                   {isSelected && <Check className="text-primary size-4 shrink-0" />}
