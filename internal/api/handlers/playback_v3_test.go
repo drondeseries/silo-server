@@ -6324,6 +6324,9 @@ func TestHandleReplanPlaybackV3ThreadsExcludedAndPreferredCandidateIDs(t *testin
 	})
 	var gotExcluded []string
 	var gotPreferred string
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
 	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, virtualURI string, _ int, _ int, _ string, _ bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
 		gotExcluded = append([]string(nil), excludedCandidateIDs...)
 		gotPreferred = preferredCandidateID
