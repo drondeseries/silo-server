@@ -1509,13 +1509,18 @@ func qualityRungHeightV3(qualityPreference string) int {
 // virtualCapRungHeightV3 derives a resolution-class height from a bandwidth
 // cap, mirroring the planner's ladderHeightForBandwidthV3 thresholds so a
 // client's delivery ceiling is honored when picking a native provider stream.
+// The planner applies a 0.8 safety factor to the cap before selecting a rung
+// (ladderHeightForBandwidthV3(int(float64(capKbps) * 0.8))), so the same
+// factor is applied here to keep the virtual candidate pick consistent with
+// the transcode ladder.
 func virtualCapRungHeightV3(bandwidthCapKbps int) int {
+	effective := int(float64(bandwidthCapKbps) * 0.8)
 	switch {
-	case bandwidthCapKbps >= 20_000:
+	case effective >= 20_000:
 		return 2160
-	case bandwidthCapKbps >= 8_000:
+	case effective >= 8_000:
 		return 1080
-	case bandwidthCapKbps >= 4_000:
+	case effective >= 4_000:
 		return 720
 	default:
 		return 480

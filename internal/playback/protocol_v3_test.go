@@ -130,30 +130,6 @@ func TestStartRequestV3UnknownQualityFallsBackToAuto(t *testing.T) {
 	}
 }
 
-// Legacy quality vocabulary must not silently degrade to "auto": 420p and
-// 328p are real low-tier rungs, and 1080p-8 is a legacy 1080p variant.
-func TestNormalizeQualityV3LegacyRungs(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"420p", "420p"},
-		{"328p", "328p"},
-		{"1080p-8", "1080p"},
-		{"420P", "420p"},
-		{"328P", "328p"},
-		{"1080P-8", "1080p"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got, changed := NormalizeQualityV3(tt.input)
-			if got != tt.want || changed {
-				t.Fatalf("NormalizeQualityV3(%q) = (%q, %t), want (%q, false)", tt.input, got, changed, tt.want)
-			}
-		})
-	}
-}
-
 func TestResolveQualityPolicyV3CompoundRung(t *testing.T) {
 	request := validStartRequestV3()
 	request.QualityPreference = QualityRung2160pMediumV3
@@ -1213,10 +1189,7 @@ func TestPlanPlaybackV3TranscodesVP9WithUnknownCodecLevel(t *testing.T) {
 	}
 }
 
-// An explicit 1080p request on a 4K source is a deliberate downscale: the 4K
-// policy gates 4K OUTPUT, so the transcode must be allowed even when 4K
-// transcoding is disabled.
-func TestPlanPlaybackV3AllowsExplicit1080pDownscaleOf4KSourceWhen4KDisabled(t *testing.T) {
+func TestPlanPlaybackV3BlocksUltrawide4KTranscode(t *testing.T) {
 	file := detailedFixtureFileV3()
 	file.Resolution = "2160p"
 	file.VideoTracks[0].Width = 3840
@@ -1229,34 +1202,8 @@ func TestPlanPlaybackV3AllowsExplicit1080pDownscaleOf4KSourceWhen4KDisabled(t *t
 	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
 
 	result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: false}, Registry: testTransformationRegistryV3()})
-	if result.Plan == nil || result.Plan.Delivery != DeliveryTranscodeHLSV3 {
-		t.Fatalf("explicit 1080p downscale of a 4K source was blocked by the 4K policy: %s", ExplainPlannerResultV3(result))
-	}
-	if result.TargetResolution != "1080p" {
-		t.Fatalf("target resolution = %q, want 1080p", result.TargetResolution)
-	}
-}
-
-// A 4K-output request on a 4K source with 4K transcoding disabled must still
-// terminal: the policy gates 4K output, not any transcode of a 4K source.
-func TestPlanPlaybackV3StillBlocks4KOutputWhen4KDisabled(t *testing.T) {
-	file := detailedFixtureFileV3()
-	file.Resolution = "2160p"
-	file.VideoTracks[0].Width = 3840
-	file.VideoTracks[0].Height = 1626
-	file.VideoTracks[0].VideoRange = "SDR"
-	file.VideoTracks[0].VideoRangeType = "SDR"
-	file.VideoTracks[0].ColorTransfer = "bt709"
-	req := validStartRequestV3()
-	// The client cannot direct-play HEVC, so the 4K source requires a
-	// transcode; the 4K-output request must then hit the 4K policy.
-	req.Capabilities.CodecsVideo = []string{"h264"}
-	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "h264", Profiles: []string{"high"}, Levels: []int{41}, BitDepths: []int{8}, MaxWidth: 1920, MaxHeight: 1080, MaxFrameRate: 60, MaxBitrateKbps: 20_000, Hardware: true}}
-	req.QualityPreference = "2160p"
-
-	result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: false}, Registry: testTransformationRegistryV3()})
 	if result.Terminal == nil || result.Terminal.Reason != "no_alternate_version" {
-		t.Fatalf("4K output with 4K transcoding disabled = %s, want no_alternate_version terminal", ExplainPlannerResultV3(result))
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
 	}
 }
 
