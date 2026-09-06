@@ -38,7 +38,7 @@ func TestReorderVirtualCandidatesForQualityPrefersAtOrBelowRung(t *testing.T) {
 	want := []string{"720p", "480p", "4k", "1080p"}
 	got := make([]string, 0, len(reordered))
 	for _, cand := range reordered {
-		got = append(got, cand.URI)
+		got = append(got, virtualResultCandidateID(cand.URI))
 	}
 	if len(got) != len(want) {
 		t.Fatalf("reordered = %v, want %v", got, want)

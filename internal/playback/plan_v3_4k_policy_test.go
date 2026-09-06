@@ -1,7 +1,6 @@
 package playback
 
 import (
-	"reflect"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -109,35 +108,5 @@ func TestPlanPlaybackV3PlansKnownNon4KSourceWhen4KDisabled(t *testing.T) {
 	})
 	if result.Plan == nil || result.Plan.Delivery != DeliveryTranscodeHLSV3 {
 		t.Fatalf("a measured 1080p source lost its transcode route: %s", ExplainPlannerResultV3(result))
-	}
-}
-
-// With 4K transcoding disabled, a 4K source must still advertise the fixed
-// rungs BELOW 4K so a client can deliberately downscale; only the 4K rungs
-// themselves are suppressed.
-func TestAvailableQualitiesV3AdvertisesSub4KRungsWhen4KDisabled(t *testing.T) {
-	input := PlannerInputV3{
-		Request:  validStartRequestV3(),
-		Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: false},
-	}
-	source := SourceDescriptorV3{Width: 3840, Height: 2160, BitrateKbps: 60_000}
-	qualities := availableQualitiesV3(input, source)
-	labels := make([]string, 0, len(qualities))
-	for _, quality := range qualities {
-		labels = append(labels, quality.Label)
-	}
-	want := []string{
-		QualityOriginalV3,
-		QualityRung1080pHighV3, QualityRung1080pMediumV3, QualityRung1080pLowV3,
-		QualityRung720pHighV3, QualityRung720pMediumV3, QualityRung720pLowV3,
-		"480p",
-	}
-	if !reflect.DeepEqual(labels, want) {
-		t.Fatalf("4K-disabled labels = %v, want %v", labels, want)
-	}
-	for _, quality := range qualities[1:] {
-		if quality.Height >= 2160 {
-			t.Fatalf("4K-disabled menu advertises a 4K rung: %#v", quality)
-		}
 	}
 }

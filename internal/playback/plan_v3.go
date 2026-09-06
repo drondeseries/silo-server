@@ -306,7 +306,7 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 	// sends the user looking for a missing encoder.
 	if dvStripUnsupportedBySource && !originalRangeOK && !clientDV81Eligible && !clientHDR10Eligible {
 		_, _, _, _, toneMapEligible := toneMapRecipeV3(input, source)
-		if !toneMapEligible || !videoTranscodeExecutableV3(input, source, quality) {
+		if !toneMapEligible || !videoTranscodeExecutableV3(input, source) {
 			return terminalPlannerResultV3(TerminalDVConversionUnsupportedV3,
 				"This source's Dolby Vision metadata cannot be removed cleanly, and this device cannot play the source as it is.", false)
 		}
@@ -373,7 +373,7 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 	// rungs keep the existing terminals.
 	if quality.RequiresTranscode && !quality.ExplicitRung && (originalSubtitleOK || remuxSubtitleOK || hlsRemuxSubtitleOK) && videoOK &&
 		(originalRangeOK || dvStripEligible || clientDV81Eligible || clientHDR10Eligible) &&
-		!videoTranscodeExecutableV3(input, source, quality) {
+		!videoTranscodeExecutableV3(input, source) {
 		warnings := append(quality.Warnings, DegradationWarningV3{
 			Code:    "quality_reduction_unavailable",
 			Message: "Reduced-quality transcoding is unavailable for this source; it is delivered at original quality.",
@@ -712,21 +712,7 @@ func availableQualitiesForRouteV3(input PlannerInputV3, source SourceDescriptorV
 	if !deliveryAvailableV3(input.Request, DeliveryClassHLSV3) || !input.Settings.TranscodeEnabled {
 		return qualities
 	}
-	// The 4K policy gates 4K OUTPUT only. A 4K source with 4K transcoding
-	// disabled still advertises the fixed rungs BELOW 4K so a client can
-	// deliberately downscale; only the 4K rungs themselves are suppressed.
 	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode {
-		for _, rung := range ladderRungsV3 {
-			if rung.Height >= 2160 || !ladderRungPublishableV3(rung, source) {
-				continue
-			}
-			qualities = append(qualities, AvailableQualityV3{
-				Label:       rung.Label,
-				DisplayName: rung.DisplayName,
-				Height:      rung.Height,
-				BitrateKbps: rung.BitrateKbps,
-			})
-		}
 		return qualities
 	}
 	if source.DynamicRange != "" && source.DynamicRange != DynamicRangeSDRV3 &&
@@ -972,13 +958,7 @@ func planVideoTranscodeV3(input PlannerInputV3, base PlanV3, source SourceDescri
 		}
 		return terminalPlannerResultV3(TerminalHDRTranscodeUnsupportedV3, "This HDR source requires video encoding, but no validated HDR-preserving or tone-map recipe is installed.", false)
 	}
-	// The 4K policy gates 4K OUTPUT, not any transcode of a 4K source: an
-	// explicit lower-rung request (or an automatic device/cap reduction) that
-	// targets a sub-4K output is a deliberate downscale and must be honored.
-	// Cinema-aspect 4K sources (e.g. 3840x1626) keep a sub-2160 height, so the
-	// output class is judged by width as well as height.
-	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode &&
-		(quality.Width == 0 && quality.Height == 0 || quality.Width >= 3840 || quality.Height >= 2160) {
+	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode {
 		if subtitleForcedAdaptation {
 			return terminalPlannerResultV3("subtitle_conversion_unsupported", "The selected subtitle must be burned into the video, but 4K transcoding is disabled.", false)
 		}
@@ -1425,15 +1405,12 @@ func toneMapRecipeVersionV3(enabled bool) string {
 
 // videoTranscodeExecutableV3 mirrors planVideoTranscodeV3's terminal
 // preconditions: it reports whether a validated video transcode of this
-// source could actually run for this client and configuration. The 4K policy
-// gates 4K OUTPUT only: a transcode targeting a sub-4K output is a deliberate
-// downscale and remains executable even when 4K transcoding is disabled.
-func videoTranscodeExecutableV3(input PlannerInputV3, source SourceDescriptorV3, quality QualityResultV3) bool {
+// source could actually run for this client and configuration.
+func videoTranscodeExecutableV3(input PlannerInputV3, source SourceDescriptorV3) bool {
 	if !deliveryAvailableV3(input.Request, DeliveryClassHLSV3) || !input.Settings.TranscodeEnabled {
 		return false
 	}
-	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode &&
-		(quality.Width == 0 && quality.Height == 0 || quality.Width >= 3840 || quality.Height >= 2160) {
+	if is4KSourceV3(input.EffectiveFile, source) && !input.Settings.Allow4KTranscode {
 		return false
 	}
 	if hdrTranscodeUnavailableV3(input, source) {
