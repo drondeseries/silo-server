@@ -105,12 +105,13 @@ func bindSessionVirtualSource(file *models.MediaFile, session *playback.Session)
 }
 
 // bindSessionVirtualSourceWithTracks binds the session's virtual source and,
-// if the target file lacks embedded subtitle tracks or fonts (e.g. because the
-// catalog placeholder row was requested), inherits the probed tracks and font
+// if the target file lacks usable embedded subtitle tracks or fonts (e.g. the
+// catalog placeholder row was requested, or it only carries provider-declared
+// language placeholders with no codec), inherits the probed tracks and font
 // attachments from the session's active candidate file.
 func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaFile, session *playback.Session, resolver FilePathResolver) *models.MediaFile {
 	bound := bindSessionVirtualSource(file, session)
-	if bound == nil || !isVirtualPlaybackFile(bound) || resolver == nil || len(bound.SubtitleTracks) > 0 {
+	if bound == nil || !isVirtualPlaybackFile(bound) || resolver == nil || hasUsableSubtitleTracks(bound) {
 		return bound
 	}
 
@@ -118,14 +119,14 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 	if session.MediaFileID > 0 && session.MediaFileID != file.ID {
 		candidate, _ = resolver.GetByID(ctx, session.MediaFileID)
 	}
-	if (candidate == nil || len(candidate.SubtitleTracks) == 0) && session.VirtualSourceURI != "" {
+	if (candidate == nil || !hasUsableSubtitleTracks(candidate)) && session.VirtualSourceURI != "" {
 		if pathResolver, ok := resolver.(interface {
 			GetByPath(context.Context, string) (*models.MediaFile, error)
 		}); ok {
 			candidate, _ = pathResolver.GetByPath(ctx, session.VirtualSourceURI)
 		}
 	}
-	if candidate != nil && len(candidate.SubtitleTracks) > 0 {
+	if candidate != nil && hasUsableSubtitleTracks(candidate) {
 		boundCopy := *bound
 		boundCopy.SubtitleTracks = candidate.SubtitleTracks
 		if len(boundCopy.ExternalSubtitles) == 0 {
@@ -135,6 +136,23 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 	}
 
 	return bound
+}
+
+// hasUsableSubtitleTracks reports whether a file carries embedded subtitle
+// tracks with real codec evidence. Provider-declared language placeholders
+// (Index 0, no Codec, no ContainerTrackID) are not usable for extraction:
+// the stream handler would pick the wrong output format and ffmpeg would
+// fail against the real provider stream.
+func hasUsableSubtitleTracks(file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	for _, track := range file.SubtitleTracks {
+		if strings.TrimSpace(track.Codec) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func hasVirtualMediaResolver(h *StreamHandler) bool {
