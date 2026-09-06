@@ -10,6 +10,7 @@ import { formatFileSize, mapAudioLabel } from "@/lib/mediaFormat";
 import { videoRangeLabel } from "@/lib/videoRange";
 import {
   audioLanguageSummary,
+  collectLanguageLabels,
   extractSourceHint,
   isVirtualFileVersion,
   subtitleLanguageSummary,
@@ -43,8 +44,9 @@ export function buildQualitySummary(version: FileVersion): string {
   const rangeLabel = videoRangeLabel(version);
   if (rangeLabel) parts.push(rangeLabel);
   if (version.codec_audio) parts.push(mapAudioLabel(version.codec_audio));
-  const audioLangs = audioLanguageSummary(version.audio_tracks);
-  if (audioLangs) parts.push(audioLangs);
+  // Audio languages are now rendered as badges in the UI.
+  // const audioLangs = audioLanguageSummary(version.audio_tracks);
+  // if (audioLangs) parts.push(audioLangs);
   if (parts.length === 0 && version.container) {
     parts.push(version.container.toUpperCase());
   }
@@ -71,8 +73,8 @@ export function buildDetailLine(version: FileVersion): string {
   if (hint) parts.push(hint);
 
   const subtitleLangs = subtitleLanguageSummary(version.subtitle_tracks);
-  if (subtitleLangs) parts.push(`Subtitles: ${subtitleLangs}`);
-
+  // Subtitle languages are now rendered as badges in the UI.
+  // if (subtitleLangs) parts.push(`Subtitles: ${subtitleLangs}`);
   return parts.join(" · ");
 }
 
@@ -126,19 +128,51 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
             </span>
 
             <span className="min-w-0 flex-1">
-              <span className="text-foreground flex flex-wrap items-center gap-1.5 text-sm font-semibold">
-                <span>{qualitySummary}</span>
-                {isVirtual && !isMoreAction && (
-                  <Badge
-                    variant="secondary"
-                    className="shrink-0 px-1.5 py-0 text-[10px] font-medium"
-                  >
-                    Virtual
-                  </Badge>
-                )}
-              </span>
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <span className="text-foreground flex items-center gap-1.5 text-sm font-semibold">
+                  <span>{qualitySummary}</span>
+                  {isVirtual && !isMoreAction && (
+                    <Badge
+                      variant="secondary"
+                      className="shrink-0 px-1.5 py-0 text-[10px] font-medium"
+                    >
+                      Virtual
+                    </Badge>
+                  )}
+                </span>
+                <div className="flex flex-wrap gap-1">
+                  {collectLanguageLabels(version.audio_tracks?.map((t) => t.language)).map(
+                    (lang) => (
+                      <Badge
+                        key={lang}
+                        variant="outline"
+                        className="border-blue-500/20 bg-blue-500/10 px-1 py-0 text-[10px] font-medium text-blue-400"
+                      >
+                        <span className="mr-0.5 opacity-70">🔊</span>
+                        {lang}
+                      </Badge>
+                    ),
+                  )}
+                </div>
+              </div>
               {detailLine && (
-                <span className="text-muted-foreground block text-xs">{detailLine}</span>
+                <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span className="text-muted-foreground text-xs">{detailLine}</span>
+                  <div className="flex flex-wrap gap-1">
+                    {collectLanguageLabels(version.subtitle_tracks?.map((t) => t.language)).map(
+                      (lang) => (
+                        <Badge
+                          key={lang}
+                          variant="outline"
+                          className="border-amber-500/20 bg-amber-500/10 px-1 py-0 text-[10px] font-medium text-amber-400"
+                        >
+                          <span className="mr-0.5 opacity-70">CC</span>
+                          {lang}
+                        </Badge>
+                      ),
+                    )}
+                  </div>
+                </div>
               )}
             </span>
           </DropdownMenuItem>

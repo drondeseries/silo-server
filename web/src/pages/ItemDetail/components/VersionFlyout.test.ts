@@ -96,7 +96,7 @@ describe("buildQualitySummary", () => {
       codec_audio: "eac3",
       audio_tracks: [{ language: "MULTI" }, { language: "fra" }],
     });
-    expect(buildQualitySummary(version)).toBe("1080p · H264 · EAC3 · Multi/French");
+    expect(buildQualitySummary(version)).toBe("1080p · H264 · EAC3");
   });
 
   it("shows audio languages even when the audio codec is missing", () => {
@@ -106,7 +106,7 @@ describe("buildQualitySummary", () => {
       codec_audio: "",
       audio_tracks: [{ language: "eng" }],
     });
-    expect(buildQualitySummary(version)).toBe("1080p · H264 · English");
+    expect(buildQualitySummary(version)).toBe("1080p · H264");
   });
 
   it("falls back to container for ebook-style files without video quality", () => {
@@ -155,7 +155,7 @@ describe("buildDetailLine", () => {
       file_size: 0,
       subtitle_tracks: [{ language: "eng" }, { language: "fra" }],
     });
-    expect(buildDetailLine(version)).toBe("Subtitles: English/French");
+    expect(buildDetailLine(version)).toBe("");
   });
 
   it("leads virtual versions with the provider release name", () => {
@@ -167,7 +167,7 @@ describe("buildDetailLine", () => {
       subtitle_tracks: [{ language: "eng" }, { language: "fra" }],
     });
     expect(buildDetailLine(version)).toBe(
-      "Disclosure Day 2160p DV HDR10 TrueHD MULTI · Subtitles: English/French",
+      "Disclosure Day 2160p DV HDR10 TrueHD MULTI",
     );
   });
 

@@ -11,7 +11,9 @@ const LANGUAGE_PLACEHOLDERS = new Set(["und", "unknown", "unk", ""]);
  * through formatLanguageName, so a virtual candidate advertising
  * ["MULTI", "FR", "eng"] summarizes to "Multi/French/English".
  */
-function collectLanguageLabels(languages: ReadonlyArray<string | undefined | null>): string[] {
+export function collectLanguageLabels(
+  languages: ReadonlyArray<string | undefined | null>,
+): string[] {
   const seen = new Set<string>();
   const labels: string[] = [];
   for (const value of languages ?? []) {
