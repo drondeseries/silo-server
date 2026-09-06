@@ -601,7 +601,7 @@ func (s *Service) resolveVirtualStreamResult(
 		}
 	}
 
-	if firstCandidateResult != nil && selection.resultID == "" && selection.profile == "" {
+	if firstCandidateResult != nil && selection.resultID == "" {
 		return firstCandidateResult, firstCandidateInstallationID, nil
 	}
 
@@ -1073,29 +1073,26 @@ func candidateMatchesProfile(candidate *pluginv1.VirtualStreamCandidate, profile
 	if candidate == nil || profile == "" {
 		return false
 	}
+	profLower := strings.ToLower(strings.TrimSpace(profile))
+	if profLower == "" {
+		return false
+	}
 	resLabel := candidate.GetResolution().GetLabel()
 	if strings.EqualFold(resLabel, profile) {
 		return true
 	}
-	profLower := strings.ToLower(strings.TrimSpace(profile))
 	resLower := strings.ToLower(strings.TrimSpace(resLabel))
-	if (profLower == "4k" || profLower == "uhd") && (resLower == "2160p" || resLower == "4k" || resLower == "uhd") {
-		return true
-	}
-	if (profLower == "1080p" || profLower == "fhd") && (resLower == "1080p" || resLower == "fhd") {
-		return true
-	}
-	if (profLower == "720p" || profLower == "hd") && (resLower == "720p" || resLower == "hd") {
-		return true
-	}
-	if (profLower == "480p" || profLower == "sd" || profLower == "576p") && (resLower == "480p" || resLower == "576p" || resLower == "sd") {
+
+	candTier := normalizeVirtualResolutionTier(resLower)
+	profTier := normalizeVirtualResolutionTier(profLower)
+	if candTier != "" && profTier != "" && candTier == profTier {
 		return true
 	}
 	if resLower != "" && (strings.Contains(resLower, profLower) || strings.Contains(profLower, resLower)) {
 		return true
 	}
 	if candidate.GetMetadata() != nil {
-		for _, k := range []string{"profile", "quality", "label"} {
+		for _, k := range []string{"profile", "quality", "label", "display_name"} {
 			if f, ok := candidate.GetMetadata().GetFields()[k]; ok {
 				val := strings.ToLower(strings.TrimSpace(f.GetStringValue()))
 				if val == profLower || (val != "" && (strings.Contains(val, profLower) || strings.Contains(profLower, val))) {
@@ -1105,6 +1102,125 @@ func candidateMatchesProfile(candidate *pluginv1.VirtualStreamCandidate, profile
 		}
 	}
 	return false
+}
+
+func normalizeVirtualResolutionTier(val string) string {
+	val = strings.ToLower(strings.TrimSpace(val))
+	switch {
+	case strings.Contains(val, "2160") || strings.Contains(val, "4k") || strings.Contains(val, "uhd"):
+		return "2160p"
+	case strings.Contains(val, "1080") || strings.Contains(val, "fhd"):
+		return "1080p"
+	case strings.Contains(val, "720") || containsExactVirtualWord(val, "hd"):
+		return "720p"
+	case strings.Contains(val, "480") || strings.Contains(val, "576") || containsExactVirtualWord(val, "sd"):
+		return "480p"
+	default:
+		return ""
+	}
+}
+
+func containsExactVirtualWord(s, word string) bool {
+	fields := strings.FieldsFunc(s, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
+	for _, f := range fields {
+		if strings.EqualFold(f, word) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCandidateHDR(candidate *pluginv1.VirtualStreamCandidate) bool {
+	if candidate == nil {
+		return false
+	}
+	if hdr := candidate.GetHdr(); hdr != nil {
+		if hdr.GetIsHdr() || hdr.GetHasDolbyVision() || strings.TrimSpace(hdr.GetFormat()) != "" || strings.TrimSpace(hdr.GetDolbyVisionProfile()) != "" {
+			return true
+		}
+	}
+	if candidate.GetMetadata() != nil {
+		for _, k := range []string{"hdr", "hdr_format", "format"} {
+			if f, ok := candidate.GetMetadata().GetFields()[k]; ok {
+				val := strings.ToLower(strings.TrimSpace(f.GetStringValue()))
+				if val != "" && val != "sdr" && val != "none" && val != "false" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func isCandidateDolbyVision(candidate *pluginv1.VirtualStreamCandidate) bool {
+	if candidate == nil {
+		return false
+	}
+	if hdr := candidate.GetHdr(); hdr != nil {
+		if hdr.GetHasDolbyVision() || strings.TrimSpace(hdr.GetDolbyVisionProfile()) != "" {
+			return true
+		}
+		fmtLower := strings.ToLower(strings.TrimSpace(hdr.GetFormat()))
+		if fmtLower == "dv" || strings.Contains(fmtLower, "dolby") || strings.Contains(fmtLower, "dovi") {
+			return true
+		}
+	}
+	if candidate.GetMetadata() != nil {
+		for _, k := range []string{"hdr", "hdr_format", "format"} {
+			if f, ok := candidate.GetMetadata().GetFields()[k]; ok {
+				val := strings.ToLower(strings.TrimSpace(f.GetStringValue()))
+				if val == "dv" || strings.Contains(val, "dolby") || strings.Contains(val, "dovi") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func filterCandidatesByHDR(candidates []*pluginv1.VirtualStreamCandidate, profile string) []*pluginv1.VirtualStreamCandidate {
+	profLower := strings.ToLower(strings.TrimSpace(profile))
+	wantsDV := strings.Contains(profLower, "dolby") || strings.Contains(profLower, "vision") || containsExactVirtualWord(profLower, "dv") || containsExactVirtualWord(profLower, "dovi")
+	wantsSDR := containsExactVirtualWord(profLower, "sdr")
+	wantsHDR := strings.Contains(profLower, "hdr") || wantsDV
+
+	if wantsDV {
+		var dv []*pluginv1.VirtualStreamCandidate
+		for _, c := range candidates {
+			if isCandidateDolbyVision(c) {
+				dv = append(dv, c)
+			}
+		}
+		if len(dv) > 0 {
+			return dv
+		}
+	}
+
+	if wantsHDR {
+		var hdr []*pluginv1.VirtualStreamCandidate
+		for _, c := range candidates {
+			if isCandidateHDR(c) {
+				hdr = append(hdr, c)
+			}
+		}
+		if len(hdr) > 0 {
+			return hdr
+		}
+	} else if wantsSDR {
+		var sdr []*pluginv1.VirtualStreamCandidate
+		for _, c := range candidates {
+			if !isCandidateHDR(c) {
+				sdr = append(sdr, c)
+			}
+		}
+		if len(sdr) > 0 {
+			return sdr
+		}
+	}
+
+	return nil
 }
 
 func filterCandidatesBySelection(candidates []*pluginv1.VirtualStreamCandidate, selection virtualStreamSelection) []*pluginv1.VirtualStreamCandidate {
@@ -1124,6 +1240,11 @@ func filterCandidatesBySelection(candidates []*pluginv1.VirtualStreamCandidate, 
 		for _, candidate := range candidates {
 			if candidateMatchesProfile(candidate, selection.profile) {
 				matched = append(matched, candidate)
+			}
+		}
+		if len(matched) > 1 {
+			if refined := filterCandidatesByHDR(matched, selection.profile); len(refined) > 0 {
+				return refined
 			}
 		}
 		return matched
