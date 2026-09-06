@@ -160,18 +160,18 @@ function VersionDropdown({
                         ) : null}
                       </div>
                       <div className="flex flex-wrap gap-1">
-                        {collectLanguageLabels(version.audio_tracks?.map((t) => t.language) ?? []).map(
-                          (lang) => (
-                            <Badge
-                              key={lang}
-                              variant="outline"
-                              className="border-blue-500/20 bg-blue-500/10 px-1 py-0 text-[10px] font-medium text-blue-400"
-                            >
-                              <span className="mr-0.5 opacity-70">🔊</span>
-                              {lang}
-                            </Badge>
-                          ),
-                        )}
+                        {collectLanguageLabels(
+                          version.audio_tracks?.map((t) => t.language) ?? [],
+                        ).map((lang) => (
+                          <Badge
+                            key={lang}
+                            variant="outline"
+                            className="border-blue-500/20 bg-blue-500/10 px-1 py-0 text-[10px] font-medium text-blue-400"
+                          >
+                            <span className="mr-0.5 opacity-70">🔊</span>
+                            {lang}
+                          </Badge>
+                        ))}
                       </div>
                     </div>
                     {detail && (

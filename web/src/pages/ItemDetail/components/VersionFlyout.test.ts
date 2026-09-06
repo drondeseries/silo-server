@@ -166,9 +166,7 @@ describe("buildDetailLine", () => {
       file_size: 0,
       subtitle_tracks: [{ language: "eng" }, { language: "fra" }],
     });
-    expect(buildDetailLine(version)).toBe(
-      "Disclosure Day 2160p DV HDR10 TrueHD MULTI",
-    );
+    expect(buildDetailLine(version)).toBe("Disclosure Day 2160p DV HDR10 TrueHD MULTI");
   });
 
   it("keeps size and source hint for virtual versions", () => {

@@ -154,18 +154,18 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
                 <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
                   <span className="text-muted-foreground text-xs">{detailLine}</span>
                   <div className="flex flex-wrap gap-1">
-                    {collectLanguageLabels(version.subtitle_tracks?.map((t) => t.language) ?? []).map(
-                      (lang) => (
-                        <Badge
-                          key={lang}
-                          variant="outline"
-                          className="border-amber-500/20 bg-amber-500/10 px-1 py-0 text-[10px] font-medium text-amber-400"
-                        >
-                          <span className="mr-0.5 opacity-70">CC</span>
-                          {lang}
-                        </Badge>
-                      ),
-                    )}
+                    {collectLanguageLabels(
+                      version.subtitle_tracks?.map((t) => t.language) ?? [],
+                    ).map((lang) => (
+                      <Badge
+                        key={lang}
+                        variant="outline"
+                        className="border-amber-500/20 bg-amber-500/10 px-1 py-0 text-[10px] font-medium text-amber-400"
+                      >
+                        <span className="mr-0.5 opacity-70">CC</span>
+                        {lang}
+                      </Badge>
+                    ))}
                   </div>
                 </div>
               )}
