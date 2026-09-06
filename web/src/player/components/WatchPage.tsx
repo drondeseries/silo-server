@@ -451,6 +451,7 @@ export function WatchPage({
       streamUrl={session.streamUrl}
       plan={session.plan}
       planRevision={session.planRevision}
+      transportRevision={session.transportRevision}
       shouldAutoPlay={session.shouldAutoPlay}
       replanning={session.replanning}
       replanError={session.error}

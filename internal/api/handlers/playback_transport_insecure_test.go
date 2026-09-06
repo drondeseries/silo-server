@@ -147,7 +147,121 @@ func TestVirtualTranscodeStartupFailsOverOnResolutionError(t *testing.T) {
 	if !foundLive {
 		t.Fatalf("live candidate was incorrectly evicted from BestResultCache: %#v", cached)
 	}
+}
 
+func TestVirtualTranscodeEvictsCandidateStoredWithDeviceFingerprint(t *testing.T) {
+	cache := NewVirtualBestResultCache(time.Minute, 10)
+	fingerprint := "device-fp-123"
+	cacheKey := bestResultCacheKey("content-fp", "virtual://series/tt1/1/1", 5, fingerprint)
+	cache.setWithDetails(cacheKey, "content-fp", "virtual://series/tt1/1/1", 5, []VirtualPlaybackStream{
+		{URI: "virtual://series/tt1/1/1?result=dead"},
+		{URI: "virtual://series/tt1/1/1?result=live"},
+	}, time.Now())
+
+	fileRes := &fakePinFileResolver{
+		file: &models.MediaFile{
+			ID:                         10,
+			ContentID:                  "content-fp",
+			FilePath:                   "virtual://series/tt1/1/1?result=dead",
+			VirtualOwnerInstallationID: 5,
+		},
+	}
+
+	h := &PlaybackHandler{
+		BestResultCache: cache,
+		fileResolver:    fileRes,
+		sessionMgr:      playback.NewSessionManager(0, 0),
+		VirtualMediaResolver: VirtualMediaResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
+			if virtualURI == "virtual://series/tt1/1/1?result=dead" {
+				return "", errors.New("candidate link expired")
+			}
+			return "http://localhost:8080/stream.mp4", nil
+		}),
+		VirtualMediaRefreshResolver: VirtualMediaRefreshResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
+			return "http://localhost:8080/stream.mp4", nil
+		}),
+	}
+
+	opts := playback.TranscodeOpts{
+		MediaFileID:                      10,
+		InputPath:                        "virtual://series/tt1/1/1?result=dead",
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "sess-fp-test",
+	}
+
+	_, _ = h.startLocalPlaybackTransportOnce(context.Background(), opts)
+
+	cached := cache.get(cacheKey, time.Now())
+	for _, c := range cached {
+		if c.URI == "virtual://series/tt1/1/1?result=dead" {
+			t.Fatalf("dead candidate was not evicted from fingerprint-keyed cache: %#v", cached)
+		}
+	}
+	foundLive := false
+	for _, c := range cached {
+		if c.URI == "virtual://series/tt1/1/1?result=live" {
+			foundLive = true
+		}
+	}
+	if !foundLive {
+		t.Fatalf("live candidate was incorrectly evicted: %#v", cached)
+	}
+}
+
+func TestVirtualTranscodeEvictionOwnerExactIsolation(t *testing.T) {
+	cache := NewVirtualBestResultCache(time.Minute, 10)
+	keyOwner5 := bestResultCacheKey("content-iso", "virtual://series/tt1/1/1", 5)
+	cache.setWithDetails(keyOwner5, "content-iso", "virtual://series/tt1/1/1", 5, []VirtualPlaybackStream{
+		{ID: "cand-same-id", URI: "virtual://series/tt1/1/1?result=cand-same-id"},
+	}, time.Now())
+
+	keyOwner7 := bestResultCacheKey("content-iso", "virtual://series/tt1/1/1", 7)
+	cache.setWithDetails(keyOwner7, "content-iso", "virtual://series/tt1/1/1", 7, []VirtualPlaybackStream{
+		{ID: "cand-same-id", URI: "virtual://series/tt1/1/1?result=cand-same-id"},
+	}, time.Now())
+
+	fileRes := &fakePinFileResolver{
+		file: &models.MediaFile{
+			ID:                         10,
+			ContentID:                  "content-iso",
+			FilePath:                   "virtual://series/tt1/1/1?result=cand-same-id",
+			VirtualOwnerInstallationID: 5,
+		},
+	}
+
+	h := &PlaybackHandler{
+		BestResultCache: cache,
+		fileResolver:    fileRes,
+		sessionMgr:      playback.NewSessionManager(0, 0),
+		VirtualMediaResolver: VirtualMediaResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
+			if ownerInstallationID == 5 {
+				return "", errors.New("owner 5 link expired")
+			}
+			return "http://localhost:8080/stream.mp4", nil
+		}),
+		VirtualMediaRefreshResolver: VirtualMediaRefreshResolverFunc(func(ctx context.Context, virtualURI string, ownerInstallationID int, userID int, profileID string) (string, error) {
+			return "http://localhost:8080/stream.mp4", nil
+		}),
+	}
+
+	opts := playback.TranscodeOpts{
+		MediaFileID:                      10,
+		InputPath:                        "virtual://series/tt1/1/1?result=cand-same-id",
+		VirtualSourceOwnerInstallationID: 5,
+		SessionID:                        "sess-iso-test",
+	}
+
+	_, _ = h.startLocalPlaybackTransportOnce(context.Background(), opts)
+
+	cached5 := cache.get(keyOwner5, time.Now())
+	if len(cached5) != 0 {
+		t.Fatalf("expected owner 5 entry to be evicted, got %#v", cached5)
+	}
+
+	cached7 := cache.get(keyOwner7, time.Now())
+	if len(cached7) != 1 || cached7[0].ID != "cand-same-id" {
+		t.Fatalf("owner 7 entry was incorrectly evicted by owner 5 failure: %#v", cached7)
+	}
 }
 
 func TestVirtualTranscodeNeutralResolutionFailureEvictsExactCandidate(t *testing.T) {

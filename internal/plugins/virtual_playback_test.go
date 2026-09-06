@@ -518,6 +518,97 @@ func TestVirtualPlaybackStaleSelectionIsRejected(t *testing.T) {
 	}
 }
 
+func TestVirtualPlaybackProfileOnlySelectionMatchesProfile(t *testing.T) {
+	best4K := virtualCandidate("candidate-4k", "https://1.1.1.1/4k")
+	best4K.Resolution.Label = "2160p"
+	match1080p := virtualCandidate("candidate-1080p", "https://1.1.1.1/1080p")
+	match1080p.Resolution.Label = "1080p"
+	match1080p.Rank = 2
+
+	service, _ := newVirtualPlaybackTestService(t,
+		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+			return virtualResponse(best4K, match1080p), nil
+		},
+	)
+	res, err := service.ResolveVirtualPlaybackDetailedWithRouting(
+		context.Background(),
+		"virtual://movie/tt1234?profile=1080p",
+		7,
+		"p1",
+		VirtualPlaybackRouting{OwnerInstallationID: 101},
+		false,
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("unexpected resolve error: %v", err)
+	}
+	if res.CandidateID != "candidate-1080p" {
+		t.Fatalf("candidateID = %q, want candidate-1080p", res.CandidateID)
+	}
+	if res.URL != "https://1.1.1.1/1080p" {
+		t.Fatalf("url = %q, want https://1.1.1.1/1080p", res.URL)
+	}
+}
+
+func TestVirtualPlaybackNamedProfileSynonymMatches(t *testing.T) {
+	cand4K := virtualCandidate("cand-4k", "https://1.1.1.1/4k")
+	cand4K.Resolution.Label = "2160p"
+	cand1080p := virtualCandidate("cand-1080p", "https://1.1.1.1/1080p")
+	cand1080p.Resolution.Label = "1080p"
+
+	service, _ := newVirtualPlaybackTestService(t,
+		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+			return virtualResponse(cand1080p, cand4K), nil
+		},
+	)
+	res, err := service.ResolveVirtualPlaybackDetailedWithRouting(
+		context.Background(),
+		"virtual://movie/tt1234?profile=4K",
+		7,
+		"p1",
+		VirtualPlaybackRouting{OwnerInstallationID: 101},
+		false,
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("unexpected resolve error: %v", err)
+	}
+	if res.CandidateID != "cand-4k" {
+		t.Fatalf("candidateID = %q, want cand-4k", res.CandidateID)
+	}
+}
+
+func TestVirtualPlaybackProfileCandidateFallbackOnInvalidURL(t *testing.T) {
+	badURLCand := virtualCandidate("cand-bad", "ftp://invalid-scheme/4k")
+	badURLCand.Resolution.Label = "2160p"
+	goodURLCand := virtualCandidate("cand-good", "https://1.1.1.1/4k")
+	goodURLCand.Resolution.Label = "2160p"
+
+	service, _ := newVirtualPlaybackTestService(t,
+		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+			return virtualResponse(badURLCand, goodURLCand), nil
+		},
+	)
+	res, err := service.ResolveVirtualPlaybackDetailedWithRouting(
+		context.Background(),
+		"virtual://movie/tt1234?profile=4K",
+		7,
+		"p1",
+		VirtualPlaybackRouting{OwnerInstallationID: 101},
+		false,
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("unexpected resolve error: %v", err)
+	}
+	if res.CandidateID != "cand-good" {
+		t.Fatalf("candidateID = %q, want cand-good", res.CandidateID)
+	}
+}
+
 func TestVirtualPlaybackMissingOwnerFallsBackToReplacementProvider(t *testing.T) {
 	service, calls := newVirtualPlaybackTestService(t,
 		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {

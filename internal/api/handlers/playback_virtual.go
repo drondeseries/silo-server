@@ -91,11 +91,11 @@ type VirtualBestResultCache struct {
 }
 
 type bestResultCacheEntry struct {
-	// streams holds the filtered, device-neutral candidate list. Ranking
-	// happens per device on every hit (the raw provider list is identical for
-	// every device, so a device-specific key would fragment cache hits).
-	streams   []VirtualPlaybackStream
-	expiresAt time.Time
+	contentID           string
+	neutralURI          string
+	ownerInstallationID int
+	streams             []VirtualPlaybackStream
+	expiresAt           time.Time
 }
 
 // NewVirtualBestResultCache returns an initialized cache. Zero or negative ttl
@@ -162,7 +162,43 @@ func (c *VirtualBestResultCache) RemoveCandidate(key string, candURI string) {
 	c.entries[key] = entry
 }
 
+func (c *VirtualBestResultCache) RemoveCandidateForContent(contentID, neutralURI string, ownerInstallationID int, candURI string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	candNeutral := virtualPlaybackNeutralKey(candURI)
+	targetCandID := ""
+	if parsed, err := url.Parse(candURI); err == nil {
+		targetCandID = parsed.Query().Get("result")
+	}
+	for k, entry := range c.entries {
+		if (contentID == "" || entry.contentID == contentID) &&
+			(neutralURI == "" || entry.neutralURI == neutralURI) &&
+			entry.ownerInstallationID == ownerInstallationID {
+			filtered := make([]VirtualPlaybackStream, 0, len(entry.streams))
+			for _, s := range entry.streams {
+				if s.URI == candURI || (candNeutral != "" && s.URI == candNeutral) || (targetCandID != "" && s.ID == targetCandID) {
+					continue
+				}
+				filtered = append(filtered, s)
+			}
+			if len(filtered) == 0 {
+				delete(c.entries, k)
+			} else {
+				entry.streams = filtered
+				c.entries[k] = entry
+			}
+		}
+	}
+}
+
 func (c *VirtualBestResultCache) set(key string, streams []VirtualPlaybackStream, now time.Time) {
+	c.setWithDetails(key, "", "", 0, streams, now)
+}
+
+func (c *VirtualBestResultCache) setWithDetails(key, contentID, neutralURI string, ownerInstallationID int, streams []VirtualPlaybackStream, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for k, entry := range c.entries {
@@ -181,8 +217,11 @@ func (c *VirtualBestResultCache) set(key string, streams []VirtualPlaybackStream
 		delete(c.entries, oldestKey)
 	}
 	c.entries[key] = bestResultCacheEntry{
-		streams:   streams,
-		expiresAt: now.Add(c.ttl),
+		contentID:           contentID,
+		neutralURI:          neutralURI,
+		ownerInstallationID: ownerInstallationID,
+		streams:             streams,
+		expiresAt:           now.Add(c.ttl),
 	}
 }
 
@@ -256,12 +295,22 @@ func (f VirtualPlaybackStreamListerFunc) ListVirtualPlaybackStreams(ctx context.
 // files.
 type VirtualPlaybackStreamSink func(context.Context, *models.MediaFile, []VirtualPlaybackStream) error
 
+type ProbeProvenance string
+
+const (
+	ProbeProvenanceDeclared ProbeProvenance = "declared"
+	ProbeProvenancePending  ProbeProvenance = "pending"
+	ProbeProvenanceVerified ProbeProvenance = "verified"
+	ProbeProvenanceFailed   ProbeProvenance = "failed"
+)
+
 type resolvedVirtualPlaybackSource struct {
 	URL            string
 	URI            string
 	OwnerID        int
 	File           *models.MediaFile
 	ProbeSucceeded bool
+	Provenance     ProbeProvenance
 }
 
 // resolveVirtualPlaybackSource chooses a ranked provider-neutral result,
@@ -339,7 +388,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			filtered := filterVirtualPlaybackStreams(file, streams)
 			if h.BestResultCache != nil && len(filtered) > 0 {
 				neutralURI := virtualPlaybackNeutralKey(file.FilePath)
-				h.BestResultCache.set(bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID, fingerprint), filtered, time.Now())
+				cacheKey := bestResultCacheKey(file.ContentID, neutralURI, file.VirtualOwnerInstallationID, fingerprint)
+				h.BestResultCache.setWithDetails(cacheKey, file.ContentID, neutralURI, file.VirtualOwnerInstallationID, filtered, time.Now())
 			}
 			if noResult {
 				if len(filtered) > 0 {
@@ -389,8 +439,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			)
 			if err == nil {
 				streamURL = res.URL
-				if len(res.RequestHeaders) > 0 && cand.RequestHeaders == nil {
-					cand.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
+				cand.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
+				if res.URI != "" {
+					cand.URI = res.URI
+				}
+				if res.CandidateID != "" {
+					cand.ID = res.CandidateID
 				}
 			} else {
 				resolveErr = err
@@ -399,6 +453,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			streamURL, resolveErr = h.VirtualPlaybackResolver.ResolveVirtualPlayback(
 				attemptCtx, cand.URI, userID, profileID, oid,
 			)
+			cand.RequestHeaders = nil
 		} else {
 			resolveErr = errors.New("virtual playback resolver is not configured")
 		}
@@ -460,7 +515,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: true,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified,
 			}, nil
 		}
 		if deferProbe {
@@ -470,12 +525,11 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
-			if h.VirtualPlaybackSourceProber != nil {
+			if h.VirtualPlaybackSourceProber != nil || h.VirtualPlaybackSourceProberWithHeaders != nil {
 				targetID := file.ID
 				if transient.ID > 0 {
 					targetID = transient.ID
 				}
-				prober := h.VirtualPlaybackSourceProber
 				probeURL := streamURL
 				probeTransient := transient
 				if len(transient.VideoTracks) > 0 {
@@ -502,7 +556,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				go func() {
 					bgCtx, bgCancel := context.WithTimeout(context.WithoutCancel(r.Context()), virtualProbeBudget)
 					defer bgCancel()
-					probed, probeErr := prober(bgCtx, probeURL, &probeTransient)
+					probed, probeErr := h.probeVirtualSource(bgCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
 					if probeErr != nil || probed == nil {
 						slog.WarnContext(bgCtx, "background virtual stream probe failed", "component", "api", "candidate_uri", probeCand.URI, "error", probeErr)
 						h.unpinVirtualSticky(stickyKey, probeCand.URI)
@@ -523,25 +577,25 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 						probed.Duration = probeTransient.Duration
 					}
 					mergeVirtualCandidateTracks(probed, probeCand)
-					h.persistVirtualMetadataBounded(bgCtx, targetID, probed)
+					h.persistVirtualMetadataBounded(bgCtx, targetID, probeCand.URI, probed)
 				}()
 			}
 			return &resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: true,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenancePending,
 			}, nil
 		}
-		if h.VirtualPlaybackSourceProber == nil {
+		if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
 				transient.HDR = true
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceDeclared,
 			}, nil
 		}
 		probeCtx, probeCancel := context.WithTimeout(attemptCtx, virtualProbeBudget)
-		probed, probeErr := h.VirtualPlaybackSourceProber(probeCtx, streamURL, &transient)
+		probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &transient, cand.RequestHeaders)
 		probeCancel()
 		if probeErr != nil || probed == nil {
 			slog.DebugContext(r.Context(), "virtual stream probe timed out or failed; using candidate metadata", "component", "api", "candidate_uri", cand.URI, "error", probeErr)
@@ -551,7 +605,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			}
 			h.maybeTriggerSubtitleSearch(attemptCtx, &transient, cand)
 			return &resolvedVirtualPlaybackSource{
-				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false,
+				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: false, Provenance: ProbeProvenanceFailed,
 			}, nil
 		}
 		if transient.ID > 0 {
@@ -564,7 +618,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		mergeVirtualCandidateTracks(probed, cand)
 		h.maybeTriggerSubtitleSearch(probeCtx, probed, cand)
 		return &resolvedVirtualPlaybackSource{
-			URL: streamURL, URI: cand.URI, OwnerID: oid, File: probed, ProbeSucceeded: true,
+			URL: streamURL, URI: cand.URI, OwnerID: oid, File: probed, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified,
 		}, nil
 	}
 
@@ -587,7 +641,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			attemptErr = errors.Join(attemptErr, err)
 			continue
 		}
-		if result.ProbeSucceeded || h.VirtualPlaybackSourceProber == nil {
+		if result.Provenance == ProbeProvenanceVerified || (h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil) {
 			// Content ground truth: a probed duration wildly different from the
 			// catalog runtime means the provider handed us mislabeled content.
 			// Skip persisting its metadata onto this content's rows and rotate.
@@ -620,7 +674,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if result.File != nil && result.File.ID > 0 {
 				targetID = result.File.ID
 			}
-			h.persistVirtualMetadataBounded(r.Context(), targetID, result.File)
+			h.persistVirtualMetadataBounded(r.Context(), targetID, result.File.FilePath, result.File)
 			// The filtered candidate list is already cached device-neutrally
 			// above (and ranked for this device), so replays skip the provider
 			// round-trip and re-rank for the requesting device. Pin this URI
@@ -637,11 +691,13 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if len(candidates) > 0 {
 			mergeVirtualCandidateTracks(firstResolved.File, candidates[0])
 		}
-		targetID := file.ID
-		if firstResolved.File != nil && firstResolved.File.ID > 0 {
-			targetID = firstResolved.File.ID
+		if firstResolved.Provenance == ProbeProvenanceVerified {
+			targetID := file.ID
+			if firstResolved.File != nil && firstResolved.File.ID > 0 {
+				targetID = firstResolved.File.ID
+			}
+			h.persistVirtualMetadataBounded(r.Context(), targetID, firstResolved.File.FilePath, firstResolved.File)
 		}
-		h.persistVirtualMetadataBounded(r.Context(), targetID, firstResolved.File)
 		return *firstResolved, nil
 	}
 	if attemptErr == nil {
@@ -659,7 +715,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	return resolvedVirtualPlaybackSource{}, attemptErr
 }
 
-func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, targetID int, file *models.MediaFile) {
+func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, targetID int, expectedFilePath string, file *models.MediaFile) {
 	if h == nil || h.VirtualFileMetadataSaver == nil || file == nil || targetID <= 0 {
 		return
 	}
@@ -670,7 +726,7 @@ func (h *PlaybackHandler) persistVirtualMetadataBounded(ctx context.Context, tar
 	go func() {
 		persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer persistCancel()
-		if err := h.VirtualFileMetadataSaver(persistCtx, targetID, videoJSON, audioJSON, subJSON, res, vCodec, aCodec, container, hdr, bitrate, duration); err != nil {
+		if err := h.VirtualFileMetadataSaver(persistCtx, targetID, expectedFilePath, videoJSON, audioJSON, subJSON, res, vCodec, aCodec, container, hdr, bitrate, duration); err != nil {
 			slog.ErrorContext(persistCtx, "virtual metadata persist failed", "component", "api", "file_id", targetID, "error", err)
 		}
 	}()
@@ -753,21 +809,40 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	if ownerID <= 0 {
 		ownerID = file.VirtualOwnerInstallationID
 	}
-	streamURL, err := h.VirtualPlaybackResolver.ResolveVirtualPlayback(
-		ctx, candidate.URI, userID, profileID, ownerID,
-	)
-	if err != nil {
-		return nil, err
+	var streamURL string
+	if h.VirtualMediaDetailedResolver != nil {
+		res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
+			ctx, candidate.URI, ownerID, userID, profileID, false, nil, "",
+		)
+		if err != nil {
+			return nil, err
+		}
+		streamURL = res.URL
+		candidate.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
+		if res.URI != "" {
+			candidate.URI = res.URI
+		}
+	} else if h.VirtualPlaybackResolver != nil {
+		var err error
+		streamURL, err = h.VirtualPlaybackResolver.ResolveVirtualPlayback(
+			ctx, candidate.URI, userID, profileID, ownerID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		candidate.RequestHeaders = nil
+	} else {
+		return nil, errors.New("virtual playback resolver is not configured")
 	}
 	transient := *file
 	transient.FilePath = candidate.URI
 	transient.VirtualOwnerInstallationID = ownerID
-	resolved := resolvedVirtualPlaybackSource{URL: streamURL, URI: candidate.URI, OwnerID: ownerID, File: &transient}
-	if h.VirtualPlaybackSourceProber == nil {
+	resolved := resolvedVirtualPlaybackSource{URL: streamURL, URI: candidate.URI, OwnerID: ownerID, File: &transient, Provenance: ProbeProvenanceDeclared}
+	if h.VirtualPlaybackSourceProber == nil && h.VirtualPlaybackSourceProberWithHeaders == nil {
 		return &resolved, nil
 	}
 	probeCtx, probeCancel := context.WithTimeout(ctx, virtualProbeBudget)
-	probed, probeErr := h.VirtualPlaybackSourceProber(probeCtx, streamURL, &transient)
+	probed, probeErr := h.probeVirtualSource(probeCtx, streamURL, &transient, candidate.RequestHeaders)
 	probeCancel()
 	if probeErr != nil || probed == nil {
 		return nil, errors.New("virtual stream probe failed during fallback")
@@ -775,6 +850,7 @@ func (h *PlaybackHandler) resolveVirtualCandidateSource(
 	resolved.File = probed
 	mergeVirtualCandidateTracks(resolved.File, candidate)
 	resolved.ProbeSucceeded = true
+	resolved.Provenance = ProbeProvenanceVerified
 	return &resolved, nil
 }
 

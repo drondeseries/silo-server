@@ -270,9 +270,10 @@ func (s *Service) ResolveVirtualPlaybackDetailedWithRouting(
 		return ResolvedVirtualStream{}, err
 	}
 	candidatesToTry := result.GetCandidates()
-	if selection.resultID != "" {
-		if matched := selectVirtualCandidate(candidatesToTry, selection); matched != nil {
-			candidatesToTry = []*pluginv1.VirtualStreamCandidate{matched}
+	if selection.resultID != "" || selection.profile != "" {
+		filtered := filterCandidatesBySelection(candidatesToTry, selection)
+		if len(filtered) > 0 {
+			candidatesToTry = filtered
 		}
 	}
 
@@ -401,8 +402,9 @@ func (s *Service) ResolveVirtualPlaybackDetailedForInstallation(
 }
 
 type virtualStreamSelection struct {
-	resultID string
-	profile  string
+	resultID     string
+	profile      string
+	forceRefresh bool
 }
 
 func virtualStreamRequest(virtualPath string, userID int, profileID string) (*pluginv1.ResolveVirtualStreamRequest, virtualStreamSelection, error) {
@@ -480,8 +482,9 @@ func virtualStreamRequestWithRefresh(
 
 	query := parsed.Query()
 	selection := virtualStreamSelection{
-		resultID: boundedQueryValue(query.Get("result")),
-		profile:  boundedQueryValue(query.Get("profile")),
+		resultID:     boundedQueryValue(query.Get("result")),
+		profile:      boundedQueryValue(query.Get("profile")),
+		forceRefresh: forceRefresh,
 	}
 	query.Del("result")
 	parsed.RawQuery = query.Encode()
@@ -598,7 +601,7 @@ func (s *Service) resolveVirtualStreamResult(
 		}
 	}
 
-	if firstCandidateResult != nil && selection.resultID == "" {
+	if firstCandidateResult != nil && selection.resultID == "" && selection.profile == "" {
 		return firstCandidateResult, firstCandidateInstallationID, nil
 	}
 
@@ -1066,44 +1069,74 @@ func validateVirtualStatus(
 	return nil
 }
 
-func selectVirtualCandidate(candidates []*pluginv1.VirtualStreamCandidate, selection virtualStreamSelection) *pluginv1.VirtualStreamCandidate {
-	if selection.resultID != "" {
-		for _, candidate := range candidates {
-			cid := candidate.GetCandidateId()
-			if cid == selection.resultID || strings.HasPrefix(cid, selection.resultID+"-") {
-				return candidate
+func candidateMatchesProfile(candidate *pluginv1.VirtualStreamCandidate, profile string) bool {
+	if candidate == nil || profile == "" {
+		return false
+	}
+	resLabel := candidate.GetResolution().GetLabel()
+	if strings.EqualFold(resLabel, profile) {
+		return true
+	}
+	profLower := strings.ToLower(strings.TrimSpace(profile))
+	resLower := strings.ToLower(strings.TrimSpace(resLabel))
+	if (profLower == "4k" || profLower == "uhd") && (resLower == "2160p" || resLower == "4k" || resLower == "uhd") {
+		return true
+	}
+	if (profLower == "1080p" || profLower == "fhd") && (resLower == "1080p" || resLower == "fhd") {
+		return true
+	}
+	if (profLower == "720p" || profLower == "hd") && (resLower == "720p" || resLower == "hd") {
+		return true
+	}
+	if (profLower == "480p" || profLower == "sd" || profLower == "576p") && (resLower == "480p" || resLower == "576p" || resLower == "sd") {
+		return true
+	}
+	if resLower != "" && (strings.Contains(resLower, profLower) || strings.Contains(profLower, resLower)) {
+		return true
+	}
+	if candidate.GetMetadata() != nil {
+		for _, k := range []string{"profile", "quality", "label"} {
+			if f, ok := candidate.GetMetadata().GetFields()[k]; ok {
+				val := strings.ToLower(strings.TrimSpace(f.GetStringValue()))
+				if val == profLower || (val != "" && (strings.Contains(val, profLower) || strings.Contains(profLower, val))) {
+					return true
+				}
 			}
 		}
-		// Candidate IDs are deliberately temporary. A provider may rotate or
-		// remove one between picker display and playback, or the owning provider
-		// may have been replaced. A provider-neutral URI without a profile can
-		// safely choose the newly ranked first result because planning/probing
-		// happens after this selection. Profile-bound selections stay strict so
-		// the server never silently crosses a user-selected quality boundary.
-		if selection.profile == "" && len(candidates) > 0 {
-			return candidates[0]
+	}
+	return false
+}
+
+func filterCandidatesBySelection(candidates []*pluginv1.VirtualStreamCandidate, selection virtualStreamSelection) []*pluginv1.VirtualStreamCandidate {
+	if selection.resultID != "" {
+		for _, candidate := range candidates {
+			if candidate.GetCandidateId() == selection.resultID {
+				return []*pluginv1.VirtualStreamCandidate{candidate}
+			}
+		}
+		if !selection.forceRefresh && selection.profile == "" && len(candidates) > 0 {
+			return []*pluginv1.VirtualStreamCandidate{candidates[0]}
 		}
 		return nil
 	}
 	if selection.profile != "" {
+		var matched []*pluginv1.VirtualStreamCandidate
 		for _, candidate := range candidates {
-			if strings.EqualFold(candidate.GetResolution().GetLabel(), selection.profile) {
-				return candidate
+			if candidateMatchesProfile(candidate, selection.profile) {
+				matched = append(matched, candidate)
 			}
 		}
-		for _, candidate := range candidates {
-			lbl := strings.ToLower(candidate.GetResolution().GetLabel())
-			prof := strings.ToLower(selection.profile)
-			if lbl != "" && (strings.Contains(lbl, prof) || strings.Contains(prof, lbl)) {
-				return candidate
-			}
-		}
-		return nil
+		return matched
 	}
-	if len(candidates) == 0 {
-		return nil
+	return candidates
+}
+
+func selectVirtualCandidate(candidates []*pluginv1.VirtualStreamCandidate, selection virtualStreamSelection) *pluginv1.VirtualStreamCandidate {
+	filtered := filterCandidatesBySelection(candidates, selection)
+	if len(filtered) > 0 {
+		return filtered[0]
 	}
-	return candidates[0]
+	return nil
 }
 
 func streamsFromVirtualResult(virtualPath string, result *pluginv1.VirtualStreamResult, installationID int) []VirtualPlaybackStream {

@@ -238,6 +238,10 @@ type SettingsReader interface {
 	Get(ctx context.Context, key string) (string, error)
 }
 
+type sessionExpirationHookAdder interface {
+	AddExpirationHook(func(*playback.Session))
+}
+
 // PlaybackSessionSyncer flushes the in-memory native-session snapshot into the
 // shared admin live-session table (playback_sessions_sync). Without it, compat
 // session starts and stops only become visible on the periodic reconciler
@@ -282,6 +286,7 @@ type PlaybackHandler struct {
 	FFmpegPath              string
 	HWAccel                 string
 	TranscodeDir            string
+	SubtitleCache           *playback.SubtitleCache
 	SegmentRetentionSeconds func() int
 	PlaybackConfig          func() config.PlaybackConfig
 	// tm is the shared transcode-session lifecycle (live map, reconstruct) — the
@@ -1099,6 +1104,7 @@ func NewPlaybackHandler(
 		SegmentRetentionSeconds: func() int { return segmentRetentionSeconds },
 		tm:                      playback.NewTranscodeManager(),
 	}
+	h.SubtitleCache = playback.NewSubtitleCache(func() string { return h.TranscodeDir })
 	// Wire the shared transcode manager with closures so it reads the handler's
 	// (late-set) JWTSecret lazily, matching the native handler.
 	h.tm.JWTSecretFn = func() string { return h.JWTSecret }
@@ -1109,6 +1115,9 @@ func NewPlaybackHandler(
 			HWAccel:                 h.HWAccel,
 			SegmentRetentionSeconds: h.segmentRetentionSeconds(),
 		}
+	}
+	h.tm.StartThrottler = func(ctx context.Context, session *playback.TranscodeSession) {
+		playback.StartConfiguredTranscodeThrottler(ctx, h.SettingsRepo, session)
 	}
 
 	h.tm.ResolveInput = func(ctx context.Context, mediaFileID, ownerInstallationID, userID int, profileID, canonicalPath string) (string, func(), error) {
@@ -1175,7 +1184,18 @@ func NewPlaybackHandler(
 			_ = h.sessionMgr.StopSession(sessionID)
 		}
 	}
+	if adder, ok := sessionMgr.(sessionExpirationHookAdder); ok {
+		adder.AddExpirationHook(h.handleExpiredSession)
+	}
 	return h
+}
+
+func (h *PlaybackHandler) handleExpiredSession(session *playback.Session) {
+	if h == nil || h.tm == nil || session == nil {
+		return
+	}
+	sessionCopy := *session
+	go h.tm.CloseTranscodeSession(sessionCopy.ID, sessionCopy.TranscodeNodeURL)
 }
 
 func (h *PlaybackHandler) segmentRetentionSeconds() int {
@@ -1541,6 +1561,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		SourceAudioChannels: compatHLSRecipeSourceAudioChannels(source),
 		TotalDuration:       float64(source.Version.Duration),
 		RequireReady:        toneMapRecipe.mode != "",
+		ThrottleSeconds:     playback.ConfiguredTranscodeThrottleSeconds(ctx, h.SettingsRepo),
 	}
 	if playback.IsAudioToAACStereoDownmixV3(reqBody.SourceAudioChannels, reqBody.TargetCodecAudio, reqBody.TargetAudioChannels) {
 		reqBody.AudioRecipeVersion = playback.TransformationAudioToAACRecipeVersionV3
@@ -1703,6 +1724,10 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
 		return err
 	}
+	if err := transcodenode.ValidateThrottleAttestation(reqBody, nodeResponse); err != nil {
+		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
+		return fmt.Errorf("%w: %w", errRemoteTranscodeStartFailed, err)
+	}
 	if reqBody.ToneMapMode != "" && nodeResponse.ToneMapMode != reqBody.ToneMapMode {
 		h.tm.StopRemoteTranscode(upstreamSessionID, transcodeNodeURL)
 		err := errors.New("remote transcode node did not confirm tone-map mode")
@@ -1769,6 +1794,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		SourceAudioChannels:              reqBody.SourceAudioChannels,
 		TargetAudioChannels:              reqBody.TargetAudioChannels,
 		TotalDuration:                    reqBody.TotalDuration,
+		ThrottleSeconds:                  reqBody.ThrottleSeconds,
 	}
 	if isCompatVirtualSource(source) {
 		opts.CanonicalInputPath = source.VirtualSourceURI
@@ -2101,7 +2127,7 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 		source.HLSRemuxMPEGTS = compatWebOSDVMPEGTS(r.UserAgent(), source)
 
 		sources = append(sources, source)
-		dto := h.mediaSourceDTO(routeItemID, playSessionID, session.Token, source)
+		dto := h.mediaSourceDTO(routeItemID, playSessionID, session.Token, source, profile)
 
 		// Append downloaded subtitles to the media streams, honoring the selection.
 		if len(downloaded) > 0 {
@@ -2110,6 +2136,9 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 			for i, dl := range downloaded {
 				streamIndex := baseIndex + i
 				format := subtitleRouteFormat(string(dl.Format))
+				if externalFormat, ok := profile.ExternalSubtitleFormat(string(dl.Format)); ok {
+					format = externalFormat
+				}
 				displayTitle := downloadedSubtitleDisplayTitle(dl)
 				dto.MediaStreams = append(dto.MediaStreams, mediaStreamDTO{
 					Index:                  streamIndex,
@@ -2154,6 +2183,7 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 		ClientDeviceID:     clientDeviceID,
 		ItemID:             detail.ContentID,
 		RouteItemID:        routeItemID,
+		NegotiationVariant: compatNegotiationVariant(sources),
 		UserID:             session.PseudoUserID.String(),
 		InitialSeekSeconds: clampSeekSeconds(float64(req.StartTimeTicks)/10_000_000, sources),
 		MediaSources:       sources,
@@ -2335,8 +2365,12 @@ func supportedHLSRemuxAudioStreamIndexes(version catalog.FileVersion, profile De
 	return indexes
 }
 
-func (h *PlaybackHandler) mediaSourceDTO(routeItemID, playSessionID, compatToken string, source PlaybackMediaSource) mediaSourceDTO {
+func (h *PlaybackHandler) mediaSourceDTO(routeItemID, playSessionID, compatToken string, source PlaybackMediaSource, profiles ...DeviceProfile) mediaSourceDTO {
 	selectedAudioStreamIndex := effectiveCompatAudioStreamIndex(source)
+	var profile DeviceProfile
+	if len(profiles) > 0 {
+		profile = profiles[0]
+	}
 	dto := mediaSourceDTO{
 		Protocol:                            "File",
 		ID:                                  source.ID,
@@ -2369,7 +2403,7 @@ func (h *PlaybackHandler) mediaSourceDTO(routeItemID, playSessionID, compatToken
 		Bitrate:                             source.Version.Bitrate * 1000,
 		DefaultAudioStreamIndex:             selectedAudioStreamIndex,
 		DefaultSubtitleStreamIndex:          effectiveCompatSubtitleStreamIndex(source),
-		MediaStreams:                        buildMediaStreamsWithSelection(routeItemID, source.ID, source.Version, selectedAudioStreamIndex, source.SelectedSubtitleStreamIndex, compatToken, playSessionID),
+		MediaStreams:                        buildMediaStreamsWithSelection(routeItemID, source.ID, source.Version, selectedAudioStreamIndex, source.SelectedSubtitleStreamIndex, compatToken, playSessionID, profile),
 	}
 	if source.SupportsDirectPlay || source.SupportsDirectStream {
 		// This URL is explicitly static=true, so HandleVideoStream always serves
@@ -2407,7 +2441,11 @@ func buildMediaStreams(routeItemID, mediaSourceID string, version catalog.FileVe
 	return buildMediaStreamsWithSelection(routeItemID, mediaSourceID, version, nil, nil, "", "")
 }
 
-func buildMediaStreamsWithSelection(routeItemID, mediaSourceID string, version catalog.FileVersion, selectedAudioStreamIndex, selectedSubtitleStreamIndex *int, compatToken, playSessionID string) []mediaStreamDTO {
+func buildMediaStreamsWithSelection(routeItemID, mediaSourceID string, version catalog.FileVersion, selectedAudioStreamIndex, selectedSubtitleStreamIndex *int, compatToken, playSessionID string, profiles ...DeviceProfile) []mediaStreamDTO {
+	var profile DeviceProfile
+	if len(profiles) > 0 {
+		profile = profiles[0]
+	}
 	streams := make([]mediaStreamDTO, 0, len(version.VideoTracks)+len(version.AudioTracks)+len(version.SubtitleTracks))
 	effectiveAudioStreamIndex := selectedAudioStreamIndex
 	if effectiveAudioStreamIndex != nil && !isValidCompatAudioStreamIndex(version, *effectiveAudioStreamIndex) {
@@ -2492,6 +2530,17 @@ func buildMediaStreamsWithSelection(routeItemID, mediaSourceID string, version c
 		}
 		streamIndex := subtitleTrackIndex(version, track, index)
 		format := subtitleRouteFormat(track.Codec)
+		deliveryMethod := subtitleDeliveryMethod(track.External)
+		supportsExternalStream := track.External
+		isExternalURL := subtitleExternalURL(track)
+		if externalFormat, ok := profile.ExternalSubtitleFormat(track.Codec); ok && !playback.NeedsBurnIn(track.Codec) {
+			format = externalFormat
+			if !track.External {
+				deliveryMethod = "External"
+				supportsExternalStream = true
+				isExternalURL = boolPtr(false)
+			}
+		}
 		displayTitle := compatSubtitleDisplayTitle(track)
 		// When the client has made an explicit subtitle selection, only that
 		// stream is the default. A negative selection ("subtitles off") matches
@@ -2513,16 +2562,38 @@ func buildMediaStreamsWithSelection(routeItemID, mediaSourceID string, version c
 			IsForced:               track.Forced,
 			IsHearingImpaired:      track.HearingImpaired,
 			IsTextSubtitleStream:   true,
-			SupportsExternalStream: track.External,
+			SupportsExternalStream: supportsExternalStream,
 			AudioSpatialFormat:     "None",
 			DeliveryURL:            subtitleDeliveryURL(routeItemID, mediaSourceID, streamIndex, format, compatToken, playSessionID),
-			DeliveryMethod:         subtitleDeliveryMethod(track.External),
+			DeliveryMethod:         deliveryMethod,
 			Path:                   subtitlePath(track, routeItemID, mediaSourceID, streamIndex, format),
-			IsExternalURL:          subtitleExternalURL(track),
+			IsExternalURL:          isExternalURL,
 		})
 	}
 
 	return streams
+}
+
+func compatNegotiationVariant(sources []PlaybackMediaSource) string {
+	var variant strings.Builder
+	for _, source := range sources {
+		fmt.Fprintf(&variant, "%s|a=%s|s=%s|r=%t|ts=%t|ta=%t;",
+			source.ID,
+			compatOptionalIndex(source.SelectedAudioStreamIndex),
+			compatOptionalIndex(source.SelectedSubtitleStreamIndex),
+			source.HLSRemux,
+			source.HLSRemuxMPEGTS,
+			source.TranscodeAudio,
+		)
+	}
+	return variant.String()
+}
+
+func compatOptionalIndex(index *int) string {
+	if index == nil {
+		return ""
+	}
+	return strconv.Itoa(*index)
 }
 
 func compatColorRange(colorRange string) string {

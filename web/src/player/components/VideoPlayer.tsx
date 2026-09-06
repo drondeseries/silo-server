@@ -110,6 +110,7 @@ interface VideoPlayerProps {
   plan: PlanV3;
   /** Bumped on every adopted plan; stream-reload effects key on it. */
   planRevision: number;
+  transportRevision?: number;
   /** Whether a newly adopted transport should begin playing immediately. */
   shouldAutoPlay?: boolean;
   /** True while a replan is in flight, so the quality menu can show progress. */
@@ -239,6 +240,7 @@ export function VideoPlayer({
   streamUrl,
   plan,
   planRevision,
+  transportRevision,
   shouldAutoPlay = true,
   replanning = false,
   replanError = null,
@@ -301,9 +303,11 @@ export function VideoPlayer({
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const isMountedRef = useRef(true);
+  const effectiveTransportRevision = transportRevision ?? planRevision;
   const hlsRef = useRef<HlsType | null>(null);
   const hlsStartupGuardRef = useRef<HlsStartupGuard | null>(null);
   const mediaRecoveryAttemptsRef = useRef(0);
+  const networkRecoveryAttemptsRef = useRef(0);
   const lastRecoveryRef = useRef(0);
   const reportedPlanFailureKeyRef = useRef<string | null>(null);
   const transportFailedForPlanRevisionRef = useRef<number | null>(null);
@@ -330,6 +334,8 @@ export function VideoPlayer({
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [pendingSeekTime, setPendingSeekTime] = useState<number | null>(null);
+  const [pendingSeekNonce, setPendingSeekNonce] = useState<number | null>(null);
+  const pendingSeekNonceRef = useRef(0);
   const [duration, setDuration] = useState(propDuration ?? 0);
   const [buffered, setBuffered] = useState<TimeRanges | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -423,19 +429,24 @@ export function VideoPlayer({
   const isHlsStream = plan.stream.protocol === "hls";
   const effectiveStreamUrl = streamUrl;
   const isPlayerReady = effectiveStreamUrl !== "";
-  const reportCurrentPlanFailure = useCallback(
-    (failure: FailureV3): boolean => {
-      if (!onPlanFailure) return false;
-      const failureKey = `${sessionId}:${plan.plan_attempt_key}`;
-      if (reportedPlanFailureKeyRef.current === failureKey) return true;
-      reportedPlanFailureKeyRef.current = failureKey;
-      transportFailedForPlanRevisionRef.current = planRevision;
-      setError(null);
-      onPlanFailure(failure, currentTimeRef.current);
-      return true;
-    },
-    [onPlanFailure, plan.plan_attempt_key, planRevision, sessionId],
-  );
+  const planRef = useRef(plan);
+  planRef.current = plan;
+  const planRevisionRef = useRef(planRevision);
+  planRevisionRef.current = planRevision;
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
+  const onPlanFailureRef = useRef(onPlanFailure);
+  onPlanFailureRef.current = onPlanFailure;
+  const reportCurrentPlanFailure = useCallback((failure: FailureV3): boolean => {
+    if (!onPlanFailureRef.current) return false;
+    const failureKey = `${sessionIdRef.current}:${planRef.current.plan_attempt_key}`;
+    if (reportedPlanFailureKeyRef.current === failureKey) return true;
+    reportedPlanFailureKeyRef.current = failureKey;
+    transportFailedForPlanRevisionRef.current = planRevisionRef.current;
+    setError(null);
+    onPlanFailureRef.current(failure, currentTimeRef.current);
+    return true;
+  }, []);
 
   useEffect(() => {
     transportFailedForPlanRevisionRef.current = null;
@@ -640,7 +651,21 @@ export function VideoPlayer({
 
   useEffect(() => {
     setPendingSeekTime(null);
+    setPendingSeekNonce(null);
   }, [planRevision]);
+
+  useEffect(() => {
+    // Only roll back when a seek reanchor is outstanding. A quality/track
+    // refusal with no pending seek must not move the scrubber.
+    if (replanError && pendingSeekNonce !== null) {
+      setPendingSeekTime(null);
+      setPendingSeekNonce(null);
+      if (videoRef.current) {
+        const nativeSeconds = videoRef.current.currentTime;
+        setCurrentTime(toMediaTime(nativeSeconds, timelineOffsetRef.current));
+      }
+    }
+  }, [replanError, pendingSeekNonce]);
 
   // Firefox stalls on codec-copy remuxes it nominally accepts. Both fallbacks
   // report an honest classification and let the server pick the next route —
@@ -751,6 +776,8 @@ export function VideoPlayer({
       const video = videoRef.current;
       if (!video) return false;
 
+      pendingSeekNonceRef.current += 1;
+      setPendingSeekNonce(pendingSeekNonceRef.current);
       setPendingSeekTime(seconds);
       setCurrentTime(seconds);
 
@@ -1425,6 +1452,7 @@ export function VideoPlayer({
     let nativeHLSMetadataHandler: (() => void) | null = null;
 
     mediaRecoveryAttemptsRef.current = 0;
+    networkRecoveryAttemptsRef.current = 0;
     setError(null);
     setAwaitingFirstFrame(true);
 
@@ -1583,11 +1611,26 @@ export function VideoPlayer({
               lastRecoveryRef.current = now;
 
               if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                if (hlsStartupGuardRef.current?.handleFatalNetworkError() ?? true) {
+                const canRecoverStartup =
+                  hlsStartupGuardRef.current?.handleFatalNetworkError() ?? true;
+                if (canRecoverStartup && networkRecoveryAttemptsRef.current < 3) {
+                  networkRecoveryAttemptsRef.current++;
                   console.warn("[hls.js] Fatal network error, attempting recovery...");
                   hls?.startLoad();
                 } else {
-                  console.error("[hls.js] Fatal startup network error, giving up");
+                  console.error(
+                    "[hls.js] Fatal network error, giving up after recovery attempts exhausted",
+                  );
+                  if (
+                    !reportCurrentPlanFailure({
+                      classification: "transport_endpoint_unreachable",
+                      message: "HLS network recovery failed after repeated attempts.",
+                    })
+                  ) {
+                    setError("Playback failed. Please try again.");
+                  }
+                  hls?.destroy();
+                  hlsRef.current = null;
                 }
               } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
                 if (mediaRecoveryAttemptsRef.current === 0) {
@@ -1633,6 +1676,7 @@ export function VideoPlayer({
 
             hls.on(Hls.Events.BUFFER_APPENDED, () => {
               if (destroyed) return;
+              networkRecoveryAttemptsRef.current = 0;
               attemptAutoplayWhenReady();
             });
 
@@ -1695,9 +1739,9 @@ export function VideoPlayer({
   }, [
     effectiveStreamUrl,
     effectiveInitialPosition,
+    effectiveTransportRevision,
     isHlsStream,
     isPlayerReady,
-    planRevision,
     plannedBitrateKbps,
     plannedDynamicRange,
     reportCurrentPlanFailure,
@@ -1728,6 +1772,9 @@ export function VideoPlayer({
       setCurrentTime(resolved.currentTime);
       if (resolved.pendingSeekTime !== pendingSeekTime) {
         setPendingSeekTime(resolved.pendingSeekTime);
+        if (resolved.pendingSeekTime === null) {
+          setPendingSeekNonce(null);
+        }
       }
       // timeupdate is the most reliable signal that frames are rendering.
       // Also clears any stale buffering state from HLS segment transitions
@@ -1737,6 +1784,7 @@ export function VideoPlayer({
     };
     const onSeeked = () => {
       setPendingSeekTime(null);
+      setPendingSeekNonce(null);
       setCurrentTime(toMediaTime(video.currentTime, timelineOffsetRef.current));
       markPlaybackStarted();
       clearBuffering();
@@ -2030,9 +2078,27 @@ export function VideoPlayer({
 
   // -- Fullscreen tracking --
   useEffect(() => {
-    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    const video = videoRef.current as
+      | (HTMLVideoElement & {
+          webkitDisplayingFullscreen?: boolean;
+        })
+      | null;
+
+    const onChange = () => {
+      const isDocFullscreen = !!document.fullscreenElement;
+      const isVideoFullscreen = !!video?.webkitDisplayingFullscreen;
+      setIsFullscreen(isDocFullscreen || isVideoFullscreen);
+    };
+
     document.addEventListener("fullscreenchange", onChange);
-    return () => document.removeEventListener("fullscreenchange", onChange);
+    video?.addEventListener("webkitbeginfullscreen", onChange);
+    video?.addEventListener("webkitendfullscreen", onChange);
+
+    return () => {
+      document.removeEventListener("fullscreenchange", onChange);
+      video?.removeEventListener("webkitbeginfullscreen", onChange);
+      video?.removeEventListener("webkitendfullscreen", onChange);
+    };
   }, []);
 
   // -- Subtitle appearance --
@@ -2096,6 +2162,8 @@ export function VideoPlayer({
   // -- Subtitle cue matching --
   // Returns active cue texts for custom rendering instead of native TextTrack
   // (which has browser bugs with stale cues persisting after seek).
+  const [textSubtitleState, setTextSubtitleState] = useState("idle");
+  const [assSubtitleState, setASSSubtitleState] = useState("idle");
   const activeCueTexts = useSubtitleTracks(
     videoRef,
     effectiveSubtitleTracks,
@@ -2107,6 +2175,7 @@ export function VideoPlayer({
     liveCues,
     liveTranslation?.trackKey ?? null,
     subtitleStreamGeneration,
+    setTextSubtitleState,
   );
 
   // -- ASS/SSA subtitle rendering via JASSUB (client-side libass) --
@@ -2117,7 +2186,9 @@ export function VideoPlayer({
     isDetached,
     timelineOffsetSeconds,
     subtitleDelayMs,
+    setASSSubtitleState,
   );
+  const subtitleLoadState = isASSActive ? assSubtitleState : textSubtitleState;
 
   // -- Authoritative subtitle track selection --
   // Some tracks (bitmap PGS/DVD/DVB) cannot be delivered as a sidecar and are
@@ -2131,6 +2202,12 @@ export function VideoPlayer({
       : null;
   const requestedSubtitleTrackChangeRef = useRef<string | null>(null);
   useEffect(() => {
+    // Live AI cues belong to the client overlay, not the server inventory.
+    // Leave the current plan alone until a real downloaded track is ready.
+    if (activeSubtitleIndex === LIVE_SUBTITLE_INDEX) {
+      requestedSubtitleTrackChangeRef.current = null;
+      return;
+    }
     const desiredServerIndex = pendingServerSubtitleSelection(
       plan.subtitle.mode,
       plan.selected_tracks.subtitle?.index ?? null,
@@ -2437,10 +2514,33 @@ export function VideoPlayer({
   }, []);
 
   const handleFullscreenToggle = useCallback(() => {
+    const video = videoRef.current as
+      | (HTMLVideoElement & {
+          webkitSupportsFullscreen?: boolean;
+          webkitDisplayingFullscreen?: boolean;
+          webkitEnterFullscreen?: () => void;
+          webkitExitFullscreen?: () => void;
+        })
+      | null;
+
     if (document.fullscreenElement) {
       document.exitFullscreen().catch(() => {});
-    } else {
-      containerRef.current?.requestFullscreen().catch(() => {});
+    } else if (video?.webkitDisplayingFullscreen) {
+      video.webkitExitFullscreen?.();
+    } else if (containerRef.current?.requestFullscreen) {
+      containerRef.current.requestFullscreen().catch(() => {
+        if (
+          video?.webkitSupportsFullscreen !== false &&
+          typeof video?.webkitEnterFullscreen === "function"
+        ) {
+          video.webkitEnterFullscreen();
+        }
+      });
+    } else if (
+      video?.webkitSupportsFullscreen !== false &&
+      typeof video?.webkitEnterFullscreen === "function"
+    ) {
+      video.webkitEnterFullscreen();
     }
   }, []);
 
@@ -2909,6 +3009,21 @@ export function VideoPlayer({
         style={!isPlayerReady ? { visibility: "hidden" } : undefined}
       />
 
+      {!isDetached &&
+        activeSubtitleIndex !== null &&
+        (subtitleLoadState === "loading" || subtitleLoadState === "error") && (
+          <div
+            role="status"
+            className="pointer-events-none absolute inset-x-0 top-20 z-40 flex justify-center"
+          >
+            <span className="rounded bg-black/75 px-3 py-2 text-sm text-white">
+              {subtitleLoadState === "loading"
+                ? "Loading subtitles…"
+                : "Subtitles couldn't load. Retrying…"}
+            </span>
+          </div>
+        )}
+
       {/* Subtitle overlay — suppressed when JASSUB (ASS) is rendering; bitmap
           tracks are burned into the video server-side and never reach here.
           While the control bar is up, bottom-anchored cues rise just above it
@@ -2996,6 +3111,7 @@ export function VideoPlayer({
           muted={muted}
           isFullscreen={isFullscreen}
           subtitleTracks={effectiveSubtitleTracks}
+          preferredSubtitleLanguage={preferredSubtitleLanguage}
           activeSubtitleIndex={activeSubtitleIndex}
           onSubtitleSelect={handleSubtitleSelect}
           subtitleDelayMs={subtitleDelayMs}

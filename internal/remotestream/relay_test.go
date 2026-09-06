@@ -493,3 +493,113 @@ func TestRegisterWithHeadersForwardsAllowedHeaders(t *testing.T) {
 		t.Fatalf("received Origin = %q, want https://provider.example", receivedOrigin)
 	}
 }
+
+func TestRelayStalledErrorBodyReturnsBoundedError(t *testing.T) {
+	hangServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "4096")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(3 * time.Second):
+		}
+	}))
+	defer hangServer.Close()
+
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+
+	relayURL, release, err := relay.RegisterInsecure(context.Background(), hangServer.URL+"/video.mp4")
+	if err != nil {
+		t.Fatalf("RegisterInsecure failed: %v", err)
+	}
+	defer release()
+
+	start := time.Now()
+	req, _ := http.NewRequest(http.MethodGet, relayURL, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do relay request failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	elapsed := time.Since(start)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if elapsed >= 2500*time.Millisecond {
+		t.Fatalf("elapsed = %v, want < 2.5s", elapsed)
+	}
+}
+
+func TestRelayResponseWriterFlusherAndUnwrap(t *testing.T) {
+	rec := httptest.NewRecorder()
+	tracked := &relayResponseWriter{ResponseWriter: rec}
+
+	if unwrapped := tracked.Unwrap(); unwrapped != rec {
+		t.Fatalf("unwrapped = %v, want %v", unwrapped, rec)
+	}
+
+	flusher, ok := any(tracked).(http.Flusher)
+	if !ok {
+		t.Fatal("expected relayResponseWriter to implement http.Flusher")
+	}
+	flusher.Flush()
+	if !rec.Flushed {
+		t.Fatal("expected underlying recorder to be flushed")
+	}
+}
+
+func TestRelayPostCommitFailureAbortsDownstreamConnection(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("first-256k-chunk-header"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		hj, ok := w.(http.Hijacker)
+		if ok {
+			conn, _, _ := hj.Hijack()
+			_ = conn.Close()
+			return
+		}
+	}))
+	defer upstream.Close()
+
+	relay := NewRelay()
+	defer func() { _ = relay.Close(context.Background()) }()
+
+	relayURL, release, err := relay.RegisterInsecure(context.Background(), upstream.URL+"/stream.mp4")
+	if err != nil {
+		t.Fatalf("RegisterInsecure failed: %v", err)
+	}
+	defer release()
+
+	req, _ := http.NewRequest(http.MethodGet, relayURL, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do relay request failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	buf := make([]byte, 23)
+	n, err := io.ReadFull(resp.Body, buf)
+	if err != nil {
+		t.Fatalf("reading first chunk failed: %v", err)
+	}
+	if string(buf[:n]) != "first-256k-chunk-header" {
+		t.Fatalf("chunk = %q, want first-256k-chunk-header", string(buf[:n]))
+	}
+
+	_, err = io.ReadAll(resp.Body)
+	if err == nil {
+		t.Fatal("expected read error on aborted stream, but got clean EOF")
+	}
+}

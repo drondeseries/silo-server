@@ -331,7 +331,9 @@ func (r *Relay) handle(w http.ResponseWriter, request *http.Request) {
 	if proxyErr != nil {
 		if !tracked.wroteHeader {
 			http.Error(w, "remote stream unavailable", http.StatusBadGateway)
+			return
 		}
+		panic(http.ErrAbortHandler)
 	}
 }
 
@@ -430,7 +432,13 @@ func (r *Relay) proxyWithClient(w http.ResponseWriter, request *http.Request, so
 		response.Header.Del("Accept-Ranges")
 	}
 	if response.StatusCode >= 400 && response.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		drainCtx, drainCancel := context.WithTimeout(request.Context(), 1*time.Second)
+		defer drainCancel()
+		stopTimer := context.AfterFunc(drainCtx, func() {
+			_ = response.Body.Close()
+		})
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		stopTimer()
 		return fmt.Errorf("remote stream returned HTTP %d", response.StatusCode)
 	}
 	if isDASHManifestResponse(response, nil) {
@@ -786,4 +794,14 @@ func (w *relayResponseWriter) Write(body []byte) (int, error) {
 		w.WriteHeader(http.StatusOK)
 	}
 	return w.ResponseWriter.Write(body)
+}
+
+func (w *relayResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *relayResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

@@ -65,33 +65,42 @@ func (c *VirtualProbeCache) Probe(
 	if probe == nil {
 		return file, errors.New("virtual probe function is not configured")
 	}
+	inputSnapshot := cloneVirtualProbeFile(file)
 	if c == nil {
-		return probe(ctx, sourceURL, file)
+		return probe(ctx, sourceURL, inputSnapshot)
 	}
-	key := virtualProbeCacheKey(sourceURL, file)
+	key := virtualProbeCacheKey(sourceURL, inputSnapshot)
 	now := time.Now()
 	if cached := c.load(key, now); cached != nil {
 		return cached, nil
 	}
-	value, err, _ := c.group.Do(key, func() (any, error) {
+	ch := c.group.DoChan(key, func() (any, error) {
 		if cached := c.load(key, time.Now()); cached != nil {
 			return cached, nil
 		}
-		probed, err := probe(ctx, sourceURL, file)
+		probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+		defer probeCancel()
+		workerSnapshot := cloneVirtualProbeFile(inputSnapshot)
+		probed, err := probe(probeCtx, sourceURL, workerSnapshot)
 		if err != nil || probed == nil {
 			return probed, err
 		}
 		c.store(key, probed, time.Now())
 		return cloneVirtualProbeFile(probed), nil
 	})
-	if err != nil || value == nil {
-		return file, err
+	select {
+	case <-ctx.Done():
+		return cloneVirtualProbeFile(inputSnapshot), ctx.Err()
+	case res := <-ch:
+		if res.Err != nil || res.Val == nil {
+			return cloneVirtualProbeFile(inputSnapshot), res.Err
+		}
+		probed, ok := res.Val.(*models.MediaFile)
+		if !ok {
+			return cloneVirtualProbeFile(inputSnapshot), errors.New("virtual probe returned an invalid media file")
+		}
+		return cloneVirtualProbeFile(probed), nil
 	}
-	probed, ok := value.(*models.MediaFile)
-	if !ok {
-		return file, errors.New("virtual probe returned an invalid media file")
-	}
-	return probed, nil
 }
 
 func (c *VirtualProbeCache) load(key string, now time.Time) *models.MediaFile {
@@ -160,7 +169,27 @@ func cloneVirtualProbeFile(file *models.MediaFile) *models.MediaFile {
 		return nil
 	}
 	clone := *file
-	clone.VideoTracks = append([]models.VideoTrack(nil), file.VideoTracks...)
+	if len(file.IdentityJSON) > 0 {
+		clone.IdentityJSON = append([]byte(nil), file.IdentityJSON...)
+	}
+	if len(file.VideoTracks) > 0 {
+		clone.VideoTracks = make([]models.VideoTrack, len(file.VideoTracks))
+		for i, vt := range file.VideoTracks {
+			clone.VideoTracks[i] = vt
+			if vt.DVProvenanceCurrent != nil {
+				val := *vt.DVProvenanceCurrent
+				clone.VideoTracks[i].DVProvenanceCurrent = &val
+			}
+			if vt.MultiplePPS != nil {
+				val := *vt.MultiplePPS
+				clone.VideoTracks[i].MultiplePPS = &val
+			}
+			if vt.DVRPUStrippable != nil {
+				val := *vt.DVRPUStrippable
+				clone.VideoTracks[i].DVRPUStrippable = &val
+			}
+		}
+	}
 	clone.AudioTracks = append([]models.AudioTrack(nil), file.AudioTracks...)
 	clone.SubtitleTracks = append([]models.SubtitleTrack(nil), file.SubtitleTracks...)
 	clone.ExternalSubtitles = append([]models.ExternalSubtitle(nil), file.ExternalSubtitles...)

@@ -24,6 +24,8 @@ const controls = vi.hoisted(() => ({
     subtitleTracks: PlayerSubtitleInfo[];
     visible: boolean;
     onSurfaceTap?: (event: React.MouseEvent<HTMLElement>) => void;
+    isFullscreen?: boolean;
+    onFullscreenToggle?: () => void;
   },
 }));
 const playerSeek = vi.hoisted(() => vi.fn());
@@ -100,6 +102,8 @@ vi.mock("./PlayerControls", () => ({
       subtitleTracks: PlayerSubtitleInfo[];
       visible: boolean;
       onSurfaceTap?: (event: React.MouseEvent<HTMLElement>) => void;
+      isFullscreen?: boolean;
+      onFullscreenToggle?: () => void;
     }) => {
       controls.current = props;
       return null;
@@ -841,7 +845,12 @@ describe("VideoPlayer translation handoff", () => {
   it("selects the refreshed downloaded track and clears the live overlay", async () => {
     const onRefreshSubtitles = vi.fn();
     const onSubtitleChanged = vi.fn();
-    const { rerenderPlayer } = renderPlayer({ onRefreshSubtitles, onSubtitleChanged });
+    const onSubtitleTrackChange = vi.fn();
+    const { rerenderPlayer } = renderPlayer({
+      onRefreshSubtitles,
+      onSubtitleChanged,
+      onSubtitleTrackChange,
+    });
 
     act(() => {
       realtimeOptions.current?.onEvent?.({
@@ -859,6 +868,7 @@ describe("VideoPlayer translation handoff", () => {
         },
       });
     });
+    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1_000_000, expect.any(Number));
     expect(controls.current?.activeSubtitleIndex).toBe(1_000_000);
     expect(controls.current?.subtitleTracks.some((track) => track.live)).toBe(true);
 
@@ -879,6 +889,7 @@ describe("VideoPlayer translation handoff", () => {
       });
     });
     expect(onRefreshSubtitles).toHaveBeenCalledOnce();
+    expect(onSubtitleTrackChange).not.toHaveBeenCalledWith(1_000_000, expect.any(Number));
     expect(controls.current?.activeSubtitleIndex).toBe(1_000_000);
 
     const downloadedTrack: PlayerSubtitleInfo = {
@@ -902,7 +913,149 @@ describe("VideoPlayer translation handoff", () => {
     });
 
     await waitFor(() => expect(onSubtitleChanged).toHaveBeenCalledWith(4, undefined));
+    expect(onSubtitleTrackChange).toHaveBeenCalledWith(4, expect.any(Number));
     expect(controls.current?.activeSubtitleIndex).toBe(4);
     expect(controls.current?.subtitleTracks).toEqual([downloadedTrack]);
+  });
+
+  it.each(["missing", "rejecting"])(
+    "falls back to webkitEnterFullscreen when requestFullscreen is %s",
+    async (mode) => {
+      const webkitEnterFullscreen = vi.fn();
+      const webkitExitFullscreen = vi.fn();
+
+      const { container } = renderPlayer();
+
+      const video = container.querySelector("video") as HTMLVideoElement & {
+        webkitSupportsFullscreen?: boolean;
+        webkitDisplayingFullscreen?: boolean;
+        webkitEnterFullscreen?: () => void;
+        webkitExitFullscreen?: () => void;
+      };
+      video.webkitSupportsFullscreen = true;
+      video.webkitEnterFullscreen = webkitEnterFullscreen;
+      video.webkitExitFullscreen = webkitExitFullscreen;
+
+      // Simulate container requestFullscreen rejecting (as WebKit on iPhone does)
+      const playerContainer = container.querySelector(".player-container") as HTMLElement;
+      expect(playerContainer).not.toBeNull();
+      const requestFullscreen = vi.fn().mockRejectedValue(new Error("Not supported"));
+      Object.defineProperty(playerContainer, "requestFullscreen", {
+        value: mode === "rejecting" ? requestFullscreen : undefined,
+        configurable: true,
+      });
+
+      act(() => {
+        controls.current?.onFullscreenToggle?.();
+      });
+
+      await waitFor(() => expect(webkitEnterFullscreen).toHaveBeenCalledOnce());
+      expect(requestFullscreen).toHaveBeenCalledTimes(mode === "rejecting" ? 1 : 0);
+
+      video.webkitDisplayingFullscreen = true;
+      act(() => {
+        controls.current?.onFullscreenToggle?.();
+      });
+      expect(webkitExitFullscreen).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("tracks WebKit fullscreen events on the video element", async () => {
+    const { container } = renderPlayer();
+
+    const video = container.querySelector("video") as HTMLVideoElement & {
+      webkitDisplayingFullscreen?: boolean;
+    };
+
+    video.webkitDisplayingFullscreen = true;
+    act(() => {
+      video.dispatchEvent(new Event("webkitbeginfullscreen"));
+    });
+
+    expect(controls.current?.isFullscreen).toBe(true);
+
+    video.webkitDisplayingFullscreen = false;
+    act(() => {
+      video.dispatchEvent(new Event("webkitendfullscreen"));
+    });
+
+    expect(controls.current?.isFullscreen).toBe(false);
+  });
+
+  it("preserves player when transportRevision is unchanged across plan revisions", async () => {
+    const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
+    try {
+      const { rerenderPlayer } = renderPlayer({
+        planRevision: 1,
+        transportRevision: 1,
+      });
+      removeAttrSpy.mockClear();
+
+      const nextPlan = fixturePlanV3({
+        ...directPlan,
+        plan_id: "plan:subtitles-only",
+        plan_attempt_key: "v3:subtitles-only",
+      });
+      rerenderPlayer({
+        plan: nextPlan,
+        planRevision: 2,
+        transportRevision: 1,
+      });
+      expect(removeAttrSpy).not.toHaveBeenCalled();
+
+      rerenderPlayer({
+        plan: nextPlan,
+        planRevision: 3,
+        transportRevision: 2,
+      });
+      expect(removeAttrSpy).toHaveBeenCalledWith("src");
+    } finally {
+      removeAttrSpy.mockRestore();
+    }
+  });
+
+  it("rolls back an outstanding reanchor seek when its replan is refused", async () => {
+    const onReanchorSeek = vi.fn();
+    const plan = fixturePlanV3({
+      ...directPlan,
+      timeline: {
+        ...directPlan.timeline,
+        can_seek_anywhere: false,
+      },
+    });
+    const { container, rerenderPlayer } = renderPlayer({ plan, onReanchorSeek });
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 12 });
+
+    act(() => {
+      (controls.current as unknown as { onSeek: (s: number) => void }).onSeek(300);
+    });
+    expect(onReanchorSeek).toHaveBeenCalledWith(300);
+    await waitFor(() =>
+      expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(300),
+    );
+
+    rerenderPlayer({ replanError: "Seek reanchor refused" });
+    await waitFor(() =>
+      expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(12),
+    );
+  });
+
+  it("does not move the scrubber on an unrelated replan refusal with no pending seek", async () => {
+    const { container, rerenderPlayer } = renderPlayer({});
+    const video = container.querySelector("video");
+    if (!video) throw new Error("expected video element");
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 50 });
+    fireEvent.timeUpdate(video);
+    await waitFor(() =>
+      expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(50),
+    );
+
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 5 });
+    rerenderPlayer({ replanError: "Quality change refused" });
+    await waitFor(() =>
+      expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(50),
+    );
   });
 });

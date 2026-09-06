@@ -50,6 +50,7 @@ interface PlaybackSessionState {
    * effects on it rather than on object identity.
    */
   planRevision: number;
+  transportRevision: number;
   streamUrl: string | null;
   sessionId: string | null;
   playbackAttemptId: string | null;
@@ -166,11 +167,34 @@ function mapSubtitleInventory(
  * the spec forbids substituting the playback engine's reported duration, which
  * on an HLS copy remux is only the length produced so far.
  */
+// Temporary client-side heuristic for A/V transport equivalence.
+// TODO: replace with a server-authoritative transport_generation on PlanV3
+// that bumps only when the A/V bytes change, so sidecar-only replans never
+// guess. Until then, compare the fields that determine the produced bytes.
+function isSameAVTransport(prev: PlanV3 | null, next: PlanV3): boolean {
+  if (!prev) return false;
+  if (prev.delivery !== next.delivery) return false;
+  if (prev.stream.url !== next.stream.url) return false;
+  if (prev.stream.protocol !== next.stream.protocol) return false;
+  if (prev.stream.container !== next.stream.container) return false;
+  if (prev.stream.mime_type !== next.stream.mime_type) return false;
+  if (prev.effective_media_file_id !== next.effective_media_file_id) return false;
+  if (prev.selected_tracks.audio?.index !== next.selected_tracks.audio?.index) return false;
+  if (prev.timeline.stream_origin_seconds !== next.timeline.stream_origin_seconds) return false;
+  if (prev.timeline.can_seek_anywhere !== next.timeline.can_seek_anywhere) return false;
+  if (prev.subtitle.mode === "burn_in" || next.subtitle.mode === "burn_in") {
+    if (prev.subtitle.mode !== next.subtitle.mode) return false;
+    if (prev.subtitle.track_id !== next.subtitle.track_id) return false;
+  }
+  return true;
+}
+
 function planToSessionState(
   plan: PlanV3,
   sessionId: string | null,
   playbackAttemptId: string,
   planRevision: number,
+  transportRevision: number,
   qualityPreference: string,
   shouldAutoPlay: boolean,
   config: PlayerConfig,
@@ -178,6 +202,7 @@ function planToSessionState(
   return {
     plan,
     planRevision,
+    transportRevision,
     streamUrl: buildPlayerStreamUrl(config.apiBaseUrl, plan.stream.url, config.getAccessToken()),
     sessionId,
     playbackAttemptId,
@@ -278,6 +303,7 @@ export function usePlaybackSession(
   const [state, setState] = useState<PlaybackSessionState>({
     plan: null,
     planRevision: 0,
+    transportRevision: 0,
     streamUrl: null,
     sessionId: null,
     playbackAttemptId: null,
@@ -300,6 +326,7 @@ export function usePlaybackSession(
   const sessionIdRef = useRef<string | null>(null);
   const planRef = useRef<PlanV3 | null>(null);
   const planRevisionRef = useRef(0);
+  const transportRevisionRef = useRef(0);
   const serverFeaturesRef = useRef<string[]>([]);
   const stateRef = useRef(state);
   const activeRequestKeyRef = useRef<string | null>(null);
@@ -458,11 +485,15 @@ export function usePlaybackSession(
         return false;
       }
 
+      const prevPlan = planRef.current;
       const sessionId = plan.session_id ?? decision.session_id ?? sessionIdRef.current;
       planAttemptIdRef.current = randomUUID();
       planRef.current = plan;
       sessionIdRef.current = sessionId ?? null;
       planRevisionRef.current += 1;
+      if (!isSameAVTransport(prevPlan, plan)) {
+        transportRevisionRef.current += 1;
+      }
       hasAdoptedPlanRef.current = true;
       if (
         Number.isFinite(plan.timeline.source_start_seconds) &&
@@ -481,6 +512,7 @@ export function usePlaybackSession(
           sessionId ?? null,
           playbackAttemptIdRef.current ?? "",
           planRevisionRef.current,
+          transportRevisionRef.current,
           qualityRef.current,
           playbackPlayingRef.current,
           config,

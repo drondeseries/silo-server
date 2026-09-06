@@ -182,6 +182,7 @@ func (f VirtualMediaDetailedResolverFunc) ResolveVirtualMediaDetailed(ctx contex
 }
 
 type VirtualPlaybackSourceProber func(context.Context, string, *models.MediaFile) (*models.MediaFile, error)
+type VirtualPlaybackSourceProberWithHeaders func(context.Context, string, *models.MediaFile, map[string]string) (*models.MediaFile, error)
 
 // VirtualFileUpdateFunc persists a media file path update after a stale
 // virtual result= candidate is replaced by a working substitute during
@@ -190,7 +191,7 @@ type VirtualFileUpdateFunc func(ctx context.Context, fileID int, newFilePath str
 
 // VirtualFileMetadataSaver persists probed track inventory, duration, and codec/container
 // facts so subsequent v3 plans can use complete evidence without re-probing.
-type VirtualFileMetadataSaver func(ctx context.Context, fileID int, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error
+type VirtualFileMetadataSaver func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error
 
 // SubtitleSearchTrigger fires a background subtitle search when a virtual
 // stream enters playback without embedded or external subtitle tracks.
@@ -283,17 +284,17 @@ type PlaybackHandler struct {
 	// for transcode-executed progressive remuxes, whose signed tokens otherwise
 	// outlive a node's in-memory stop fence. Without a usable store those remuxes
 	// use another legal route; tokenless HLS sessions replan instead of recovering.
-	NodeRecipeStore    recipeCardStoreV3
-	ItemAccess         PlaybackItemAccessChecker // optional; enables file authorization checks
-	ItemLookup         PlaybackItemLookup
-	EpisodeLookup      PlaybackEpisodeLookup     // optional; resolves episode files to their series
+	NodeRecipeStore recipeCardStoreV3
+	ItemAccess      PlaybackItemAccessChecker // optional; enables file authorization checks
+	ItemLookup      PlaybackItemLookup
+	EpisodeLookup   PlaybackEpisodeLookup // optional; resolves episode files to their series
 	// virtualSticky remembers the last virtual candidate URI that played
 	// successfully per content key, so candidate rotation between equally
 	// ranked releases cannot churn a viewer's session (and invalidate cached
 	// client track identities) while the pinned source stays healthy.
 	virtualStickyMu    sync.Mutex
 	virtualStickyPins  map[string]virtualStickyPin
-	ExtraLookup        PlaybackExtraLookup       // optional; resolves extras files to their parent item
+	ExtraLookup        PlaybackExtraLookup // optional; resolves extras files to their parent item
 	OriginalLangLookup PlaybackOriginalLanguageLookup
 	SettingsRepo       PlaybackSettingsReader     // optional; reads server settings (e.g., allow_4k_transcode)
 	FileVersionFetcher PlaybackFileVersionFetcher // optional; queries sibling file versions for 4K guard
@@ -326,14 +327,15 @@ type PlaybackHandler struct {
 	RemoteStreamRelay            *remotestream.Relay
 	// AllowInsecureVirtual reports whether the owning plugin installation has
 	// explicitly enabled allow_insecure_http for private/local stream hosts.
-	AllowInsecureVirtual        func(installationID int) bool
-	VirtualPlaybackSourceProber VirtualPlaybackSourceProber
-	BestResultCache             *VirtualBestResultCache
-	VirtualFileUpdater          VirtualFileUpdateFunc
-	VirtualFileMetadataSaver    VirtualFileMetadataSaver
-	VirtualSubtitleSearcher     SubtitleSearchTrigger
-	SubtitleSearchInFlight      *sync.Map
-	DeviceCapabilitySource      *providerDeviceCapabilitySource
+	AllowInsecureVirtual                   func(installationID int) bool
+	VirtualPlaybackSourceProber            VirtualPlaybackSourceProber
+	VirtualPlaybackSourceProberWithHeaders VirtualPlaybackSourceProberWithHeaders
+	BestResultCache                        *VirtualBestResultCache
+	VirtualFileUpdater                     VirtualFileUpdateFunc
+	VirtualFileMetadataSaver               VirtualFileMetadataSaver
+	VirtualSubtitleSearcher                SubtitleSearchTrigger
+	SubtitleSearchInFlight                 *sync.Map
+	DeviceCapabilitySource                 *providerDeviceCapabilitySource
 	// PlaybackConfig returns the current playback config (ffmpeg path,
 	// hwaccel, transcode dir). Wired to the live config in integrated mode
 	// so admin changes apply to newly started transcodes. Read it through
@@ -393,8 +395,8 @@ type PlaybackWatchScrobbler interface {
 	ScrobbleStop(ctx context.Context, event watchsync.ScrobbleEvent) error
 }
 
-type sessionExpirationHookSetter interface {
-	SetExpirationHook(func(*playback.Session))
+type sessionExpirationHookAdder interface {
+	AddExpirationHook(func(*playback.Session))
 }
 
 // NewPlaybackHandler creates a new PlaybackHandler backed by the given
@@ -469,8 +471,8 @@ func NewPlaybackHandler(sessionMgr SessionManagerInterface, opts ...FilePathReso
 	}); ok {
 		h.tm.Sessions = reg
 	}
-	if setter, ok := sessionMgr.(sessionExpirationHookSetter); ok {
-		setter.SetExpirationHook(h.handleExpiredSession)
+	if adder, ok := sessionMgr.(sessionExpirationHookAdder); ok {
+		adder.AddExpirationHook(h.handleExpiredSession)
 	}
 	return h
 }
@@ -504,6 +506,19 @@ func (h *PlaybackHandler) playbackConfig() config.PlaybackConfig {
 		TranscodeDir:     filepath.Join(os.TempDir(), "silo-transcode"),
 		Routing:          config.DefaultPlaybackRoutingPolicy(),
 	}
+}
+
+func (h *PlaybackHandler) probeVirtualSource(ctx context.Context, sourceURL string, file *models.MediaFile, headers map[string]string) (*models.MediaFile, error) {
+	if h == nil {
+		return file, errors.New("playback handler is not configured")
+	}
+	if h.VirtualPlaybackSourceProberWithHeaders != nil {
+		return h.VirtualPlaybackSourceProberWithHeaders(ctx, sourceURL, file, headers)
+	}
+	if h.VirtualPlaybackSourceProber != nil {
+		return h.VirtualPlaybackSourceProber(ctx, sourceURL, file)
+	}
+	return file, errors.New("virtual playback source prober is not configured")
 }
 
 // CleanupOrphanedTranscodes removes stale per-session temp directories for
@@ -2151,19 +2166,7 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 
 // maybeStartThrottler reads throttle settings and starts the throttler if enabled.
 func (h *PlaybackHandler) maybeStartThrottler(ctx context.Context, session *playback.TranscodeSession) {
-	if h.SettingsRepo == nil {
-		return
-	}
-	enableThrottle, _ := h.SettingsRepo.Get(ctx, "enable_transcode_throttle")
-	if enableThrottle != "true" {
-		return
-	}
-	thresholdStr, _ := h.SettingsRepo.Get(ctx, "transcode_throttle_seconds")
-	threshold := 300 // default
-	if v, err := strconv.Atoi(thresholdStr); err == nil && v > 0 {
-		threshold = v
-	}
-	session.StartThrottler(threshold)
+	playback.StartConfiguredTranscodeThrottler(ctx, h.SettingsRepo, session)
 }
 
 // findAlternateFile finds another file version for the same content. It

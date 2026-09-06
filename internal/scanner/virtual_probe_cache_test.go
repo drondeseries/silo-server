@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -76,5 +77,125 @@ func TestVirtualProbeCacheIsBounded(t *testing.T) {
 	defer cache.mu.Unlock()
 	if len(cache.entries) != 2 {
 		t.Fatalf("cache entries=%d, want 2", len(cache.entries))
+	}
+}
+
+func TestVirtualProbeCacheConcurrentSingleflightDistinctClones(t *testing.T) {
+	cache := NewVirtualProbeCache(time.Minute, 4)
+	boolVal := true
+	file := &models.MediaFile{
+		ID:       8,
+		FilePath: "virtual://movie/tt8",
+		VideoTracks: []models.VideoTrack{{
+			Codec:               "h264",
+			MultiplePPS:         &boolVal,
+			DVRPUStrippable:     &boolVal,
+			DVProvenanceCurrent: &boolVal,
+		}},
+	}
+	workerStarted := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	probe := func(_ context.Context, _ string, input *models.MediaFile) (*models.MediaFile, error) {
+		close(workerStarted)
+		<-releaseWorker
+		result := *input
+		result.CodecAudio = "aac"
+		result.AudioTracks = []models.AudioTrack{{Codec: "aac"}}
+		return &result, nil
+	}
+
+	type res struct {
+		file *models.MediaFile
+		err  error
+	}
+	ch1 := make(chan res, 1)
+	ch2 := make(chan res, 1)
+
+	go func() {
+		f, err := cache.Probe(context.Background(), "https://provider.example/v.mp4", file, probe)
+		ch1 <- res{file: f, err: err}
+	}()
+
+	<-workerStarted
+
+	go func() {
+		f, err := cache.Probe(context.Background(), "https://provider.example/v.mp4", file, probe)
+		ch2 <- res{file: f, err: err}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	close(releaseWorker)
+
+	r1 := <-ch1
+	r2 := <-ch2
+	if r1.err != nil || r2.err != nil {
+		t.Fatalf("unexpected error: r1=%v, r2=%v", r1.err, r2.err)
+	}
+	if r1.file == r2.file {
+		t.Fatal("concurrent singleflight callers received the same pointer instead of distinct clones")
+	}
+	if len(r1.file.VideoTracks) == 0 || len(r2.file.VideoTracks) == 0 {
+		t.Fatal("expected video tracks in both results")
+	}
+	if r1.file.VideoTracks[0].MultiplePPS == r2.file.VideoTracks[0].MultiplePPS {
+		t.Fatal("nested pointer MultiplePPS was shared instead of deeply cloned")
+	}
+	*r1.file.VideoTracks[0].MultiplePPS = false
+	if !*r2.file.VideoTracks[0].MultiplePPS {
+		t.Fatal("mutating r1 pointer affected r2 pointer")
+	}
+}
+
+func TestVirtualProbeCacheLeaderCancellationDoesNotPoisonFollower(t *testing.T) {
+	cache := NewVirtualProbeCache(time.Minute, 4)
+	file1 := &models.MediaFile{ID: 9, FilePath: "virtual://movie/tt9"}
+	file2 := &models.MediaFile{ID: 9, FilePath: "virtual://movie/tt9"}
+	workerStarted := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	probe := func(probeCtx context.Context, _ string, input *models.MediaFile) (*models.MediaFile, error) {
+		close(workerStarted)
+		select {
+		case <-releaseWorker:
+		case <-probeCtx.Done():
+			return nil, probeCtx.Err()
+		}
+		result := *input
+		result.CodecAudio = "eac3"
+		return &result, nil
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ch1 := make(chan error, 1)
+	go func() {
+		_, err := cache.Probe(ctx1, "https://provider.example/v2.mp4", file1, probe)
+		ch1 <- err
+	}()
+
+	<-workerStarted
+
+	ch2 := make(chan *models.MediaFile, 1)
+	ch2Err := make(chan error, 1)
+	go func() {
+		f, err := cache.Probe(context.Background(), "https://provider.example/v2.mp4", file2, probe)
+		ch2 <- f
+		ch2Err <- err
+	}()
+
+	cancel1()
+	err1 := <-ch1
+	if !errors.Is(err1, context.Canceled) {
+		t.Fatalf("expected caller 1 to receive context.Canceled, got %v", err1)
+	}
+
+	file1.CodecAudio = "mutated-caller-input"
+	close(releaseWorker)
+
+	f2 := <-ch2
+	err2 := <-ch2Err
+	if err2 != nil {
+		t.Fatalf("caller 2 should not fail when caller 1 cancels: %v", err2)
+	}
+	if f2.CodecAudio != "eac3" {
+		t.Fatalf("f2 codec = %q, want eac3", f2.CodecAudio)
 	}
 }

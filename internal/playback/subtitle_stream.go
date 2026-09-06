@@ -36,12 +36,12 @@ type StreamExtractOpts struct {
 	// SeekSeconds asks ffmpeg to start demuxing at this position. For
 	// text-event codecs this is the key win — ffmpeg skips the prefix of
 	// the container instead of scanning from byte 0 to produce earlier
-	// cues the client will never display. Ignored for ASS because ASS
-	// output needs the script header that only appears at offset 0.
+	// cues the client will never display. Ignored for ASS because its
+	// renderer fetches the complete script once.
 	SeekSeconds float64
-	// DurationSeconds bounds the extract to a window of this length
-	// (passed as ffmpeg's `-t`). Zero means "until end of file". A
-	// bounded window lets the client consume one fetch to completion
+	// DurationSeconds bounds the extract to a window of this length,
+	// using an absolute ffmpeg output endpoint. Zero means "until end of file".
+	// A bounded window lets the client consume one fetch to completion
 	// while keeping memory and in-flight state finite; the client
 	// requests subsequent windows as playback approaches the tail.
 	DurationSeconds float64
@@ -49,9 +49,8 @@ type StreamExtractOpts struct {
 	// By default PGS is never windowed because clients fetch the .sup
 	// stream exactly once and consume it whole; a client that explicitly
 	// opts in (via ?windowed=1) re-requests fresh windows itself as
-	// playback moves outside coverage. ASS ignores this flag — its
-	// [Script Info] header exists only at stream offset 0, so a seeked
-	// extract would be structurally broken.
+	// playback moves outside coverage. ASS ignores this flag so its
+	// renderer receives the complete script and event timeline.
 	AllowWindow bool
 	// DisableBackgroundWarm prevents a windowed PGS miss from starting a
 	// detached full-track extract. Remote relay inputs use request-scoped
@@ -100,7 +99,9 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 		bin = "ffmpeg"
 	}
 
-	cmd := exec.CommandContext(ctx, bin, streamExtractArgs(opts)...)
+	extractCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(extractCtx, bin, streamExtractArgs(opts)...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("stdout pipe: %w", err)
@@ -116,6 +117,12 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 	// Copy stdout → writer with per-chunk flush so the browser receives
 	// cues as they're produced rather than at ffmpeg exit.
 	copyErr := copyAndFlush(opts.Writer, stdout)
+	if copyErr != nil {
+		// A failed response writer need not cancel the request context (for
+		// example, a write deadline). Stop the producer before waiting: it
+		// otherwise blocks forever once its unread stdout pipe fills.
+		cancel()
+	}
 
 	waitErr := cmd.Wait()
 	slog.DebugContext(ctx, "subtitle stream extract finished", "component", "playback",
@@ -125,6 +132,12 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 		"ffmpeg_err", waitErr,
 	)
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if copyErr != nil {
+		return copyErr
+	}
 	if waitErr != nil {
 		// ExitError with non-zero status is ffmpeg reporting a real
 		// problem. Client disconnect (copy failed) manifests as the
@@ -135,9 +148,6 @@ func StreamExtractSubtitle(ctx context.Context, opts StreamExtractOpts) error {
 		}
 		return fmt.Errorf("ffmpeg subtitle stream failed: %w (stderr: %s)",
 			waitErr, truncateStderr(stderrBuf.String()))
-	}
-	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
-		return copyErr
 	}
 	return nil
 }
@@ -152,8 +162,8 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 	}
 
 	// Input seek (before -i) is the fast variant: ffmpeg jumps near the
-	// requested position before demuxing. ASS can't use it because the
-	// output needs the [Script Info] header which only sits at offset 0.
+	// requested position before demuxing. ASS ignores it because its
+	// renderer fetches the complete script and event timeline once.
 	// PGS defaults to non-windowed too: a client that fetches the .sup
 	// stream exactly once and consumes it whole needs the complete track
 	// from offset 0 — windowing would silently drop every cue outside
@@ -165,15 +175,6 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 	seekApplied := opts.SeekSeconds > 0 && windowable
 	if seekApplied {
 		args = append(args, "-ss", strconv.FormatFloat(opts.SeekSeconds, 'f', 3, 64))
-	}
-
-	// Duration limit must be an *input* option (placed before -i) so it
-	// caps how much of the file we read. Placed as an output option, -t
-	// combined with -copyts stops output when PTS reaches the given
-	// value — which with a non-zero seek is already in the past, so
-	// ffmpeg would emit only the WEBVTT header and zero cues.
-	if opts.DurationSeconds > 0 && windowable {
-		args = append(args, "-t", strconv.FormatFloat(opts.DurationSeconds, 'f', 3, 64))
 	}
 
 	// A cached .sup input has no container magic worth probing and exactly
@@ -196,6 +197,18 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 	// the video the player is showing at the same media time.
 	if seekApplied {
 		args = append(args, "-copyts", "-avoid_negative_ts", "disabled")
+	}
+	// Input -t does not bound subtitle-only output: ffmpeg keeps demuxing
+	// and emitting cues to EOF. Limit the output instead, using the absolute
+	// window end because -copyts preserves the source timeline after a seek.
+	// Using only the duration here would end resumed windows too early (or
+	// emit no cues when the seek already exceeds that duration).
+	if opts.DurationSeconds > 0 && windowable {
+		end := opts.DurationSeconds
+		if seekApplied {
+			end += opts.SeekSeconds
+		}
+		args = append(args, "-to", strconv.FormatFloat(end, 'f', 3, 64))
 	}
 
 	return append(args,

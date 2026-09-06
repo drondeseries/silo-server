@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -228,6 +230,198 @@ func TestHandleStream_VirtualDirectPlayRelay502ReturnsStructuredJSON(t *testing.
 	}
 	if errResp.Error != "virtual_stream_unavailable" {
 		t.Fatalf("error code = %q, want virtual_stream_unavailable", errResp.Error)
+	}
+}
+
+func TestHandleStream_VirtualDirectPlayRetriesWithForcedRefresh(t *testing.T) {
+	liveServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("refreshed-live-stream"))
+	}))
+	defer liveServer.Close()
+
+	deadServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer deadServer.Close()
+
+	file := &models.MediaFile{
+		ID:                         42,
+		ContentID:                  "movie-virtual-refresh",
+		FilePath:                   "virtual://movie/movie-refresh?result=first",
+		VirtualOwnerInstallationID: 7,
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := sessionMgr.SetVirtualSource(session.ID, file.FilePath, file.VirtualOwnerInstallationID); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.RemoteStreamRelay = remotestream.NewRelay()
+	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
+	handler.AllowInsecureVirtual = func(int) bool { return true }
+
+	refreshCalls := 0
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, forceRefresh bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		if forceRefresh {
+			refreshCalls++
+			return ResolvedVirtualMedia{URL: liveServer.URL + "/video.mp4"}, nil
+		}
+		return ResolvedVirtualMedia{URL: deadServer.URL + "/video.mp4"}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil)
+	req = req.WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", session.ID)
+	rr := httptest.NewRecorder()
+	handler.HandleStream(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.String() != "refreshed-live-stream" {
+		t.Fatalf("body = %q, want refreshed-live-stream", rr.Body.String())
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("refreshCalls = %d, want 1", refreshCalls)
+	}
+}
+
+func TestHandleStream_VirtualDirectPlayRefreshRejectsMismatchedCandidateID(t *testing.T) {
+	candBServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("candidate-B-bytes"))
+	}))
+	defer candBServer.Close()
+
+	deadServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer deadServer.Close()
+
+	file := &models.MediaFile{
+		ID:                         42,
+		ContentID:                  "movie-virtual-mismatch",
+		FilePath:                   "virtual://movie/movie-mismatch?result=cand-A",
+		VirtualOwnerInstallationID: 7,
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := sessionMgr.SetVirtualSource(session.ID, file.FilePath, file.VirtualOwnerInstallationID); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.RemoteStreamRelay = remotestream.NewRelay()
+	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
+	handler.AllowInsecureVirtual = func(int) bool { return true }
+
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, forceRefresh bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		if forceRefresh {
+			return ResolvedVirtualMedia{
+				URL:         candBServer.URL + "/video.mp4",
+				CandidateID: "cand-B",
+			}, nil
+		}
+		return ResolvedVirtualMedia{
+			URL:         deadServer.URL + "/video.mp4",
+			CandidateID: "cand-A",
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil)
+	req = req.WithContext(newAuthorizedPlaybackContext())
+	req = withPlaybackRouteParam(req, "session_id", session.ID)
+	rr := httptest.NewRecorder()
+	handler.HandleStream(rr, req)
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502, body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.String() == "candidate-B-bytes" {
+		t.Fatal("handler served candidate B bytes instead of rejecting mismatched candidate")
+	}
+}
+
+func TestHandleStream_VirtualDirectPlaySurvivesServerWriteTimeout(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Content-Length", "3000")
+		flusher, _ := w.(http.Flusher)
+		for i := 0; i < 3; i++ {
+			_, _ = w.Write(make([]byte, 1000))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}))
+	defer upstream.Close()
+
+	file := &models.MediaFile{
+		ID:                         42,
+		ContentID:                  "movie-virtual-deadline",
+		FilePath:                   "virtual://movie/movie-deadline?result=slow",
+		VirtualOwnerInstallationID: 7,
+	}
+	sessionMgr := playback.NewSessionManager(0, 0)
+	session, err := sessionMgr.StartSession(1, "profile-1", file.ID, playback.PlayDirect, false)
+	if err != nil {
+		t.Fatalf("StartSession: %v", err)
+	}
+	if err := sessionMgr.SetVirtualSource(session.ID, file.FilePath, file.VirtualOwnerInstallationID); err != nil {
+		t.Fatalf("SetVirtualSource: %v", err)
+	}
+
+	handler := NewStreamHandler(sessionMgr, testPlaybackFileResolver{file: file})
+	handler.RemoteStreamRelay = remotestream.NewRelay()
+	defer func() { _ = handler.RemoteStreamRelay.Close(context.Background()) }()
+	handler.AllowInsecureVirtual = func(int) bool { return true }
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		return ResolvedVirtualMedia{URL: upstream.URL + "/video.mp4"}, nil
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/stream/{session_id}", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(newAuthorizedPlaybackContext())
+		r = withPlaybackRouteParam(r, "session_id", session.ID)
+		handler.HandleStream(w, r)
+	})
+
+	server := &http.Server{
+		Handler:      mux,
+		WriteTimeout: 400 * time.Millisecond,
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+	go func() { _ = server.Serve(listener) }()
+	defer func() { _ = server.Close() }()
+
+	resp, err := http.Get("http://" + listener.Addr().String() + "/api/v1/stream/" + session.ID)
+	if err != nil {
+		t.Fatalf("Get stream: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll failed (deadline hit?): %v", err)
+	}
+	if len(body) != 3000 {
+		t.Fatalf("body len = %d, want 3000", len(body))
 	}
 }
 
@@ -1086,5 +1280,72 @@ func TestHandleSubtitle_VirtualPlaceholderInheritsCandidateTracks(t *testing.T) 
 	// Since candidate tracks are inherited, it progresses past track inventory lookup.
 	if rr.Code == http.StatusNotFound && strings.Contains(rr.Body.String(), "Embedded subtitle track not found") {
 		t.Fatalf("Candidate subtitle tracks were not inherited: %s", rr.Body.String())
+	}
+}
+
+func TestSubtitleDefaultRequestReturnsWholeTrack(t *testing.T) {
+	for _, query := range []string{"", "?file_id=42", "?duration=invalid", "?position=NaN", "?position=+Inf"} {
+		req := httptest.NewRequest(http.MethodGet, "/subtitles/0.vtt"+query, nil)
+		if got := subtitleSeekPosition(req); got != 0 {
+			t.Errorf("query %q seek = %v, want full track from zero", query, got)
+		}
+		if got := subtitleWindowDuration(req); got != 0 {
+			t.Errorf("query %q duration = %v, want complete track", query, got)
+		}
+	}
+}
+
+func TestSubtitleExplicitWindow(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/subtitles/0.vtt?position=1200&duration=600", nil)
+	if got := subtitleSeekPosition(req); got != 1200 {
+		t.Fatalf("seek = %v", got)
+	}
+	if got := subtitleWindowDuration(req); got != 600 {
+		t.Fatalf("duration = %v", got)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/subtitles/0.vtt?duration=600", nil)
+	if got := subtitleSeekPosition(req); got != 0 {
+		t.Fatalf("duration-only seek = %v, want zero", got)
+	}
+}
+
+func TestEmbeddedSubtitleExtractionFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, script string
+		status       int
+		interrupted  bool
+	}{
+		{"before_output", "exit 1", http.StatusInternalServerError, false},
+		{"after_output", "printf 'WEBVTT\\n\\n00:00:01.000 --> 00:00:02.000\\nPartial\\n\\n'; exit 1", http.StatusOK, true},
+		{"complete", "printf 'WEBVTT\\n\\n00:20:01.000 --> 00:20:02.000\\nComplete\\n\\n'", http.StatusOK, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ffmpeg := filepath.Join(t.TempDir(), "ffmpeg")
+			if err := os.WriteFile(ffmpeg, []byte("#!/bin/sh\n"+tc.script+"\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			handler := NewStreamHandler(nil, nil)
+			handler.PlaybackConfig = func() config.PlaybackConfig { return config.PlaybackConfig{FFmpegPath: ffmpeg} }
+			file := &models.MediaFile{ID: 42, FilePath: "/synthetic/media.mkv", SubtitleTracks: []models.SubtitleTrack{{Codec: "subrip"}}}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handler.streamEmbeddedSubtitle(w, r, file, 0, nil, "vtt")
+			}))
+			defer server.Close()
+			response, err := server.Client().Get(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = response.Body.Close() }()
+			_, err = io.ReadAll(response.Body)
+			if response.StatusCode != tc.status {
+				t.Fatalf("status=%d, want %d", response.StatusCode, tc.status)
+			}
+			if tc.interrupted && err == nil {
+				t.Fatal("failed extraction ended with successful EOF")
+			}
+			if !tc.interrupted && err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
