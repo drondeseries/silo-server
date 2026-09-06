@@ -110,6 +110,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/taskmanager/tasks"
 	"github.com/Silo-Server/silo-server/internal/taskmanager/triggers"
 	"github.com/Silo-Server/silo-server/internal/telemetry"
+	"github.com/Silo-Server/silo-server/internal/tonemap"
 	"github.com/Silo-Server/silo-server/internal/transcodenode"
 	"github.com/Silo-Server/silo-server/internal/usercollections"
 	"github.com/Silo-Server/silo-server/internal/userdb"
@@ -362,6 +363,34 @@ func newStreamTelemetryViewCache(registry *streamtelemetry.Registry) *streamtele
 	// disagree if the environment changed between them.
 	return streamtelemetry.NewViewCache(registry, registry.ViewTTL(), slog.Default())
 }
+
+// logToneMapStartupSummary reports which tone-map executors validated for
+// this host's FFmpeg and device configuration, once, without delaying
+// startup. When transcodes are enabled and hardware acceleration was not
+// explicitly disabled yet no hardware executor validated, it warns with the
+// per-backend probe reasons — the exact answer to "why did this transcode
+// use libx264 instead of QSV". Both probes are cached and singleflighted, so
+// this also warms the caches the first transcode would otherwise fill.
+func logToneMapStartupSummary(cfg *config.Config) {
+	hwAccel := strings.TrimSpace(cfg.Playback.HWAccel)
+	hwDevice := strings.TrimSpace(cfg.Playback.HWDevice)
+	timeout := playback.CapabilityRequestTimeout(hwAccel, hwDevice)
+	probeCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	info, detectErr := playback.DetectHWAccelWithFFmpegContextResult(probeCtx, hwAccel, cfg.Playback.FFmpegPath, hwDevice)
+	var caps tonemap.Capabilities
+	var probeErr error
+	if probeCtx.Err() == nil {
+		caps, probeErr = tonemap.Probe(probeCtx, playback.ResolveFFmpegPath(cfg.Playback.FFmpegPath), info.Resolved, hwDevice)
+	}
+	summary := playback.SummarizeToneMapInventory(info, caps, hwAccel, cfg.Playback.TranscodeEnabled, detectErr, probeErr)
+	if summary.Warn {
+		slog.Warn("no hardware tone-map executor validated; HDR transcodes will use software encoding", summary.Attrs...)
+		return
+	}
+	slog.Info("hardware acceleration inventory", summary.Attrs...)
+}
+
 func resolvePluginCacheDir() string {
 	if v := strings.TrimSpace(os.Getenv("SILO_PLUGIN_CACHE_DIR")); v != "" {
 		return v
@@ -2974,6 +3003,13 @@ func main() {
 		}
 
 		slog.Info("background workers started")
+	}
+
+	// Proxy nodes never run ffmpeg locally, so there is nothing to validate.
+	// Everywhere else the inventory runs detached: a cold multi-device walk
+	// can take minutes and must never delay serving traffic.
+	if mode != "proxy" {
+		go logToneMapStartupSummary(cfg)
 	}
 
 	// Step 10: Create and start the HTTP server.
