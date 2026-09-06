@@ -609,6 +609,121 @@ func TestVirtualPlaybackProfileCandidateFallbackOnInvalidURL(t *testing.T) {
 	}
 }
 
+func TestVirtualPlaybackCompoundProfileMatches4KHDR(t *testing.T) {
+	cand1080p := virtualCandidate("cand-1080p", "https://1.1.1.1/1080p")
+	cand1080p.Resolution.Label = "1080p"
+	cand4KHDR := virtualCandidate("cand-4k-hdr", "https://1.1.1.1/4k-hdr")
+	cand4KHDR.Resolution.Label = "2160p"
+	cand4KHDR.Hdr = &pluginv1.VirtualStreamHDR{IsHdr: true, Format: "hdr10"}
+
+	service, _ := newVirtualPlaybackTestService(t,
+		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+			return virtualResponse(cand1080p, cand4KHDR), nil
+		},
+	)
+	res, err := service.ResolveVirtualPlaybackDetailedWithRouting(
+		context.Background(),
+		"virtual://series/tt22202452/1/1?profile=4K+HDR",
+		7,
+		"p1",
+		VirtualPlaybackRouting{OwnerInstallationID: 101},
+		false,
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("unexpected resolve error: %v", err)
+	}
+	if res.CandidateID != "cand-4k-hdr" {
+		t.Fatalf("candidateID = %q, want cand-4k-hdr", res.CandidateID)
+	}
+}
+
+func TestVirtualPlaybackCompoundProfileRefinesDolbyVision(t *testing.T) {
+	candHDR10 := virtualCandidate("cand-hdr10", "https://1.1.1.1/hdr10")
+	candHDR10.Resolution.Label = "2160p"
+	candHDR10.Hdr = &pluginv1.VirtualStreamHDR{IsHdr: true, Format: "hdr10"}
+
+	candDV := virtualCandidate("cand-dv", "https://1.1.1.1/dv")
+	candDV.Resolution.Label = "2160p"
+	candDV.Hdr = &pluginv1.VirtualStreamHDR{IsHdr: true, Format: "dv", HasDolbyVision: true}
+
+	service, _ := newVirtualPlaybackTestService(t,
+		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+			return virtualResponse(candHDR10, candDV), nil
+		},
+	)
+	res, err := service.ResolveVirtualPlaybackDetailedWithRouting(
+		context.Background(),
+		"virtual://movie/tt1234?profile=4K+Dolby+Vision",
+		7,
+		"p1",
+		VirtualPlaybackRouting{OwnerInstallationID: 101},
+		false,
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("unexpected resolve error: %v", err)
+	}
+	if res.CandidateID != "cand-dv" {
+		t.Fatalf("candidateID = %q, want cand-dv", res.CandidateID)
+	}
+}
+
+func TestVirtualPlaybackProfileFallsBackToAvailableStreams(t *testing.T) {
+	cand1080p := virtualCandidate("cand-1080p", "https://1.1.1.1/1080p")
+	cand1080p.Resolution.Label = "1080p"
+
+	service, _ := newVirtualPlaybackTestService(t,
+		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+			return virtualResponse(cand1080p), nil
+		},
+	)
+	res, err := service.ResolveVirtualPlaybackDetailedWithRouting(
+		context.Background(),
+		"virtual://series/tt22202452/1/1?profile=4K+HDR",
+		7,
+		"p1",
+		VirtualPlaybackRouting{OwnerInstallationID: 101},
+		false,
+		nil,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("expected fallback resolution, got error: %v", err)
+	}
+	if res.CandidateID != "cand-1080p" {
+		t.Fatalf("candidateID = %q, want cand-1080p", res.CandidateID)
+	}
+}
+
+func TestVirtualPlaybackListStreamsReturnsAllCandidatesEvenWithProfile(t *testing.T) {
+	cand1 := virtualCandidate("c1", "https://1.1.1.1/1")
+	cand1.Resolution.Label = "2160p"
+	cand2 := virtualCandidate("c2", "https://1.1.1.1/2")
+	cand2.Resolution.Label = "1080p"
+
+	service, _ := newVirtualPlaybackTestService(t,
+		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {
+			return virtualResponse(cand1, cand2), nil
+		},
+	)
+	streams, err := service.ListVirtualPlaybackStreamsWithRouting(
+		context.Background(),
+		"virtual://series/tt22202452/1/1?profile=4K+HDR",
+		7,
+		"p1",
+		VirtualPlaybackRouting{OwnerInstallationID: 101},
+	)
+	if err != nil {
+		t.Fatalf("ListVirtualPlaybackStreamsWithRouting failed: %v", err)
+	}
+	if len(streams) != 2 {
+		t.Fatalf("got %d streams, want 2", len(streams))
+	}
+}
+
 func TestVirtualPlaybackMissingOwnerFallsBackToReplacementProvider(t *testing.T) {
 	service, calls := newVirtualPlaybackTestService(t,
 		func(context.Context, *pluginv1.ResolveVirtualStreamRequest) (*pluginv1.ResolveVirtualStreamResponse, error) {

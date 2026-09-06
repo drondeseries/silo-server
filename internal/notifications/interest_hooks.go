@@ -48,18 +48,26 @@ func (p *interestTrackingProvider) ForUser(ctx context.Context, userID int) (use
 	completion, hasCompletion := store.(userstore.EpisodeParentCompletionStore)
 	switch {
 	case hasDevices && hasRollup && hasCompletion:
+		inner := &interestTrackingStoreWithDevicesAndRollup{
+			interestTrackingStore: tracked, DeviceRegistry: registry, SeriesEpisodeRollupStore: rollup,
+		}
+		if hasProfiles {
+			inner.DeviceProfileRegistry = profiles
+		}
 		return &interestTrackingStoreWithDevicesRollupAndCompletion{
-			interestTrackingStoreWithDevicesAndRollup: &interestTrackingStoreWithDevicesAndRollup{
-				interestTrackingStore: tracked, DeviceRegistry: registry, SeriesEpisodeRollupStore: rollup,
-			},
-			EpisodeParentCompletionStore: completion,
+			interestTrackingStoreWithDevicesAndRollup: inner,
+			EpisodeParentCompletionStore:              completion,
 		}, nil
 	case hasDevices && hasCompletion:
+		inner := &interestTrackingStoreWithDevices{
+			interestTrackingStore: tracked, DeviceRegistry: registry,
+		}
+		if hasProfiles {
+			inner.DeviceProfileRegistry = profiles
+		}
 		return &interestTrackingStoreWithDevicesAndCompletion{
-			interestTrackingStoreWithDevices: &interestTrackingStoreWithDevices{
-				interestTrackingStore: tracked, DeviceRegistry: registry,
-			},
-			EpisodeParentCompletionStore: completion,
+			interestTrackingStoreWithDevices: inner,
+			EpisodeParentCompletionStore:     completion,
 		}, nil
 	case hasRollup && hasCompletion:
 		return &interestTrackingStoreWithRollupAndCompletion{
