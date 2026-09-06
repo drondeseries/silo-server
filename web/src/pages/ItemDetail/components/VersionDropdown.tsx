@@ -7,12 +7,8 @@ import { Button } from "@/components/ui/button";
 import { videoRangeLabel } from "@/lib/videoRange";
 import DetailPopover from "./DetailPopover";
 import { sortPlaybackVariantsByEditionPreference } from "./versionRankingUtils";
-import {
-  buildDetailLine,
-  buildQualitySummary,
-  sortByResolution,
-  collectLanguageLabels,
-} from "./VersionFlyout";
+import { collectLanguageLabels } from "./versionFormatUtils";
+import { buildDetailLine, buildQualitySummary, sortByResolution } from "./VersionFlyout";
 
 interface VersionDropdownProps {
   versions: FileVersion[];
@@ -164,7 +160,7 @@ function VersionDropdown({
                         ) : null}
                       </div>
                       <div className="flex flex-wrap gap-1">
-                        {collectLanguageLabels(version.audio_tracks?.map((t) => t.language)).map(
+                        {collectLanguageLabels(version.audio_tracks?.map((t) => t.language) ?? []).map(
                           (lang) => (
                             <Badge
                               key={lang}
@@ -183,7 +179,7 @@ function VersionDropdown({
                         <span className="text-muted-foreground text-xs">{detail}</span>
                         <div className="flex flex-wrap gap-1">
                           {collectLanguageLabels(
-                            version.subtitle_tracks?.map((t) => t.language),
+                            version.subtitle_tracks?.map((t) => t.language) ?? [],
                           ).map((lang) => (
                             <Badge
                               key={lang}

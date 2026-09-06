@@ -9,11 +9,9 @@ import {
 import { formatFileSize, mapAudioLabel } from "@/lib/mediaFormat";
 import { videoRangeLabel } from "@/lib/videoRange";
 import {
-  audioLanguageSummary,
   collectLanguageLabels,
   extractSourceHint,
   isVirtualFileVersion,
-  subtitleLanguageSummary,
 } from "./versionFormatUtils";
 import { audioScore, resolutionScore } from "./versionRankingUtils";
 
@@ -72,9 +70,6 @@ export function buildDetailLine(version: FileVersion): string {
   const hint = textToScan ? extractSourceHint(textToScan) : null;
   if (hint) parts.push(hint);
 
-  const subtitleLangs = subtitleLanguageSummary(version.subtitle_tracks);
-  // Subtitle languages are now rendered as badges in the UI.
-  // if (subtitleLangs) parts.push(`Subtitles: ${subtitleLangs}`);
   return parts.join(" · ");
 }
 
@@ -141,7 +136,7 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
                   )}
                 </span>
                 <div className="flex flex-wrap gap-1">
-                  {collectLanguageLabels(version.audio_tracks?.map((t) => t.language)).map(
+                  {collectLanguageLabels(version.audio_tracks?.map((t) => t.language) ?? []).map(
                     (lang) => (
                       <Badge
                         key={lang}
@@ -159,7 +154,7 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
                 <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
                   <span className="text-muted-foreground text-xs">{detailLine}</span>
                   <div className="flex flex-wrap gap-1">
-                    {collectLanguageLabels(version.subtitle_tracks?.map((t) => t.language)).map(
+                    {collectLanguageLabels(version.subtitle_tracks?.map((t) => t.language) ?? []).map(
                       (lang) => (
                         <Badge
                           key={lang}
