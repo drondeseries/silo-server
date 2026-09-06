@@ -25,6 +25,52 @@ func TestVisibleVirtualPlaybackStreamsHidesAlternatesOnlyWhenMarked(t *testing.T
 	}
 }
 
+func TestReorderVirtualCandidatesForQualityPrefersAtOrBelowRung(t *testing.T) {
+	candidates := []VirtualPlaybackStream{
+		{URI: "virtual://movie/1?result=4k", Resolution: "2160p"},
+		{URI: "virtual://movie/1?result=1080p", Resolution: "1080p"},
+		{URI: "virtual://movie/1?result=720p", Resolution: "720p"},
+		{URI: "virtual://movie/1?result=480p", Resolution: "480p"},
+	}
+	// 720p preference: 720p and 480p move ahead of 4K/1080p, keeping device
+	// order within each group.
+	reordered := reorderVirtualCandidatesForQuality(candidates, "720p", 0)
+	want := []string{"720p", "480p", "4k", "1080p"}
+	got := make([]string, 0, len(reordered))
+	for _, cand := range reordered {
+		got = append(got, cand.URI)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("reordered = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("reordered = %v, want %v", got, want)
+		}
+	}
+
+	// auto/original keep the device ranking unchanged.
+	if out := reorderVirtualCandidatesForQuality(candidates, "auto", 0); len(out) != len(candidates) || out[0].URI != candidates[0].URI {
+		t.Fatalf("auto reorder changed the ranking: %#v", out)
+	}
+	if out := reorderVirtualCandidatesForQuality(candidates, "original", 0); len(out) != len(candidates) || out[0].URI != candidates[0].URI {
+		t.Fatalf("original reorder changed the ranking: %#v", out)
+	}
+
+	// No candidate at or below the rung keeps the device ranking.
+	only4K := []VirtualPlaybackStream{{URI: "virtual://movie/1?result=4k", Resolution: "2160p"}}
+	if out := reorderVirtualCandidatesForQuality(only4K, "720p", 0); len(out) != 1 || out[0].URI != only4K[0].URI {
+		t.Fatalf("no-match reorder changed the ranking: %#v", out)
+	}
+
+	// A bandwidth cap tightens the rung: 8Mbps cap on a 1080p preference
+	// prefers 720p-or-below candidates.
+	capped := reorderVirtualCandidatesForQuality(candidates, "1080p", 8_000)
+	if capped[0].URI != "virtual://movie/1?result=720p" {
+		t.Fatalf("capped reorder = %v, want 720p first", capped)
+	}
+}
+
 func TestMergeVirtualCandidateLanguagesSynthesizesAudioTracksOnly(t *testing.T) {
 	probed := &models.MediaFile{
 		VideoTracks:    []models.VideoTrack{{Codec: "hevc", Width: 3840, Height: 2160}},
@@ -303,7 +349,7 @@ func TestVirtualCandidateLookupUsesStableEpisodeIdentity(t *testing.T) {
 		FilePath:  "virtual://series/tt11198330/3/2",
 	}
 
-	resolved, err := h.resolveVirtualPlaybackSource(req, episodeFile, "profile-1", false)
+	resolved, err := h.resolveVirtualPlaybackSource(req, episodeFile, "profile-1", false, nil, "", "", 0)
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource failed: %v", err)
 	}
@@ -384,7 +430,7 @@ func TestResolveVirtualPlaybackSourceKeepsUnprobedPinnedFallbackWhenOthersFail(t
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
 	file := &models.MediaFile{ID: 10, ContentID: "movie-1", FilePath: "virtual://movie/1"}
 
-	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false)
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "", 0)
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource returned error %v, want fallback to resolved pinned candidate", err)
 	}
@@ -435,7 +481,7 @@ func TestResolveVirtualPlaybackSourceExplicitResultPreservesSelectedVersion(t *t
 		FilePath:  "virtual://movie/1?result=stream-1080p",
 	}
 
-	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false)
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "", 0)
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 	}

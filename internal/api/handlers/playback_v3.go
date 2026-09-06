@@ -1566,7 +1566,7 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 	// path, which only understands local/HTTP media files.
 	if isVirtualPlaybackFile(requestedFile) {
 		requestedCatalogFileID := requestedFile.ID
-		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, true)
+		resolved, resolveErr := h.resolveVirtualPlaybackSource(r, requestedFile, profileID, true, nil, "", req.QualityPreference, intOrZeroHandlerV3(req.BandwidthCapKbps))
 		if resolveErr != nil {
 			termFileID := requestedFile.ID
 			if requestedFile.EpisodeID != "" && h.VirtualEpisodeFileLookup != nil {
@@ -1825,7 +1825,7 @@ func (h *PlaybackHandler) prepareVirtualAlternateFileV3(r *http.Request, alterna
 	if !isVirtualPlaybackFile(alternate) {
 		return h.ensurePlaybackProbe(r.Context(), alternate), nil
 	}
-	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false)
+	resolved, err := h.resolveVirtualPlaybackSource(r, alternate, profileID, false, nil, "", "", 0)
 	if err != nil {
 		return nil, err
 	}
@@ -4503,7 +4503,11 @@ func (h *PlaybackHandler) HandleReplanPlaybackV3(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusConflict, "stale_playback_plan", "The failed plan is no longer current")
 		return
 	}
-	replanCtx, cancelReplan := context.WithTimeout(r.Context(), 10*time.Second)
+	// The replan budget must cover the declared virtual resolution budgets
+	// (60s startup / 15s probe) without allowing hangs; 30s is a bounded value
+	// that fits a slow provider's synchronous rehydration while still failing
+	// fast on a genuinely stuck provider.
+	replanCtx, cancelReplan := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancelReplan()
 	response, updated, transport, replanErr := h.executeReplanV3(r.WithContext(replanCtx), record, req)
 	if replanErr != nil {
@@ -5080,20 +5084,43 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 			pinnedFile := *currentEffectiveFile
 			pinnedFile.FilePath = session.VirtualSourceURI
 			pinnedFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
-			resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false)
-			if resolveErr != nil {
-				slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
-				virtualRehydrationFailed = true
-				virtualRehydrationErr = resolveErr
-			} else if resolved.File == nil {
-				slog.WarnContext(r.Context(), "virtual playback rehydration returned no file", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID)
-				virtualRehydrationFailed = true
+			// When the catalog row already points at the exact session-bound
+			// candidate and carries complete probed evidence, rehydrating it
+			// again would force a synchronous provider probe (up to 15s) for
+			// metadata the planner already has. Skip the round-trip entirely
+			// and use the loaded row directly.
+			candidateUnchanged := currentEffectiveFile.FilePath == session.VirtualSourceURI
+			evidenceComplete := completeVirtualVideoEvidenceV3(currentEffectiveFile) &&
+				completeVirtualAudioEvidenceV3(currentEffectiveFile) &&
+				completeVirtualContainerEvidenceV3(currentEffectiveFile)
+			if candidateUnchanged && evidenceComplete {
+				currentEffectiveFile.FilePath = session.VirtualSourceURI
+				currentEffectiveFile.VirtualOwnerInstallationID = session.VirtualSourceOwnerInstallationID
 			} else {
-				resolvedFile := *resolved.File
-				resolvedFile.ID = currentEffectiveFile.ID
-				resolvedFile.FilePath = resolved.URI
-				resolvedFile.VirtualOwnerInstallationID = resolved.OwnerID
-				currentEffectiveFile = &resolvedFile
+				// The session-bound release is preferred so re-ranking cannot
+				// drift to a different provider candidate; the failed
+				// candidate (the effective file the failed plan mounted) is
+				// excluded so it cannot be re-selected under a new row ID.
+				preferredCandidateID := virtualResultCandidateID(session.VirtualSourceURI)
+				var excludedCandidateIDs []string
+				if failedID := virtualResultCandidateID(currentEffectiveFile.FilePath); failedID != "" {
+					excludedCandidateIDs = []string{failedID}
+				}
+				resolved, resolveErr := h.resolveVirtualPlaybackSource(r, &pinnedFile, record.ProfileID, false, excludedCandidateIDs, preferredCandidateID, start.QualityPreference, intOrZeroHandlerV3(start.BandwidthCapKbps))
+				if resolveErr != nil {
+					slog.WarnContext(r.Context(), "virtual playback rehydration failed", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID, "error", logredact.SanitizeURLError(resolveErr))
+					virtualRehydrationFailed = true
+					virtualRehydrationErr = resolveErr
+				} else if resolved.File == nil {
+					slog.WarnContext(r.Context(), "virtual playback rehydration returned no file", "component", "api", "session_id", record.SessionID, "file_id", currentEffectiveFile.ID, "owner_installation_id", session.VirtualSourceOwnerInstallationID)
+					virtualRehydrationFailed = true
+				} else {
+					resolvedFile := *resolved.File
+					resolvedFile.ID = currentEffectiveFile.ID
+					resolvedFile.FilePath = resolved.URI
+					resolvedFile.VirtualOwnerInstallationID = resolved.OwnerID
+					currentEffectiveFile = &resolvedFile
+				}
 			}
 		}
 	} else {

@@ -85,6 +85,8 @@ function playbackSession(
     loading: false,
     replacing: false,
     replanning: false,
+    replanningQuality: false,
+    pendingSwitchFileId: null,
     errorTitle: null,
     error: null,
     initialSubtitleErrorTitle: null,
@@ -201,5 +203,52 @@ describe("WatchPage playback state", () => {
 
     expect(updatePlaybackState).toHaveBeenCalledWith(321, true);
     expect(onPlaybackStateChange).toHaveBeenCalledWith(state);
+  });
+});
+
+describe("WatchPage version switch feedback", () => {
+  it("shows a non-blocking switching indicator while replacing with an active plan", () => {
+    playbackSessionMock.mockReturnValue(playbackSession({ replacing: true }));
+
+    render(createElement(WatchPage, watchPageProps));
+
+    expect(screen.getByRole("status", { name: "Switching version" })).toBeInTheDocument();
+    expect(screen.getByText("Switching version…")).toBeInTheDocument();
+    // The old stream keeps playing: the player stays mounted.
+    expect(screen.getByText("Mounted video player")).toBeInTheDocument();
+  });
+
+  it("keeps the full-screen loading overlay for the no-plan case", () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: null,
+        streamUrl: null,
+        sessionId: null,
+        mediaFileId: null,
+        loading: true,
+        replacing: true,
+      }),
+    );
+
+    render(createElement(WatchPage, watchPageProps));
+
+    expect(screen.getByText("Loading player...")).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "Switching version" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Mounted video player")).not.toBeInTheDocument();
+  });
+
+  it("forwards the quality-replan and pending-switch flags to the player", () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({ replanningQuality: true, pendingSwitchFileId: 99 }),
+    );
+
+    render(createElement(WatchPage, watchPageProps));
+
+    const props = videoPlayerMock.mock.calls[0]?.[0] as {
+      replanningQuality?: boolean;
+      pendingSwitchFileId?: number | null;
+    };
+    expect(props.replanningQuality).toBe(true);
+    expect(props.pendingSwitchFileId).toBe(99);
   });
 });

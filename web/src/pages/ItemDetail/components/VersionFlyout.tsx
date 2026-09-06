@@ -8,7 +8,12 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { formatFileSize, mapAudioLabel } from "@/lib/mediaFormat";
 import { videoRangeLabel } from "@/lib/videoRange";
-import { extractSourceHint } from "./versionFormatUtils";
+import {
+  audioLanguageSummary,
+  extractSourceHint,
+  isVirtualFileVersion,
+  subtitleLanguageSummary,
+} from "./versionFormatUtils";
 import { audioScore, resolutionScore } from "./versionRankingUtils";
 
 // ---------------------------------------------------------------------------
@@ -38,6 +43,8 @@ export function buildQualitySummary(version: FileVersion): string {
   const rangeLabel = videoRangeLabel(version);
   if (rangeLabel) parts.push(rangeLabel);
   if (version.codec_audio) parts.push(mapAudioLabel(version.codec_audio));
+  const audioLangs = audioLanguageSummary(version.audio_tracks);
+  if (audioLangs) parts.push(audioLangs);
   if (parts.length === 0 && version.container) {
     parts.push(version.container.toUpperCase());
   }
@@ -48,12 +55,23 @@ export function buildQualitySummary(version: FileVersion): string {
 export function buildDetailLine(version: FileVersion): string {
   const parts: string[] = [];
 
+  // Virtual candidates carry the provider's release name in edition_raw; it
+  // is the only human-readable identity a zero-storage version has, so it
+  // takes the lead over the generic size/source scan.
+  if (isVirtualFileVersion(version)) {
+    const releaseName = version.edition_raw?.trim();
+    if (releaseName) parts.push(releaseName);
+  }
+
   const size = formatFileSize(version.file_size);
   if (size) parts.push(size);
 
   const textToScan = [version.file_name, version.edition_raw].filter(Boolean).join(" ");
   const hint = textToScan ? extractSourceHint(textToScan) : null;
   if (hint) parts.push(hint);
+
+  const subtitleLangs = subtitleLanguageSummary(version.subtitle_tracks);
+  if (subtitleLangs) parts.push(`Subtitles: ${subtitleLangs}`);
 
   return parts.join(" · ");
 }
@@ -111,7 +129,10 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
               <span className="text-foreground flex items-center gap-1.5 truncate text-sm font-semibold">
                 <span className="truncate">{qualitySummary}</span>
                 {isVirtual && !isMoreAction && (
-                  <Badge variant="secondary" className="px-1.5 py-0 text-[10px] font-medium shrink-0">
+                  <Badge
+                    variant="secondary"
+                    className="shrink-0 px-1.5 py-0 text-[10px] font-medium"
+                  >
                     Virtual
                   </Badge>
                 )}

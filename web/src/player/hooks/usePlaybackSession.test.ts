@@ -381,6 +381,64 @@ describe("usePlaybackSession quality changes", () => {
 
     unmount();
   });
+
+  it("sets replanningQuality only for quality/output replans and resets it on adoption", async () => {
+    const plan = fixturePlanV3();
+    let replanCount = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: plan,
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanCount += 1;
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: fixturePlanV3({
+            plan_id: `plan:replan-${replanCount}`,
+            plan_attempt_key: `v3:replan-${replanCount}`,
+          }),
+        });
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.replanningQuality).toBe(false);
+
+    // A quality change lights the quality flag while in flight.
+    act(() => result.current.changeQuality("720p", 120));
+    expect(result.current.replanning).toBe(true);
+    expect(result.current.replanningQuality).toBe(true);
+    await waitFor(() => expect(result.current.replanningQuality).toBe(false));
+
+    // A track change does not.
+    act(() => result.current.switchAudioTrack(1, 120));
+    expect(result.current.replanning).toBe(true);
+    expect(result.current.replanningQuality).toBe(false);
+    await waitFor(() => expect(result.current.replanning).toBe(false));
+
+    unmount();
+  });
 });
 
 describe("usePlaybackSession initial bitmap subtitles", () => {
@@ -1402,6 +1460,133 @@ describe("usePlaybackSession version switches", () => {
     expect(result.current.sessionId).toBeNull();
     expect(result.current.error).toContain("could not start playback");
     expect(stoppedSessions).toEqual(["/api/v1/playback/session-1"]);
+
+    unmount();
+  });
+
+  it("sets pendingSwitchFileId optimistically and clears it when the new plan lands", async () => {
+    const startBodies: Array<{ file_id: number }> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { file_id: number };
+        startBodies.push(body);
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: `session-${startBodies.length}`,
+            playback_plan: fixturePlanV3({
+              session_id: `session-${startBodies.length}`,
+              plan_id: `plan:switch-${startBodies.length}`,
+              requested_media_file_id: body.file_id,
+              effective_media_file_id: body.file_id,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.pendingSwitchFileId).toBeNull();
+
+    act(() => result.current.switchVersion(99, 0));
+    // Set synchronously, before the replacement plan lands.
+    expect(result.current.pendingSwitchFileId).toBe(99);
+    expect(result.current.replacing).toBe(true);
+
+    await waitFor(() => expect(result.current.mediaFileId).toBe(99));
+    expect(result.current.pendingSwitchFileId).toBeNull();
+    expect(result.current.replacing).toBe(false);
+    expect(startBodies.map((body) => body.file_id)).toEqual([7, 99]);
+
+    unmount();
+  });
+
+  it("coalesces a rapid second version click to the latest target", async () => {
+    const startBodies: Array<{ file_id: number }> = [];
+    let releaseFirstSwitch: ((response: Response) => void) | undefined;
+    const firstSwitchResponse = new Promise<Response>((resolve) => {
+      releaseFirstSwitch = resolve;
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as { file_id: number };
+        startBodies.push(body);
+        if (startBodies.length === 2) {
+          // Hold the first switch open so the second click lands while it is
+          // still in flight.
+          return firstSwitchResponse;
+        }
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: `session-${startBodies.length}`,
+            playback_plan: fixturePlanV3({
+              session_id: `session-${startBodies.length}`,
+              plan_id: `plan:switch-${startBodies.length}`,
+              requested_media_file_id: body.file_id,
+              effective_media_file_id: body.file_id,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+
+    act(() => result.current.switchVersion(99, 0));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    // The second click lands while the first switch is still in flight.
+    act(() => result.current.switchVersion(123, 0));
+    expect(startBodies).toHaveLength(2);
+    expect(result.current.pendingSwitchFileId).toBe(123);
+
+    await act(async () => {
+      releaseFirstSwitch?.(
+        jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-2",
+          playback_plan: fixturePlanV3({
+            session_id: "session-2",
+            plan_id: "plan:switch-2",
+            requested_media_file_id: 99,
+            effective_media_file_id: 99,
+          }),
+        }),
+      );
+      await firstSwitchResponse;
+    });
+
+    // The coalesced switch to the latest target runs immediately after.
+    await waitFor(() => expect(startBodies).toHaveLength(3));
+    expect(startBodies.map((body) => body.file_id)).toEqual([7, 99, 123]);
+    await waitFor(() => expect(result.current.mediaFileId).toBe(123));
+    expect(result.current.pendingSwitchFileId).toBeNull();
 
     unmount();
   });

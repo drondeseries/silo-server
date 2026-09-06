@@ -98,6 +98,25 @@ const LIVE_SUBTITLE_INDEX = 1_000_000;
 // playhead; a hard cap also resumes so we never wait forever.
 const TRANSLATION_RESUME_TIMEOUT_MS = 30_000;
 
+/**
+ * Matches a subtitle track by identity — the fields that describe the same
+ * underlying track across two files' inventories. Used to carry a manual
+ * subtitle selection across a version switch, where the raw combined ordinal
+ * can name a *different* language track in the new file.
+ */
+function sameSubtitleTrackIdentity(a: PlayerSubtitleInfo, b: PlayerSubtitleInfo): boolean {
+  return (
+    normalizeSubtitleIdentity(a.language) === normalizeSubtitleIdentity(b.language) &&
+    normalizeSubtitleIdentity(a.codec) === normalizeSubtitleIdentity(b.codec) &&
+    Boolean(a.forced) === Boolean(b.forced) &&
+    Boolean(a.hearing_impaired) === Boolean(b.hearing_impaired)
+  );
+}
+
+function normalizeSubtitleIdentity(value: string | undefined | null): string {
+  return (value ?? "").trim().toLowerCase();
+}
+
 interface VideoPlayerProps {
   title: string;
   year?: number;
@@ -115,6 +134,17 @@ interface VideoPlayerProps {
   shouldAutoPlay?: boolean;
   /** True while a replan is in flight, so the quality menu can show progress. */
   replanning?: boolean;
+  /**
+   * True only while the in-flight replan is a quality/output change. The
+   * quality menu's "…" label keys on this rather than on `replanning`, which
+   * is also set for track changes, seek reanchors and failure recovery.
+   */
+  replanningQuality?: boolean;
+  /**
+   * The file the viewer most recently asked to switch to while the switch is
+   * still in flight. Lights the clicked version as "Requested" optimistically.
+   */
+  pendingSwitchFileId?: number | null;
   /** Server-described replan error, if the last replan was refused. */
   replanError?: string | null;
   /** Title for the replan error, used when surfacing the refusal as a toast. */
@@ -243,6 +273,8 @@ export function VideoPlayer({
   transportRevision,
   shouldAutoPlay = true,
   replanning = false,
+  replanningQuality = false,
+  pendingSwitchFileId = null,
   replanError = null,
   replanErrorTitle = null,
   sessionId,
@@ -357,6 +389,14 @@ export function VideoPlayer({
   );
   const lastSubtitleIndexRef = useRef<number | null>(null);
   const subtitleSelectionWasManualRef = useRef(false);
+  // Previous effective media file and subtitle inventory, so a version switch
+  // can remap a manual subtitle selection to the equivalent track in the new
+  // file's inventory by identity rather than by raw index.
+  const lastEffectiveMediaFileIdRef = useRef<number | null>(null);
+  const lastSubtitleTracksRef = useRef<PlayerSubtitleInfo[]>([]);
+  // Staged identity remap from a version switch, applied by the auto-select
+  // effect before any selection logic runs against the new inventory.
+  const subtitleRemapRef = useRef<number | null>(null);
   // Per-session subtitle delay in ms. Positive = show later. Reset when the
   // underlying file changes so sync adjustments don't carry across media.
   const [subtitleDelayMs, setSubtitleDelayMs] = useState(0);
@@ -2262,6 +2302,57 @@ export function VideoPlayer({
     }
   }, [plan.selected_tracks.subtitle?.index, replanError, replanErrorTitle, replanning]);
 
+  // -- Carry a manual subtitle selection across a version switch by identity --
+  // A version switch mints a new session and a new subtitle inventory, and the
+  // combined ordinal is only meaningful within one file's inventory: the same
+  // numeric index can name a *different* language track in the new file. When
+  // the effective media file changes and the selection was manual, remap it to
+  // the equivalent track in the new inventory (language + codec + forced +
+  // hearing_impaired), falling back to the raw index only if no identity match
+  // exists, and to auto-select if nothing matches at all. Auto-selected
+  // subtitles are left alone — the auto-select effect re-runs against the new
+  // inventory on its own.
+  //
+  // This runs *before* the sessionId-clearing effect below so the manual flag
+  // survives the session change long enough to be remapped; the remap is
+  // staged in a ref and applied by the auto-select effect.
+  useEffect(() => {
+    const effectiveFileId = plan.effective_media_file_id;
+    const previousFileId = lastEffectiveMediaFileIdRef.current;
+    lastEffectiveMediaFileIdRef.current = effectiveFileId;
+    const previousTracks = lastSubtitleTracksRef.current;
+    lastSubtitleTracksRef.current = effectiveSubtitleTracks;
+
+    if (previousFileId === null || previousFileId === effectiveFileId) {
+      return;
+    }
+    if (!subtitleSelectionWasManualRef.current) {
+      return;
+    }
+    if (activeSubtitleIndex === null || activeSubtitleIndex === LIVE_SUBTITLE_INDEX) {
+      return;
+    }
+
+    const previousTrack = previousTracks.find((track) => track.index === activeSubtitleIndex);
+    if (!previousTrack) {
+      return;
+    }
+
+    // Prefer the identity match; fall back to the raw index (the same ordinal
+    // in the new inventory) only when no equivalent track exists.
+    const identityMatch = effectiveSubtitleTracks.find((track) =>
+      sameSubtitleTrackIdentity(track, previousTrack),
+    );
+    const remappedIndex = identityMatch?.index ?? activeSubtitleIndex;
+    const remappedTrack = effectiveSubtitleTracks.find((track) => track.index === remappedIndex);
+    if (remappedTrack) {
+      subtitleRemapRef.current = remappedIndex;
+    } else {
+      // Nothing matches in the new inventory: reset to auto-select.
+      subtitleSelectionWasManualRef.current = false;
+    }
+  }, [activeSubtitleIndex, effectiveSubtitleTracks, plan.effective_media_file_id]);
+
   // A refusal pin belongs only to the session that rejected the automatic
   // selection. Clear it before the auto-selection effect evaluates a new
   // session so the viewer's persisted subtitle mode applies to the next title.
@@ -2271,6 +2362,26 @@ export function VideoPlayer({
 
   // -- Auto-select subtitle track based on mode --
   useEffect(() => {
+    // Apply a staged identity remap from a version switch first, so the manual
+    // selection lands on the equivalent track before any auto-selection logic
+    // runs against the new inventory.
+    const pendingRemap = subtitleRemapRef.current;
+    if (pendingRemap !== null) {
+      subtitleRemapRef.current = null;
+      const remappedTrack = effectiveSubtitleTracks.find((track) => track.index === pendingRemap);
+      if (remappedTrack) {
+        setActiveSubtitleIndex(pendingRemap);
+        lastSubtitleIndexRef.current = pendingRemap;
+        // The remap preserved a manual choice; keep the flag so a later
+        // version switch remaps it again instead of falling back to
+        // auto-selection.
+        subtitleSelectionWasManualRef.current = true;
+        return;
+      }
+      // The staged track vanished (the inventory changed again); fall through
+      // to the normal selection handling below.
+    }
+
     if (subtitleSelectionWasManualRef.current) {
       const selectionStillExists =
         activeSubtitleIndex === null ||
@@ -2321,6 +2432,7 @@ export function VideoPlayer({
     activeAudioIndex,
     selectedVersion,
     sessionId,
+    plan.effective_media_file_id,
   ]);
 
   // -- Control callbacks --
@@ -3128,19 +3240,41 @@ export function VideoPlayer({
           onAudioSelect={onAudioSelect}
           qualityOptions={qualityOptions}
           activeQualityId={activeQualityId}
-          isTranscoding={replanning}
+          isTranscoding={replanningQuality}
           qualityError={replanError}
           onQualitySelect={handleQualitySelect}
           versions={
             versions.length > 1
-              ? versions.map((v) => ({
-                  fileId: v.file_id,
-                  label: `${v.resolution} ${v.codec_video.toUpperCase()}${v.hdr ? " HDR" : ""}`,
-                  // The server names the file it actually planned against; a
-                  // fallback to an alternate version shows up here.
-                  isCurrentSource: v.file_id === plan.effective_media_file_id,
-                  isRequestedSource: v.file_id === plan.requested_media_file_id,
-                }))
+              ? versions.map((v) => {
+                  // Compact audio languages for the version switcher so a
+                  // MULTI/French track set is recognizable before playback.
+                  const audioLangs = [
+                    ...new Set(
+                      (v.audio_tracks ?? [])
+                        .map((track) => track.language?.trim())
+                        .filter((language): language is string => Boolean(language)),
+                    ),
+                  ].join("/");
+                  const audioPart = v.codec_audio
+                    ? ` ${v.codec_audio.toUpperCase()}${audioLangs ? ` ${audioLangs}` : ""}`
+                    : audioLangs
+                      ? ` ${audioLangs}`
+                      : "";
+                  return {
+                    fileId: v.file_id,
+                    label: `${v.resolution} ${v.codec_video.toUpperCase()}${v.hdr ? " HDR" : ""}${audioPart}`,
+                    // The server names the file it actually planned against; a
+                    // fallback to an alternate version shows up here.
+                    isCurrentSource: v.file_id === plan.effective_media_file_id,
+                    // The clicked version lights up "Requested" immediately,
+                    // before the replacement plan lands: the plan's
+                    // requested_media_file_id still names the OLD file until
+                    // the switch completes.
+                    isRequestedSource:
+                      v.file_id === pendingSwitchFileId ||
+                      v.file_id === plan.requested_media_file_id,
+                  };
+                })
               : undefined
           }
           onSwitchVersion={
