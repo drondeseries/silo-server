@@ -22,6 +22,14 @@ var proxyMediaRoutes = []streamtelemetry.MediaRoute{
 	proxyRoute(http.MethodGet, "/stream/subtitles/{token}/{track}/fonts", streamtelemetry.ClassPlayback, true),
 	proxyRoute(http.MethodGet, "/downloads/file/{token}", streamtelemetry.ClassTransfer, false),
 	proxyRoute(http.MethodHead, "/downloads/file/{token}", streamtelemetry.ClassTransfer, false),
+	// Credential-free grant routes (authorized_media_origins_v1). Same media
+	// bytes as the token routes above, addressed by session id and authorized
+	// by the caller's own Authorization header.
+	grantRoute(http.MethodHead, "/stream/v3/{session_id}", streamtelemetry.ClassPlayback, true),
+	grantRoute(http.MethodGet, "/stream/v3/{session_id}", streamtelemetry.ClassPlayback, true),
+	grantRoute(http.MethodHead, "/stream/v3/{session_id}/master.m3u8", streamtelemetry.ClassManifest, true),
+	grantRoute(http.MethodGet, "/stream/v3/{session_id}/master.m3u8", streamtelemetry.ClassManifest, true),
+	grantRoute(http.MethodGet, "/stream/v3/{session_id}/segment/{name}", streamtelemetry.ClassPlayback, true),
 }
 
 func proxyRoute(method, pattern string, class streamtelemetry.Class, capRelevant bool) streamtelemetry.MediaRoute {
