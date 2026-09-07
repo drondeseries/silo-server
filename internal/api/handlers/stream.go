@@ -585,6 +585,19 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Capture the catalog row's subtitle layout before the session overlay. A
+	// virtual release can rotate between planning and extraction: the row is
+	// re-probed against the current candidate while this session's URLs still
+	// name the layout captured at plan time. When the two diverge, extraction
+	// must verify the live source (and possibly re-map the plan ordinal) before
+	// spawning ffmpeg, because the ordinal is only valid against the pinned
+	// release's actual layout.
+	rowSubs := file.SubtitleTracks
+	driftSuspected := isVirtualPlaybackFile(file) &&
+		session.VirtualSourceURI != "" &&
+		session.VirtualSubtitleEvidenceSet &&
+		!playback.SubtitleLayoutsEqual(rowSubs, session.VirtualSubtitleTracks)
+
 	// Bind to the session's planned virtual URI when available: the catalog
 	// row's path is mutable (candidate rotation, stale pin removal), but the
 	// session captured the exact URI that was resolved and probed during
@@ -704,7 +717,7 @@ func (h *StreamHandler) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		// demuxed, so the first byte lands within ~1s even on network
 		// storage. Works identically for direct-play, remux, and
 		// transcode because it doesn't depend on any other ffmpeg.
-		h.streamEmbeddedSubtitle(w, r, file, embeddedIndex, session, requestedFormat)
+		h.streamEmbeddedSubtitle(w, r, file, embeddedIndex, session, driftSuspected, requestedFormat)
 		return
 	}
 
@@ -1015,7 +1028,7 @@ func (h *StreamHandler) markVirtualCandidateFailed(ctx context.Context, file *mo
 // track, optionally windowed by explicit client parameters, and pipes its
 // stdout directly to w. Because this ffmpeg is independent of the video
 // pipeline, it works the same for direct play, remux, and transcode.
-func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Request, file *models.MediaFile, embeddedIndex int, session *playback.Session, requestedFormat ...string) {
+func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Request, file *models.MediaFile, embeddedIndex int, session *playback.Session, driftSuspected bool, requestedFormat ...string) {
 	track := file.SubtitleTracks[embeddedIndex]
 	outFormat := "vtt"
 	switch {
@@ -1046,6 +1059,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		"track_probed_index", track.Index,
 		"seek_seconds", seek,
 		"duration_seconds", duration,
+		"virtual_drift", driftSuspected,
 	)
 
 	opts := playback.StreamExtractOpts{
@@ -1062,6 +1076,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// spawns its own ffmpeg independent of the video pipeline, so it must
 	// resolve separately even though the transcode transport already did.
 	releaseInput := func() {}
+	virtualResolved := false
 	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) && h.RemoteStreamRelay != nil && session != nil {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
 		if resolveErr != nil {
@@ -1071,6 +1086,7 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		}
 		opts.InputPath = resolved.URL
 		releaseInput = cleanup
+		virtualResolved = true
 	}
 	defer releaseInput()
 	if len(requestedFormat) > 0 && requestedFormat[0] == "vtt" {
@@ -1092,18 +1108,131 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 	// Only complete successful extracts enter the cache; explicit windows
 	// remain streamed. Keep failures distinguishable from a clean subtitle EOF.
 	response := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
-	if err := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle); err != nil {
-		playback.LogSubtitleStreamError(r.Context(), err, file.ID, embeddedIndex)
+	virtualActive := virtualResolved && session != nil && session.VirtualSourceURI != ""
+
+	// Row-vs-evidence drift (flagged in handleSubtitle) means the catalog row
+	// no longer describes the release this session planned against. Probe the
+	// live relay input once before any spawn or header commit and re-map the
+	// plan ordinal onto a same-class live track when the pinned release
+	// rotated. Mandatory for PGS, whose .sup response commits 200 before
+	// ffmpeg spawns and therefore can never be retrofitted after a failed map.
+	if virtualActive && driftSuspected && !h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts) {
+		writeSubtitleSourceChanged(w)
+		return
+	}
+
+	extractErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle)
+	if extractErr != nil {
+		playback.LogSubtitleStreamError(r.Context(), extractErr, file.ID, embeddedIndex)
 		if r.Context().Err() != nil {
 			return
 		}
-		if response.Status() == 0 {
+		// A successful HTTP EOF would make clients accept the partial track.
+		if response.Status() != 0 {
+			panic(http.ErrAbortHandler)
+		}
+		if !virtualActive || !playback.IsSubtitleStreamMapError(extractErr) {
 			writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
 			return
 		}
-		// A successful HTTP EOF would make clients accept the partial track.
-		panic(http.ErrAbortHandler)
+		// Post-spawn safety net: the plan ordinal named a subtitle stream the
+		// live input does not have, meaning the pinned release rotated between
+		// the last probe and this spawn (or no pre-spawn probe ran because the
+		// row still matched the plan evidence). Re-probe the already-registered
+		// relay URL once — no second resolve — and re-map; a source that still
+		// cannot satisfy the requested representation gets a clean retryable 4xx
+		// instead of a 500.
+		if !h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts) {
+			writeSubtitleSourceChanged(w)
+			return
+		}
+		if retryErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle); retryErr != nil {
+			playback.LogSubtitleStreamError(r.Context(), retryErr, file.ID, embeddedIndex)
+			if r.Context().Err() != nil {
+				return
+			}
+			if response.Status() != 0 {
+				panic(http.ErrAbortHandler)
+			}
+			if playback.IsSubtitleStreamMapError(retryErr) {
+				writeSubtitleSourceChanged(w)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "subtitle_extract_failed", "Failed to extract subtitles")
+			return
+		}
 	}
+}
+
+// verifyVirtualSubtitleLayout probes the live relay input once and, when its
+// subtitle layout drifted from the plan-time evidence this session captured,
+// re-maps the extract options onto a same-class live track. It reports whether
+// extraction may proceed. False means the live source cannot satisfy the
+// requested representation — rotation to a different subtitle class, an
+// ambiguous or absent match, or an unverifiable layout for a PGS request whose
+// .sup response commits 200 before ffmpeg spawns — and the caller must answer
+// with a clean retryable 4xx before ffmpeg spawns or headers commit. Virtual
+// inputs are request-local probe state; the session's published evidence is
+// never rewritten.
+func (h *StreamHandler) verifyVirtualSubtitleLayout(ctx context.Context, requestedTrack models.SubtitleTrack, session *playback.Session, opts *playback.StreamExtractOpts) bool {
+	if session == nil || opts == nil || strings.TrimSpace(opts.InputPath) == "" {
+		return true
+	}
+	liveTracks, err := playback.ProbeSubtitleLayout(ctx, h.ffmpegPath(), opts.InputPath)
+	if err != nil {
+		// The live layout could not be inspected under a suspected rotation.
+		// PGS is unforgiving: its .sup response commits 200 before ffmpeg
+		// spawns, so an unverified spawn risks an unrecoverable mid-response
+		// abort — refuse rather than risk it. Text/ASS extracts fail before
+		// headers are committed, so the post-spawn safety net can still recover
+		// a rotated source; keep the plan ordinal.
+		slog.WarnContext(ctx, "virtual subtitle layout probe failed", "component", "api",
+			"track_codec", requestedTrack.Codec,
+			"error", err)
+		return !playback.IsPGS(requestedTrack.Codec)
+	}
+	if playback.SubtitleLayoutsEqual(liveTracks, session.VirtualSubtitleTracks) {
+		// The pinned release is unchanged — the catalog row was re-probed
+		// against a different candidate. The plan ordinal already names the
+		// live layout.
+		return true
+	}
+	liveOrdinal, liveTrack, matched := playback.MatchEmbeddedSubtitleTrack(requestedTrack, liveTracks)
+	if !matched {
+		slog.WarnContext(ctx, "virtual subtitle layout rotated without a usable match", "component", "api",
+			"requested_codec", requestedTrack.Codec,
+			"requested_language", requestedTrack.Language,
+			"live_subtitle_count", len(liveTracks))
+		return false
+	}
+	// Class preservation is the hard rule: the URL extension was minted at
+	// plan time, so a re-map may only land on a codec whose extraction uses
+	// the same output muxer.
+	if playback.SubtitleExtractMuxer(requestedTrack.Codec, opts.TargetFormat) != playback.SubtitleExtractMuxer(liveTrack.Codec, opts.TargetFormat) {
+		slog.WarnContext(ctx, "virtual subtitle remap rejected: output muxer mismatch", "component", "api",
+			"plan_codec", requestedTrack.Codec,
+			"live_codec", liveTrack.Codec)
+		return false
+	}
+	planOrdinal := opts.TrackIndex
+	opts.TrackIndex = liveOrdinal
+	opts.SourceCodec = liveTrack.Codec
+	slog.InfoContext(ctx, "virtual subtitle track remapped onto live layout", "component", "api",
+		"plan_ordinal", planOrdinal,
+		"live_ordinal", liveOrdinal,
+		"codec", liveTrack.Codec,
+		"language", liveTrack.Language)
+	return true
+}
+
+// writeSubtitleSourceChanged answers a clean retryable 4xx when a virtual
+// release rotated so the requested subtitle representation can no longer be
+// produced from the live source. Clients already retry through the
+// sliding-window fetcher / replan flow, so the response is deliberately a
+// retryable 4xx, never a 500 or an ambiguous partial stream.
+func writeSubtitleSourceChanged(w http.ResponseWriter) {
+	writeError(w, http.StatusConflict, "subtitle_source_changed",
+		"The selected subtitle track changed on the media source; retry")
 }
 
 // subtitleSeekPosition uses only the caller's explicit position. Session

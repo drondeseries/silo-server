@@ -292,6 +292,22 @@ func streamExtractOutput(codec string, targetFormat ...string) (outCodec, outFor
 	return "webvtt", "webvtt"
 }
 
+// IsSubtitleStreamMapError reports whether an ffmpeg subtitle-extract failure
+// came from a stream map that named a subtitle ordinal the input does not have
+// ("matches no streams" / "for option 'map'"). A virtual release can rotate its
+// subtitle layout between planning and extraction, so a map failure against a
+// relay input means the source rotated rather than that ffmpeg is broken.
+// Conservative by design: only ffmpeg's map diagnostics match, so genuine
+// ffmpeg failures stay loud.
+func IsSubtitleStreamMapError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "matches no streams") ||
+		strings.Contains(message, "for option 'map'")
+}
+
 // LogSubtitleStreamError writes a non-fatal warning for subtitle stream
 // failures. Handlers that already committed HTTP headers call this so
 // the user sees a truncated subtitle instead of an error response, and

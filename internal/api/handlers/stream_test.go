@@ -1328,7 +1328,7 @@ func TestEmbeddedSubtitleExtractionFailures(t *testing.T) {
 			handler.PlaybackConfig = func() config.PlaybackConfig { return config.PlaybackConfig{FFmpegPath: ffmpeg} }
 			file := &models.MediaFile{ID: 42, FilePath: "/synthetic/media.mkv", SubtitleTracks: []models.SubtitleTrack{{Codec: "subrip"}}}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				handler.streamEmbeddedSubtitle(w, r, file, 0, nil, "vtt")
+				handler.streamEmbeddedSubtitle(w, r, file, 0, nil, false, "vtt")
 			}))
 			defer server.Close()
 			response, err := server.Client().Get(server.URL)
