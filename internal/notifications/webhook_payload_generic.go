@@ -108,8 +108,13 @@ func BuildGenericWebhookPayload(row DeliveryRow, webhookID string, test bool) ([
 		}
 	case DeliveryTypeRatingSet:
 		flags := parseRatingFlags(row.ReasonFlags)
+		// item_id is the rated content itself: the episode for episode
+		// ratings (so receivers can resolve/download the exact episode),
+		// otherwise the movie/series content_id.
 		itemID := ""
-		if row.SeriesID != nil {
+		if row.EpisodeID != nil {
+			itemID = *row.EpisodeID
+		} else if row.SeriesID != nil {
 			itemID = *row.SeriesID
 		}
 		body.Rating = &genericWebhookRating{Rating: flags.Rating, ItemID: itemID}
