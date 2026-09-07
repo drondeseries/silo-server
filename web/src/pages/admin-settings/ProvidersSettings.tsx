@@ -300,7 +300,9 @@ function SubtitleProviderTile({
             value={username}
             onChange={handleUsernameChange}
             description={
-              config.has_credentials ? "Leave blank to keep the saved username." : undefined
+              config.has_credentials
+                ? "OpenSubtitles signs you in with your username, not your email. Leave blank to keep the saved one."
+                : "OpenSubtitles signs you in with your username, not your email."
             }
           />
           <SecretField
