@@ -918,9 +918,44 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Build the font-bundle cache key before any virtual resolve: the identity
+	// must never depend on the resolved relay URL, which rotates per
+	// registration. Virtual rows key on the pinned "result=" candidate id (the
+	// 10-minute generation bucket bounds staleness); local rows key on the file
+	// row's mtime+size so a re-probed or replaced file reads as a miss.
+	virtualFontSource := isVirtualPlaybackFile(file) && session.VirtualSourceURI != ""
+	var cacheKey playback.FontBundleKey
+	if virtualFontSource {
+		cacheKey = playback.FontBundleKey{
+			FileID:       file.ID,
+			PinnedResult: virtualResultCandidateID(session.VirtualSourceURI),
+			FFmpegPath:   h.ffmpegPath(),
+		}
+	} else {
+		mtimeUnixNano := int64(0)
+		if file.FileModifiedAt != nil {
+			mtimeUnixNano = file.FileModifiedAt.UnixNano()
+		}
+		cacheKey = playback.FontBundleKey{
+			FileID:        file.ID,
+			Size:          file.FileSize,
+			MtimeUnixNano: mtimeUnixNano,
+			FFmpegPath:    h.ffmpegPath(),
+		}
+	}
+
+	// A cache hit serves the encoded bundle immediately: no provider round-trip,
+	// no relay registration, no ffmpeg spawn.
+	if h.SubtitleCache != nil {
+		if cached, ok := h.SubtitleCache.LookupFontBundle(cacheKey); ok {
+			writeFontBundleResponse(w, cached)
+			return
+		}
+	}
+
 	inputPath := file.FilePath
 	releaseInput := func() {}
-	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
+	if virtualFontSource && hasVirtualMediaResolver(h) {
 		var resolved ResolvedVirtualMedia
 		resolved, releaseInput, err = h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
 		if err != nil {
@@ -931,7 +966,34 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 	}
 	defer releaseInput()
 
-	fonts, err := playback.ExtractAttachedSubtitleFonts(r.Context(), inputPath, h.ffmpegPath())
+	if h.SubtitleCache == nil {
+		// No cache configured: keep the historical uncached path.
+		fonts, err := playback.ExtractAttachedSubtitleFonts(r.Context(), inputPath, h.ffmpegPath())
+		if err != nil {
+			slog.WarnContext(r.Context(), "subtitle font extraction failed", "component", "api",
+				"file_id", file.ID,
+				"track", trackIndex,
+				"error", err,
+			)
+			writeError(w, http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Cache-Control", "no-store")
+		if err := json.NewEncoder(w).Encode(playback.EncodeSubtitleFontBundle(fonts)); err != nil {
+			slog.WarnContext(r.Context(), "subtitle font response encode failed", "component", "api", "error", err)
+		}
+		return
+	}
+
+	bundle, err := h.SubtitleCache.ExtractFontBundle(r.Context(), cacheKey, func(ctx context.Context) ([]byte, error) {
+		fonts, extractErr := playback.ExtractAttachedSubtitleFonts(ctx, inputPath, h.ffmpegPath())
+		if extractErr != nil {
+			return nil, extractErr
+		}
+		return json.Marshal(playback.EncodeSubtitleFontBundle(fonts))
+	})
 	if err != nil {
 		slog.WarnContext(r.Context(), "subtitle font extraction failed", "component", "api",
 			"file_id", file.ID,
@@ -941,13 +1003,17 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
 		return
 	}
+	writeFontBundleResponse(w, bundle)
+}
 
+// writeFontBundleResponse writes an encoded font-bundle payload with the
+// shared cache headers. Both the cache-hit and cache-miss paths serve the same
+// bytes, so the response is identical whichever path produced them.
+func writeFontBundleResponse(w http.ResponseWriter, bundle []byte) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Cache-Control", "no-store")
-	if err := json.NewEncoder(w).Encode(playback.EncodeSubtitleFontBundle(fonts)); err != nil {
-		slog.WarnContext(r.Context(), "subtitle font response encode failed", "component", "api", "error", err)
-	}
+	w.Header().Set("Cache-Control", "private, max-age=600")
+	_, _ = w.Write(bundle)
 }
 
 func (h *StreamHandler) syncSessionsNow(ctx context.Context, reason string) {
@@ -1121,6 +1187,15 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Virtual relay inputs never enter the payload cache under their rotating
+	// URL; key on the pinned source + effective ordinal instead (the identity
+	// must reflect any drift remap above), and never run a detached warm
+	// against a request-scoped relay registration.
+	if virtualActive {
+		opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+		opts.DisableBackgroundWarm = true
+	}
+
 	extractErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle)
 	if extractErr != nil {
 		playback.LogSubtitleStreamError(r.Context(), extractErr, file.ID, embeddedIndex)
@@ -1145,6 +1220,12 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		if !h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts) {
 			writeSubtitleSourceChanged(w)
 			return
+		}
+		// The retry may have remapped to a different live ordinal; the cache
+		// identity must track the effective map so a remapped extraction lands
+		// under its own key.
+		if virtualActive {
+			opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
 		}
 		if retryErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle); retryErr != nil {
 			playback.LogSubtitleStreamError(r.Context(), retryErr, file.ID, embeddedIndex)
