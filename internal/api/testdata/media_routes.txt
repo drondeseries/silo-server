@@ -366,6 +366,7 @@ HEAD /api/v1/stream/{session_id}	media	playback	viewer_egress	true	true
 GET /api/v1/stream/{session_id}/subtitles/{track}	media	playback	viewer_egress	true	true
 HEAD /api/v1/stream/{session_id}/subtitles/{track}	media	playback	viewer_egress	true	true
 GET /api/v1/stream/{session_id}/subtitles/{track}/fonts	media	playback	viewer_egress	true	true
+GET /api/v1/subtitles/ai/status	non-media
 GET /api/v1/subtitles/providers/status	non-media
 GET /api/v1/theme/admin-css	non-media
 GET /api/v1/theme/catalog	non-media

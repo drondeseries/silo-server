@@ -3108,13 +3108,14 @@ func NewRouter(deps Dependencies) chi.Router {
 				} else {
 					// The whole group above is conditional (it needs the DB,
 					// S3 and the subtitle repo), so on a storage-less
-					// deployment the capability probe would 404 — leaving a
-					// client to interpret the same ambiguous status the probe
-					// exists to replace. Mount the probe alone, answering
+					// deployment the capability probes would 404 — leaving a
+					// client to interpret the same ambiguous status the probes
+					// exist to replace. Mount both probes alone, answering
 					// enabled:false, so feature detection always gets a real
 					// answer.
 					r.Route("/subtitles", func(r chi.Router) {
 						r.Get("/providers/status", handlers.WriteSubtitleProvidersDisabledStatus)
+						r.Get("/ai/status", handlers.WriteSubtitleAIDisabledStatus)
 					})
 				}
 

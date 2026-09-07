@@ -1662,7 +1662,15 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 			var firstFailureFile *models.MediaFile
 			var firstFailureReq playback.StartRequestV3
 			firstFailureAudioIndex := 0
+			// A tone-map capability failure is server-wide, not per-candidate:
+			// every sibling would plan to the same verdict, so paying a
+			// resolve+probe+plan round-trip per file only delays the start the
+			// client is already waiting on. Stop at the first.
+			var capabilityBlocked bool
 			for _, alternate := range alternates {
+				if capabilityBlocked {
+					break
+				}
 				candidateFile, err := h.prepareVirtualAlternateFileV3(r, alternate, profileID)
 				if err != nil || candidateFile == nil {
 					continue
@@ -1678,6 +1686,13 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 						continue
 					}
 					candidateResult, candidateToneMapErr = h.planPlaybackWithCapabilitiesV3(r.Context(), playback.PlannerInputV3{Request: candidateReq, RequestedFile: requestedFile, EffectiveFile: candidateFile, AudioTrackIndex: candidateAudioIndex, Settings: settings, Registry: h.transformationRegistryV3(r.Context()), DVRPUStrippable: h.lazyDVRPUStrippableV3(r.Context(), candidateFile), Now: time.Now(), AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), candidateFile)})
+					// A retryable tone-map discovery failure converts to
+					// transcode_start_failed below; that verdict will not
+					// change for a sibling file, so stop here.
+					if candidateToneMapErr != nil && candidateResult.Terminal != nil &&
+						candidateResult.Terminal.Reason == transcodeStartFailedReasonV3 {
+						capabilityBlocked = true
+					}
 				}
 				clampPlannerTargetResolution(&candidateResult, candidateFile)
 				if candidateResult.Terminal == nil {
@@ -4184,11 +4199,17 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 	}
 	// Bind the session to the exact virtual URI that was resolved and probed
 	// during planning, so later serving resolves the same release rather than
-	// re-reading a mutable catalog path.
+	// re-reading a mutable catalog path. The subtitle inventories travel with
+	// it: candidate rotation re-probes the catalog row and can overwrite its
+	// tracks between planning and a later subtitle fetch, and the serve path
+	// must extract from the same evidence the plan promised.
 	if isVirtualPlaybackFile(file) && strings.HasPrefix(file.FilePath, "virtual://") {
 		state.VirtualSourceURI = file.FilePath
 		state.VirtualSourceSet = true
 		state.VirtualSourceOwnerInstallationID = file.VirtualOwnerInstallationID
+		state.VirtualSubtitleTracks = file.SubtitleTracks
+		state.VirtualExternalSubtitles = file.ExternalSubtitles
+		state.VirtualSubtitleEvidenceSet = true
 	}
 	return state
 }
@@ -5332,7 +5353,16 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 				baseStart := start
 				baseEffectiveFile := effectiveFile
 				var firstFailureEval *candidateEvaluationV3
+				// A terminal that names a server-wide condition (no tone-map
+				// recipe, transcoding disabled) is not per-candidate: every
+				// remaining sibling would plan to the same verdict, so paying
+				// a resolve+probe+plan round-trip per file only delays the
+				// replan the client is already waiting on. Stop at the first.
+				var capabilityBlocked bool
 				for _, alternate := range alternates {
+					if capabilityBlocked {
+						break
+					}
 					if alternate.ID == baseEffectiveFile.ID {
 						continue
 					}
@@ -5343,6 +5373,13 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 							"requested_file_id", record.RequestedMediaFileID, "base_file_id", baseEffectiveFile.ID,
 							"candidate_file_id", alternate.ID, "error", logredact.SanitizeURLError(err),
 						)
+						// A planner terminal of transcode_start_failed here is
+						// the tone-map discovery retry: it is a server-wide
+						// capability condition, so later candidates cannot
+						// succeed either.
+						if err.Stage == candidateStagePlan && err.TerminalReason == transcodeStartFailedReasonV3 {
+							capabilityBlocked = true
+						}
 					}
 					if eval != nil && eval.result.Terminal == nil {
 						start = eval.start

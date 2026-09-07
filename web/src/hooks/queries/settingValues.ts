@@ -7,6 +7,7 @@ import {
   isProfileRequestContextCurrent,
   type ProfileRequestContextSnapshot,
 } from "@/api/client";
+import { useOptionalAuth } from "@/hooks/useAuth";
 import { storage } from "@/utils/storage";
 import {
   SETTING_DEFINITIONS,
@@ -155,6 +156,11 @@ export function useEffectiveSettings(options?: {
   const seriesIds = options?.seriesIds;
   const deviceId = options?.deviceId;
   const profileId = options?.profileId;
+  // Effective settings are an authenticated read (see useProfiles): wait for
+  // the auth provider to finish restoring a stored session so the first
+  // request already carries a token rather than answering 401 pre-bootstrap.
+  const auth = useOptionalAuth();
+  const authReady = auth === null || (!auth.loading && !auth.setupLoading && auth.user !== null);
 
   return useQuery({
     queryKey: effectiveSettingsQueryKey({ keys, libraryIds, seriesIds, deviceId, profileId }),
@@ -175,7 +181,7 @@ export function useEffectiveSettings(options?: {
       }
       return byKey;
     },
-    enabled: options?.enabled ?? true,
+    enabled: (options?.enabled ?? true) && authReady,
     staleTime: 5 * 60 * 1000,
   });
 }
@@ -406,10 +412,17 @@ export function settingsCapabilitiesSupportAtomicShortcuts(
 }
 
 export function useSettingsCapabilities() {
+  // Capabilities are an authenticated read that shell-level components
+  // subscribe to before the auth provider finishes restoring a stored session
+  // (see useProfiles). Wait for auth to settle so the first request already
+  // carries a token instead of answering 401 and refetching after bootstrap.
+  const auth = useOptionalAuth();
+  const authReady = auth === null || (!auth.loading && !auth.setupLoading && auth.user !== null);
   return useQuery({
     queryKey: [...settingsKeys.all, "capabilities"] as const,
     queryFn: () => api<SettingsCapabilities>("/settings/contract/capabilities"),
     staleTime: 30 * 60 * 1000,
+    enabled: authReady,
   });
 }
 

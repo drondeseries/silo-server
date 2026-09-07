@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/tonemap"
 )
 
@@ -44,6 +45,13 @@ type Session struct {
 	// this URI again when a transport or subtitle input is opened.
 	VirtualSourceURI                 string
 	VirtualSourceOwnerInstallationID int
+	// VirtualSubtitleTracks and VirtualExternalSubtitles are the subtitle
+	// inventories captured at plan time. A virtual catalog row is mutable
+	// (candidate rotation re-probes it), so the serve paths must extract from
+	// the same evidence the plan promised, not whatever the row holds now.
+	VirtualSubtitleTracks      []models.SubtitleTrack
+	VirtualExternalSubtitles   []models.ExternalSubtitle
+	VirtualSubtitleEvidenceSet bool
 
 	// RequireMediaAuthorization distinguishes v3 transports whose session ID is
 	// only a route (media requests must present an authenticated user) from
@@ -146,6 +154,9 @@ type SessionStreamState struct {
 	VirtualSourceURI                 string
 	VirtualSourceOwnerInstallationID int
 	VirtualSourceSet                 bool
+	VirtualSubtitleTracks            []models.SubtitleTrack
+	VirtualExternalSubtitles         []models.ExternalSubtitle
+	VirtualSubtitleEvidenceSet       bool
 
 	// Byte-affecting transcode recipe fields preserved so an offloaded restart
 	// (e.g. audio switch) can rebuild the exact same stream. SubtitleTrackIndex
@@ -1037,6 +1048,11 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 	if state.VirtualSourceSet {
 		s.VirtualSourceURI = state.VirtualSourceURI
 		s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
+		if state.VirtualSubtitleEvidenceSet {
+			s.VirtualSubtitleTracks = state.VirtualSubtitleTracks
+			s.VirtualExternalSubtitles = state.VirtualExternalSubtitles
+			s.VirtualSubtitleEvidenceSet = true
+		}
 	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
 	s.SubtitleBurnIn = state.SubtitleBurnIn
@@ -1090,6 +1106,9 @@ func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 		VirtualSourceURI:                 s.VirtualSourceURI,
 		VirtualSourceOwnerInstallationID: s.VirtualSourceOwnerInstallationID,
 		VirtualSourceSet:                 true,
+		VirtualSubtitleTracks:            s.VirtualSubtitleTracks,
+		VirtualExternalSubtitles:         s.VirtualExternalSubtitles,
+		VirtualSubtitleEvidenceSet:       s.VirtualSubtitleEvidenceSet,
 	}
 }
 
@@ -1127,6 +1146,11 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.RequireMediaAuthorization = state.RequireMediaAuthorization
 	s.VirtualSourceURI = state.VirtualSourceURI
 	s.VirtualSourceOwnerInstallationID = state.VirtualSourceOwnerInstallationID
+	if state.VirtualSubtitleEvidenceSet {
+		s.VirtualSubtitleTracks = state.VirtualSubtitleTracks
+		s.VirtualExternalSubtitles = state.VirtualExternalSubtitles
+		s.VirtualSubtitleEvidenceSet = true
+	}
 	s.SubtitleTrackIndex = state.SubtitleTrackIndex
 	s.SubtitleBurnIn = state.SubtitleBurnIn
 	s.SegmentDuration = state.SegmentDuration
