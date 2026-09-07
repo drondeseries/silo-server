@@ -54,6 +54,7 @@ type Webhook struct {
 	NotifyContinueWatching  bool
 	NotifyNextUp            bool
 	NotifyRequests          bool
+	NotifyRatings           bool
 	ConsecutiveFailures     int
 	DisabledReason          *string
 	LastSuccessAt           *time.Time

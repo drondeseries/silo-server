@@ -2855,6 +2855,7 @@ export interface NotificationWebhook {
   notify_continue_watching: boolean;
   notify_next_up: boolean;
   notify_requests: boolean;
+  notify_ratings: boolean;
   consecutive_failures: number;
   disabled_reason: string | null;
   last_success_at: string | null;
@@ -2875,6 +2876,7 @@ export interface NotificationWebhookInput {
   notify_continue_watching?: boolean;
   notify_next_up?: boolean;
   notify_requests?: boolean;
+  notify_ratings?: boolean;
 }
 
 export interface NotificationWebhookTestResult {

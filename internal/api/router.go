@@ -983,6 +983,11 @@ func NewRouter(deps Dependencies) chi.Router {
 	var recsRepoForStale *recommendations.Repo
 	if ratingsRepo != nil && itemRepo != nil {
 		ratingsHandler = handlers.NewRatingsHandler(ratingsRepo, itemRepo)
+		// Fire rating.set outbound deliveries (webhooks with notify_ratings)
+		// when notifications are wired. Best-effort and non-blocking.
+		if deps.Notifications != nil && episodeRepo != nil {
+			ratingsHandler.SetRatingNotifier(notifications.NewRatingNotifier(deps.Notifications, itemRepo, episodeRepo, seasonRepo))
+		}
 		if deps.DB != nil {
 			recsRepoForStale = recommendations.NewRepo(deps.DB)
 			ratingsHandler.SetProfileStaler(recsRepoForStale)
