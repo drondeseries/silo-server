@@ -1516,7 +1516,11 @@ func (h *PlaybackHandler) HandleUpdateProgress(w http.ResponseWriter, r *http.Re
 	session, err := h.sessionMgr.GetSession(sessionID)
 	if err != nil {
 		if errors.Is(err, playback.ErrSessionNotFound) {
-			writePlaybackSessionNotFound(w)
+			// Progress for a session that is already gone (e.g. a version
+			// switch deleted it while a 10s progress tick was in flight) is a
+			// benign no-op, not an error the client must handle. Answer 204 so
+			// browsers don't log a 404 on every switch.
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load playback session")
@@ -1537,7 +1541,7 @@ func (h *PlaybackHandler) HandleUpdateProgress(w http.ResponseWriter, r *http.Re
 	err = h.sessionMgr.UpdateProgress(sessionID, req.Position, req.IsPaused)
 	if err != nil {
 		if errors.Is(err, playback.ErrSessionNotFound) {
-			writePlaybackSessionNotFound(w)
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update progress")
