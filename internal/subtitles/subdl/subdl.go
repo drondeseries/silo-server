@@ -62,6 +62,18 @@ func New(cfg Config) *Provider {
 
 func (p *Provider) Name() string { return "subdl" }
 
+// TestConnection verifies the API key by running a search: SubDL rejects an
+// invalid key with a non-200 response, so a successful search proves the key
+// is accepted. Empty results still count as connected — a valid key can return
+// nothing for a title — only an HTTP/transport error fails the test.
+func (p *Provider) TestConnection(ctx context.Context) error {
+	_, err := p.Search(ctx, subtitles.SearchRequest{Title: "The Matrix", Year: 1999, Languages: []string{"en"}})
+	if err != nil {
+		return fmt.Errorf("subdl search failed: %w", err)
+	}
+	return nil
+}
+
 func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]subtitles.SubtitleResult, error) {
 	if err := p.limiter.Wait(ctx); err != nil {
 		return nil, err

@@ -208,10 +208,26 @@ func (h *AdminSubtitleHandler) HandleTestProvider(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Do a test search with a well-known title.
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
+	// Providers that validate credentials through their own handshake (e.g.
+	// OpenSubtitles login) expose TestConnection; a search would not prove
+	// their account works. Prefer the credential test, fall back to a search.
+	if tester, ok := provider.(subtitles.ConnectionTester); ok {
+		if err := tester.TestConnection(ctx); err != nil {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success": false, "error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+		})
+		return
+	}
+
+	// Do a test search with a well-known title.
 	results, err := provider.Search(ctx, subtitles.SearchRequest{
 		Title:     "The Matrix",
 		Year:      1999,
