@@ -544,6 +544,7 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 			&f.ProbeUpdatedAt,
 			&f.MatchAttemptedAt,
 			&f.MissingSince,
+			&f.FailedAt,
 			&firstSeenScanRunID,
 			&f.CreatedAt,
 			&f.UpdatedAt,
