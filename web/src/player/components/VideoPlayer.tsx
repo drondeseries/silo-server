@@ -251,6 +251,17 @@ function readNumericPayload(
   return null;
 }
 
+// Autoplay policy blocks play() when the user gesture that caused a transport
+// change has expired (the async replan + buffering can outlive transient
+// activation). No timer can unlock that — only a fresh interaction can.
+function isAutoplayNotAllowedError(error: unknown): boolean {
+  return (
+    typeof DOMException !== "undefined" &&
+    error instanceof DOMException &&
+    error.name === "NotAllowedError"
+  );
+}
+
 function readStringPayload(
   payload: Record<string, unknown> | undefined,
   ...keys: string[]
@@ -1544,8 +1555,50 @@ export function VideoPlayer({
       autoplayRetryTimer = null;
     };
 
+    // Autoplay policy: play() needs a fresh user gesture. When it is rejected
+    // with NotAllowedError, timer retries can never unlock it — only a real
+    // interaction can. Arm one-shot document listeners that retry play() on
+    // the next pointer/key/touch, so a transport change that outlived the
+    // original gesture resumes from the user's next interaction instead of
+    // stranding them on a paused player.
+    const gestureResumeEvents = ["pointerdown", "keydown", "touchstart"] as const;
+    let gestureResumeCleanup: (() => void) | null = null;
+
+    const cleanupGestureResume = () => {
+      gestureResumeCleanup?.();
+      gestureResumeCleanup = null;
+    };
+
+    const armGestureResume = () => {
+      if (gestureResumeCleanup) return;
+      const resume = (event: Event) => {
+        const target = event.target instanceof Element ? event.target : null;
+        // The video surface and the transport buttons resume playback within
+        // their own click handlers under a fresh gesture; let them, instead
+        // of resuming here and then toggling straight back to paused.
+        if (
+          target &&
+          (target === video ||
+            target.closest("button, video, [role='button'], [role='slider'], input"))
+        ) {
+          return;
+        }
+        cleanupGestureResume();
+        attemptAutoplayWhenReady();
+      };
+      for (const type of gestureResumeEvents) {
+        document.addEventListener(type, resume, true);
+      }
+      gestureResumeCleanup = () => {
+        for (const type of gestureResumeEvents) {
+          document.removeEventListener(type, resume, true);
+        }
+      };
+    };
+
     const cleanupStartupListeners = () => {
       clearAutoplayRetry();
+      cleanupGestureResume();
       video.removeEventListener("loadeddata", attemptAutoplayWhenReady);
       video.removeEventListener("canplay", attemptAutoplayWhenReady);
       video.removeEventListener("loadedmetadata", attemptAutoplayWhenReady);
@@ -1557,7 +1610,9 @@ export function VideoPlayer({
 
     // Settles the player into a deliberate paused state: the startup guard is
     // told playback is viable so it does not report a bogus startup timeout,
-    // and the first frame is shown with the controls up.
+    // and the first frame is shown with the controls up. The autoplay gate
+    // stays armed (playbackStarted stays false) so a later gesture can still
+    // start playback.
     const settlePaused = () => {
       playbackStarted = true;
       cleanupStartupListeners();
@@ -1594,6 +1649,18 @@ export function VideoPlayer({
           // The element is paused now, whatever happens next, so the transport
           // reflects that immediately.
           setPlaying(false);
+          if (isAutoplayNotAllowedError(error)) {
+            // Autoplay policy: play() needs a fresh user gesture, and the one
+            // that caused this transport change expired during the async
+            // replan + buffering. Timer retries can never unlock it. Mark the
+            // media viable so the startup guard does not report a bogus
+            // timeout while the viewer decides to interact, show the paused
+            // player, and resume on the next real interaction.
+            hlsStartupGuardRef.current?.markPlaybackStarted();
+            setAwaitingFirstFrame(false);
+            armGestureResume();
+            return;
+          }
           if (autoplayAttempts < MAX_AUTOPLAY_ATTEMPTS) {
             // Deliberately keeps the readiness listeners armed: whichever
             // wakes first — a later `canplay` or this timer — retries.
