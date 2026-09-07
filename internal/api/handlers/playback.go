@@ -387,6 +387,13 @@ type PlaybackHandler struct {
 	v3ReplanSlots           chan struct{}
 	v3EventRateMu           sync.Mutex
 	v3EventRates            map[string]v3EventRate
+	// v3DVRPUVerds memoizes the Dolby Vision RPU strip verdict per catalog
+	// file-row identity (ID + size + mtime). The shared probe cache keys on
+	// bin|inputPath and the transport URL rotates per relay registration, so
+	// without this memo every sidecar replan would re-run the ~6s probe.
+	// Guarded by v3DVRPUMu.
+	v3DVRPUMu    sync.Mutex
+	v3DVRPUVerds map[dvRPUMemoKeyV3]bool
 }
 
 type PlaybackWatchScrobbler interface {

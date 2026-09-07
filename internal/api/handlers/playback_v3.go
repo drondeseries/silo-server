@@ -5478,10 +5478,10 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		}
 	}
 	transportReused := false
-	if trackChange && h.hasActiveHLSTransportV3(session) {
+	if trackChange && h.hasActiveReusableTransportV3(session, record.CurrentPlan.Delivery) {
 		proxyAllowed := mode.proxyEgress || (!mode.headerAuth && h.JWTSecret != "")
 		policy := h.playbackRoutingPolicyForContextV3(r.Context())
-		if reusedRecipe, ok := sidecarOnlyHLSReplanV3(record, result.Plan, artifactRecipe, req.ClientPlaybackContext.Output.OutputContextID); ok &&
+		if reusedRecipe, ok := sidecarOnlyReuseReplanV3(record, result.Plan, artifactRecipe, req.ClientPlaybackContext.Output.OutputContextID); ok &&
 			reusedHLSRouteAllowedV3(session, result, policy, proxyAllowed) {
 			artifactRecipe = reusedRecipe
 			result.ToneMapMode = reusedRecipe.ToneMapMode
@@ -5505,7 +5505,7 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		result.Plan.Timeline = reusedTimeline
 		result.Plan.ExpiresAt = record.CurrentPlan.ExpiresAt
 		transport = reusedHLSTransportV3(session, record.CurrentPlan.Stream.URL)
-		slog.InfoContext(r.Context(), "protocol v3 replan reused active HLS A/V transport",
+		slog.InfoContext(r.Context(), "protocol v3 replan reused active A/V transport",
 			logComponentKey, playbackLogValueV3,
 			"playback_session_id", session.ID,
 			"previous_plan_id", record.CurrentPlanID,
@@ -5904,19 +5904,19 @@ func sameStringMultisetV3(left, right []string) bool {
 	return true
 }
 
-// sidecarOnlyHLSReplanV3 proves that a track-change plan can keep the active
-// HLS A/V generation. Subtitle identity and claims are intentionally excluded:
+// sidecarOnlyReuseReplanV3 proves that a track-change plan can keep the active
+// A/V generation. Subtitle identity and claims are intentionally excluded:
 // those are the point of the replan and are delivered by the independently
 // addressed sidecar artifact. Every field that can change FFmpeg's audio/video
 // output remains part of the comparison.
-func sidecarOnlyHLSReplanV3(record *playback.AttemptRecordV3, candidate *playback.PlanV3, candidateRecipe playback.ExecutableRecipeV3, outputContextID string) (playback.ExecutableRecipeV3, bool) {
+func sidecarOnlyReuseReplanV3(record *playback.AttemptRecordV3, candidate *playback.PlanV3, candidateRecipe playback.ExecutableRecipeV3, outputContextID string) (playback.ExecutableRecipeV3, bool) {
 	if record == nil || candidate == nil || record.CurrentPlan.Stream.URL == "" ||
 		!record.FrozenRecipe.ValidFor(record.CurrentPlan) || !candidateRecipe.ValidFor(*candidate) ||
 		record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID != outputContextID ||
 		record.EffectiveMediaFileID != candidate.EffectiveMediaFileID ||
 		record.CurrentPlan.RequestedMediaFileID != candidate.RequestedMediaFileID ||
 		record.CurrentPlan.EffectiveMediaFileID != candidate.EffectiveMediaFileID ||
-		!isHLSDeliveryV3(record.CurrentPlan.Delivery) || record.CurrentPlan.Delivery != candidate.Delivery ||
+		!reuseEligibleDeliveryV3(record.CurrentPlan.Delivery) || record.CurrentPlan.Delivery != candidate.Delivery ||
 		record.CurrentPlan.Subtitle.Mode == playback.SubtitleBurnInV3 || candidate.Subtitle.Mode == playback.SubtitleBurnInV3 ||
 		!sameTrackIdentityV3(record.CurrentPlan.SelectedTracks.Audio, candidate.SelectedTracks.Audio) {
 		return candidateRecipe, false
@@ -5948,6 +5948,18 @@ func sidecarOnlyHLSReplanV3(record *playback.AttemptRecordV3, candidate *playbac
 
 func isHLSDeliveryV3(delivery playback.DeliveryV3) bool {
 	return delivery == playback.DeliveryRemuxHLSV3 || delivery == playback.DeliveryTranscodeHLSV3
+}
+
+// reuseEligibleDeliveryV3 reports whether a delivery keeps a single addressable
+// stream window whose bytes do not change when a sidecar-only track switch
+// replans. HLS generations are keyed to the session, and a local progressive
+// remux is served lazily from /stream/{sessionID}, so both survive a subtitle
+// switch without a client remount. Direct HTTP is excluded: it is a fresh URL
+// per plan.
+func reuseEligibleDeliveryV3(delivery playback.DeliveryV3) bool {
+	return delivery == playback.DeliveryRemuxProgressiveV3 ||
+		delivery == playback.DeliveryRemuxHLSV3 ||
+		delivery == playback.DeliveryTranscodeHLSV3
 }
 
 // sameExecutableAVRecipeV3 reports whether two frozen A/V recipes are equivalent.
@@ -6033,14 +6045,24 @@ func reusedHLSRouteAllowedV3(session *playback.Session, result playback.PlannerR
 	return false
 }
 
-func (h *PlaybackHandler) hasActiveHLSTransportV3(session *playback.Session) bool {
+func (h *PlaybackHandler) hasActiveReusableTransportV3(session *playback.Session, delivery playback.DeliveryV3) bool {
 	if h == nil || session == nil {
 		return false
 	}
 	if session.TranscodeNodeURL != "" {
 		return true
 	}
-	return h.tm.GetTranscodeSession(session.ID) != nil
+	if h.tm.GetTranscodeSession(session.ID) != nil {
+		return true
+	}
+	if delivery == playback.DeliveryRemuxProgressiveV3 {
+		// Local progressive remux is served lazily from /stream/{sessionID}
+		// and never holds a transcode-manager session. The committed routing
+		// facts are its active-transport evidence; remote/proxy progressive
+		// already returned above via TranscodeNodeURL.
+		return session.RoutingWorkload == string(noderouting.WorkloadRemux) && session.RoutingExecution != ""
+	}
+	return false
 }
 
 func applySelectedTracksToStartV3(start *playback.StartRequestV3, selected playback.SelectedTracksV3) {
@@ -6871,6 +6893,15 @@ func videoSampleEntryForPlanV3(plan *playback.PlanV3) string {
 	return ""
 }
 
+// dvRPUMemoKeyV3 identifies a catalog file row for the DV RPU verdict memo.
+// Keyed on the stable file-row identity rather than the transport URL, which
+// rotates per relay registration and defeats the shared probe cache.
+type dvRPUMemoKeyV3 struct {
+	fileID        int
+	size          int64
+	mtimeUnixNano int64
+}
+
 // lazyDVRPUStrippableV3 defers (and memoizes) the per-source RPU probe so the
 // planner only shells out to ffmpeg when a Dolby Vision strip route is
 // genuinely on the table; every other start never touches it.
@@ -6884,11 +6915,36 @@ func (h *PlaybackHandler) lazyDVRPUStrippableV3(ctx context.Context, file *model
 	if file == nil || strings.TrimSpace(file.FilePath) == "" || isVirtualPlaybackFile(file) || strings.HasPrefix(strings.ToLower(file.FilePath), "virtual://") {
 		return nil
 	}
+	// The shared DV RPU probe cache keys on bin|inputPath; the transport URL
+	// rotates per relay registration, so a sidecar-only replan would miss it
+	// and re-probe every time. Memoize on the stable file-row identity instead.
+	// A missing mtime or size still falls through to the probe: the memo must
+	// never claim a verdict the probe could not have reached.
+	var memoKey dvRPUMemoKeyV3
+	memoize := false
+	if file.FileModifiedAt != nil && file.FileSize > 0 {
+		memoKey = dvRPUMemoKeyV3{fileID: file.ID, size: file.FileSize, mtimeUnixNano: file.FileModifiedAt.UnixNano()}
+		h.v3DVRPUMu.Lock()
+		verdict, ok := h.v3DVRPUVerds[memoKey]
+		h.v3DVRPUMu.Unlock()
+		if ok {
+			return func() bool { return verdict }
+		}
+		memoize = true
+	}
 	var once sync.Once
 	strippable := true
 	return func() bool {
 		once.Do(func() {
 			strippable = playback.DVRPUStrippable(ctx, h.playbackConfig().FFmpegPath, file.FilePath)
+			if memoize {
+				h.v3DVRPUMu.Lock()
+				if h.v3DVRPUVerds == nil {
+					h.v3DVRPUVerds = make(map[dvRPUMemoKeyV3]bool)
+				}
+				h.v3DVRPUVerds[memoKey] = strippable
+				h.v3DVRPUMu.Unlock()
+			}
 		})
 		return strippable
 	}

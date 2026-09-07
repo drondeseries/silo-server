@@ -4714,12 +4714,123 @@ func TestSidecarOnlyHLSReplanKeepsEffectiveToneMapFallback(t *testing.T) {
 	}
 	record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID = "output-context"
 
-	reusedRecipe, ok := sidecarOnlyHLSReplanV3(record, &candidatePlan, candidateRecipe, "output-context")
+	reusedRecipe, ok := sidecarOnlyReuseReplanV3(record, &candidatePlan, candidateRecipe, "output-context")
 	if !ok {
 		t.Fatal("byte-identical sidecar replan did not reuse the active transport")
 	}
 	if reusedRecipe.ToneMapMode != tonemap.ModeSoftware {
 		t.Fatalf("reused tone-map mode = %q, want active software fallback", reusedRecipe.ToneMapMode)
+	}
+}
+
+func TestSidecarOnlyReuseReplanProgressiveDelivery(t *testing.T) {
+	currentPlan := playback.PlanV3{
+		PlanID:               "current-plan",
+		Delivery:             playback.DeliveryRemuxProgressiveV3,
+		Stream:               playback.StreamV3{URL: "/stream/session-1"},
+		RequestedMediaFileID: 1,
+		EffectiveMediaFileID: 1,
+	}
+	candidatePlan := currentPlan
+	candidatePlan.PlanID = "candidate-plan"
+	currentRecipe := playback.FreezeExecutableRecipeV3(playback.PlannerResultV3{
+		Plan: &currentPlan, PlayMethod: playback.PlayRemux,
+	})
+	candidateRecipe := playback.FreezeExecutableRecipeV3(playback.PlannerResultV3{
+		Plan: &candidatePlan, PlayMethod: playback.PlayRemux,
+	})
+	record := &playback.AttemptRecordV3{
+		EffectiveMediaFileID: 1,
+		CurrentPlan:          currentPlan,
+		FrozenRecipe:         currentRecipe,
+	}
+	record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID = "output-context"
+
+	if _, ok := sidecarOnlyReuseReplanV3(record, &candidatePlan, candidateRecipe, "output-context"); !ok {
+		t.Fatal("byte-identical progressive sidecar replan did not reuse the active transport")
+	}
+
+	// A delivery mismatch must still refuse reuse.
+	drifted := candidatePlan
+	drifted.Delivery = playback.DeliveryRemuxHLSV3
+	if _, ok := sidecarOnlyReuseReplanV3(record, &drifted, candidateRecipe, "output-context"); ok {
+		t.Fatal("progressive sidecar replan reused across a delivery change")
+	}
+}
+
+func TestHasActiveReusableTransportV3Progressive(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager)
+
+	localProgressive := &playback.Session{
+		ID:               "progressive-local",
+		RoutingWorkload:  string(noderouting.WorkloadRemux),
+		RoutingExecution: string(noderouting.ExecutionAPI),
+	}
+	if !handler.hasActiveReusableTransportV3(localProgressive, playback.DeliveryRemuxProgressiveV3) {
+		t.Fatal("local progressive remux with committed routing was not reusable")
+	}
+	// The committed routing facts are the only evidence for local progressive;
+	// an uncommitted routing shape must not be treated as an active transport.
+	uncommitted := &playback.Session{
+		ID:              "progressive-uncommitted",
+		RoutingWorkload: string(noderouting.WorkloadRemux),
+	}
+	if handler.hasActiveReusableTransportV3(uncommitted, playback.DeliveryRemuxProgressiveV3) {
+		t.Fatal("progressive remux without committed routing execution was reusable")
+	}
+	// A remote transcode node is active evidence for any reuse-eligible delivery.
+	remote := &playback.Session{ID: "progressive-remote", TranscodeNodeURL: "http://node:8096"}
+	if !handler.hasActiveReusableTransportV3(remote, playback.DeliveryRemuxProgressiveV3) {
+		t.Fatal("progressive remux on a transcode node was not reusable")
+	}
+	// The progressive branch must not leak into HLS deliveries: those rely on a
+	// transcode-manager session or node URL alone.
+	if handler.hasActiveReusableTransportV3(localProgressive, playback.DeliveryRemuxHLSV3) {
+		t.Fatal("HLS delivery was deemed reusable from progressive-only routing evidence")
+	}
+}
+
+func TestLazyDVRPUStrippableV3MemoizesOnFileRowIdentity(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	// A missing binary would make any real probe fail open to true; the memo
+	// hit must return the memoized verdict without ever consulting it.
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{FFmpegPath: "/nonexistent/ffmpeg"}
+	}
+	mtime := time.Now()
+	key := dvRPUMemoKeyV3{fileID: 7, size: 12345, mtimeUnixNano: mtime.UnixNano()}
+	handler.v3DVRPUMu.Lock()
+	handler.v3DVRPUVerds = map[dvRPUMemoKeyV3]bool{key: false}
+	handler.v3DVRPUMu.Unlock()
+
+	file := &models.MediaFile{
+		ID: 7, FileSize: 12345, FileModifiedAt: &mtime,
+		FilePath: "/media/movie.mkv",
+	}
+	verdict := handler.lazyDVRPUStrippableV3(context.Background(), file)
+	if verdict == nil {
+		t.Fatal("memoized non-virtual file returned nil probe")
+	}
+	if verdict() {
+		t.Fatal("memoized false verdict was not returned without probing")
+	}
+
+	// A rotated transport URL must still hit the same file-row memo: the URL is
+	// not part of the key, exactly what the relay-registration churn needs.
+	rotated := *file
+	rotated.FilePath = "/relay/registration/42/movie.mkv"
+	if verdict := handler.lazyDVRPUStrippableV3(context.Background(), &rotated); verdict == nil || verdict() {
+		t.Fatal("URL-rotated file did not reuse the file-row memoized verdict")
+	}
+
+	// A different mtime is a different source: it must miss the memo (a fresh
+	// closure), never inherit the old verdict.
+	stale := *file
+	changed := mtime.Add(time.Second)
+	stale.FileModifiedAt = &changed
+	if verdict := handler.lazyDVRPUStrippableV3(context.Background(), &stale); verdict == nil {
+		t.Fatal("changed mtime unexpectedly hit the memo")
 	}
 }
 
@@ -4810,7 +4921,7 @@ func TestSidecarOnlyHLSReplanRejectsSourceVideoExecutionFactDrift(t *testing.T) 
 				TargetVideoCodec: "h264", TargetAudioCodec: "aac",
 				FrozenSourceMetadata: &candidateSource,
 			})
-			if _, reused := sidecarOnlyHLSReplanV3(record, &candidatePlan, candidateRecipe, "output-context"); reused {
+			if _, reused := sidecarOnlyReuseReplanV3(record, &candidatePlan, candidateRecipe, "output-context"); reused {
 				t.Fatalf("sidecar-only replan reused A/V bytes after source video %s changed", test.name)
 			}
 		})
