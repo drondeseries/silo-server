@@ -544,6 +544,7 @@ func TestFallbackResolveStaleVirtualSourcePersistsSubstituteMetadata(t *testing.
 	var savedPath string
 	var savedAudio []byte
 	var savedSubs []byte
+	saved := make(chan struct{}, 1)
 
 	h := &PlaybackHandler{
 		PlaybackConfig: func() config.PlaybackConfig {
@@ -569,6 +570,7 @@ func TestFallbackResolveStaleVirtualSourcePersistsSubstituteMetadata(t *testing.
 			savedPath = expectedFilePath
 			savedAudio = append([]byte(nil), audioTracks...)
 			savedSubs = append([]byte(nil), subtitleTracks...)
+			saved <- struct{}{}
 			return nil
 		},
 	}
@@ -580,6 +582,13 @@ func TestFallbackResolveStaleVirtualSourcePersistsSubstituteMetadata(t *testing.
 	}
 	if updatedPath != substitute.URI {
 		t.Fatalf("updated path = %q, want %q", updatedPath, substitute.URI)
+	}
+	// The metadata saver runs on a bounded background goroutine; wait for it
+	// before asserting what it captured.
+	select {
+	case <-saved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("metadata saver was not called")
 	}
 	if savedFileID != file.ID {
 		t.Fatalf("metadata saved for file %d, want %d", savedFileID, file.ID)
