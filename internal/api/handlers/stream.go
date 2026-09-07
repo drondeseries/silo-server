@@ -109,14 +109,29 @@ func bindSessionVirtualSource(file *models.MediaFile, session *playback.Session)
 	return &bound
 }
 
-// bindSessionVirtualSourceWithTracks binds the session's virtual source and,
-// if the target file lacks usable embedded subtitle tracks or fonts (e.g. the
-// catalog placeholder row was requested, or it only carries provider-declared
-// language placeholders with no codec), inherits the probed tracks and font
-// attachments from the session's active candidate file.
+// bindSessionVirtualSourceWithTracks binds the session's virtual source and
+// prefers the subtitle evidence captured at plan time. The catalog row is
+// mutable: candidate rotation re-probes it and can replace its subtitle
+// tracks after this session planned against a specific release. Pinned
+// subtitle URLs name plan-time ordinals/stream indices, so the extraction
+// must use the evidence the plan promised, not whatever the row holds now.
 func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaFile, session *playback.Session, resolver FilePathResolver) *models.MediaFile {
 	bound := bindSessionVirtualSource(file, session)
-	if bound == nil || !isVirtualPlaybackFile(bound) || resolver == nil || hasUsableSubtitleTracks(bound) {
+	if bound == nil || !isVirtualPlaybackFile(bound) {
+		return bound
+	}
+
+	if len(session.VirtualSubtitleTracks) > 0 || len(session.VirtualExternalSubtitles) > 0 {
+		boundCopy := *bound
+		boundCopy.SubtitleTracks = session.VirtualSubtitleTracks
+		boundCopy.ExternalSubtitles = session.VirtualExternalSubtitles
+		return &boundCopy
+	}
+
+	// No session evidence (e.g. a reconstructed session): fall back to the
+	// live candidate row when the bound file only carries provider-declared
+	// placeholders, mirroring the historical behavior.
+	if resolver == nil || hasUsableSubtitleTracks(bound) {
 		return bound
 	}
 

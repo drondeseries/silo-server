@@ -4199,11 +4199,17 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 	}
 	// Bind the session to the exact virtual URI that was resolved and probed
 	// during planning, so later serving resolves the same release rather than
-	// re-reading a mutable catalog path.
+	// re-reading a mutable catalog path. The subtitle inventories travel with
+	// it: candidate rotation re-probes the catalog row and can overwrite its
+	// tracks between planning and a later subtitle fetch, and the serve path
+	// must extract from the same evidence the plan promised.
 	if isVirtualPlaybackFile(file) && strings.HasPrefix(file.FilePath, "virtual://") {
 		state.VirtualSourceURI = file.FilePath
 		state.VirtualSourceSet = true
 		state.VirtualSourceOwnerInstallationID = file.VirtualOwnerInstallationID
+		state.VirtualSubtitleTracks = file.SubtitleTracks
+		state.VirtualExternalSubtitles = file.ExternalSubtitles
+		state.VirtualSubtitleEvidenceSet = true
 	}
 	return state
 }
