@@ -3,6 +3,7 @@ import { api } from "@/api/client";
 import type { AdminSession, Profile, CreateProfileRequest, ProfileListResponse } from "@/api/types";
 import { profileKeys } from "./keys";
 import { toast } from "sonner";
+import { useOptionalAuth } from "@/hooks/useAuth";
 
 function replaceProfileInList(profiles: Profile[] | undefined, updatedProfile: Profile) {
   if (!profiles || profiles.length === 0) {
@@ -36,9 +37,19 @@ export function useHouseholdSessions(enabled = true) {
 }
 
 export function useProfiles() {
+  // The profile list needs an authenticated session, but shell-level
+  // components (sidebar, realtime provider, route gates) subscribe to it
+  // before the auth provider has finished restoring a stored session — the
+  // first fetch would fire with no access token and answer 401, then refetch
+  // after bootstrap. Wait for auth to settle instead, so the first request
+  // already carries a token. Outside an AuthProvider (unit tests, preview
+  // renders) there is nothing to wait on.
+  const auth = useOptionalAuth();
+  const authReady = auth === null || (!auth.loading && !auth.setupLoading && auth.user !== null);
   const query = useQuery({
     queryKey: profileKeys.list(),
     queryFn: () => api<ProfileListResponse>("/profiles"),
+    enabled: authReady,
   });
 
   return {
