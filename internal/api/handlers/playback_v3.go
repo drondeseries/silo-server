@@ -4144,6 +4144,7 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 		AudioTrackIndex:           plannedAudioTrackIndexV3(result, session.AudioTrackIndex),
 		TranscodeAudio:            result.TranscodeAudio,
 		RemuxDVMode:               remuxDVModeForPlanV3(result.Plan),
+		DVProfile:                 planDVProfileV3(result.Plan),
 		TranscodeHWAccel:          transport.hwAccel,
 		ToneMapMode:               transport.toneMapMode,
 		TranscodeNodeURL:          transport.nodeURL,
@@ -6789,6 +6790,17 @@ func remuxDVModeForPlanV3(plan *playback.PlanV3) playback.RemuxDVMode {
 		return playback.RemuxDVPreserveV3
 	}
 	return ""
+}
+
+// planDVProfileV3 returns the Dolby Vision profile the plan's probe validated
+// (0 when the plan carries none). Stream time re-deriving the profile from the
+// catalog row can return 0 for virtual candidates whose video_tracks are
+// empty, so the session persists the plan's ground truth.
+func planDVProfileV3(plan *playback.PlanV3) int {
+	if plan == nil {
+		return 0
+	}
+	return plan.Source.DVProfile
 }
 
 func videoBitstreamFilterForPlanV3(plan *playback.PlanV3) string {

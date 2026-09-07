@@ -27,13 +27,18 @@ type Session struct {
 	BasePlayMethod       PlayMethod
 	TranscodeAudio       bool // when true, remux should transcode audio to AAC
 	RemuxDVMode          RemuxDVMode
-	ClientIP             string // resolved client IP for the playback session
-	ClientName           string // reported playback client name, when available
-	ClientVersion        string // reported playback client version, when available
-	ClientBuild          string // opaque reported client build identifier, when available
-	ClientChannel        string // opaque reported client distribution channel, when available
-	ClientUserAgent      string // trimmed request user agent for the playback session
-	IsJellyfinCompat     bool   // immutable origin identity for Jellyfin compatibility sessions
+	// DVProfile is the Dolby Vision profile the committed plan probed and
+	// validated. Virtual catalog rows can carry empty video_tracks while the
+	// plan's probe has ground truth, so stream time must trust the session's
+	// profile over the re-derived file value.
+	DVProfile        int
+	ClientIP         string // resolved client IP for the playback session
+	ClientName       string // reported playback client name, when available
+	ClientVersion    string // reported playback client version, when available
+	ClientBuild      string // opaque reported client build identifier, when available
+	ClientChannel    string // opaque reported client distribution channel, when available
+	ClientUserAgent  string // trimmed request user agent for the playback session
+	IsJellyfinCompat bool   // immutable origin identity for Jellyfin compatibility sessions
 	// VirtualSourceURI is the provider-neutral result selected and probed for
 	// this session. Provider URLs never enter session state; handlers resolve
 	// this URI again when a transport or subtitle input is opened.
@@ -111,6 +116,7 @@ type SessionStreamState struct {
 	AudioTrackIndex                  int
 	TranscodeAudio                   bool
 	RemuxDVMode                      RemuxDVMode
+	DVProfile                        int
 	ClientIP                         string
 	ClientName                       string
 	ClientVersion                    string
@@ -994,8 +1000,12 @@ func applySessionStreamStateLocked(s *Session, state SessionStreamState) {
 		// later remux request fails the profile check. Legacy partial updates
 		// never carry a mode and must not clobber one.
 		s.RemuxDVMode = state.RemuxDVMode
+		s.DVProfile = state.DVProfile
 	} else if state.RemuxDVMode != "" {
 		s.RemuxDVMode = state.RemuxDVMode
+		if state.DVProfile > 0 {
+			s.DVProfile = state.DVProfile
+		}
 	}
 	s.ClientIP = state.ClientIP
 	if value := normalizeClientMetadataValue(state.ClientName, 128); value != "" {
@@ -1047,6 +1057,7 @@ func snapshotSessionStreamStateLocked(s *Session) SessionStreamState {
 		AudioTrackIndex:                  s.AudioTrackIndex,
 		TranscodeAudio:                   s.TranscodeAudio,
 		RemuxDVMode:                      s.RemuxDVMode,
+		DVProfile:                        s.DVProfile,
 		ClientIP:                         s.ClientIP,
 		ClientName:                       s.ClientName,
 		ClientVersion:                    s.ClientVersion,
@@ -1089,6 +1100,7 @@ func restoreSessionStreamStateLocked(s *Session, state SessionStreamState) {
 	s.AudioTrackIndex = state.AudioTrackIndex
 	s.TranscodeAudio = state.TranscodeAudio
 	s.RemuxDVMode = state.RemuxDVMode
+	s.DVProfile = state.DVProfile
 	s.ClientIP = state.ClientIP
 	s.ClientName = state.ClientName
 	s.ClientVersion = state.ClientVersion

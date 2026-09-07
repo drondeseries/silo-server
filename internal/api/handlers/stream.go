@@ -427,7 +427,11 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		// audio/mp4 for it, and a declared-tier client refuses to attach a
 		// source buffer whose advertised type its probe rejected — so the
 		// response has to keep the same promise the plan made.
-		if err := playback.ServeRemuxWithOptions(w, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, file.PrimaryDVProfile(), playback.RemuxServeOptions{
+		dvProfile := session.DVProfile
+		if dvProfile == 0 {
+			dvProfile = file.PrimaryDVProfile()
+		}
+		if err := playback.ServeRemuxWithOptions(w, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, dvProfile, playback.RemuxServeOptions{
 			DVMode:                 session.RemuxDVMode,
 			FFmpegPath:             h.ffmpegPath(),
 			ContentType:            playback.RemuxContentType(file.IsAudioOnly()),
