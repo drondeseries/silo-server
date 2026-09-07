@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -525,6 +526,72 @@ func TestFallbackResolveStaleVirtualSourceRespectsMaxFailoverLimit(t *testing.T)
 	}
 	if resolveAttempts != 3 {
 		t.Fatalf("resolve attempts = %d, want exactly max attempts (3)", resolveAttempts)
+	}
+}
+
+// A stale result= pin that falls back to a substitute must persist the
+// substitute's probed track inventory onto the media file row. Without it the
+// row keeps advertising the dead candidate's tracks — wrong audio languages
+// and phantom subtitle tracks — while the stream serves the substitute's
+// real ones, so track switches appear to do nothing.
+func TestFallbackResolveStaleVirtualSourcePersistsSubstituteMetadata(t *testing.T) {
+	substitute := VirtualPlaybackStream{
+		URI:        "virtual://movie/1?result=substitute",
+		Resolution: "1080p",
+	}
+	updatedPath := ""
+	var savedFileID int
+	var savedPath string
+	var savedAudio []byte
+	var savedSubs []byte
+
+	h := &PlaybackHandler{
+		PlaybackConfig: func() config.PlaybackConfig {
+			return config.PlaybackConfig{MaxVirtualFailoverAttempts: 3}
+		},
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{substitute}, nil
+		}),
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
+			return "http://localhost:8080/substitute.mp4", nil
+		}),
+		VirtualPlaybackSourceProber: func(ctx context.Context, streamURL string, transient *models.MediaFile) (*models.MediaFile, error) {
+			transient.AudioTracks = []models.AudioTrack{{Language: "eng", Codec: "eac3", Channels: 6}}
+			transient.SubtitleTracks = []models.SubtitleTrack{{Language: "eng", Codec: "subrip"}}
+			return transient, nil
+		},
+		VirtualFileUpdater: func(ctx context.Context, fileID int, newFilePath string) error {
+			updatedPath = newFilePath
+			return nil
+		},
+		VirtualFileMetadataSaver: func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error {
+			savedFileID = fileID
+			savedPath = expectedFilePath
+			savedAudio = append([]byte(nil), audioTracks...)
+			savedSubs = append([]byte(nil), subtitleTracks...)
+			return nil
+		},
+	}
+
+	file := &models.MediaFile{ID: 10, ContentID: "movie-1", FilePath: "virtual://movie/1?result=dead"}
+	result := h.fallbackResolveStaleVirtualSource(context.Background(), file, 1, "profile-1")
+	if result == nil {
+		t.Fatal("fallback returned nil, want resolved substitute")
+	}
+	if updatedPath != substitute.URI {
+		t.Fatalf("updated path = %q, want %q", updatedPath, substitute.URI)
+	}
+	if savedFileID != file.ID {
+		t.Fatalf("metadata saved for file %d, want %d", savedFileID, file.ID)
+	}
+	if savedPath != substitute.URI {
+		t.Fatalf("metadata saved with path %q, want %q", savedPath, substitute.URI)
+	}
+	if !bytes.Contains(savedAudio, []byte("eac3")) || !bytes.Contains(savedAudio, []byte("eng")) {
+		t.Fatalf("saved audio tracks = %s, want probed eac3/eng inventory", savedAudio)
+	}
+	if !bytes.Contains(savedSubs, []byte("subrip")) {
+		t.Fatalf("saved subtitle tracks = %s, want probed subrip inventory", savedSubs)
 	}
 }
 

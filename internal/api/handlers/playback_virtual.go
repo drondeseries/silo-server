@@ -809,6 +809,14 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 					slog.ErrorContext(ctx, "virtual stale fallback: persist update failed", "component", "api", "file_id", file.ID, "new_path", stream.URI, "error", updateErr)
 				}
 			}
+			// The substitute is a different provider stream than the stale pin
+			// described. Its probed track inventory must replace the row's
+			// metadata, or the picker keeps advertising the dead candidate's
+			// tracks (wrong audio languages, phantom subtitle tracks) while the
+			// stream serves the substitute's real ones.
+			if resolved.File != nil && resolved.Provenance == ProbeProvenanceVerified {
+				h.persistVirtualMetadataBounded(ctx, file.ID, stream.URI, resolved.File)
+			}
 			return resolved
 		}
 		slog.ErrorContext(ctx, "virtual stale fallback: candidate failed", "component", "api", "candidate", stream.URI, "error", err)
