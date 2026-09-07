@@ -64,7 +64,7 @@ function VersionDropdown({
         <DetailPopover
           open={editionOpen}
           onOpenChange={setEditionOpen}
-          contentClassName="w-96 p-1.5"
+          contentClassName="w-[30rem] p-1.5"
           trigger={
             <Button
               variant="glass"
@@ -113,7 +113,7 @@ function VersionDropdown({
         <DetailPopover
           open={versionOpen}
           onOpenChange={setVersionOpen}
-          contentClassName="w-96 p-1.5"
+          contentClassName="w-[30rem] p-1.5"
           trigger={
             <Button
               variant="glass"
