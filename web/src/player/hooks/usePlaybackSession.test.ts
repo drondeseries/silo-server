@@ -1807,6 +1807,10 @@ describe("usePlaybackSession replans", () => {
         result.current.recoverFromFailure({ classification: "decoder_error" }, 120 + attempt);
       });
       await waitFor(() => expect(result.current.planRevision).toBe(attempt + 2));
+      // Every recovery prepares a fresh server generation even when the plan is
+      // transport-identical (the A/V-byte heuristic cannot see regeneration),
+      // so the transport revision must bump alongside the plan revision.
+      expect(result.current.transportRevision).toBe(attempt + 2);
     }
 
     act(() => {
@@ -1817,6 +1821,71 @@ describe("usePlaybackSession replans", () => {
       expect(result.current.error).toBe("Playback failed after repeated recovery attempts.");
     });
     expect(replanCount).toBe(8);
+
+    unmount();
+  });
+
+  it("subtitle track_change with a transport-identical plan does not bump transportRevision", async () => {
+    const initialPlan = fixturePlanV3();
+    const subtitlePlan = fixturePlanV3({
+      plan_id: "plan:2222222222222222",
+      plan_attempt_key: "v3:2222222222222222",
+      subtitle: {
+        mode: "render",
+        track_id: "file:7:subtitle:0",
+        inventory: [],
+      },
+    });
+    const replanBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: "session-1",
+            playback_plan: initialPlan,
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/session-1/replan")) {
+        replanBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return jsonResponse({
+          protocol_version: 3,
+          server_features: ["playback_plan_v3"],
+          outcome: "playable",
+          session_id: "session-1",
+          playback_plan: subtitlePlan,
+        });
+      }
+      if (url.endsWith("/playback/route-events")) {
+        return new Response(null, { status: 202 });
+      }
+      if (init?.method === "DELETE") {
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    expect(result.current.planRevision).toBe(1);
+    expect(result.current.transportRevision).toBe(1);
+
+    act(() => result.current.changeSubtitleTrack(0, 45));
+    await waitFor(() => expect(result.current.plan?.plan_id).toBe("plan:2222222222222222"));
+    expect(replanBodies[0]?.operation).toBe("track_change");
+    expect(result.current.planRevision).toBe(2);
+    // The replan only changed the subtitle artifact; the A/V transport bytes
+    // are identical, so the player must keep the mounted element.
+    expect(result.current.transportRevision).toBe(1);
 
     unmount();
   });

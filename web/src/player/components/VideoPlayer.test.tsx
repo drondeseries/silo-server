@@ -1015,6 +1015,95 @@ describe("VideoPlayer translation handoff", () => {
     }
   });
 
+  it("does not reload when only player_start_seconds changes (reused-transport replan)", async () => {
+    const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
+    try {
+      const startPlan = fixturePlanV3({
+        ...directPlan,
+        timeline: {
+          ...directPlan.timeline,
+          player_start_seconds: 100,
+        },
+      });
+      const { rerenderPlayer } = renderPlayer({
+        plan: startPlan,
+        planRevision: 1,
+        transportRevision: 1,
+      });
+      removeAttrSpy.mockClear();
+
+      // A reused-transport subtitle replan rewrites player_start_seconds to the
+      // live playhead; the stream URL and transport identity are unchanged.
+      const driftedPlan = fixturePlanV3({
+        ...directPlan,
+        timeline: {
+          ...directPlan.timeline,
+          player_start_seconds: 148,
+        },
+      });
+      rerenderPlayer({
+        plan: driftedPlan,
+        planRevision: 2,
+        transportRevision: 1,
+      });
+      expect(removeAttrSpy).not.toHaveBeenCalled();
+
+      // A genuine transport change must still tear the element down.
+      rerenderPlayer({
+        plan: driftedPlan,
+        planRevision: 3,
+        transportRevision: 2,
+      });
+      expect(removeAttrSpy).toHaveBeenCalledWith("src");
+    } finally {
+      removeAttrSpy.mockRestore();
+    }
+  });
+
+  it("does not reload when only player_start_seconds changes on a reused HLS transport", async () => {
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime) =>
+      mime === "application/vnd.apple.mpegurl" ? "probably" : "",
+    );
+    const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
+    try {
+      const startPlan = fixturePlanV3({
+        timeline: {
+          ...fixturePlanV3().timeline,
+          player_start_seconds: 100,
+        },
+      });
+      const { rerenderPlayer } = renderPlayer({
+        plan: startPlan,
+        planRevision: 1,
+        transportRevision: 1,
+        streamUrl: "/api/v1/stream/session-1/master.m3u8?token=token",
+      });
+      removeAttrSpy.mockClear();
+
+      const driftedPlan = fixturePlanV3({
+        timeline: {
+          ...fixturePlanV3().timeline,
+          player_start_seconds: 148,
+        },
+      });
+      rerenderPlayer({
+        plan: driftedPlan,
+        planRevision: 2,
+        transportRevision: 1,
+      });
+      expect(removeAttrSpy).not.toHaveBeenCalled();
+
+      rerenderPlayer({
+        plan: driftedPlan,
+        planRevision: 3,
+        transportRevision: 2,
+      });
+      expect(removeAttrSpy).toHaveBeenCalledWith("src");
+    } finally {
+      removeAttrSpy.mockRestore();
+    }
+  });
+
   it("rolls back an outstanding reanchor seek when its replan is refused", async () => {
     const onReanchorSeek = vi.fn();
     const plan = fixturePlanV3({

@@ -534,6 +534,13 @@ export function VideoPlayer({
   const backendDuration = plan.source.duration_seconds ?? propDuration ?? 0;
   backendDurationRef.current = backendDuration;
   const effectiveInitialPosition = plan.timeline.player_start_seconds;
+  // The transport-init effect reads the start position through a ref. On a
+  // reused transport the server rewrites player_start_seconds to the current
+  // playhead, and keying the effect on that drift would tear down a stream
+  // that must keep playing. The ref is re-read whenever the effect actually
+  // runs, so a genuine transport change still starts at the latest position.
+  const effectiveInitialPositionRef = useRef(effectiveInitialPosition);
+  effectiveInitialPositionRef.current = effectiveInitialPosition;
   const canSeekAnywhere = plan.timeline.can_seek_anywhere;
   // The menu is the plan's; which entry is lit is the session's own preference,
   // since `auto` is a valid preference that names no rung.
@@ -1611,7 +1618,7 @@ export function VideoPlayer({
     const attachNativeHLS = () => {
       video.src = effectiveStreamUrl;
       nativeHLSMetadataHandler = () => {
-        video.currentTime = effectiveInitialPosition;
+        video.currentTime = effectiveInitialPositionRef.current;
         attemptAutoplayWhenReady();
       };
       video.addEventListener("loadedmetadata", nativeHLSMetadataHandler, { once: true });
@@ -1658,7 +1665,7 @@ export function VideoPlayer({
               backBufferLength: Infinity,
               maxBufferLength,
               maxMaxBufferLength: maxBufferLength,
-              startPosition: effectiveInitialPosition,
+              startPosition: effectiveInitialPositionRef.current,
               startFragPrefetch: true,
               // Segment requests may block while FFmpeg encodes on demand.
               // Remote transcode nodes can also briefly defer the initial
@@ -1787,7 +1794,7 @@ export function VideoPlayer({
         // the load algorithm that is about to seek to the resume position, and
         // the spec has that algorithm reject it.
         video.src = effectiveStreamUrl;
-        video.currentTime = effectiveInitialPosition;
+        video.currentTime = effectiveInitialPositionRef.current;
         attemptAutoplayWhenReady();
       }
     }
@@ -1809,11 +1816,13 @@ export function VideoPlayer({
         video.load();
       }
     };
-    // `planRevision` is the single signal that the transport changed: two plans
-    // can share a stream URL and still differ in protocol, timeline, or recipe.
+    // The effect must re-run only when the transport itself changed: the stream
+    // URL, the A/V transport identity (transportRevision), the delivery class,
+    // or the recipe facts that change the produced bytes. The start position is
+    // read fresh from the ref, so a plan whose only difference is the playhead
+    // (a reused-transport subtitle replan) must not reload the element.
   }, [
     effectiveStreamUrl,
-    effectiveInitialPosition,
     effectiveTransportRevision,
     isHlsStream,
     isPlayerReady,

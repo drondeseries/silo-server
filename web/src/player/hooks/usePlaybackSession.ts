@@ -483,6 +483,7 @@ export function usePlaybackSession(
     (
       decision: DecisionResponseV3,
       initialSubtitleFailure?: PlaybackSessionErrorState | null,
+      forceTransportBump?: boolean,
     ): boolean => {
       serverFeaturesRef.current = decision.server_features;
       const plan = decision.playback_plan;
@@ -513,7 +514,11 @@ export function usePlaybackSession(
       planRef.current = plan;
       sessionIdRef.current = sessionId ?? null;
       planRevisionRef.current += 1;
-      if (!isSameAVTransport(prevPlan, plan)) {
+      // A failure recovery always prepares a fresh server generation, even when
+      // the replacement plan reuses the same session-scoped URL and transport
+      // shape; the A/V-byte heuristic cannot see that regeneration. Force a
+      // transport revision bump so the player reloads and re-fetches the stream.
+      if (forceTransportBump || !isSameAVTransport(prevPlan, plan)) {
         transportRevisionRef.current += 1;
       }
       hasAdoptedPlanRef.current = true;
@@ -1068,6 +1073,7 @@ export function usePlaybackSession(
         const adopted = adoptDecision(
           decision,
           options.operation === "track_change" && options.subtitle !== undefined ? null : undefined,
+          isFailureRecovery,
         );
         if (!adopted && retireSessionOnRefusal) {
           const pending = pendingReplanRef.current;
