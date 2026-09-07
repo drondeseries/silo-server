@@ -34,6 +34,8 @@ type genericWebhookBody struct {
 	// matched item); approved/declined have no catalog item yet, so the
 	// request's own title rides here.
 	Request *genericWebhookRequest `json:"request,omitempty"`
+	// Rating is present for rating.set deliveries.
+	Rating *genericWebhookRating `json:"rating,omitempty"`
 }
 
 type genericWebhookSeries struct {
@@ -55,6 +57,12 @@ type genericWebhookRequest struct {
 	Title     string `json:"title,omitempty"`
 	Year      int    `json:"year,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+}
+
+// genericWebhookRating carries the rating payload for rating.set deliveries.
+type genericWebhookRating struct {
+	Rating int    `json:"rating"`
+	ItemID string `json:"item_id"`
 }
 
 // BuildGenericWebhookPayload renders a delivery as canonical Silo JSON. Pure
@@ -98,6 +106,13 @@ func BuildGenericWebhookPayload(row DeliveryRow, webhookID string, test bool) ([
 			Year:      flags.Year,
 			Reason:    flags.Reason,
 		}
+	case DeliveryTypeRatingSet:
+		flags := parseRatingFlags(row.ReasonFlags)
+		itemID := ""
+		if row.SeriesID != nil {
+			itemID = *row.SeriesID
+		}
+		body.Rating = &genericWebhookRating{Rating: flags.Rating, ItemID: itemID}
 	}
 	return json.Marshal(body)
 }

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -19,17 +20,30 @@ type ratingsRepository interface {
 	List(ctx context.Context, userID int, profileID string, limit, offset int) ([]catalog.UserRating, error)
 }
 
+// ratingNotifier is the optional outbound hook fired after a rating is set.
+// Implemented by notifications.RatingNotifier; nil when notifications are
+// unavailable.
+type ratingNotifier interface {
+	NotifyRating(ctx context.Context, userID int, profileID, contentID string, rating int) error
+}
+
 // RatingsHandler handles user rating operations.
 type RatingsHandler struct {
 	ratingsRepo             ratingsRepository
 	itemRepo                personalDataItemRepository
 	profileStaler           ProfileStaler
 	profileRefreshRequester ProfileRefreshRequester
+	notifier                ratingNotifier
 }
 
 // NewRatingsHandler creates a new RatingsHandler.
 func NewRatingsHandler(ratingsRepo ratingsRepository, itemRepo personalDataItemRepository) *RatingsHandler {
 	return &RatingsHandler{ratingsRepo: ratingsRepo, itemRepo: itemRepo}
+}
+
+// SetRatingNotifier configures the optional outbound notification hook.
+func (h *RatingsHandler) SetRatingNotifier(n ratingNotifier) {
+	h.notifier = n
 }
 
 // SetProfileStaler configures an optional staleness trigger for taste profiles.
@@ -103,6 +117,13 @@ func (h *RatingsHandler) HandleSetRating(w http.ResponseWriter, r *http.Request)
 	}
 
 	h.markStale(r.Context(), userID, profileID)
+	if h.notifier != nil {
+		// Best-effort: a delivery failure must never fail the rating write.
+		if err := h.notifier.NotifyRating(r.Context(), userID, profileID, itemID, req.Rating); err != nil {
+			slog.WarnContext(r.Context(), "failed to dispatch rating notification",
+				"component", "ratings", "item_id", itemID, "error", err)
+		}
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
