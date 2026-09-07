@@ -15,6 +15,7 @@ import { useIntroSkipPrompt } from "../hooks/useIntroSkipPrompt";
 import { useRemuxSeeking } from "../hooks/useRemuxSeeking";
 import { useSubtitleTracks } from "../hooks/useSubtitleTracks";
 import { useASSSubtitles } from "../hooks/useASSSubtitles";
+import { useSubtitleFontPrefetch } from "../hooks/useSubtitleFontPrefetch";
 import { useSubtitleAppearance } from "../hooks/useSubtitleAppearance";
 import { useSubtitleLayout } from "../hooks/useSubtitleLayout";
 import { useCoarsePointer } from "../hooks/useCoarsePointer";
@@ -2339,6 +2340,11 @@ export function VideoPlayer({
     subtitleDelayMs,
     setASSSubtitleState,
   );
+  // Prefetch ASS font bundles at plan adoption so a later track selection hits
+  // the in-memory font cache instead of a cold server extraction. Purely a
+  // warm-up: errors are swallowed and never affect playback. Mirrors the
+  // useASSSubtitles gating — the hook itself no-ops without font inventory.
+  useSubtitleFontPrefetch(subtitleUrls);
   const subtitleLoadState = isASSActive ? assSubtitleState : textSubtitleState;
 
   // -- Authoritative subtitle track selection --

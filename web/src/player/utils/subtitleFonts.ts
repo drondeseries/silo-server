@@ -91,6 +91,21 @@ interface SubtitleFontBundleItem {
   data: string;
 }
 
+/**
+ * Normalizes a font bundle URL for cache keying. The N embedded ASS tracks of
+ * one file share one font payload, but the server URLs differ only by
+ * `embedded_stream_index`; without stripping that parameter each track would
+ * get its own cache entry for identical bytes (and the prefetch of one track
+ * would not warm the selection of another). The fetch URL itself is unchanged.
+ */
+export function fontBundleCacheKey(url: string): string {
+  const [path, query = ""] = url.split("?");
+  const params = query
+    .split("&")
+    .filter((param) => param !== "" && param.split("=")[0] !== "embedded_stream_index");
+  return params.length > 0 ? `${path}?${params.join("&")}` : path;
+}
+
 export function loadSubtitleFallbackFontData(font: SubtitleFallbackFont): Promise<Uint8Array[]> {
   const cached = fontDataCache.get(font.family);
   if (cached) return cached;
@@ -112,10 +127,11 @@ export function loadSubtitleFallbackFontData(font: SubtitleFallbackFont): Promis
 }
 
 export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promise<Uint8Array[]> {
-  const cached = fontBundleCache.get(url);
+  const cacheKey = fontBundleCacheKey(url);
+  const cached = fontBundleCache.get(cacheKey);
   if (cached) {
-    fontBundleCache.delete(url);
-    fontBundleCache.set(url, cached);
+    fontBundleCache.delete(cacheKey);
+    fontBundleCache.set(cacheKey, cached);
     return cached.promise;
   }
 
@@ -134,7 +150,7 @@ export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promi
     .then((fonts) => {
       entry.bytes = totalByteLength(fonts);
       if (entry.bytes > MAX_FONT_BUNDLE_CACHE_BYTES) {
-        fontBundleCache.delete(url);
+        fontBundleCache.delete(cacheKey);
       } else {
         evictFontBundleCache();
       }
@@ -143,11 +159,11 @@ export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promi
 
   // Do not poison the cache with transient network errors or aborted requests.
   const cachedPromise = promise.catch((err) => {
-    fontBundleCache.delete(url);
+    fontBundleCache.delete(cacheKey);
     throw err;
   });
   entry.promise = cachedPromise;
-  fontBundleCache.set(url, entry);
+  fontBundleCache.set(cacheKey, entry);
   evictFontBundleCache();
   return cachedPromise;
 }

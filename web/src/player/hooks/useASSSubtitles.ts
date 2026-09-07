@@ -16,6 +16,44 @@ import {
 // silently render nothing.
 import liberationSansUrl from "../assets/liberation-sans.woff2?url";
 
+// A font bundle extraction (up to 32MiB, server-side, over network-backed or
+// virtual storage) is allowed this much time before JASSUB is constructed
+// without it. Subtitles render with the fallback/default fonts meanwhile; the
+// losing fetch keeps running in the background and lands in the shared
+// fontBundleCache, so a later re-select or the prefetch path picks up the real
+// fonts. The subtitle TEXT is never gated by this budget.
+const FONT_BUNDLE_BUDGET_MS = 3000;
+
+/**
+ * Fetches an ASS font bundle but abandons it at a time budget. On a budget miss
+ * the in-flight fetch continues in the background (warming the shared cache)
+ * and this resolves with no attached fonts so subtitle appearance is never
+ * delayed. Errors degrade to [] exactly like the old parallel Promise.all.
+ */
+async function loadSubtitleFontBundleWithinBudget(
+  url: string,
+  signal: AbortSignal,
+): Promise<Uint8Array[]> {
+  const fontPromise = loadSubtitleFontBundle(url, signal);
+  let budgetTimer: ReturnType<typeof setTimeout> | null = null;
+  const budgetMiss = new Promise<Uint8Array[]>((resolve) => {
+    budgetTimer = setTimeout(() => resolve([]), FONT_BUNDLE_BUDGET_MS);
+  });
+  try {
+    const fonts = await Promise.race([fontPromise, budgetMiss]);
+    // The race is settled on the font result; never leave the budget timer
+    // dangling to fire into a settled pipeline.
+    if (budgetTimer !== null) clearTimeout(budgetTimer);
+    return fonts;
+  } catch (err) {
+    if (budgetTimer !== null) clearTimeout(budgetTimer);
+    if ((err as Error).name !== "AbortError") {
+      console.error(`[useASSSubtitles] Failed to load subtitle font bundle ${url}:`, err);
+    }
+    return [];
+  }
+}
+
 /**
  * Manages client-side ASS/SSA subtitle rendering via JASSUB (libass WASM).
  *
@@ -102,36 +140,28 @@ export function useASSSubtitles(
       let subContent: string;
       let attachedFontData: Uint8Array[] = [];
       try {
-        const [content, loadedAttachedFontData] = await Promise.all([
-          fetch(activeUrl!, { signal }).then(async (response) => {
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        subContent = await fetch(activeUrl!, { signal }).then(async (response) => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          progress();
+          if (!response.body) return response.text();
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let text = "";
+          while (!signal.aborted && !cancelled) {
+            const { value, done } = await reader.read();
+            if (done) return text + decoder.decode();
             progress();
-            if (!response.body) return response.text();
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let text = "";
-            while (!signal.aborted && !cancelled) {
-              const { value, done } = await reader.read();
-              if (done) return text + decoder.decode();
-              progress();
-              text += decoder.decode(value, { stream: true });
-            }
-            throw new DOMException("Subtitle loading cancelled", "AbortError");
-          }),
-          activeFontBundleUrl
-            ? loadSubtitleFontBundle(activeFontBundleUrl, signal).catch((err) => {
-                if ((err as Error).name !== "AbortError") {
-                  console.error(
-                    `[useASSSubtitles] Failed to load subtitle font bundle ${activeFontBundleUrl}:`,
-                    err,
-                  );
-                }
-                return [];
-              })
-            : Promise.resolve([]),
-        ]);
-        subContent = content;
-        attachedFontData = loadedAttachedFontData;
+            text += decoder.decode(value, { stream: true });
+          }
+          throw new DOMException("Subtitle loading cancelled", "AbortError");
+        });
+        // The subtitle TEXT drives the pipeline (and the stall watchdog); the
+        // font bundle is raced against a budget so a slow extraction never
+        // delays subtitle appearance. JASSUB renders with fallback fonts
+        // meanwhile, and the budget-losing fetch continues in the background.
+        if (activeFontBundleUrl) {
+          attachedFontData = await loadSubtitleFontBundleWithinBudget(activeFontBundleUrl, signal);
+        }
       } catch (err) {
         if (!cancelled && (err as Error).name !== "AbortError") {
           console.error(`[useASSSubtitles] Failed to fetch ${activeUrl}:`, err);
