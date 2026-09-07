@@ -68,7 +68,7 @@ const fileColumns = `id, content_id, episode_id, extra_id, season_number, episod
 	presentation_kind, presentation_group_key, presentation_part_index, presentation_part_total,
 	multi_episode_start, multi_episode_end,
 	multiple_pps, multiple_pps_scan_size, multiple_pps_scan_mtime,
-	probe_source, probe_updated_at, match_attempted_at, missing_since,
+	probe_source, probe_updated_at, match_attempted_at, missing_since, failed_at,
 	first_seen_scan_run_id, created_at, updated_at,
 	virtual_owner_installation_id`
 
@@ -94,7 +94,7 @@ const mfFileColumns = `mf.id, mf.content_id, mf.episode_id, mf.extra_id, mf.seas
 	mf.presentation_kind, mf.presentation_group_key, mf.presentation_part_index, mf.presentation_part_total,
 	mf.multi_episode_start, mf.multi_episode_end,
 	mf.multiple_pps, mf.multiple_pps_scan_size, mf.multiple_pps_scan_mtime,
-	mf.probe_source, mf.probe_updated_at, mf.match_attempted_at, mf.missing_since,
+	mf.probe_source, mf.probe_updated_at, mf.match_attempted_at, mf.missing_since, mf.failed_at,
 	mf.first_seen_scan_run_id, mf.created_at, mf.updated_at,
 	mf.virtual_owner_installation_id`
 
@@ -219,6 +219,7 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 		&f.ProbeUpdatedAt,
 		&f.MatchAttemptedAt,
 		&f.MissingSince,
+		&f.FailedAt,
 		&firstSeenScanRunID,
 		&f.CreatedAt,
 		&f.UpdatedAt,
@@ -1086,6 +1087,10 @@ type VirtualCandidate struct {
 	Bitrate             int
 	AudioLanguages      []string
 	SubtitleLanguages   []string
+	// FailedAt marks a candidate that produced no bytes at stream-open
+	// (corrupted NZB, dead provider URL). A fresh listing clears it; the
+	// auto-pick skips failed candidates while the dropdown still shows them.
+	FailedAt *time.Time
 }
 
 // ReplaceVirtualCandidates atomically replaces the just-in-time candidates
@@ -1181,6 +1186,9 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 				probe_source='virtual',
 				probe_updated_at=NOW(),
 				missing_since=NULL,
+				-- A fresh listing means the provider still offers this release;
+				-- the failed flag is a runtime signal, not a permanent verdict.
+				failed_at=NULL,
 				updated_at=NOW()
 			RETURNING id`,
 			source.ContentID, source.EpisodeID, source.MediaFolderID, candidate.URI,
@@ -1253,6 +1261,20 @@ func virtualCandidateGroup(raw string) (string, bool) {
 	parsed.RawQuery = query.Encode()
 	parsed.Fragment = ""
 	return parsed.String(), true
+}
+
+// MarkVirtualCandidateFailed stamps a virtual candidate row as known-bad after
+// a transport produced no bytes (corrupted NZB, dead provider URL). The
+// auto-pick skips failed candidates; a fresh listing clears the flag.
+func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID int) error {
+	if r == nil || r.pool == nil {
+		return errors.New("file repository is not configured")
+	}
+	if fileID <= 0 {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NOW(), updated_at = NOW() WHERE id = $1`, fileID)
+	return err
 }
 
 func virtualCandidateSelection(raw string) bool {

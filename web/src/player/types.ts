@@ -21,6 +21,7 @@ export interface PlayerFileVersion {
   file_size: number;
   duration: number;
   bitrate: number;
+  failed?: boolean;
   edition_key?: string;
   presentation_kind?: string;
   presentation_group_key?: string;

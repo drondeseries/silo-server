@@ -487,6 +487,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			dbFile, _ = h.VirtualCandidateFileLookup(attemptCtx, virtualPlaybackNeutralKey(cand.URI), file.ContentID, file.EpisodeID, oid)
 		}
 		if dbFile != nil && dbFile.ID > 0 {
+			// Auto-pick skips candidates whose catalog row is marked failed
+			// (a transport produced no bytes on a prior attempt). An explicit
+			// result= selection still allows a manual retry.
+			if noResult && dbFile.FailedAt != nil {
+				return nil, fmt.Errorf("candidate %s is marked failed", cand.URI)
+			}
 			transient = *dbFile
 			transient.FilePath = cand.URI
 			transient.VirtualOwnerInstallationID = oid

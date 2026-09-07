@@ -547,6 +547,41 @@ export function VideoPlayer({
     [plan.effective_media_file_id, selectedVersion, versions],
   );
 
+  // Resolve source status for the quality menu.
+  // A version is "Playing" if it's the effective source.
+  // It's "Requested" if it was clicked and is still pending, OR if the plan
+  // names it as requested but it hasn't become effective yet.
+  const versionStatus = useMemo(
+    () =>
+      versions.map((v) => {
+        // Compact audio languages for the version switcher so a
+        // MULTI/French track set is recognizable before playback.
+        const audioLangs = [
+          ...new Set(
+            (v.audio_tracks ?? [])
+              .map((track) => track.language?.trim())
+              .filter((language): language is string => Boolean(language)),
+          ),
+        ].join("/");
+        const audioPart = v.codec_audio
+          ? ` ${v.codec_audio.toUpperCase()}${audioLangs ? ` ${audioLangs}` : ""}`
+          : audioLangs
+            ? ` ${audioLangs}`
+            : "";
+        return {
+          fileId: v.file_id,
+          label: `${v.resolution} ${v.codec_video.toUpperCase()}${v.hdr ? " HDR" : ""}${audioPart}`,
+          isCurrentSource: v.file_id === plan.effective_media_file_id,
+          isRequestedSource:
+            (v.file_id === pendingSwitchFileId && v.file_id !== plan.effective_media_file_id) ||
+            (v.file_id === plan.requested_media_file_id &&
+              v.file_id !== plan.effective_media_file_id),
+          failed: v.failed,
+        };
+      }),
+    [versions, plan.effective_media_file_id, plan.requested_media_file_id, pendingSwitchFileId],
+  );
+
   // Any stream restart (transcode restart on seek, quality/audio switch,
   // turning off bitmap burn-in) reloads the <video> element, which can orphan
   // a programmatic TextTrack — cuechange stops firing and the last cue
@@ -3243,40 +3278,7 @@ export function VideoPlayer({
           isTranscoding={replanningQuality}
           qualityError={replanError}
           onQualitySelect={handleQualitySelect}
-          versions={
-            versions.length > 1
-              ? versions.map((v) => {
-                  // Compact audio languages for the version switcher so a
-                  // MULTI/French track set is recognizable before playback.
-                  const audioLangs = [
-                    ...new Set(
-                      (v.audio_tracks ?? [])
-                        .map((track) => track.language?.trim())
-                        .filter((language): language is string => Boolean(language)),
-                    ),
-                  ].join("/");
-                  const audioPart = v.codec_audio
-                    ? ` ${v.codec_audio.toUpperCase()}${audioLangs ? ` ${audioLangs}` : ""}`
-                    : audioLangs
-                      ? ` ${audioLangs}`
-                      : "";
-                  return {
-                    fileId: v.file_id,
-                    label: `${v.resolution} ${v.codec_video.toUpperCase()}${v.hdr ? " HDR" : ""}${audioPart}`,
-                    // The server names the file it actually planned against; a
-                    // fallback to an alternate version shows up here.
-                    isCurrentSource: v.file_id === plan.effective_media_file_id,
-                    // The clicked version lights up "Requested" immediately,
-                    // before the replacement plan lands: the plan's
-                    // requested_media_file_id still names the OLD file until
-                    // the switch completes.
-                    isRequestedSource:
-                      v.file_id === pendingSwitchFileId ||
-                      v.file_id === plan.requested_media_file_id,
-                  };
-                })
-              : undefined
-          }
+          versions={versions.length > 1 ? versionStatus : undefined}
           onSwitchVersion={
             onSwitchVersion ? (fileId) => onSwitchVersion(fileId, currentTime) : undefined
           }

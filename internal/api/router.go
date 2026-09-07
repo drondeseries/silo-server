@@ -1188,6 +1188,10 @@ func NewRouter(deps Dependencies) chi.Router {
 			streamHandler.AllowInsecureVirtual = playbackHandler.AllowInsecureVirtual
 		}
 		if deps.DB != nil {
+			streamHandler.VirtualCandidateFailMarker = func(ctx context.Context, fileID int) error {
+				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET failed_at = NOW(), updated_at = NOW() WHERE id = $1`, fileID)
+				return err
+			}
 			playbackHandler.VirtualFileUpdater = func(ctx context.Context, fileID int, newFilePath string) error {
 				_, _ = deps.DB.Exec(ctx, `DELETE FROM media_files WHERE file_path=$1 AND id != $2 AND virtual_owner_installation_id IS NOT NULL`, newFilePath, fileID)
 				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET file_path=$1, updated_at=now() WHERE id=$2`, newFilePath, fileID)

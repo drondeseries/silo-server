@@ -9,6 +9,7 @@ export interface VersionInfo {
   label: string;
   isCurrentSource: boolean;
   isRequestedSource: boolean;
+  failed?: boolean;
 }
 
 interface QualityMenuProps {
@@ -152,7 +153,11 @@ export function QualityMenu({
                           {statusLabels.map((status) => (
                             <span
                               key={status}
-                              className="rounded border border-white/15 bg-white/10 px-1.5 py-0.5 text-[10px] leading-none text-white/70"
+                              className={`rounded border border-white/15 px-1.5 py-0.5 text-[10px] leading-none ${
+                                status === "Failed"
+                                  ? "border-red-500/30 bg-red-500/20 text-red-400"
+                                  : "bg-white/10 text-white/70"
+                              }`}
                             >
                               {status}
                             </span>
@@ -215,6 +220,9 @@ export function buildVersionStatusLabels(version: VersionInfo): string[] {
   }
   if (version.isRequestedSource) {
     labels.push("Requested");
+  }
+  if (version.failed) {
+    labels.push("Failed");
   }
   return labels;
 }
