@@ -431,6 +431,23 @@ export function WatchPage({
     );
   }
 
+  // A version switch keeps the old stream playing while the replacement plan
+  // is resolved (for virtual versions the server round trip can take seconds).
+  // Surface that with a small non-blocking chip near the controls instead of
+  // replacing the whole page — the viewer keeps watching the old stream.
+  const switchingIndicator = session.replacing ? (
+    <div
+      role="status"
+      aria-label="Switching version"
+      className="pointer-events-none absolute top-[max(4.5rem,calc(env(safe-area-inset-top)+3.5rem))] left-1/2 z-50 -translate-x-1/2"
+    >
+      <div className="flex items-center gap-2 rounded-full border border-white/15 bg-black/70 px-3 py-1.5 text-xs font-medium text-white/80 shadow-lg backdrop-blur">
+        <span className="h-3 w-3 animate-spin rounded-full border-2 border-white/25 border-t-white" />
+        Switching version…
+      </div>
+    </div>
+  ) : null;
+
   // Find the duration of the selected file so the player knows the total
   // length even when the stream is chunked (no Content-Length header).
   const selectedDuration =
@@ -445,80 +462,85 @@ export function WatchPage({
   const activeMarkers = resolveActiveVersionMarkers(selectedVersion);
 
   return (
-    <VideoPlayer
-      title={title}
-      year={year}
-      streamUrl={session.streamUrl}
-      plan={session.plan}
-      planRevision={session.planRevision}
-      transportRevision={session.transportRevision}
-      shouldAutoPlay={session.shouldAutoPlay}
-      replanning={session.replanning}
-      replanError={session.error}
-      replanErrorTitle={session.errorTitle}
-      sessionId={session.sessionId}
-      selectedVersion={selectedVersion}
-      versions={playbackVersions}
-      activeFileId={session.mediaFileId}
-      chapters={activeChapters}
-      onSwitchVersion={handleSwitchVersion}
-      subtitleUrls={playableSubtitles}
-      initialPosition={session.initialPosition}
-      onQualitySelect={session.changeQuality}
-      onSubtitleTrackChange={session.changeSubtitleTrack}
-      onPlanFailure={session.recoverFromFailure}
-      onPlanInvalidated={session.invalidatePlan}
-      onReanchorSeek={session.reanchorSeek}
-      onApplySubtitleTrack={session.applySubtitleTrack}
-      preferredSubtitleLanguage={preferredSubtitleLanguage}
-      preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
-      subtitleMode={session.initialSubtitleError ? "off" : subtitleMode}
-      showForcedSubtitles={session.initialSubtitleError ? false : showForcedSubtitles}
-      profileLanguage={profileLanguage}
-      intro={activeMarkers.intro}
-      introSkipMode={introSkipMode}
-      credits={activeMarkers.credits}
-      recap={activeMarkers.recap}
-      autoSkipRecap={autoSkipRecap}
-      preview={activeMarkers.preview}
-      autoPlayNextPreview={autoPlayNextPreview}
-      canEditMarkers={canEditMarkers}
-      onMarkersEdited={(fileId, markers) =>
-        setPlaybackVersions((current) =>
-          patchVersionMarkers(
-            current,
-            fileId,
-            markers.intro,
-            markers.credits,
-            markers.recap,
-            markers.preview,
-          ),
-        )
-      }
-      duration={selectedDuration}
-      // The session's preference, not the caller's: the server normalizes what
-      // was requested and the menu has to light up whatever it settled on.
-      qualityPreference={session.qualityPreference}
-      seriesContext={seriesContext}
-      onNavigateEpisode={onNavigateEpisode}
-      displayMode={displayMode}
-      onPictureInPictureChange={onPictureInPictureChange}
-      autoEnterPictureInPicture={autoEnterPictureInPicture}
-      onPlaybackStateChange={handlePlaybackStateChange}
-      onPlaybackTransportReady={onPlaybackTransportReady}
-      onRealtimeEvent={handleRealtimeEvent}
-      onRealtimeConnectionStateChange={setRealtimeConnectionState}
-      onExit={onExit}
-      onMinimize={onMinimize}
-      onEnded={handleEnded}
-      onRefreshSubtitles={session.refreshSubtitles}
-      audioTracks={audioTracks}
-      activeAudioIndex={session.audioTrackIndex}
-      onAudioSelect={handleSwitchAudio}
-      onSubtitleChanged={handleSubtitleChanged}
-      onReturnFromPostRoll={onReturnFromPostRoll}
-      watchTogetherRoomId={watchTogetherRoomId}
-      watchTogetherConnection={watchTogetherConnection}
-    />
+    <>
+      {switchingIndicator}
+      <VideoPlayer
+        title={title}
+        year={year}
+        streamUrl={session.streamUrl}
+        plan={session.plan}
+        planRevision={session.planRevision}
+        transportRevision={session.transportRevision}
+        shouldAutoPlay={session.shouldAutoPlay}
+        replanning={session.replanning}
+        replanningQuality={session.replanningQuality}
+        pendingSwitchFileId={session.pendingSwitchFileId}
+        replanError={session.error}
+        replanErrorTitle={session.errorTitle}
+        sessionId={session.sessionId}
+        selectedVersion={selectedVersion}
+        versions={playbackVersions}
+        activeFileId={session.mediaFileId}
+        chapters={activeChapters}
+        onSwitchVersion={handleSwitchVersion}
+        subtitleUrls={playableSubtitles}
+        initialPosition={session.initialPosition}
+        onQualitySelect={session.changeQuality}
+        onSubtitleTrackChange={session.changeSubtitleTrack}
+        onPlanFailure={session.recoverFromFailure}
+        onPlanInvalidated={session.invalidatePlan}
+        onReanchorSeek={session.reanchorSeek}
+        onApplySubtitleTrack={session.applySubtitleTrack}
+        preferredSubtitleLanguage={preferredSubtitleLanguage}
+        preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
+        subtitleMode={session.initialSubtitleError ? "off" : subtitleMode}
+        showForcedSubtitles={session.initialSubtitleError ? false : showForcedSubtitles}
+        profileLanguage={profileLanguage}
+        intro={activeMarkers.intro}
+        introSkipMode={introSkipMode}
+        credits={activeMarkers.credits}
+        recap={activeMarkers.recap}
+        autoSkipRecap={autoSkipRecap}
+        preview={activeMarkers.preview}
+        autoPlayNextPreview={autoPlayNextPreview}
+        canEditMarkers={canEditMarkers}
+        onMarkersEdited={(fileId, markers) =>
+          setPlaybackVersions((current) =>
+            patchVersionMarkers(
+              current,
+              fileId,
+              markers.intro,
+              markers.credits,
+              markers.recap,
+              markers.preview,
+            ),
+          )
+        }
+        duration={selectedDuration}
+        // The session's preference, not the caller's: the server normalizes what
+        // was requested and the menu has to light up whatever it settled on.
+        qualityPreference={session.qualityPreference}
+        seriesContext={seriesContext}
+        onNavigateEpisode={onNavigateEpisode}
+        displayMode={displayMode}
+        onPictureInPictureChange={onPictureInPictureChange}
+        autoEnterPictureInPicture={autoEnterPictureInPicture}
+        onPlaybackStateChange={handlePlaybackStateChange}
+        onPlaybackTransportReady={onPlaybackTransportReady}
+        onRealtimeEvent={handleRealtimeEvent}
+        onRealtimeConnectionStateChange={setRealtimeConnectionState}
+        onExit={onExit}
+        onMinimize={onMinimize}
+        onEnded={handleEnded}
+        onRefreshSubtitles={session.refreshSubtitles}
+        audioTracks={audioTracks}
+        activeAudioIndex={session.audioTrackIndex}
+        onAudioSelect={handleSwitchAudio}
+        onSubtitleChanged={handleSubtitleChanged}
+        onReturnFromPostRoll={onReturnFromPostRoll}
+        watchTogetherRoomId={watchTogetherRoomId}
+        watchTogetherConnection={watchTogetherConnection}
+      />
+    </>
   );
 }

@@ -131,9 +131,14 @@ type MediaFile struct {
 	ProbeUpdatedAt       *time.Time
 	MatchAttemptedAt     *time.Time
 	MissingSince         *time.Time
-	FirstSeenScanRunID   string
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	// FailedAt marks a virtual candidate that produced no bytes at
+	// stream-open (corrupted NZB, dead provider URL). A fresh listing clears
+	// it; the auto-pick skips failed candidates while the dropdown still
+	// shows them for a manual retry.
+	FailedAt           *time.Time
+	FirstSeenScanRunID string
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // MediaChapter represents a single media chapter derived from embedded file metadata.

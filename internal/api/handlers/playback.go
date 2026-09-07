@@ -2300,9 +2300,11 @@ func resolutionRank(res string) int {
 }
 
 func transcodeResolutionHeight(resolution string) (int, bool) {
-	switch resolution {
-	case transcodeResolution2160p:
+	switch strings.ToLower(strings.TrimSpace(resolution)) {
+	case transcodeResolution2160p, "4k", "uhd":
 		return 2160, true
+	case "4320p", "8k":
+		return 4320, true
 	case transcodeResolution1080p:
 		return 1080, true
 	case transcodeResolution720p:

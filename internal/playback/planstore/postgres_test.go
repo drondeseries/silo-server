@@ -187,6 +187,50 @@ func mustJSON(t *testing.T, v any) []byte {
 	return data
 }
 
+// A virtual candidate rotation can delete the requested media file row between
+// the client's request and the attempt persist while the effective file
+// survives. The FK on requested_media_file_id would reject the insert and turn
+// a recoverable rotation into a hard 500; the effective file must become the
+// requested identity so the attempt stays durable and replayable.
+func TestResolveAttemptRequestedFileIDFallsBackToEffectiveWhenRequestedDeleted(t *testing.T) {
+	exists := func(id int) (bool, error) {
+		switch id {
+		case 10, 20:
+			return true, nil
+		default:
+			return false, nil
+		}
+	}
+
+	// Requested row present: unchanged.
+	if got, err := resolveAttemptRequestedFileID(10, 20, exists); err != nil || got != 10 {
+		t.Fatalf("requested present: got %d, %v; want 10", got, err)
+	}
+	// Requested row deleted, effective present: fall back to effective.
+	if got, err := resolveAttemptRequestedFileID(99, 20, exists); err != nil || got != 20 {
+		t.Fatalf("requested deleted: got %d, %v; want effective 20", got, err)
+	}
+	// Both present but distinct: requested wins.
+	if got, err := resolveAttemptRequestedFileID(10, 20, exists); err != nil || got != 10 {
+		t.Fatalf("both present: got %d, %v; want 10", got, err)
+	}
+	// Requested deleted and effective equals requested: keep requested (the
+	// insert will fail the FK, but there is no surviving row to fall back to).
+	if got, err := resolveAttemptRequestedFileID(99, 99, exists); err != nil || got != 99 {
+		t.Fatalf("both deleted: got %d, %v; want 99", got, err)
+	}
+	// Zero IDs pass through untouched.
+	if got, err := resolveAttemptRequestedFileID(0, 0, exists); err != nil || got != 0 {
+		t.Fatalf("zero ids: got %d, %v; want 0", got, err)
+	}
+	// Lookup failure propagates.
+	if _, err := resolveAttemptRequestedFileID(10, 20, func(int) (bool, error) {
+		return false, errors.New("lookup failed")
+	}); err == nil {
+		t.Fatal("lookup failure: want error")
+	}
+}
+
 func TestPostgresPlanStore(t *testing.T) {
 	f := newPlanstoreFixture(t)
 	store := NewPostgres(f.pool)
@@ -289,6 +333,35 @@ func TestPostgresPlanStore(t *testing.T) {
 		f.expireAttempt(t, attemptID)
 		if err := store.SaveAttempt(ctx, record); err != nil {
 			t.Fatalf("SaveAttempt after expiry should reclaim the attempt-ID: %v", err)
+		}
+	})
+
+	// A virtual candidate rotation can delete the requested media file row
+	// between the client's request and the attempt persist while the effective
+	// file survives. SaveAttempt must fall back to the effective file as the
+	// requested identity instead of failing the FK and 500-ing.
+	t.Run("SaveAttemptRequestedFileDeletedFallsBackToEffective", func(t *testing.T) {
+		sessionID := uuid.NewString()
+		attemptID := "att-rotated-" + sessionID
+		record := f.attemptRecord(sessionID, attemptID, "digest-rotated")
+		record.RequestedMediaFileID = 999999 // deleted by candidate rotation
+		record.EffectiveMediaFileID = f.altFileID
+		record.CurrentPlan.RequestedMediaFileID = 999999
+		record.CurrentPlan.EffectiveMediaFileID = f.altFileID
+		record.NormalizedRequest.FileID = 999999
+
+		if err := store.SaveAttempt(ctx, record); err != nil {
+			t.Fatalf("SaveAttempt with deleted requested file: %v", err)
+		}
+		got, err := store.GetAttemptByPlaybackAttemptID(ctx, attemptID)
+		if err != nil {
+			t.Fatalf("GetAttemptByPlaybackAttemptID: %v", err)
+		}
+		if got.RequestedMediaFileID != f.altFileID {
+			t.Fatalf("persisted requested file = %d, want effective %d", got.RequestedMediaFileID, f.altFileID)
+		}
+		if got.EffectiveMediaFileID != f.altFileID {
+			t.Fatalf("persisted effective file = %d, want %d", got.EffectiveMediaFileID, f.altFileID)
 		}
 	})
 

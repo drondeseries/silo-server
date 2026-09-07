@@ -20,7 +20,9 @@ const SEEK_BACKOFF = 2;
 // a chunk. Extraction streams cues progressively, so a healthy-but-slow
 // ffmpeg keeps resetting the clock; only a genuinely hung one trips it.
 // Without this, one hung fetch blocks every future window for the session.
-const FETCH_STALL_TIMEOUT_MS = 30_000;
+// 60s matches the server relay's first-byte budget (30s) plus headroom for
+// a slow-but-progressing Usenet/altmount extraction.
+const FETCH_STALL_TIMEOUT_MS = 60_000;
 // Wait this long after a failed window fetch before retrying, so a
 // persistently failing extraction doesn't turn timeupdate into a fetch storm.
 const FETCH_RETRY_BACKOFF_MS = 5_000;
@@ -315,44 +317,48 @@ export function useSubtitleTracks(
         armStallTimer();
         const resp = await fetch(url, { signal: controller.signal });
         if (!resp.ok || !resp.body) {
+          // Non-ok responses (including 404/415) fall through to the finally
+          // block, which schedules a bounded exponential-backoff retry. A
+          // silent return here would let every timeupdate re-trigger the
+          // fetch and storm the server.
           console.error(`[useSubtitleTracks] Failed to fetch ${url}: ${resp.status}`);
-          return;
-        }
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = "";
+        } else {
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
 
-        // Split on the last complete cue boundary (blank line) and parse
-        // the safe prefix, keep the rest. The WebVTT muxer emits cues
-        // terminated by "\n\n".
-        while (!cancelled) {
-          armStallTimer();
-          const { value, done } = await reader.read();
-          if (cancelled || controller.signal.aborted || inflight !== controller) return;
-          if (done) break;
-          buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-          const split = buf.lastIndexOf("\n\n");
-          if (split < 0) continue;
-          const safe = buf.slice(0, split);
-          buf = buf.slice(split + 2);
-          const cues = parseVTT(safe);
-          if (cues.length > 0) {
-            addParsedCues(cues);
-            onLoadStateRef.current?.("ready");
+          // Split on the last complete cue boundary (blank line) and parse
+          // the safe prefix, keep the rest. The WebVTT muxer emits cues
+          // terminated by "\n\n".
+          while (!cancelled) {
+            armStallTimer();
+            const { value, done } = await reader.read();
+            if (cancelled || controller.signal.aborted || inflight !== controller) return;
+            if (done) break;
+            buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+            const split = buf.lastIndexOf("\n\n");
+            if (split < 0) continue;
+            const safe = buf.slice(0, split);
+            buf = buf.slice(split + 2);
+            const cues = parseVTT(safe);
+            if (cues.length > 0) {
+              addParsedCues(cues);
+              onLoadStateRef.current?.("ready");
+            }
           }
-        }
 
-        // Flush any tail the muxer didn't terminate with a blank line.
-        buf += decoder.decode();
-        if (buf.trim()) {
-          const cues = parseVTT(buf);
-          if (cues.length > 0) {
-            addParsedCues(cues);
-            onLoadStateRef.current?.("ready");
+          // Flush any tail the muxer didn't terminate with a blank line.
+          buf += decoder.decode();
+          if (buf.trim()) {
+            const cues = parseVTT(buf);
+            if (cues.length > 0) {
+              addParsedCues(cues);
+              onLoadStateRef.current?.("ready");
+            }
           }
-        }
 
-        succeeded = true;
+          succeeded = true;
+        }
       } catch (err) {
         if ((err as Error).name !== "AbortError") {
           console.error("[useSubtitleTracks] Stream error:", err);

@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { videoRangeLabel } from "@/lib/videoRange";
 import DetailPopover from "./DetailPopover";
 import { sortPlaybackVariantsByEditionPreference } from "./versionRankingUtils";
+import { collectLanguageLabels } from "./versionFormatUtils";
 import { buildDetailLine, buildQualitySummary, sortByResolution } from "./VersionFlyout";
 
 interface VersionDropdownProps {
@@ -63,7 +64,7 @@ function VersionDropdown({
         <DetailPopover
           open={editionOpen}
           onOpenChange={setEditionOpen}
-          contentClassName="w-72 p-1.5"
+          contentClassName="w-[30rem] p-1.5"
           trigger={
             <Button
               variant="glass"
@@ -98,9 +99,7 @@ function VersionDropdown({
                 >
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-sm font-medium">{option.label}</div>
-                    {detail && (
-                      <div className="text-muted-foreground truncate text-xs">{detail}</div>
-                    )}
+                    {detail && <div className="text-muted-foreground text-xs">{detail}</div>}
                   </div>
                   {isSelected && <Check className="text-primary size-4 shrink-0" />}
                 </button>
@@ -114,7 +113,7 @@ function VersionDropdown({
         <DetailPopover
           open={versionOpen}
           onOpenChange={setVersionOpen}
-          contentClassName="w-80 p-1.5"
+          contentClassName="w-[30rem] p-1.5"
           trigger={
             <Button
               variant="glass"
@@ -149,18 +148,50 @@ function VersionDropdown({
                   }`}
                 >
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate text-sm font-medium">
-                        {summary || `Version ${version.file_id}`}
-                      </span>
-                      {rangeLabel ? (
-                        <Badge variant="secondary" className="px-1.5 py-0 text-[10px] uppercase">
-                          {rangeLabel}
-                        </Badge>
-                      ) : null}
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium">
+                          {summary || `Version ${version.file_id}`}
+                        </span>
+                        {rangeLabel ? (
+                          <Badge variant="secondary" className="px-1.5 py-0 text-[10px] uppercase">
+                            {rangeLabel}
+                          </Badge>
+                        ) : null}
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {collectLanguageLabels(
+                          version.audio_tracks?.map((t) => t.language) ?? [],
+                        ).map((lang) => (
+                          <Badge
+                            key={lang}
+                            variant="outline"
+                            className="border-blue-500/20 bg-blue-500/10 px-1 py-0 text-[10px] font-medium text-blue-400"
+                          >
+                            <span className="mr-0.5 opacity-70">🔊</span>
+                            {lang}
+                          </Badge>
+                        ))}
+                      </div>
                     </div>
                     {detail && (
-                      <span className="text-muted-foreground block truncate text-xs">{detail}</span>
+                      <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <span className="text-muted-foreground text-xs">{detail}</span>
+                        <div className="flex flex-wrap gap-1">
+                          {collectLanguageLabels(
+                            version.subtitle_tracks?.map((t) => t.language) ?? [],
+                          ).map((lang) => (
+                            <Badge
+                              key={lang}
+                              variant="outline"
+                              className="border-amber-500/20 bg-amber-500/10 px-1 py-0 text-[10px] font-medium text-amber-400"
+                            >
+                              <span className="mr-0.5 opacity-70">CC</span>
+                              {lang}
+                            </Badge>
+                          ))}
+                        </div>
+                      </div>
                     )}
                   </div>
                   {isSelected && <Check className="text-primary size-4 shrink-0" />}

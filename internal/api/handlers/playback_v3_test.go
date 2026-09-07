@@ -6220,6 +6220,158 @@ func TestHandleReplanPlaybackV3RehydratesPinnedVirtualSourceBeforePlanning(t *te
 	}
 }
 
+// An unchanged virtual candidate whose catalog row already carries complete
+// probed evidence must skip the synchronous re-probe on replan: no provider
+// round-trip, no probe, and the loaded row is used directly.
+func TestHandleReplanPlaybackV3SkipsRehydrationOfUnchangedVirtualCandidate(t *testing.T) {
+	complete := v3HandlerFixtureFile(t)
+	complete.ID = 500
+	complete.FilePath = "virtual://movie/tt-replan-skip?result=pinned"
+	complete.VirtualOwnerInstallationID = 5
+	files := map[int]*models.MediaFile{complete.ID: complete}
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), mapPlaybackFileResolver{files: files})
+	stubCopySeekAnchorV3(handler)
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	resolveCalls := 0
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		resolveCalls++
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	probeCalls := 0
+	handler.VirtualPlaybackSourceProber = func(_ context.Context, _ string, f *models.MediaFile) (*models.MediaFile, error) {
+		probeCalls++
+		return f, nil
+	}
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = complete.ID
+	startRequest.QualityPreference = "auto"
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"mp4"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+	startResolveCalls := resolveCalls
+	if startResolveCalls == 0 {
+		t.Fatal("start path should have resolved the virtual source")
+	}
+
+	failedKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "replan-virtual-skip-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "plan-attempt-virtual-skip-0001",
+		PlanAttemptKey:        failedKey,
+		AttemptedPlanKeys:     []string{failedKey},
+		AttemptCount:          1,
+		QualityPreference:     "auto",
+		PositionSeconds:       12,
+		Failure:               playback.FailureV3{Classification: "playback_error"},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("virtual replan response = %#v terminal=%+v", response, response.Terminal)
+	}
+	if resolveCalls != startResolveCalls {
+		t.Fatalf("replan re-resolved the unchanged virtual candidate: resolve calls %d -> %d", startResolveCalls, resolveCalls)
+	}
+	if probeCalls != 0 {
+		t.Fatalf("replan probed the unchanged virtual candidate: probe calls = %d", probeCalls)
+	}
+	if response.PlaybackPlan.EffectiveMediaFileID != complete.ID {
+		t.Fatalf("effective file = %d, want unchanged candidate %d", response.PlaybackPlan.EffectiveMediaFileID, complete.ID)
+	}
+}
+
+// A replan whose pinned candidate changed must thread the session-bound
+// candidate as preferred and the failed candidate as excluded into the
+// detailed resolver, so re-ranking cannot drift to a different release or
+// re-select the failed candidate under a new row ID.
+func TestHandleReplanPlaybackV3ThreadsExcludedAndPreferredCandidateIDs(t *testing.T) {
+	source := v3HandlerFixtureFile(t)
+	source.ID = 510
+	// The catalog row carries the failed candidate's result= pick; the session
+	// later binds to a different pinned release.
+	source.FilePath = "virtual://movie/replan-source-510?result=failed-cand"
+	source.VirtualOwnerInstallationID = 5
+	// Incomplete container evidence keeps the start path on the candidate
+	// listing path so the session binds to the pinned release.
+	source.Container = "virtual"
+
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: map[int]*models.MediaFile{source.ID: source}})
+	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{
+		source.ContentID: {source},
+	}}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{}}
+	handler.PlaybackConfig = playbackTestConfig("", "")
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	// The provider lists a result=-suffixed candidate (ID matches the catalog
+	// row's failed pick) so the start path selects it and the session binds to
+	// the pinned release, which differs from the catalog row.
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			ID: "failed-cand", URI: "virtual://movie/replan-source-510?result=pinned",
+			Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mp4",
+		}}, nil
+	})
+	var gotExcluded []string
+	var gotPreferred string
+	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	handler.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(_ context.Context, virtualURI string, _ int, _ int, _ string, _ bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
+		gotExcluded = append([]string(nil), excludedCandidateIDs...)
+		gotPreferred = preferredCandidateID
+		return ResolvedVirtualMedia{URL: "http://127.0.0.1:8080/stream?path=" + virtualURI, URI: virtualURI, CandidateID: "pinned"}, nil
+	})
+
+	startRequest := v3HandlerStartRequest()
+	startRequest.FileID = source.ID
+	startRequest.QualityPreference = "auto"
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"hls"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	startRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassProgressiveV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true, Containers: []string{"mp4"}, VideoCodecs: []string{"h264"}, AudioDecodeCodecs: []string{"aac"},
+	}
+	started := startV3PlaybackForHandlerTest(t, handler, startRequest)
+
+	currentKey := playback.PlanAttemptKeyV3(*started.PlaybackPlan, startRequest.ClientPlaybackContext.Output.OutputContextID, nil)
+	response := postPlaybackReplanV3(t, handler, started.SessionID, playback.ReplanRequestV3{
+		ProtocolVersion:       playback.ProtocolV3,
+		Operation:             playback.ReplanOperationFailureRecoveryV3,
+		PlaybackAttemptID:     startRequest.PlaybackAttemptID,
+		ReplanRequestID:       "virtual-thread-ids-0001",
+		FailedPlanID:          started.PlaybackPlan.PlanID,
+		PlanAttemptID:         "virtual-thread-ids-0001",
+		PlanAttemptKey:        currentKey,
+		AttemptedPlanKeys:     []string{currentKey},
+		AttemptCount:          1,
+		QualityPreference:     "auto",
+		SelectedTracks:        started.PlaybackPlan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "playback_error"},
+		Capabilities:          startRequest.Capabilities,
+		ClientPlaybackContext: startRequest.ClientPlaybackContext,
+	})
+	if response.Terminal != nil || response.PlaybackPlan == nil {
+		t.Fatalf("expected successful replan, got response=%#v terminal=%#v", response, response.Terminal)
+	}
+	if gotPreferred != "pinned" {
+		t.Fatalf("preferred candidate = %q, want pinned", gotPreferred)
+	}
+	if len(gotExcluded) != 1 || gotExcluded[0] != "failed-cand" {
+		t.Fatalf("excluded candidates = %v, want [failed-cand] (the failed candidate)", gotExcluded)
+	}
+}
+
 func TestHandleReplanPlaybackV3HealsIncompleteCatalogRowBeforePlanning(t *testing.T) {
 	complete := v3HandlerFixtureFile(t)
 	files := map[int]*models.MediaFile{complete.ID: complete}
@@ -6441,6 +6593,14 @@ func TestPrepareTransportV3KeepsRemuxLocalWhenProxyLacksTheRecipe(t *testing.T) 
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
 	handler.JWTSecret = "test-secret"
 	stubCopySeekAnchorV3(handler)
+	// The local API shape must be eligible for the fallback to be selected.
+	// Without a stubbed registry the probe runs against the machine's real
+	// ffmpeg, which CI does not install — audio_to_aac is then unavailable,
+	// the API shape is excluded, and only the incapable proxy remains.
+	handler.v3Registry = playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
+		{Name: playback.TransformationAudioToAACV3, RecipeVersion: playback.TransformationAudioToAACRecipeVersionV3, Available: true},
+		{Name: playback.TransformationVideoToH264V3, RecipeVersion: playback.TransformationVideoToH264RecipeVersionV3, Available: true},
+	})
 	planner := &recordingNodePlannerV3{plan: nodepool.Plan{ProxyNode: &nodepool.Node{URL: proxy.URL}}}
 	handler.NodePlanner = planner
 
@@ -6906,6 +7066,14 @@ func TestHandleReplanPlaybackV3ExhaustivelyTriesVirtualAlternatesOnFailureRecove
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
 	})
+	// The provider lists a result=-suffixed candidate so the session binds to a
+	// URI that differs from the catalog row, keeping the replan on the
+	// fall-through rehydration path.
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			URI: path + "?result=pinned", Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mp4",
+		}}, nil
+	})
 
 	startRequest := v3HandlerStartRequest()
 	startRequest.FileID = source.ID
@@ -6978,6 +7146,15 @@ func TestHandleReplanPlaybackV3VirtualRehydrationAllAlternatesFailReturnsVirtual
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
 	})
+	// The provider lists a result=-suffixed candidate, so the session binds to
+	// a URI that differs from the catalog row. The replan rehydration then
+	// takes the fall-through path (candidate changed) instead of the
+	// unchanged-candidate skip, exercising the failure handling.
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			URI: path + "?result=pinned", Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mp4",
+		}}, nil
+	})
 
 	startRequest := v3HandlerStartRequest()
 	startRequest.FileID = source.ID
@@ -7040,6 +7217,14 @@ func TestHandleReplanPlaybackV3VirtualRehydrationDeadlineExceededReturnsTimeout(
 			return "", context.DeadlineExceeded
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	// The provider lists a result=-suffixed candidate so the session binds to a
+	// URI that differs from the catalog row, keeping the replan on the
+	// fall-through rehydration path.
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			URI: path + "?result=pinned", Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mp4",
+		}}, nil
 	})
 
 	startRequest := v3HandlerStartRequest()
@@ -7111,6 +7296,14 @@ func TestHandleReplanPlaybackV3VirtualRehydrationFirstAlternateFailsPlanningSeco
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
 	})
+	// The provider lists a result=-suffixed candidate so the session binds to a
+	// URI that differs from the catalog row, keeping the replan on the
+	// fall-through rehydration path.
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			URI: path + "?result=pinned", Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mp4",
+		}}, nil
+	})
 
 	startRequest := v3HandlerStartRequest()
 	startRequest.FileID = source.ID
@@ -7168,6 +7361,14 @@ func TestHandleReplanPlaybackV3VirtualRehydrationOriginalQualityAllowsAlternate(
 			return "", errors.New("source offline")
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	// The provider lists a result=-suffixed candidate so the session binds to a
+	// URI that differs from the catalog row, keeping the replan on the
+	// fall-through rehydration path.
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			URI: path + "?result=pinned", Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mp4",
+		}}, nil
 	})
 
 	startRequest := v3HandlerStartRequest()
@@ -7227,6 +7428,14 @@ func TestHandleReplanPlaybackV3VirtualRehydrationSeekRecoveryPinsCurrentVersion(
 			return "", errors.New("source offline")
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	// The provider lists a result=-suffixed candidate so the session binds to a
+	// URI that differs from the catalog row, keeping the replan on the
+	// fall-through rehydration path.
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			URI: path + "?result=pinned", Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mp4",
+		}}, nil
 	})
 
 	startRequest := v3HandlerStartRequest()
@@ -7419,6 +7628,14 @@ func TestHandleReplanPlaybackV3VirtualFirstAlternateTransportFailsSecondSucceeds
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
 	})
+	// The provider lists a result=-suffixed candidate so the session binds to a
+	// URI that differs from the catalog row, keeping the replan on the
+	// fall-through rehydration path.
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			URI: path + "?result=pinned", Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mp4",
+		}}, nil
+	})
 
 	handler.copySeekAnchor = func(_ context.Context, _ string, input string, requested float64, _ int) (float64, int, error) {
 		if strings.Contains(input, "alt-fail-451") {
@@ -7496,6 +7713,14 @@ func TestHandleReplanPlaybackV3VirtualAllAlternateTransportsFail(t *testing.T) {
 			return "", errors.New("source offline")
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	// The provider lists a result=-suffixed candidate so the session binds to a
+	// URI that differs from the catalog row, keeping the replan on the
+	// fall-through rehydration path.
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			URI: path + "?result=pinned", Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mp4",
+		}}, nil
 	})
 
 	handler.copySeekAnchor = func(_ context.Context, _ string, input string, requested float64, _ int) (float64, int, error) {
@@ -7588,6 +7813,14 @@ func TestHandleReplanPlaybackV3TerminalAllowsAlternateFirstFailsTransportSecondS
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 	handler.VirtualPlaybackResolver = VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	// The provider lists a result=-suffixed candidate so the session binds to a
+	// URI that differs from the catalog row, keeping the replan on the
+	// fall-through rehydration path.
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			URI: path + "?result=pinned", Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mp4",
+		}}, nil
 	})
 
 	var alt1Tried, alt2Tried bool
@@ -7723,6 +7956,14 @@ func TestHandleReplanPlaybackV3RollsBackAllocatedTransportOnSubtitleArtifactFail
 			return "", errors.New("source offline")
 		}
 		return "http://127.0.0.1:8080/stream?path=" + path, nil
+	})
+	// The provider lists a result=-suffixed candidate so the session binds to a
+	// URI that differs from the catalog row, keeping the replan on the
+	// fall-through rehydration path.
+	handler.VirtualPlaybackStreamLister = VirtualPlaybackStreamListerFunc(func(_ context.Context, path string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
+		return []VirtualPlaybackStream{{
+			URI: path + "?result=pinned", Resolution: source.Resolution, CodecVideo: source.CodecVideo, CodecAudio: source.CodecAudio, Container: "mp4",
+		}}, nil
 	})
 
 	var alt1Prepared, alt2Prepared bool

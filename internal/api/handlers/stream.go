@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -82,6 +83,10 @@ type StreamHandler struct {
 	// AllowInsecureVirtual reports whether the owning plugin installation has
 	// explicitly enabled allow_insecure_http for private/local stream hosts.
 	AllowInsecureVirtual func(installationID int) bool
+	// VirtualCandidateFailMarker stamps a virtual candidate row as known-bad
+	// after a transport produced no bytes, so the auto-pick skips it on the
+	// next play while the dropdown still shows it for a manual retry.
+	VirtualCandidateFailMarker func(ctx context.Context, fileID int) error
 }
 
 // ffmpegPath returns the currently configured ffmpeg binary path.
@@ -105,12 +110,13 @@ func bindSessionVirtualSource(file *models.MediaFile, session *playback.Session)
 }
 
 // bindSessionVirtualSourceWithTracks binds the session's virtual source and,
-// if the target file lacks embedded subtitle tracks or fonts (e.g. because the
-// catalog placeholder row was requested), inherits the probed tracks and font
+// if the target file lacks usable embedded subtitle tracks or fonts (e.g. the
+// catalog placeholder row was requested, or it only carries provider-declared
+// language placeholders with no codec), inherits the probed tracks and font
 // attachments from the session's active candidate file.
 func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaFile, session *playback.Session, resolver FilePathResolver) *models.MediaFile {
 	bound := bindSessionVirtualSource(file, session)
-	if bound == nil || !isVirtualPlaybackFile(bound) || resolver == nil || len(bound.SubtitleTracks) > 0 {
+	if bound == nil || !isVirtualPlaybackFile(bound) || resolver == nil || hasUsableSubtitleTracks(bound) {
 		return bound
 	}
 
@@ -118,14 +124,14 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 	if session.MediaFileID > 0 && session.MediaFileID != file.ID {
 		candidate, _ = resolver.GetByID(ctx, session.MediaFileID)
 	}
-	if (candidate == nil || len(candidate.SubtitleTracks) == 0) && session.VirtualSourceURI != "" {
+	if (candidate == nil || !hasUsableSubtitleTracks(candidate)) && session.VirtualSourceURI != "" {
 		if pathResolver, ok := resolver.(interface {
 			GetByPath(context.Context, string) (*models.MediaFile, error)
 		}); ok {
 			candidate, _ = pathResolver.GetByPath(ctx, session.VirtualSourceURI)
 		}
 	}
-	if candidate != nil && len(candidate.SubtitleTracks) > 0 {
+	if candidate != nil && hasUsableSubtitleTracks(candidate) {
 		boundCopy := *bound
 		boundCopy.SubtitleTracks = candidate.SubtitleTracks
 		if len(boundCopy.ExternalSubtitles) == 0 {
@@ -135,6 +141,23 @@ func bindSessionVirtualSourceWithTracks(ctx context.Context, file *models.MediaF
 	}
 
 	return bound
+}
+
+// hasUsableSubtitleTracks reports whether a file carries embedded subtitle
+// tracks with real codec evidence. Provider-declared language placeholders
+// (Index 0, no Codec, no ContainerTrackID) are not usable for extraction:
+// the stream handler would pick the wrong output format and ffmpeg would
+// fail against the real provider stream.
+func hasUsableSubtitleTracks(file *models.MediaFile) bool {
+	if file == nil {
+		return false
+	}
+	for _, track := range file.SubtitleTracks {
+		if strings.TrimSpace(track.Codec) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func hasVirtualMediaResolver(h *StreamHandler) bool {
@@ -148,11 +171,26 @@ func (h *StreamHandler) resolveVirtualInputURI(
 	profileID string,
 	forceRefresh bool,
 ) (ResolvedVirtualMedia, func(), error) {
+	return h.resolveVirtualInputURIExcluding(ctx, file, userID, profileID, forceRefresh, nil)
+}
+
+// resolveVirtualInputURIExcluding resolves a virtual input, optionally
+// excluding a failed candidate so the next-ranked release is tried. The
+// excluded candidate ID is threaded into the detailed resolver, which re-lists
+// and skips it (see plugins.ResolveVirtualPlaybackDetailedWithRouting).
+func (h *StreamHandler) resolveVirtualInputURIExcluding(
+	ctx context.Context,
+	file *models.MediaFile,
+	userID int,
+	profileID string,
+	forceRefresh bool,
+	excludedCandidateIDs []string,
+) (ResolvedVirtualMedia, func(), error) {
 	resolved := ResolvedVirtualMedia{URI: file.FilePath}
 	var err error
 	if h.VirtualMediaDetailedResolver != nil {
 		resolved, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-			ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, forceRefresh, nil, "",
+			ctx, file.FilePath, file.VirtualOwnerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, "",
 		)
 	} else if forceRefresh && h.VirtualMediaRefreshResolver != nil {
 		resolved.URL, err = h.VirtualMediaRefreshResolver.RefreshVirtualMedia(
@@ -355,7 +393,18 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 						releaseInput()
 						releaseInput = nil
 					}
-					refreshedMedia, refreshCleanup, refreshErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, true)
+					// The pinned candidate served no bytes (corrupted NZB, dead
+					// provider URL). Mark it failed and re-resolve with it
+					// excluded so the next-ranked release is tried.
+					failedID := virtualResultCandidateID(file.FilePath)
+					if failedID != "" {
+						h.markVirtualCandidateFailed(r.Context(), file, failedID)
+					}
+					excluded := []string{failedID}
+					if failedID == "" {
+						excluded = nil
+					}
+					refreshedMedia, refreshCleanup, refreshErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded)
 					if refreshErr == nil {
 						expectedCandidateID := ""
 						if parsed, err := url.Parse(file.FilePath); err == nil {
@@ -409,7 +458,11 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		// audio/mp4 for it, and a declared-tier client refuses to attach a
 		// source buffer whose advertised type its probe rejected — so the
 		// response has to keep the same promise the plan made.
-		if err := playback.ServeRemuxWithOptions(w, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, file.PrimaryDVProfile(), playback.RemuxServeOptions{
+		dvProfile := session.DVProfile
+		if dvProfile == 0 {
+			dvProfile = file.PrimaryDVProfile()
+		}
+		remuxErr := playback.ServeRemuxWithOptions(w, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, dvProfile, playback.RemuxServeOptions{
 			DVMode:                 session.RemuxDVMode,
 			FFmpegPath:             h.ffmpegPath(),
 			ContentType:            playback.RemuxContentType(file.IsAudioOnly()),
@@ -417,8 +470,48 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			SourceAudioChannels:    session.SourceAudioChannels,
 			TargetAudioChannels:    session.TargetAudioChannels,
 			TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
-		}); err != nil {
-			h.handleTransportStartFailure(r.Context(), session, file, err)
+		})
+		if remuxErr != nil {
+			// The remux only commits 200 after FFmpeg produces media bytes, so
+			// a failure here means the provider release served no output
+			// (corrupted NZB, dead URL). Mark the candidate failed and retry
+			// once with it excluded so the next-ranked release is tried.
+			if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
+				failedID := virtualResultCandidateID(file.FilePath)
+				if failedID != "" {
+					h.markVirtualCandidateFailed(r.Context(), file, failedID)
+				}
+				if releaseInput != nil {
+					releaseInput()
+					releaseInput = nil
+				}
+				excluded := []string{failedID}
+				if failedID == "" {
+					excluded = nil
+				}
+				retried, retryCleanup, retryErr := h.resolveVirtualInputURIExcluding(r.Context(), file, session.UserID, session.ProfileID, true, excluded)
+				if retryErr == nil {
+					releaseInput = retryCleanup
+					retryURL, parseErr := url.Parse(retried.URL)
+					if parseErr == nil && retryURL.Scheme == "http" {
+						retryHost := retryURL.Hostname()
+						if retryHost == "127.0.0.1" || retryHost == "::1" || retryHost == "[::1]" {
+							remuxErr = playback.ServeRemuxWithOptions(w, r, retried.URL, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, dvProfile, playback.RemuxServeOptions{
+								DVMode:                 session.RemuxDVMode,
+								FFmpegPath:             h.ffmpegPath(),
+								ContentType:            playback.RemuxContentType(file.IsAudioOnly()),
+								AudioOnly:              file.IsAudioOnly(),
+								SourceAudioChannels:    session.SourceAudioChannels,
+								TargetAudioChannels:    session.TargetAudioChannels,
+								TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
+							})
+						}
+					}
+				}
+			}
+			if remuxErr != nil {
+				h.handleTransportStartFailure(r.Context(), session, file, remuxErr)
+			}
 		}
 
 	case playback.PlayTranscode:
@@ -883,6 +976,24 @@ func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session
 		"error", err,
 		"playback_session_id", session.ID,
 	)
+}
+
+// markVirtualCandidateFailed stamps the catalog row for a virtual candidate
+// as known-bad after a transport produced no bytes, so the auto-pick skips it
+// on the next play while the dropdown still shows it (clickable) for a manual
+// retry. Best-effort: a persistence failure must not turn a 502 into a 500.
+func (h *StreamHandler) markVirtualCandidateFailed(ctx context.Context, file *models.MediaFile, candidateID string) {
+	if h == nil || file == nil || candidateID == "" {
+		return
+	}
+	if h.VirtualCandidateFailMarker == nil {
+		return
+	}
+	markCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := h.VirtualCandidateFailMarker(markCtx, file.ID); err != nil {
+		slog.WarnContext(ctx, "mark virtual candidate failed", "component", "api", "file_id", file.ID, "candidate", candidateID, "error", err)
+	}
 }
 
 // streamEmbeddedSubtitle runs a dedicated ffmpeg for a single embedded

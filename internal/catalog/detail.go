@@ -450,6 +450,7 @@ type FileVersion struct {
 	MultiEpisodeEnd          int                    `json:"multi_episode_end,omitempty"`
 	EffectiveAudioTrackIndex *int                   `json:"effective_audio_track_index,omitempty"`
 	EffectiveAudioLanguage   string                 `json:"effective_audio_language,omitempty"`
+	Failed                   bool                   `json:"failed,omitempty"`
 	VideoTracks              []models.VideoTrack    `json:"video_tracks,omitempty"`
 	AudioTracks              []models.AudioTrack    `json:"audio_tracks,omitempty"`
 	SubtitleTracks           []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
@@ -3600,6 +3601,7 @@ func (s *DetailService) buildPlaybackInfo(
 			MultiEpisodeEnd:          f.MultiEpisodeEnd,
 			EffectiveAudioTrackIndex: intPtr(effectiveAudioSelection.Index),
 			EffectiveAudioLanguage:   effectiveAudioSelection.Language,
+			Failed:                   f.FailedAt != nil,
 			VideoTracks:              append([]models.VideoTrack(nil), f.VideoTracks...),
 			AudioTracks:              append([]models.AudioTrack(nil), f.AudioTracks...),
 			SubtitleTracks:           buildVersionSubtitleTracks(f),

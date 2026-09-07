@@ -20,6 +20,7 @@ import (
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/plugins"
 	"golang.org/x/text/language"
 )
@@ -324,7 +325,14 @@ type resolvedVirtualPlaybackSource struct {
 // the resolved source is then probed in the background so the next play has
 // complete evidence. Restart/track-change paths pass false because they need
 // probed track inventory to remap selections.
-func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *models.MediaFile, profileID string, deferProbe bool) (resolvedVirtualPlaybackSource, error) {
+//
+// excludedCandidateIDs and preferredCandidateID are threaded into the detailed
+// resolver so a replan can exclude the failed candidate and prefer the
+// session-bound release instead of letting re-ranking drift to a different
+// provider candidate. qualityPreference (already normalized) and
+// bandwidthCapKbps steer the post-device-ranking reorder toward native
+// lower-resolution candidates when the client asked for a fixed rung.
+func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *models.MediaFile, profileID string, deferProbe bool, excludedCandidateIDs []string, preferredCandidateID string, qualityPreference string, bandwidthCapKbps int) (resolvedVirtualPlaybackSource, error) {
 	if !isVirtualPlaybackFile(file) {
 		return resolvedVirtualPlaybackSource{File: file}, nil
 	}
@@ -358,6 +366,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			// for this device so a TV and a phone pick their own best stream
 			// without another provider round-trip.
 			candidates, _ = h.rankVirtualCandidatesForDevice(r, cached)
+			candidates = reorderVirtualCandidatesForQuality(candidates, qualityPreference, bandwidthCapKbps)
 			noResult = false // treated as if file already had a result=
 		}
 	}
@@ -394,6 +403,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			if noResult {
 				if len(filtered) > 0 {
 					candidates, _ = h.rankVirtualCandidatesForDevice(r, filtered)
+					candidates = reorderVirtualCandidatesForQuality(candidates, qualityPreference, bandwidthCapKbps)
 				}
 			} else {
 				// Explicit candidate selected. Find it in streams to enrich its metadata,
@@ -410,6 +420,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 				if len(filtered) > 0 {
 					rankedAlternatives, _ := h.rankVirtualCandidatesForDevice(r, filtered)
+					rankedAlternatives = reorderVirtualCandidatesForQuality(rankedAlternatives, qualityPreference, bandwidthCapKbps)
 					candidates = append([]VirtualPlaybackStream{candidates[0]}, rankedAlternatives...)
 				}
 			}
@@ -435,7 +446,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		var resolveErr error
 		if h.VirtualMediaDetailedResolver != nil {
 			res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
-				attemptCtx, cand.URI, oid, userID, profileID, false, nil, "",
+				attemptCtx, cand.URI, oid, userID, profileID, false, excludedCandidateIDs, preferredCandidateID,
 			)
 			if err == nil {
 				streamURL = res.URL
@@ -476,6 +487,12 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 			dbFile, _ = h.VirtualCandidateFileLookup(attemptCtx, virtualPlaybackNeutralKey(cand.URI), file.ContentID, file.EpisodeID, oid)
 		}
 		if dbFile != nil && dbFile.ID > 0 {
+			// Auto-pick skips candidates whose catalog row is marked failed
+			// (a transport produced no bytes on a prior attempt). An explicit
+			// result= selection still allows a manual retry.
+			if noResult && dbFile.FailedAt != nil {
+				return nil, fmt.Errorf("candidate %s is marked failed", cand.URI)
+			}
 			transient = *dbFile
 			transient.FilePath = cand.URI
 			transient.VirtualOwnerInstallationID = oid
@@ -554,7 +571,16 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					}
 				}
 				go func() {
-					bgCtx, bgCancel := context.WithTimeout(context.WithoutCancel(r.Context()), virtualProbeBudget)
+					// The start path may outlive the request (the client can
+					// disconnect while the probe completes), so it keeps a
+					// WithoutCancel context. The replan path must not: a
+					// timed-out replan cancels the probe so it cannot persist
+					// metadata for a candidate the replan never committed.
+					probeParent := r.Context()
+					if deferProbe {
+						probeParent = context.WithoutCancel(r.Context())
+					}
+					bgCtx, bgCancel := context.WithTimeout(probeParent, virtualProbeBudget)
 					defer bgCancel()
 					probed, probeErr := h.probeVirtualSource(bgCtx, probeURL, &probeTransient, probeCand.RequestHeaders)
 					if probeErr != nil || probed == nil {
@@ -789,6 +815,14 @@ func (h *PlaybackHandler) fallbackResolveStaleVirtualSource(
 					slog.ErrorContext(ctx, "virtual stale fallback: persist update failed", "component", "api", "file_id", file.ID, "new_path", stream.URI, "error", updateErr)
 				}
 			}
+			// The substitute is a different provider stream than the stale pin
+			// described. Its probed track inventory must replace the row's
+			// metadata, or the picker keeps advertising the dead candidate's
+			// tracks (wrong audio languages, phantom subtitle tracks) while the
+			// stream serves the substitute's real ones.
+			if resolved.File != nil && resolved.Provenance == ProbeProvenanceVerified {
+				h.persistVirtualMetadataBounded(ctx, file.ID, stream.URI, resolved.File)
+			}
 			return resolved
 		}
 		slog.ErrorContext(ctx, "virtual stale fallback: candidate failed", "component", "api", "candidate", stream.URI, "error", err)
@@ -977,6 +1011,16 @@ func virtualPlaybackNeutralKey(virtualPath string) string {
 	q.Del("result")
 	parsed.RawQuery = q.Encode()
 	return parsed.String()
+}
+
+// virtualResultCandidateID returns the concrete "result=" candidate ID bound
+// to a virtual URI, or "" when the URI carries no explicit pick.
+func virtualResultCandidateID(virtualPath string) string {
+	parsed, err := url.Parse(virtualPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parsed.Query().Get("result"))
 }
 
 // maybeTriggerSubtitleSearch kicks off a background subtitle search when a
@@ -1413,8 +1457,10 @@ func inferChannelsFromCodec(codec string) int {
 
 // resolutionWidth returns a typical width for a resolution label.
 func resolutionWidth(label string) int {
-	switch strings.ToLower(label) {
-	case "2160p":
+	switch strings.ToLower(strings.TrimSpace(label)) {
+	case "4320p", "8k":
+		return 7680
+	case "2160p", "4k", "uhd":
 		return 3840
 	case "1080p":
 		return 1920
@@ -1429,8 +1475,10 @@ func resolutionWidth(label string) int {
 
 // resolutionHeight returns a typical height for a resolution label.
 func resolutionHeight(label string) int {
-	switch strings.ToLower(label) {
-	case "2160p":
+	switch strings.ToLower(strings.TrimSpace(label)) {
+	case "4320p", "8k":
+		return 4320
+	case "2160p", "4k", "uhd":
 		return 2160
 	case "1080p":
 		return 1080
@@ -1441,6 +1489,89 @@ func resolutionHeight(label string) int {
 	default:
 		return 0
 	}
+}
+
+// qualityRungHeightV3 maps a normalized quality preference to its resolution
+// class height. Only explicit fixed rungs return a height; "auto" and
+// "original" return 0 so the caller keeps the device ranking unchanged.
+// Compound ladder rungs ("1080p-high") carry their resolution class in the
+// label prefix.
+func qualityRungHeightV3(qualityPreference string) int {
+	normalized, _ := playback.NormalizeQualityV3(qualityPreference)
+	class := normalized
+	if idx := strings.IndexByte(class, '-'); idx > 0 {
+		class = class[:idx]
+	}
+	switch class {
+	case "2160p":
+		return 2160
+	case "1080p":
+		return 1080
+	case "720p":
+		return 720
+	case "480p":
+		return 480
+	case "420p":
+		return 420
+	case "328p":
+		return 328
+	default:
+		return 0
+	}
+}
+
+// virtualCapRungHeightV3 derives a resolution-class height from a bandwidth
+// cap, mirroring the planner's ladderHeightForBandwidthV3 thresholds so a
+// client's delivery ceiling is honored when picking a native provider stream.
+// The planner applies a 0.8 safety factor to the cap before selecting a rung
+// (ladderHeightForBandwidthV3(int(float64(capKbps) * 0.8))), so the same
+// factor is applied here to keep the virtual candidate pick consistent with
+// the transcode ladder.
+func virtualCapRungHeightV3(bandwidthCapKbps int) int {
+	effective := int(float64(bandwidthCapKbps) * 0.8)
+	switch {
+	case effective >= 20_000:
+		return 2160
+	case effective >= 8_000:
+		return 1080
+	case effective >= 4_000:
+		return 720
+	default:
+		return 480
+	}
+}
+
+// reorderVirtualCandidatesForQuality prefers candidates whose resolution class
+// is at or below the requested fixed rung (further constrained by the
+// bandwidth cap), keeping the device ranking stable within each group. When no
+// candidate matches the rung (a provider that only offers higher
+// resolutions), the device ranking is returned unchanged. The reorder is a
+// preference, never a hard filter: a client that asked for 720p still gets the
+// best device-ranked stream when no native 720p-or-below candidate exists.
+func reorderVirtualCandidatesForQuality(candidates []VirtualPlaybackStream, qualityPreference string, bandwidthCapKbps int) []VirtualPlaybackStream {
+	rungHeight := qualityRungHeightV3(qualityPreference)
+	if rungHeight <= 0 || len(candidates) <= 1 {
+		return candidates
+	}
+	if bandwidthCapKbps > 0 {
+		if capHeight := virtualCapRungHeightV3(bandwidthCapKbps); capHeight < rungHeight {
+			rungHeight = capHeight
+		}
+	}
+	preferred := make([]VirtualPlaybackStream, 0, len(candidates))
+	rest := make([]VirtualPlaybackStream, 0, len(candidates))
+	for _, cand := range candidates {
+		height := resolutionHeight(cand.Resolution)
+		if height > 0 && height <= rungHeight {
+			preferred = append(preferred, cand)
+		} else {
+			rest = append(rest, cand)
+		}
+	}
+	if len(preferred) == 0 {
+		return candidates
+	}
+	return append(preferred, rest...)
 }
 
 // canSkipProbeForContainer returns true for container formats that ffmpeg

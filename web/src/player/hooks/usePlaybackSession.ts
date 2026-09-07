@@ -64,6 +64,18 @@ interface PlaybackSessionState {
   loading: boolean;
   replacing: boolean;
   replanning: boolean;
+  /**
+   * True only while the in-flight replan is a quality/output change. The
+   * quality menu's "…" label keys on this rather than on `replanning`, which
+   * is also set for track changes, seek reanchors and failure recovery.
+   */
+  replanningQuality: boolean;
+  /**
+   * The file the viewer most recently asked to switch to, while the switch is
+   * still in flight. Lets the version menu light the clicked entry as
+   * "Requested" optimistically, before the replacement plan lands.
+   */
+  pendingSwitchFileId: number | null;
   errorTitle: string | null;
   error: string | null;
   initialSubtitleErrorTitle: string | null;
@@ -220,6 +232,8 @@ function planToSessionState(
     loading: false,
     replacing: false,
     replanning: false,
+    replanningQuality: false,
+    pendingSwitchFileId: null,
     errorTitle: null,
     error: null,
     initialSubtitleErrorTitle: null,
@@ -317,6 +331,8 @@ export function usePlaybackSession(
     loading: true,
     replacing: false,
     replanning: false,
+    replanningQuality: false,
+    pendingSwitchFileId: null,
     errorTitle: null,
     error: null,
     initialSubtitleErrorTitle: null,
@@ -341,6 +357,10 @@ export function usePlaybackSession(
   const playbackPlayingRef = useRef(true);
   const playbackStartedRef = useRef(false);
   const switchingRef = useRef(false);
+  // Latest-wins coalescing for version switches: while a switch is in flight,
+  // a second click records the newest target here instead of being dropped, and
+  // the completion handler starts the switch to it immediately.
+  const pendingSwitchFileIdRef = useRef<number | null>(null);
   const loadSequenceRef = useRef(0);
 
   // v3 identity. `playback_attempt_id` spans one whole attempt chain (a start
@@ -479,6 +499,8 @@ export function usePlaybackSession(
           loading: false,
           replacing: false,
           replanning: false,
+          replanningQuality: false,
+          pendingSwitchFileId: null,
           errorTitle: failure.title,
           error: failure.message,
         }));
@@ -599,6 +621,8 @@ export function usePlaybackSession(
           loading: false,
           replacing: false,
           replanning: false,
+          replanningQuality: false,
+          pendingSwitchFileId: null,
         };
       });
     },
@@ -661,6 +685,8 @@ export function usePlaybackSession(
         ...current,
         loading: !hasExistingSession,
         replacing: hasExistingSession,
+        replanning: false,
+        replanningQuality: false,
         errorTitle: hasExistingSession ? current.errorTitle : null,
         error: hasExistingSession ? current.error : null,
         initialSubtitleErrorTitle: hasExistingSession ? current.initialSubtitleErrorTitle : null,
@@ -696,6 +722,8 @@ export function usePlaybackSession(
           loading: false,
           replacing: false,
           replanning: false,
+          replanningQuality: false,
+          pendingSwitchFileId: null,
           errorTitle: nextError?.title ?? current.errorTitle,
           error: nextError?.message ?? current.error,
         }));
@@ -776,6 +804,9 @@ export function usePlaybackSession(
             ...current,
             loading: false,
             replacing: false,
+            replanning: false,
+            replanningQuality: false,
+            pendingSwitchFileId: null,
             errorTitle: previousState.errorTitle,
             error: previousState.error,
           }));
@@ -802,6 +833,9 @@ export function usePlaybackSession(
             ...current,
             loading: false,
             replacing: false,
+            replanning: false,
+            replanningQuality: false,
+            pendingSwitchFileId: null,
           }));
           return;
         }
@@ -962,6 +996,7 @@ export function usePlaybackSession(
         setState((current) => ({
           ...current,
           replanning: false,
+          replanningQuality: false,
           errorTitle: "Playback failed",
           error: "Playback failed after repeated recovery attempts.",
         }));
@@ -998,9 +1033,12 @@ export function usePlaybackSession(
       const loadSequence = loadSequenceRef.current;
       replanInFlightRef.current = true;
       beginAdoption(loadSequence);
+      const isQualityReplan =
+        options.operation === "quality_change" || options.operation === "output_change";
       setState((current) => ({
         ...current,
         replanning: true,
+        replanningQuality: isQualityReplan,
         errorTitle: null,
         error: null,
       }));
@@ -1062,13 +1100,18 @@ export function usePlaybackSession(
         setState((current) => ({
           ...current,
           replanning: false,
+          replanningQuality: false,
           errorTitle: nextError.title,
           error: nextError.message,
         }));
         return false;
       } finally {
         replanInFlightRef.current = false;
-        setState((current) => (current.replanning ? { ...current, replanning: false } : current));
+        setState((current) =>
+          current.replanning || current.replanningQuality
+            ? { ...current, replanning: false, replanningQuality: false }
+            : current,
+        );
 
         const pendingReplan = pendingReplanRef.current;
         pendingReplanRef.current = null;
@@ -1328,9 +1371,17 @@ export function usePlaybackSession(
 
   const switchVersion = useCallback(
     (newFileId: number, currentPosition: number) => {
-      if (switchingRef.current) return;
       if (newFileId === stateRef.current.mediaFileId) return;
+      if (switchingRef.current) {
+        // A switch is already in flight. Remember the newest target; the
+        // completion handler starts the switch to it once the current one
+        // settles (latest-wins, mirroring the replan queue pattern).
+        pendingSwitchFileIdRef.current = newFileId;
+        setState((current) => ({ ...current, pendingSwitchFileId: newFileId }));
+        return;
+      }
       switchingRef.current = true;
+      setState((current) => ({ ...current, pendingSwitchFileId: newFileId }));
 
       (async () => {
         try {
@@ -1347,6 +1398,11 @@ export function usePlaybackSession(
           });
         } finally {
           switchingRef.current = false;
+          const latest = pendingSwitchFileIdRef.current;
+          pendingSwitchFileIdRef.current = null;
+          if (latest !== null && latest !== stateRef.current.mediaFileId) {
+            switchVersion(latest, currentPosition);
+          }
         }
       })();
     },

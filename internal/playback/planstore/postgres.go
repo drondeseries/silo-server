@@ -103,6 +103,22 @@ func (s *Postgres) SaveAttempt(ctx context.Context, record playback.AttemptRecor
 		record.PlaybackAttemptID, record.SessionID); err != nil {
 		return err
 	}
+	// A virtual candidate rotation can delete the requested media file row
+	// between the client's request and the attempt persist while the effective
+	// file survives. The FK on requested_media_file_id would reject the insert
+	// and turn a recoverable rotation into a hard 500. When the requested row
+	// is gone but the effective row exists, record the effective file as the
+	// requested identity so the attempt stays durable and replayable.
+	requestedID, err := resolveAttemptRequestedFileID(record.RequestedMediaFileID, record.EffectiveMediaFileID, func(id int) (bool, error) {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM media_files WHERE id = $1)`, id).Scan(&exists); err != nil {
+			return false, err
+		}
+		return exists, nil
+	})
+	if err != nil {
+		return err
+	}
 	result, err := tx.Exec(ctx, `
 		INSERT INTO playback_v3_attempts (
 			playback_attempt_id, session_id, user_id, profile_id,
@@ -112,7 +128,7 @@ func (s *Postgres) SaveAttempt(ctx context.Context, record playback.AttemptRecor
 		) VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT DO NOTHING`,
 		record.PlaybackAttemptID, record.SessionID, record.UserID, record.ProfileID,
-		record.RequestedMediaFileID, record.EffectiveMediaFileID,
+		requestedID, record.EffectiveMediaFileID,
 		record.CurrentPlanID, record.CurrentReplanRequestID, planJSON, recipeJSON,
 		requestJSON, responseJSON, record.RequestDigest, record.ExpiresAt)
 	if err != nil {
@@ -131,6 +147,35 @@ func (s *Postgres) SaveAttempt(ctx context.Context, record playback.AttemptRecor
 		return playback.ErrPlaybackAttemptExistsV3
 	}
 	return tx.Commit(ctx)
+}
+
+// resolveAttemptRequestedFileID returns the requested media file ID to persist
+// for an attempt. A virtual candidate rotation can delete the requested file
+// row between the client's request and the attempt persist while the effective
+// file survives; the FK on requested_media_file_id would reject the insert and
+// turn a recoverable rotation into a hard 500. When the requested row is gone
+// but the effective row exists, the effective file becomes the requested
+// identity so the attempt stays durable and replayable.
+func resolveAttemptRequestedFileID(requestedID, effectiveID int, exists func(int) (bool, error)) (int, error) {
+	if requestedID > 0 {
+		ok, err := exists(requestedID)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return requestedID, nil
+		}
+	}
+	if effectiveID > 0 && effectiveID != requestedID {
+		ok, err := exists(effectiveID)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return effectiveID, nil
+		}
+	}
+	return requestedID, nil
 }
 
 func (s *Postgres) GetAttempt(ctx context.Context, sessionID string) (*playback.AttemptRecordV3, error) {

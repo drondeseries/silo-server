@@ -981,12 +981,18 @@ func NormalizeQualityV3(value string) (string, bool) {
 		return QualityOriginalV3, false
 	case "2160p", "4k", "uhd":
 		return "2160p", false
-	case "1080p", "fhd":
+	case "1080p", "fhd", "1080p-8":
+		// 1080p-8 is a legacy 1080p variant (8-bit encode); it is not a
+		// distinct ladder rung, so it normalizes to the plain 1080p rung.
 		return "1080p", false
 	case "720p", "hd":
 		return "720p", false
 	case "480p", "sd":
 		return "480p", false
+	case "420p":
+		return "420p", false
+	case "328p":
+		return "328p", false
 	default:
 		if rung, ok := ladderRungForLabelV3(value); ok {
 			return rung.Label, false

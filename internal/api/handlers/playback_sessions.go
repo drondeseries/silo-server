@@ -252,6 +252,7 @@ func (l *PlaybackSessionsLoader) Load(
 			COALESCE(s.target_resolution, ''),
 			COALESCE(s.target_video_codec, ''),
 			COALESCE(s.target_audio_codec, ''),
+			s.target_audio_channels,
 			s.target_bitrate_kbps,
 			COALESCE(s.transcode_hw_accel, ''),
 			COALESCE(s.tone_map_mode, ''),

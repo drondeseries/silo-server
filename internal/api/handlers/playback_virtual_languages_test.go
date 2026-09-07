@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,52 @@ func TestVisibleVirtualPlaybackStreamsHidesAlternatesOnlyWhenMarked(t *testing.T
 	legacy := visibleVirtualPlaybackStreams([]VirtualPlaybackStream{{URI: "one"}, {URI: "two"}})
 	if len(legacy) != 2 {
 		t.Fatalf("unmarked streams = %#v, want both candidates", legacy)
+	}
+}
+
+func TestReorderVirtualCandidatesForQualityPrefersAtOrBelowRung(t *testing.T) {
+	candidates := []VirtualPlaybackStream{
+		{URI: "virtual://movie/1?result=4k", Resolution: "2160p"},
+		{URI: "virtual://movie/1?result=1080p", Resolution: "1080p"},
+		{URI: "virtual://movie/1?result=720p", Resolution: "720p"},
+		{URI: "virtual://movie/1?result=480p", Resolution: "480p"},
+	}
+	// 720p preference: 720p and 480p move ahead of 4K/1080p, keeping device
+	// order within each group.
+	reordered := reorderVirtualCandidatesForQuality(candidates, "720p", 0)
+	want := []string{"720p", "480p", "4k", "1080p"}
+	got := make([]string, 0, len(reordered))
+	for _, cand := range reordered {
+		got = append(got, virtualResultCandidateID(cand.URI))
+	}
+	if len(got) != len(want) {
+		t.Fatalf("reordered = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("reordered = %v, want %v", got, want)
+		}
+	}
+
+	// auto/original keep the device ranking unchanged.
+	if out := reorderVirtualCandidatesForQuality(candidates, "auto", 0); len(out) != len(candidates) || out[0].URI != candidates[0].URI {
+		t.Fatalf("auto reorder changed the ranking: %#v", out)
+	}
+	if out := reorderVirtualCandidatesForQuality(candidates, "original", 0); len(out) != len(candidates) || out[0].URI != candidates[0].URI {
+		t.Fatalf("original reorder changed the ranking: %#v", out)
+	}
+
+	// No candidate at or below the rung keeps the device ranking.
+	only4K := []VirtualPlaybackStream{{URI: "virtual://movie/1?result=4k", Resolution: "2160p"}}
+	if out := reorderVirtualCandidatesForQuality(only4K, "720p", 0); len(out) != 1 || out[0].URI != only4K[0].URI {
+		t.Fatalf("no-match reorder changed the ranking: %#v", out)
+	}
+
+	// A bandwidth cap tightens the rung: 8Mbps cap on a 1080p preference
+	// prefers 720p-or-below candidates.
+	capped := reorderVirtualCandidatesForQuality(candidates, "1080p", 8_000)
+	if capped[0].URI != "virtual://movie/1?result=720p" {
+		t.Fatalf("capped reorder = %v, want 720p first", capped)
 	}
 }
 
@@ -303,7 +350,7 @@ func TestVirtualCandidateLookupUsesStableEpisodeIdentity(t *testing.T) {
 		FilePath:  "virtual://series/tt11198330/3/2",
 	}
 
-	resolved, err := h.resolveVirtualPlaybackSource(req, episodeFile, "profile-1", false)
+	resolved, err := h.resolveVirtualPlaybackSource(req, episodeFile, "profile-1", false, nil, "", "", 0)
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource failed: %v", err)
 	}
@@ -384,7 +431,7 @@ func TestResolveVirtualPlaybackSourceKeepsUnprobedPinnedFallbackWhenOthersFail(t
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", nil)
 	file := &models.MediaFile{ID: 10, ContentID: "movie-1", FilePath: "virtual://movie/1"}
 
-	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false)
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "", 0)
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource returned error %v, want fallback to resolved pinned candidate", err)
 	}
@@ -435,7 +482,7 @@ func TestResolveVirtualPlaybackSourceExplicitResultPreservesSelectedVersion(t *t
 		FilePath:  "virtual://movie/1?result=stream-1080p",
 	}
 
-	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false)
+	resolved, err := h.resolveVirtualPlaybackSource(req, file, "profile-1", false, nil, "", "", 0)
 	if err != nil {
 		t.Fatalf("resolveVirtualPlaybackSource error: %v", err)
 	}
@@ -479,6 +526,81 @@ func TestFallbackResolveStaleVirtualSourceRespectsMaxFailoverLimit(t *testing.T)
 	}
 	if resolveAttempts != 3 {
 		t.Fatalf("resolve attempts = %d, want exactly max attempts (3)", resolveAttempts)
+	}
+}
+
+// A stale result= pin that falls back to a substitute must persist the
+// substitute's probed track inventory onto the media file row. Without it the
+// row keeps advertising the dead candidate's tracks — wrong audio languages
+// and phantom subtitle tracks — while the stream serves the substitute's
+// real ones, so track switches appear to do nothing.
+func TestFallbackResolveStaleVirtualSourcePersistsSubstituteMetadata(t *testing.T) {
+	substitute := VirtualPlaybackStream{
+		URI:        "virtual://movie/1?result=substitute",
+		Resolution: "1080p",
+	}
+	updatedPath := ""
+	var savedFileID int
+	var savedPath string
+	var savedAudio []byte
+	var savedSubs []byte
+	saved := make(chan struct{}, 1)
+
+	h := &PlaybackHandler{
+		PlaybackConfig: func() config.PlaybackConfig {
+			return config.PlaybackConfig{MaxVirtualFailoverAttempts: 3}
+		},
+		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) ([]VirtualPlaybackStream, error) {
+			return []VirtualPlaybackStream{substitute}, nil
+		}),
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(ctx context.Context, path string, userID int, profileID string, ownerInstallationID int) (string, error) {
+			return "http://localhost:8080/substitute.mp4", nil
+		}),
+		VirtualPlaybackSourceProber: func(ctx context.Context, streamURL string, transient *models.MediaFile) (*models.MediaFile, error) {
+			transient.AudioTracks = []models.AudioTrack{{Language: "eng", Codec: "eac3", Channels: 6}}
+			transient.SubtitleTracks = []models.SubtitleTrack{{Language: "eng", Codec: "subrip"}}
+			return transient, nil
+		},
+		VirtualFileUpdater: func(ctx context.Context, fileID int, newFilePath string) error {
+			updatedPath = newFilePath
+			return nil
+		},
+		VirtualFileMetadataSaver: func(ctx context.Context, fileID int, expectedFilePath string, videoTracks, audioTracks, subtitleTracks []byte, resolution, codecVideo, codecAudio, container string, hdr bool, bitrate int, duration int) error {
+			savedFileID = fileID
+			savedPath = expectedFilePath
+			savedAudio = append([]byte(nil), audioTracks...)
+			savedSubs = append([]byte(nil), subtitleTracks...)
+			saved <- struct{}{}
+			return nil
+		},
+	}
+
+	file := &models.MediaFile{ID: 10, ContentID: "movie-1", FilePath: "virtual://movie/1?result=dead"}
+	result := h.fallbackResolveStaleVirtualSource(context.Background(), file, 1, "profile-1")
+	if result == nil {
+		t.Fatal("fallback returned nil, want resolved substitute")
+	}
+	if updatedPath != substitute.URI {
+		t.Fatalf("updated path = %q, want %q", updatedPath, substitute.URI)
+	}
+	// The metadata saver runs on a bounded background goroutine; wait for it
+	// before asserting what it captured.
+	select {
+	case <-saved:
+	case <-time.After(2 * time.Second):
+		t.Fatal("metadata saver was not called")
+	}
+	if savedFileID != file.ID {
+		t.Fatalf("metadata saved for file %d, want %d", savedFileID, file.ID)
+	}
+	if savedPath != substitute.URI {
+		t.Fatalf("metadata saved with path %q, want %q", savedPath, substitute.URI)
+	}
+	if !bytes.Contains(savedAudio, []byte("eac3")) || !bytes.Contains(savedAudio, []byte("eng")) {
+		t.Fatalf("saved audio tracks = %s, want probed eac3/eng inventory", savedAudio)
+	}
+	if !bytes.Contains(savedSubs, []byte("subrip")) {
+		t.Fatalf("saved subtitle tracks = %s, want probed subrip inventory", savedSubs)
 	}
 }
 

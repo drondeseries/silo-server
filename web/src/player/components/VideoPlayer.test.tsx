@@ -26,6 +26,7 @@ const controls = vi.hoisted(() => ({
     onSurfaceTap?: (event: React.MouseEvent<HTMLElement>) => void;
     isFullscreen?: boolean;
     onFullscreenToggle?: () => void;
+    onSubtitleSelect?: (index: number) => void;
   },
 }));
 const playerSeek = vi.hoisted(() => vi.fn());
@@ -1057,5 +1058,263 @@ describe("VideoPlayer translation handoff", () => {
     await waitFor(() =>
       expect((controls.current as unknown as { currentTime: number }).currentTime).toBe(50),
     );
+  });
+});
+
+describe("VideoPlayer version switch UX", () => {
+  beforeEach(() => {
+    realtimeOptions.current = null;
+    controls.current = null;
+    subtitleTimeline.textOffsetSeconds = null;
+    subtitleTimeline.assOffsetSeconds = null;
+    hlsJS.supported = false;
+    hlsJS.constructed.mockClear();
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  const versionA = {
+    file_id: 7,
+    resolution: "1080p",
+    codec_video: "h264",
+    codec_audio: "aac",
+    hdr: false,
+    container: "mp4",
+    file_size: 1,
+    duration: 3600,
+    bitrate: 1,
+  };
+  const versionB = {
+    file_id: 99,
+    resolution: "2160p",
+    codec_video: "hevc",
+    codec_audio: "aac",
+    hdr: true,
+    container: "mkv",
+    file_size: 1,
+    duration: 3600,
+    bitrate: 1,
+  };
+
+  it("lights the clicked version as Requested optimistically via pendingSwitchFileId", async () => {
+    const { rerenderPlayer } = renderPlayer({
+      versions: [versionA, versionB],
+      activeFileId: 7,
+    });
+
+    // Before the switch, the old plan names file 7 as requested.
+    let props = controls.current as unknown as {
+      versions?: Array<{
+        fileId: number;
+        isCurrentSource: boolean;
+        isRequestedSource: boolean;
+      }>;
+    };
+    expect(props.versions?.find((v) => v.fileId === 99)?.isRequestedSource).toBe(false);
+
+    // The switch is in flight: pendingSwitchFileId names the clicked version.
+    rerenderPlayer({ pendingSwitchFileId: 99 });
+    props = controls.current as unknown as {
+      versions?: Array<{
+        fileId: number;
+        isCurrentSource: boolean;
+        isRequestedSource: boolean;
+      }>;
+    };
+    expect(props.versions?.find((v) => v.fileId === 99)?.isRequestedSource).toBe(true);
+    expect(props.versions?.find((v) => v.fileId === 7)?.isCurrentSource).toBe(true);
+  });
+
+  it("shows the quality ellipsis only for quality replans, not track changes", async () => {
+    const { rerenderPlayer } = renderPlayer({});
+
+    // A track-change replan must not flicker the quality label.
+    rerenderPlayer({ replanning: true, replanningQuality: false });
+    expect((controls.current as unknown as { isTranscoding: boolean }).isTranscoding).toBe(false);
+
+    // A quality/output replan does.
+    rerenderPlayer({ replanning: true, replanningQuality: true });
+    expect((controls.current as unknown as { isTranscoding: boolean }).isTranscoding).toBe(true);
+  });
+
+  it("remaps a manual subtitle selection by identity across a version switch", async () => {
+    const englishTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const frenchTrack: PlayerSubtitleInfo = {
+      index: 1,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:1",
+      language: "fr",
+      codec: "srt",
+      label: "French",
+      source: "external",
+      url: "/stream/session-1/subtitles/1.vtt",
+    };
+    const { rerenderPlayer } = renderPlayer({
+      subtitleUrls: [englishTrack, frenchTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+    });
+
+    // The viewer manually picks French (index 1).
+    act(() => {
+      controls.current?.onSubtitleSelect?.(1);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(1));
+
+    // The new version's inventory reorders tracks: French is now index 0 and
+    // English index 1. The raw index would silently switch to English.
+    const nextPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:switched-version",
+      plan_attempt_key: "v3:switched-version",
+      requested_media_file_id: 99,
+      effective_media_file_id: 99,
+    });
+    const frenchInNewFile: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 99,
+      track_id: "file:99:subtitle:0",
+      language: "fr",
+      codec: "srt",
+      label: "French",
+      source: "external",
+      url: "/stream/session-99/subtitles/0.vtt",
+    };
+    const englishInNewFile: PlayerSubtitleInfo = {
+      index: 1,
+      media_file_id: 99,
+      track_id: "file:99:subtitle:1",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-99/subtitles/1.vtt",
+    };
+    rerenderPlayer({
+      plan: nextPlan,
+      planRevision: 2,
+      subtitleUrls: [frenchInNewFile, englishInNewFile],
+    });
+
+    // The manual French selection is remapped to the French track in the new
+    // inventory (index 0) rather than keeping the raw index 1 (English).
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+  });
+
+  it("falls back to the raw index when no identity match exists in the new inventory", async () => {
+    const englishTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const { rerenderPlayer } = renderPlayer({
+      subtitleUrls: [englishTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+    });
+
+    act(() => {
+      controls.current?.onSubtitleSelect?.(0);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    const nextPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:switched-version-2",
+      plan_attempt_key: "v3:switched-version-2",
+      requested_media_file_id: 99,
+      effective_media_file_id: 99,
+    });
+    // The new file has a German track at index 0 — no identity match for the
+    // English selection, so the raw index 0 is kept.
+    const germanInNewFile: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 99,
+      track_id: "file:99:subtitle:0",
+      language: "de",
+      codec: "srt",
+      label: "German",
+      source: "external",
+      url: "/stream/session-99/subtitles/0.vtt",
+    };
+    rerenderPlayer({
+      plan: nextPlan,
+      planRevision: 2,
+      subtitleUrls: [germanInNewFile],
+    });
+
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+  });
+
+  it("resets to auto-select when neither identity nor raw index matches", async () => {
+    const englishTrack: PlayerSubtitleInfo = {
+      index: 0,
+      media_file_id: 7,
+      track_id: "file:7:subtitle:0",
+      language: "en",
+      codec: "srt",
+      label: "English",
+      source: "external",
+      url: "/stream/session-1/subtitles/0.vtt",
+    };
+    const { rerenderPlayer } = renderPlayer({
+      subtitleUrls: [englishTrack],
+      subtitleMode: "always",
+      preferredSubtitleLanguage: "en",
+    });
+
+    act(() => {
+      controls.current?.onSubtitleSelect?.(0);
+    });
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBe(0));
+
+    const nextPlan = fixturePlanV3({
+      ...directPlan,
+      plan_id: "plan:switched-version-3",
+      plan_attempt_key: "v3:switched-version-3",
+      requested_media_file_id: 99,
+      effective_media_file_id: 99,
+    });
+    // The new file has only a German track at index 5 — neither the identity
+    // nor the raw index (0) exists, so the selection resets to auto-select.
+    const germanInNewFile: PlayerSubtitleInfo = {
+      index: 5,
+      media_file_id: 99,
+      track_id: "file:99:subtitle:5",
+      language: "de",
+      codec: "srt",
+      label: "German",
+      source: "external",
+      url: "/stream/session-99/subtitles/5.vtt",
+    };
+    rerenderPlayer({
+      plan: nextPlan,
+      planRevision: 2,
+      subtitleUrls: [germanInNewFile],
+    });
+
+    // Auto-select with mode "always" and preferred language "en" finds no
+    // English track, so subtitles reset to off.
+    await waitFor(() => expect(controls.current?.activeSubtitleIndex).toBeNull());
   });
 });
