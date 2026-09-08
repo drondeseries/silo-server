@@ -37,6 +37,11 @@ AS $$
     WHERE code IS NOT NULL AND code <> ''
 $$;
 
+-- The UPDATE trigger from 142_episode_catalog_entries.sql names the two
+-- STORED columns in its WHEN clause, so the columns cannot be dropped while
+-- it exists. Drop it around the column swap and recreate it verbatim.
+DROP TRIGGER IF EXISTS trg_episode_catalog_entries_media_files_update ON public.media_files;
+
 DROP INDEX IF EXISTS idx_media_files_audio_lang_gin;
 DROP INDEX IF EXISTS idx_media_files_subtitle_lang_gin;
 
@@ -57,6 +62,23 @@ ON public.media_files USING gin (audio_language_codes);
 CREATE INDEX IF NOT EXISTS idx_media_files_subtitle_lang_gin
 ON public.media_files USING gin (subtitle_language_codes);
 
+CREATE TRIGGER trg_episode_catalog_entries_media_files_update
+AFTER UPDATE ON public.media_files
+FOR EACH ROW
+WHEN (
+    OLD.episode_id IS DISTINCT FROM NEW.episode_id OR
+    OLD.media_folder_id IS DISTINCT FROM NEW.media_folder_id OR
+    OLD.missing_since IS DISTINCT FROM NEW.missing_since OR
+    OLD.resolution IS DISTINCT FROM NEW.resolution OR
+    OLD.bitrate IS DISTINCT FROM NEW.bitrate OR
+    OLD.hdr IS DISTINCT FROM NEW.hdr OR
+    OLD.video_tracks IS DISTINCT FROM NEW.video_tracks OR
+    OLD.external_subtitles IS DISTINCT FROM NEW.external_subtitles OR
+    OLD.audio_language_codes IS DISTINCT FROM NEW.audio_language_codes OR
+    OLD.subtitle_language_codes IS DISTINCT FROM NEW.subtitle_language_codes
+)
+EXECUTE FUNCTION public.episode_catalog_entries_media_files_trigger();
+
 ALTER TABLE public.media_files
 ADD COLUMN IF NOT EXISTS probe_version INTEGER NOT NULL DEFAULT 0;
 -- +goose StatementEnd
@@ -67,6 +89,8 @@ ADD COLUMN IF NOT EXISTS probe_version INTEGER NOT NULL DEFAULT 0;
 -- probe_version shape. The languages arrays remain in the JSONB (harmless
 -- extra keys) but are no longer indexed; rows keep whatever probe_version the
 -- up migration's re-probe wrote.
+
+DROP TRIGGER IF EXISTS trg_episode_catalog_entries_media_files_update ON public.media_files;
 
 DROP INDEX IF EXISTS idx_media_files_audio_lang_gin;
 DROP INDEX IF EXISTS idx_media_files_subtitle_lang_gin;
@@ -98,6 +122,23 @@ ON public.media_files USING gin (audio_language_codes);
 
 CREATE INDEX IF NOT EXISTS idx_media_files_subtitle_lang_gin
 ON public.media_files USING gin (subtitle_language_codes);
+
+CREATE TRIGGER trg_episode_catalog_entries_media_files_update
+AFTER UPDATE ON public.media_files
+FOR EACH ROW
+WHEN (
+    OLD.episode_id IS DISTINCT FROM NEW.episode_id OR
+    OLD.media_folder_id IS DISTINCT FROM NEW.media_folder_id OR
+    OLD.missing_since IS DISTINCT FROM NEW.missing_since OR
+    OLD.resolution IS DISTINCT FROM NEW.resolution OR
+    OLD.bitrate IS DISTINCT FROM NEW.bitrate OR
+    OLD.hdr IS DISTINCT FROM NEW.hdr OR
+    OLD.video_tracks IS DISTINCT FROM NEW.video_tracks OR
+    OLD.external_subtitles IS DISTINCT FROM NEW.external_subtitles OR
+    OLD.audio_language_codes IS DISTINCT FROM NEW.audio_language_codes OR
+    OLD.subtitle_language_codes IS DISTINCT FROM NEW.subtitle_language_codes
+)
+EXECUTE FUNCTION public.episode_catalog_entries_media_files_trigger();
 
 ALTER TABLE public.media_files DROP COLUMN IF EXISTS probe_version;
 -- +goose StatementEnd
