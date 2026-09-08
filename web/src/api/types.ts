@@ -938,6 +938,8 @@ export interface FileVersion {
   added_at?: string;
   edition_raw?: string;
   edition_key?: string;
+  release_name?: string;
+  release_group?: string;
   presentation_kind?: string;
   presentation_group_key?: string;
   presentation_part_index?: number;
@@ -1016,6 +1018,7 @@ export interface VersionAudioTrack {
   title?: string;
   embedded_title?: string;
   language?: string;
+  languages?: string[];
   codec?: string;
   profile?: string;
   layout?: string;

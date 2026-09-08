@@ -126,6 +126,11 @@ func ParseVariantHints(filePath string, libraryType string) *VariantHints {
 		parentBase = parts[len(parts)-2]
 	}
 
+	// Release name/group are pure filename facts carried by every shape
+	// (including multi_episode/multipart, which return early below).
+	hints.ReleaseName = baseNoExt
+	hints.ReleaseGroup = matchVariantReleaseGroup(baseNoExt)
+
 	for i := len(parts) - 2; i >= 0; i-- {
 		if match := plexEditionTagRe.FindStringSubmatch(parts[i]); match != nil {
 			hints.EditionRaw = strings.TrimSpace(match[1])
@@ -340,6 +345,18 @@ func stripVariantReleaseGroup(surface string) string {
 		return surface
 	}
 	return strings.TrimSpace(surface[:match[2]-1])
+}
+
+// matchVariantReleaseGroup returns the release group captured from a release
+// surface — the trailing [a-z0-9][a-z0-9-]{1,31} tag after a recognized
+// quality/source token ("Movie.2023.2160p.AltMount" → "AltMount") — or "" when
+// the surface carries no group.
+func matchVariantReleaseGroup(surface string) string {
+	match := variantReleaseGroupRe.FindStringSubmatch(surface)
+	if len(match) < 2 {
+		return ""
+	}
+	return match[1]
 }
 
 func inferEditionTokenKey(token string) string {

@@ -226,10 +226,24 @@ func convertProbeData(raw *ffprobeOutput) *ProbeData {
 				pd.HDR = isHDR(s.ColorTransfer) || normalized.DVProfile > 0 || track.HDR10Plus
 			}
 		case "audio":
+			rawLang := lang.Canonical(s.Tags["language"])
+			var languages []string
+			switch rawLang {
+			case "", "und", "mul":
+				// MULTI/DUAL releases often carry no (or an unhelpful) language
+				// tag but list the languages in the track title ("English /
+				// French"). Parse the title so the languages array has real
+				// values, and promote the first one to the display language.
+				languages = lang.ParseLanguages(s.Tags["title"])
+				if len(languages) > 0 {
+					rawLang = languages[0]
+				}
+			}
 			track := AudioTrackInfo{
 				Title:         firstNonEmpty(s.Tags["title"], s.CodecLongName, strings.ToUpper(s.CodecName)),
 				EmbeddedTitle: s.Tags["title"],
-				Language:      lang.Canonical(s.Tags["language"]),
+				Language:      rawLang,
+				Languages:     languages,
 				Codec:         s.CodecName,
 				Profile:       s.Profile,
 				Layout:        s.ChannelLayout,

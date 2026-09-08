@@ -65,10 +65,11 @@ const fileColumns = `id, content_id, episode_id, extra_id, season_number, episod
 	recap_markers_source, recap_markers_provider, recap_markers_confidence, recap_markers_algorithm, recap_markers_detected_at,
 	preview_markers_source, preview_markers_provider, preview_markers_confidence, preview_markers_algorithm, preview_markers_detected_at,
 	edition_raw, edition_key, edition_confidence, edition_source,
+	release_name, release_group,
 	presentation_kind, presentation_group_key, presentation_part_index, presentation_part_total,
 	multi_episode_start, multi_episode_end,
 	multiple_pps, multiple_pps_scan_size, multiple_pps_scan_mtime,
-	probe_source, probe_updated_at, match_attempted_at, missing_since, failed_at,
+	probe_source, probe_updated_at, probe_version, match_attempted_at, missing_since, failed_at,
 	first_seen_scan_run_id, created_at, updated_at,
 	virtual_owner_installation_id`
 
@@ -91,10 +92,11 @@ const mfFileColumns = `mf.id, mf.content_id, mf.episode_id, mf.extra_id, mf.seas
 	mf.recap_markers_source, mf.recap_markers_provider, mf.recap_markers_confidence, mf.recap_markers_algorithm, mf.recap_markers_detected_at,
 	mf.preview_markers_source, mf.preview_markers_provider, mf.preview_markers_confidence, mf.preview_markers_algorithm, mf.preview_markers_detected_at,
 	mf.edition_raw, mf.edition_key, mf.edition_confidence, mf.edition_source,
+	mf.release_name, mf.release_group,
 	mf.presentation_kind, mf.presentation_group_key, mf.presentation_part_index, mf.presentation_part_total,
 	mf.multi_episode_start, mf.multi_episode_end,
 	mf.multiple_pps, mf.multiple_pps_scan_size, mf.multiple_pps_scan_mtime,
-	mf.probe_source, mf.probe_updated_at, mf.match_attempted_at, mf.missing_since, mf.failed_at,
+	mf.probe_source, mf.probe_updated_at, mf.probe_version, mf.match_attempted_at, mf.missing_since, mf.failed_at,
 	mf.first_seen_scan_run_id, mf.created_at, mf.updated_at,
 	mf.virtual_owner_installation_id`
 
@@ -112,12 +114,14 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	var fileModifiedAt *time.Time
 	var fileHash *string
 	var codecVideo, codecAudio, resolution, container, probeSource *string
+	var probeVersion int
 	var markersSource, introMarkersSource, introMarkersProvider, introMarkersAlgorithm *string
 	var creditsMarkersSource, creditsMarkersProvider, creditsMarkersAlgorithm *string
 	var recapMarkersSource, recapMarkersProvider, recapMarkersAlgorithm *string
 	var previewMarkersSource, previewMarkersProvider, previewMarkersAlgorithm *string
 	var chapterThumbnailLastError *string
 	var editionRaw, editionKey, editionSource *string
+	var releaseName, releaseGroup *string
 	var audioChannels *int
 	var hdr *bool
 	var duration, bitrate *int
@@ -206,6 +210,8 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 		&editionKey,
 		&editionConfidence,
 		&editionSource,
+		&releaseName,
+		&releaseGroup,
 		&presentationKind,
 		&presentationGroupKey,
 		&presentationPartIndex,
@@ -217,6 +223,7 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 		&f.MultiplePPSScanMtime,
 		&probeSource,
 		&f.ProbeUpdatedAt,
+		&probeVersion,
 		&f.MatchAttemptedAt,
 		&f.MissingSince,
 		&f.FailedAt,
@@ -321,6 +328,7 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	if probeSource != nil {
 		f.ProbeSource = *probeSource
 	}
+	f.ProbeVersion = probeVersion
 	if editionRaw != nil {
 		f.EditionRaw = *editionRaw
 	}
@@ -330,6 +338,12 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	f.EditionConfidence = editionConfidence
 	if editionSource != nil {
 		f.EditionSource = *editionSource
+	}
+	if releaseName != nil {
+		f.ReleaseName = *releaseName
+	}
+	if releaseGroup != nil {
+		f.ReleaseGroup = *releaseGroup
 	}
 	if presentationKind != nil {
 		f.PresentationKind = *presentationKind
@@ -437,12 +451,14 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		var fileModifiedAt *time.Time
 		var fileHash *string
 		var codecVideo, codecAudio, resolution, container, probeSource *string
+		var probeVersion int
 		var markersSource, introMarkersSource, introMarkersProvider, introMarkersAlgorithm *string
 		var creditsMarkersSource, creditsMarkersProvider, creditsMarkersAlgorithm *string
 		var recapMarkersSource, recapMarkersProvider, recapMarkersAlgorithm *string
 		var previewMarkersSource, previewMarkersProvider, previewMarkersAlgorithm *string
 		var chapterThumbnailLastError *string
 		var editionRaw, editionKey, editionSource *string
+		var releaseName, releaseGroup *string
 		var audioChannels *int
 		var hdr *bool
 		var duration, bitrate *int
@@ -531,6 +547,8 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 			&editionKey,
 			&editionConfidence,
 			&editionSource,
+			&releaseName,
+			&releaseGroup,
 			&presentationKind,
 			&presentationGroupKey,
 			&presentationPartIndex,
@@ -542,6 +560,7 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 			&f.MultiplePPSScanMtime,
 			&probeSource,
 			&f.ProbeUpdatedAt,
+			&probeVersion,
 			&f.MatchAttemptedAt,
 			&f.MissingSince,
 			&f.FailedAt,
@@ -638,6 +657,7 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		if probeSource != nil {
 			f.ProbeSource = *probeSource
 		}
+		f.ProbeVersion = probeVersion
 		if editionRaw != nil {
 			f.EditionRaw = *editionRaw
 		}
@@ -647,6 +667,12 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		f.EditionConfidence = editionConfidence
 		if editionSource != nil {
 			f.EditionSource = *editionSource
+		}
+		if releaseName != nil {
+			f.ReleaseName = *releaseName
+		}
+		if releaseGroup != nil {
+			f.ReleaseGroup = *releaseGroup
 		}
 		if presentationKind != nil {
 			f.PresentationKind = *presentationKind
@@ -929,9 +955,10 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		duration, bitrate, video_tracks, audio_tracks, subtitle_tracks, external_subtitles, chapters,
 		intro_start, intro_end, credits_start, credits_end, markers_source, markers_confidence,
 		edition_raw, edition_key, edition_confidence, edition_source,
+		release_name, release_group,
 		presentation_kind, presentation_group_key, presentation_part_index, presentation_part_total,
 		multi_episode_start, multi_episode_end,
-		probe_source, probe_updated_at, missing_since,
+		probe_source, probe_updated_at, probe_version, missing_since,
 		first_seen_scan_run_id, virtual_owner_installation_id
 	) VALUES (
 		$1, $2, $3, $4, $5,
@@ -941,10 +968,10 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		$20, $21, $22, $23, $24, $25,
 		$26, $27, $28, $29, $30, $31, $32,
 		$33, $34, $35, $36, $37, $38,
-		$39, $40, $41, $42,
-		$43, $44, $45, $46,
-		$47, $48,
-		$49, $50, $51, $52, $53
+		$39, $40, $41, $42, $43, $44,
+		$45, $46, $47, $48,
+		$49, $50, $51,
+		$52, $53, $54, $55, $56
 	)
 	ON CONFLICT (file_path) WHERE virtual_owner_installation_id IS NULL DO UPDATE SET
 		content_id = CASE
@@ -994,6 +1021,8 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		edition_key = EXCLUDED.edition_key,
 		edition_confidence = EXCLUDED.edition_confidence,
 		edition_source = EXCLUDED.edition_source,
+		release_name = EXCLUDED.release_name,
+		release_group = EXCLUDED.release_group,
 		presentation_kind = EXCLUDED.presentation_kind,
 		presentation_group_key = EXCLUDED.presentation_group_key,
 		presentation_part_index = EXCLUDED.presentation_part_index,
@@ -1002,6 +1031,7 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		multi_episode_end = EXCLUDED.multi_episode_end,
 		probe_source = EXCLUDED.probe_source,
 		probe_updated_at = EXCLUDED.probe_updated_at,
+		probe_version = EXCLUDED.probe_version,
 		match_suppressed_at = NULL,
 		missing_since = NULL,
 		updated_at = NOW()
@@ -1050,6 +1080,8 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		mf.EditionKey,
 		mf.EditionConfidence,
 		mf.EditionSource,
+		mf.ReleaseName,
+		mf.ReleaseGroup,
 		mf.PresentationKind,
 		mf.PresentationGroupKey,
 		nilIfZero(mf.PresentationPartIndex),
@@ -1058,6 +1090,7 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		nilIfZero(mf.MultiEpisodeEnd),
 		probeSource,
 		mf.ProbeUpdatedAt,
+		mf.ProbeVersion,
 		mf.MissingSince,
 		nilIfEmpty(scanbatch.RunID(ctx)),
 		virtualOwnerInstallationValue(mf),
@@ -1161,12 +1194,12 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 			INSERT INTO media_files (
 				content_id, episode_id, media_folder_id, file_path, file_size,
 				resolution, codec_video, codec_audio, hdr, container, bitrate,
-				edition_raw, audio_tracks, subtitle_tracks, probe_source,
+				edition_raw, release_name, release_group, audio_tracks, subtitle_tracks, probe_source,
 				probe_updated_at, virtual_owner_installation_id
 			) VALUES (
 				$1, NULLIF($2,''), $3, $4, $5,
 				NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), $9, 'virtual',
-				NULLIF($10,0), $11, $12, $13, 'virtual', NOW(), $14
+				NULLIF($10,0), $11, $11, $11, $12, $13, 'virtual', NOW(), $14
 			)
 			ON CONFLICT (file_path, virtual_owner_installation_id, media_folder_id)
 				WHERE virtual_owner_installation_id IS NOT NULL
@@ -1182,6 +1215,8 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 				container='virtual',
 				bitrate=EXCLUDED.bitrate,
 				edition_raw=EXCLUDED.edition_raw,
+				release_name=EXCLUDED.release_name,
+				release_group=EXCLUDED.release_group,
 				audio_tracks=EXCLUDED.audio_tracks,
 				subtitle_tracks=EXCLUDED.subtitle_tracks,
 				probe_source='virtual',
@@ -1373,13 +1408,15 @@ func (r *FileRepository) updateIdentity(ctx context.Context, mf models.MediaFile
 		edition_key = $15,
 		edition_confidence = $16,
 		edition_source = $17,
-		presentation_kind = $18,
-		presentation_group_key = $19,
-		presentation_part_index = $20,
-		presentation_part_total = $21,
-		multi_episode_start = $22,
-		multi_episode_end = $23,
-		external_subtitles = COALESCE($24, external_subtitles),
+		release_name = $18,
+		release_group = $19,
+		presentation_kind = $20,
+		presentation_group_key = $21,
+		presentation_part_index = $22,
+		presentation_part_total = $23,
+		multi_episode_start = $24,
+		multi_episode_end = $25,
+		external_subtitles = COALESCE($26, external_subtitles),
 		match_suppressed_at = NULL,
 		updated_at = NOW()
 	WHERE file_path = $1
@@ -1404,6 +1441,8 @@ func (r *FileRepository) updateIdentity(ctx context.Context, mf models.MediaFile
 		mf.EditionKey,
 		mf.EditionConfidence,
 		mf.EditionSource,
+		mf.ReleaseName,
+		mf.ReleaseGroup,
 		mf.PresentationKind,
 		mf.PresentationGroupKey,
 		nilIfZero(mf.PresentationPartIndex),

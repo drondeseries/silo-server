@@ -442,6 +442,8 @@ type FileVersion struct {
 	AddedAt                  time.Time              `json:"added_at"`
 	EditionRaw               string                 `json:"edition_raw,omitempty"`
 	EditionKey               string                 `json:"edition_key,omitempty"`
+	ReleaseName              string                 `json:"release_name,omitempty"`
+	ReleaseGroup             string                 `json:"release_group,omitempty"`
 	PresentationKind         string                 `json:"presentation_kind,omitempty"`
 	PresentationGroupKey     string                 `json:"presentation_group_key,omitempty"`
 	PresentationPartIndex    int                    `json:"presentation_part_index,omitempty"`
@@ -3528,6 +3530,30 @@ func sortAudiobookMediaFiles(files []*models.MediaFile) {
 	})
 }
 
+// ensureTrackLanguages backfills the languages array from a track's embedded
+// title when the track carries no explicit list and its language tag is absent,
+// undetermined, or multiple. Rows probed before the MULTI/DUAL languages
+// support were scanned with an empty array; re-deriving it at read time keeps
+// the version flyout complete until the probe-version re-probe catches up.
+func ensureTrackLanguages(tracks []models.AudioTrack) []models.AudioTrack {
+	for i := range tracks {
+		track := &tracks[i]
+		if len(track.Languages) > 0 {
+			continue
+		}
+		if track.Language != "" && track.Language != "und" && track.Language != "mul" {
+			continue
+		}
+		if languages := lang.ParseLanguages(track.EmbeddedTitle); len(languages) > 0 {
+			track.Languages = languages
+			if track.Language == "" || track.Language == "und" || track.Language == "mul" {
+				track.Language = languages[0]
+			}
+		}
+	}
+	return tracks
+}
+
 func (s *DetailService) buildPlaybackInfo(
 	ctx context.Context,
 	files []*models.MediaFile,
@@ -3578,6 +3604,8 @@ func (s *DetailService) buildPlaybackInfo(
 			}
 		}
 
+		audioTracks := ensureTrackLanguages(append([]models.AudioTrack(nil), f.AudioTracks...))
+
 		versions = append(versions, FileVersion{
 			FileID:                   f.ID,
 			FileName:                 filepath.Base(f.FilePath),
@@ -3593,6 +3621,8 @@ func (s *DetailService) buildPlaybackInfo(
 			AddedAt:                  f.CreatedAt,
 			EditionRaw:               f.EditionRaw,
 			EditionKey:               f.EditionKey,
+			ReleaseName:              f.ReleaseName,
+			ReleaseGroup:             f.ReleaseGroup,
 			PresentationKind:         f.PresentationKind,
 			PresentationGroupKey:     f.PresentationGroupKey,
 			PresentationPartIndex:    f.PresentationPartIndex,
@@ -3603,7 +3633,7 @@ func (s *DetailService) buildPlaybackInfo(
 			EffectiveAudioLanguage:   effectiveAudioSelection.Language,
 			Failed:                   f.FailedAt != nil,
 			VideoTracks:              append([]models.VideoTrack(nil), f.VideoTracks...),
-			AudioTracks:              append([]models.AudioTrack(nil), f.AudioTracks...),
+			AudioTracks:              audioTracks,
 			SubtitleTracks:           buildVersionSubtitleTracks(f),
 			Chapters:                 s.buildVersionChapters(ctx, f),
 			Intro:                    versionIntro,

@@ -1518,7 +1518,7 @@ func upsertVirtualFileVariant(ctx context.Context, tx pgx.Tx, contentID, episode
 				probe_source=CASE WHEN probe_source='virtual_collection' THEN probe_source ELSE 'virtual' END,
 				probe_updated_at=now(), missing_since=NULL, updated_at=now(),
 				resolution=NULLIF($6,''), codec_video=NULLIF($7,''), codec_audio=NULLIF($8,''),
-				hdr=$9, bitrate=NULLIF($10,0), edition_raw=$11,
+				hdr=$9, bitrate=NULLIF($10,0), edition_raw=$11, release_name=$11, release_group=$11,
 				duration=CASE
 					WHEN $5>0 THEN $5
 					WHEN duration>0 THEN duration
@@ -1536,8 +1536,8 @@ func upsertVirtualFileVariant(ctx context.Context, tx pgx.Tx, contentID, episode
 	_, err := tx.Exec(ctx, `
 		INSERT INTO media_files(
 			content_id,episode_id,media_folder_id,file_path,file_size,container,duration,probe_source,probe_updated_at,
-			resolution,codec_video,codec_audio,hdr,bitrate,edition_raw,audio_tracks,subtitle_tracks,virtual_owner_installation_id
-		) VALUES($1,NULLIF($2,''),$3,$4,$12,$13,COALESCE(NULLIF($5,0),(SELECT runtime * 60 FROM episodes WHERE content_id = NULLIF($2,'')),(SELECT runtime * 60 FROM media_items WHERE content_id = $1 AND NULLIF($2,'') IS NULL)),'virtual',now(),NULLIF($6,''),NULLIF($7,''),NULLIF($8,''),$9,NULLIF($10,0),$11,COALESCE((SELECT jsonb_agg(jsonb_build_object('language', x)) FROM unnest($14::text[]) x),'[]'::jsonb),COALESCE((SELECT jsonb_agg(jsonb_build_object('language', x)) FROM unnest($15::text[]) x),'[]'::jsonb),$16)
+			resolution,codec_video,codec_audio,hdr,bitrate,edition_raw,release_name,release_group,audio_tracks,subtitle_tracks,virtual_owner_installation_id
+		) VALUES($1,NULLIF($2,''),$3,$4,$12,$13,COALESCE(NULLIF($5,0),(SELECT runtime * 60 FROM episodes WHERE content_id = NULLIF($2,'')),(SELECT runtime * 60 FROM media_items WHERE content_id = $1 AND NULLIF($2,'') IS NULL)),'virtual',now(),NULLIF($6,''),NULLIF($7,''),NULLIF($8,''),$9,NULLIF($10,0),$11,$11,$11,COALESCE((SELECT jsonb_agg(jsonb_build_object('language', x)) FROM unnest($14::text[]) x),'[]'::jsonb),COALESCE((SELECT jsonb_agg(jsonb_build_object('language', x)) FROM unnest($15::text[]) x),'[]'::jsonb),$16)
 		ON CONFLICT (file_path, virtual_owner_installation_id, media_folder_id) WHERE virtual_owner_installation_id IS NOT NULL DO UPDATE SET
 			content_id=EXCLUDED.content_id,
 			episode_id=EXCLUDED.episode_id,
@@ -1562,6 +1562,8 @@ func upsertVirtualFileVariant(ctx context.Context, tx pgx.Tx, contentID, episode
 				ELSE COALESCE((SELECT runtime * 60 FROM episodes WHERE content_id = EXCLUDED.episode_id),(SELECT runtime * 60 FROM media_items WHERE content_id = EXCLUDED.content_id AND EXCLUDED.episode_id IS NULL))
 			END,
 			edition_raw=EXCLUDED.edition_raw,
+			release_name=EXCLUDED.release_name,
+			release_group=EXCLUDED.release_group,
 			audio_tracks=EXCLUDED.audio_tracks,
 			subtitle_tracks=EXCLUDED.subtitle_tracks`,
 		contentID, episodeID, folderID, v.VirtualURI, runtimeSeconds(effRuntimeMinutes), v.Resolution, v.CodecVideo, v.CodecAudio, isHDR, v.Bitrate, v.Label, fileSize, "virtual", audioLangs, subLangs, installationID)

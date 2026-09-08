@@ -92,14 +92,18 @@ type AudioTrackInfo struct {
 	Title         string
 	EmbeddedTitle string
 	Language      string
-	Codec         string
-	Profile       string
-	Layout        string
-	Channels      int
-	Bitrate       int
-	SampleRate    int
-	BitDepth      int
-	Default       bool
+	// Languages is the full advertised language list for MULTI/DUAL tracks
+	// ("English / French"), parsed from the track title when the container
+	// language tag is absent, undetermined, or multiple.
+	Languages  []string
+	Codec      string
+	Profile    string
+	Layout     string
+	Channels   int
+	Bitrate    int
+	SampleRate int
+	BitDepth   int
+	Default    bool
 }
 
 // SubtitleTrackInfo describes an embedded subtitle track from probing.

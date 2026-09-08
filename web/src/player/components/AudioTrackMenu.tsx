@@ -39,7 +39,9 @@ interface TrackDescriptor {
 
 function describeTrack(track: PlayerAudioTrack, index: number): TrackDescriptor {
   const title = audioTitle(track) || `Track ${index + 1}`;
-  const language = formatLanguageName(track.language ?? "");
+  const language = track.languages?.length
+    ? track.languages.map(formatLanguageName).filter(Boolean).join("/")
+    : formatLanguageName(track.language ?? "");
   const metaParts = [
     language && language.toLowerCase() !== title.toLowerCase() ? language : "",
     compactAudioMeta(track),

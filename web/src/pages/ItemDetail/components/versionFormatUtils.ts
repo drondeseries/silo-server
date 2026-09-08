@@ -32,7 +32,10 @@ export function collectLanguageLabels(
 
 /** Compact, deduplicated audio language list ("Multi/French") or null. */
 export function audioLanguageSummary(tracks: VersionAudioTrack[] | undefined): string | null {
-  const labels = collectLanguageLabels(tracks?.map((track) => track.language) ?? []);
+  const languages = tracks?.flatMap((track) =>
+    track.languages?.length ? track.languages : [track.language],
+  );
+  const labels = collectLanguageLabels(languages ?? []);
   return labels.length > 0 ? labels.join("/") : null;
 }
 

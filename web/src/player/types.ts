@@ -23,6 +23,8 @@ export interface PlayerFileVersion {
   bitrate: number;
   failed?: boolean;
   edition_key?: string;
+  release_name?: string;
+  release_group?: string;
   presentation_kind?: string;
   presentation_group_key?: string;
   presentation_part_index?: number;
@@ -93,6 +95,7 @@ export interface PlayerAudioTrack {
   title?: string;
   embedded_title?: string;
   language?: string;
+  languages?: string[];
   codec?: string;
   layout?: string;
   channels?: number;

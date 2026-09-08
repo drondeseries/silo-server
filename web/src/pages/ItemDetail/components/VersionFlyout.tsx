@@ -8,11 +8,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { formatFileSize, mapAudioLabel } from "@/lib/mediaFormat";
 import { videoRangeLabel } from "@/lib/videoRange";
-import {
-  collectLanguageLabels,
-  extractSourceHint,
-  isVirtualFileVersion,
-} from "./versionFormatUtils";
+import { collectLanguageLabels, extractSourceHint } from "./versionFormatUtils";
 import { audioScore, resolutionScore } from "./versionRankingUtils";
 
 // ---------------------------------------------------------------------------
@@ -52,21 +48,28 @@ export function buildQualitySummary(version: FileVersion): string {
   return parts.join(" · ");
 }
 
+/** Turns a release-style name ("Movie.2023.2160p.Remux-GRP") into a readable
+ *  line ("Movie 2023 2160p Remux GRP"). */
+export function prettifyReleaseName(releaseName?: string): string {
+  if (!releaseName) return "";
+  return releaseName.replace(/[._]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
 export function buildDetailLine(version: FileVersion): string {
   const parts: string[] = [];
 
-  // Virtual candidates carry the provider's release name in edition_raw; it
-  // is the only human-readable identity a zero-storage version has, so it
-  // takes the lead over the generic size/source scan.
-  if (isVirtualFileVersion(version)) {
-    const releaseName = version.edition_raw?.trim();
-    if (releaseName) parts.push(releaseName);
-  }
+  // The release name (provider label for virtual candidates, file stem for
+  // local files) leads the line; edition_raw is the fallback for rows scanned
+  // before release_name existed.
+  const releaseName = prettifyReleaseName(version.release_name || version.edition_raw);
+  if (releaseName) parts.push(releaseName);
 
   const size = formatFileSize(version.file_size);
   if (size) parts.push(size);
 
-  const textToScan = [version.file_name, version.edition_raw].filter(Boolean).join(" ");
+  const textToScan = [version.file_name, version.edition_raw, version.release_name]
+    .filter(Boolean)
+    .join(" ");
   const hint = textToScan ? extractSourceHint(textToScan) : null;
   if (hint) parts.push(hint);
 
