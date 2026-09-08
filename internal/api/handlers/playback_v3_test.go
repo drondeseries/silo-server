@@ -4341,6 +4341,16 @@ func TestHandleReplanPlaybackV3TrackChangeStaysOnEffectiveAlternate(t *testing.T
 	manager := playback.NewSessionManager(0, 0)
 	handler := NewPlaybackHandler(manager, mapPlaybackFileResolver{files: files})
 	stubCopySeekAnchorV3(handler)
+	// With renditions enabled, the audio track_change replan prefers the
+	// renditions HLS remux delivery, whose local transport spawn needs ffmpeg
+	// (absent in CI). Stub the spawn like the other HLS transport tests: the
+	// point of this test is that the replan stays on the effective alternate,
+	// not that a real ffmpeg runs.
+	tempDir := t.TempDir()
+	handler.StartTranscodeFunc = func(_ context.Context, opts playback.TranscodeOpts) (*playback.TranscodeSession, error) {
+		opts.OutputDir = tempDir
+		return playback.NewReadyTranscodeSessionForTesting(tempDir, opts)
+	}
 	handler.FileVersionFetcher = testPlaybackFileVersionFetcher{byContent: map[string][]*models.MediaFile{source.ContentID: {source, alternate}}}
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "false"}}
 	handler.ItemAccess = allowAllPlaybackItemAccess{}

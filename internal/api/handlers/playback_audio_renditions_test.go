@@ -123,10 +123,12 @@ func renditionsReuseFixture(t *testing.T, planID string) (*playback.AttemptRecor
 		HeaderRefresh: playback.HeaderRefreshNoneV3,
 	}
 	plan := playback.PlanV3{
-		PlanID:         planID,
-		Delivery:       playback.DeliveryRemuxHLSV3,
-		Stream:         stream,
-		SelectedTracks: playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: "file:1:audio:0", Index: intPtr(0)}},
+		PlanID:               planID,
+		Delivery:             playback.DeliveryRemuxHLSV3,
+		Stream:               stream,
+		EffectiveMediaFileID: 1,
+		RequestedMediaFileID: 1,
+		SelectedTracks:       playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: "file:1:audio:0", Index: intPtr(0)}},
 		AudioRenditions: []playback.AudioRenditionV3{
 			{Index: 0, TrackID: "file:1:audio:0", Language: "en", Languages: []string{"en", "fr"}, Codec: "eac3"},
 			{Index: 1, TrackID: "file:1:audio:1", Language: "ja", Codec: "aac"},
