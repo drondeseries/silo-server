@@ -1559,6 +1559,24 @@ export function VideoPlayer({
   const plannedBitrateKbps = plan.effective_recipe.bitrate_kbps ?? 0;
   const plannedDynamicRange = plan.effective_recipe.dynamic_range;
 
+  // Warm the new progressive transport as soon as a transport-changing plan
+  // adopts, before the transport-init effect below tears down the element.
+  // A copy remux's first bytes cost a cold ffmpeg start (1-3s); firing the
+  // request now means the element's own load hits a warm remux.
+  const warmTransportUrlRef = useRef<string | null>(null);
+  const transportRevisionRef = useRef<number | null>(null);
+  useEffect(() => {
+    const url = effectiveStreamUrl;
+    if (!url || !isPlayerReady) return;
+    if (warmTransportUrlRef.current === url) return;
+    if (!transportRevision || effectiveTransportRevision === transportRevisionRef.current) return; // unchanged transport
+    transportRevisionRef.current = effectiveTransportRevision;
+    const controller = new AbortController();
+    warmTransportUrlRef.current = url;
+    void fetch(url, { signal: controller.signal, method: "GET" }).catch(() => {});
+    return () => controller.abort();
+  }, [effectiveStreamUrl, effectiveTransportRevision, isPlayerReady]);
+
   // -- hls.js lifecycle --
   useEffect(() => {
     const video = videoRef.current;

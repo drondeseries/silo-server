@@ -1025,6 +1025,37 @@ describe("VideoPlayer translation handoff", () => {
     }
   });
 
+  it("warms the new transport once when transportRevision bumps and not on first load", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    try {
+      const { rerenderPlayer } = renderPlayer({
+        planRevision: 1,
+        transportRevision: 0,
+      });
+      // First load with transportRevision 0: the transport did not change, so
+      // no warm fetch fires.
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // A transport-changing replan (same URL, bumped revision) warms the
+      // stream exactly once, before the transport effect reloads the element.
+      rerenderPlayer({ planRevision: 2, transportRevision: 2 });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/stream/session-1?token=token",
+        expect.objectContaining({ method: "GET", signal: expect.any(AbortSignal) }),
+      );
+
+      // The same transportRevision across a further plan revision must not
+      // refire the warm fetch.
+      rerenderPlayer({ planRevision: 3, transportRevision: 2 });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it("refreshes the subtitle inventory once per plan_id on a source-changed signal", async () => {
     const onRefreshSubtitles = vi.fn();
     const planA = fixturePlanV3({ plan_id: "plan:aaa", plan_attempt_key: "v3:aaa" });
