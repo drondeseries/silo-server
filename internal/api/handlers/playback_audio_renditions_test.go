@@ -102,3 +102,106 @@ func TestAttachAudioRenditionsV3SessionScoping(t *testing.T) {
 		t.Fatalf("URL %q not scoped under the session namespace", url)
 	}
 }
+
+// renditionsReuseFixture builds the minimal record/candidate pair the reuse
+// gate needs: a valid copy-audio HLS remux recipe, identical stream shape, and
+// an HLS stream URL shared by both generations.
+func renditionsReuseFixture(t *testing.T, planID string) (*playback.AttemptRecordV3, playback.PlanV3, playback.ExecutableRecipeV3) {
+	t.Helper()
+	recipe := playback.ExecutableRecipeV3{
+		Version:             1,
+		PlanID:              planID,
+		PlayMethod:          playback.PlayRemux,
+		SourceAudioChannels: 0,
+	}
+	stream := playback.StreamV3{
+		URL:           "/playback/transcode/s1/master.m3u8",
+		Protocol:      playback.StreamHLSV3,
+		Container:     "hls",
+		MIMEType:      "application/vnd.apple.mpegurl",
+		Headers:       map[string]string{},
+		HeaderRefresh: playback.HeaderRefreshNoneV3,
+	}
+	plan := playback.PlanV3{
+		PlanID:         planID,
+		Delivery:       playback.DeliveryRemuxHLSV3,
+		Stream:         stream,
+		SelectedTracks: playback.SelectedTracksV3{Audio: &playback.TrackIdentityV3{ID: "file:1:audio:0", Index: intPtr(0)}},
+		AudioRenditions: []playback.AudioRenditionV3{
+			{Index: 0, TrackID: "file:1:audio:0", Language: "en", Languages: []string{"en", "fr"}, Codec: "eac3"},
+			{Index: 1, TrackID: "file:1:audio:1", Language: "ja", Codec: "aac"},
+		},
+	}
+	record := &playback.AttemptRecordV3{
+		CurrentPlanID:        planID,
+		CurrentPlan:          plan,
+		FrozenRecipe:         recipe,
+		RequestedMediaFileID: 1,
+		EffectiveMediaFileID: 1,
+		NormalizedRequest:    playback.StartRequestV3{ClientPlaybackContext: playback.ClientPlaybackContextV3{Output: playback.OutputContextV3{OutputContextID: "route-1"}}},
+	}
+	return record, plan, recipe
+}
+
+// TestSidecarOnlyReuseReplanV3RenditionsAudioSwitch verifies a same-version
+// AUDIO switch on renditions delivery reuses the active HLS generation when
+// the rendition SET is unchanged, even though the selected audio identity
+// moved. This is the behavior the client-side activation depends on.
+func TestSidecarOnlyReuseReplanV3RenditionsAudioSwitch(t *testing.T) {
+	record, currentPlan, recipe := renditionsReuseFixture(t, "plan:current")
+
+	candidate := currentPlan
+	candidate.PlanID = "plan:candidate"
+	candidate.SelectedTracks.Audio = &playback.TrackIdentityV3{ID: "file:1:audio:1", Index: intPtr(1)}
+	candidateRecipe := recipe
+	candidateRecipe.PlanID = "plan:candidate"
+
+	reusedRecipe, ok := sidecarOnlyReuseReplanV3(record, &candidate, candidateRecipe, "route-1")
+	if !ok {
+		t.Fatal("renditions audio switch with equal rendition sets must reuse the transport")
+	}
+	if reusedRecipe.PlanID != "plan:candidate" {
+		t.Fatalf("reused recipe = %q, want the candidate recipe", reusedRecipe.PlanID)
+	}
+}
+
+// TestSidecarOnlyReuseReplanV3RenditionsSetChangeRebuilds verifies a genuine
+// rendition-set change (a track disappeared) still rebuilds the transport.
+func TestSidecarOnlyReuseReplanV3RenditionsSetChangeRebuilds(t *testing.T) {
+	record, currentPlan, recipe := renditionsReuseFixture(t, "plan:current")
+
+	candidate := currentPlan
+	candidate.PlanID = "plan:candidate"
+	candidate.SelectedTracks.Audio = &playback.TrackIdentityV3{ID: "file:1:audio:1", Index: intPtr(1)}
+	candidate.AudioRenditions = []playback.AudioRenditionV3{
+		{Index: 0, TrackID: "file:1:audio:0", Language: "en", Languages: []string{"en", "fr"}, Codec: "eac3"},
+	}
+	candidateRecipe := recipe
+	candidateRecipe.PlanID = "plan:candidate"
+
+	if _, ok := sidecarOnlyReuseReplanV3(record, &candidate, candidateRecipe, "route-1"); ok {
+		t.Fatal("a rendition-set change must rebuild the transport")
+	}
+}
+
+// TestSidecarOnlyReuseReplanV3ProgressiveAudioSwitchRebuilds verifies a
+// non-renditions audio switch (progressive delivery) keeps the historical
+// rebuild behavior: byte-identical to before the renditions relaxation.
+func TestSidecarOnlyReuseReplanV3ProgressiveAudioSwitchRebuilds(t *testing.T) {
+	record, currentPlan, recipe := renditionsReuseFixture(t, "plan:current")
+	// Strip renditions and switch to progressive: the generation has no
+	// rendition contract, so an audio identity change must rebuild.
+	record.CurrentPlan.Delivery = playback.DeliveryRemuxProgressiveV3
+	currentPlan.Delivery = playback.DeliveryRemuxProgressiveV3
+	currentPlan.AudioRenditions = nil
+
+	candidate := currentPlan
+	candidate.PlanID = "plan:candidate"
+	candidate.SelectedTracks.Audio = &playback.TrackIdentityV3{ID: "file:1:audio:1", Index: intPtr(1)}
+	candidateRecipe := recipe
+	candidateRecipe.PlanID = "plan:candidate"
+
+	if _, ok := sidecarOnlyReuseReplanV3(record, &candidate, candidateRecipe, "route-1"); ok {
+		t.Fatal("a progressive audio switch must rebuild the transport (unchanged behavior)")
+	}
+}

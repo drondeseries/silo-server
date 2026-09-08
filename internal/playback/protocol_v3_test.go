@@ -2823,7 +2823,13 @@ func TestPlanPlaybackV3NonDefaultAudioSelectionCannotUseOriginalHTTP(t *testing.
 	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
 
 	result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 1, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: testTransformationRegistryV3()})
-	if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxProgressiveV3 || result.PlayMethod != PlayRemux || result.TranscodeAudio {
+	// With renditions enabled, a multi-audio file prefers the renditions HLS
+	// remux delivery (every audio track rides one generation as a rendition),
+	// so a non-default selection still cannot use original HTTP — it lands on
+	// the HLS remux instead of progressive. Rendition URLs are minted by the
+	// handler layer (attachAudioRenditionsV3), not by the planner, so the plan
+	// carries the delivery choice here and the renditions in the handler test.
+	if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxHLSV3 || result.PlayMethod != PlayRemux || result.TranscodeAudio {
 		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
 	}
 	if result.Plan.SelectedTracks.Audio == nil || result.Plan.SelectedTracks.Audio.Index == nil || *result.Plan.SelectedTracks.Audio.Index != 1 {

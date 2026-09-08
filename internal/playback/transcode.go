@@ -33,12 +33,16 @@ func init() {
 
 // AudioRenditionsEnabled gates the HLS alternate-audio renditions capability.
 // Step 2 of the work lands the data model and plumbing only: the protocol
-// field, the minting helper, the multi-output recipe builder, the manifest
-// producers, and the serving routes all exist and are dead while this is
-// false. Nothing selects the renditions delivery yet, and there is no
-// reuse-gate or delivery-policy change. Activation (delivery policy +
-// reuse-gate relaxation + client wiring) is a later commit that flips this on.
-const AudioRenditionsEnabled = false
+// AudioRenditionsEnabled gates the HLS alternate-audio renditions delivery:
+// multi-audio items stream via an HLS generation that carries every audio
+// track as a rendition, so a same-version audio switch becomes a rendition
+// swap (hls.js audioTrack) instead of a transport rebuild. When on, the
+// delivery policy prefers the renditions HLS remux for multi-audio, the
+// minting + generation-level freeze run on start and replan, the reuse gate
+// allows a same-generation rendition switch, and the audio rendition
+// playlist/segment routes are registered. When off, everything is dead path
+// and behavior is unchanged (single-audio and progressive untouched).
+const AudioRenditionsEnabled = true
 
 // TranscodeOpts holds configuration for an HLS transcode session.
 type TranscodeOpts struct {

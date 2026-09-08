@@ -513,6 +513,25 @@ export interface SubtitleDecisionV3 {
   inventory: SubtitleInventoryItemV3[];
 }
 
+/**
+ * One audio track of the effective file exposed as a session-scoped rendition
+ * of the SAME HLS generation as the video stream. An audio switch in renditions
+ * delivery selects a different rendition URL without renegotiating the
+ * transport or restarting the encode.
+ */
+export interface AudioRenditionV3 {
+  /** Combined ordinal; echoed back on track_change. */
+  index: number;
+  /** file:<id>:audio:<n> */
+  track_id?: string;
+  language?: string;
+  languages?: string[];
+  codec?: string;
+  /** Session-scoped audio playlist URL. */
+  url?: string;
+  default?: boolean;
+}
+
 export interface AppliedQuirkV3 {
   id: string;
   registry_revision: string;
@@ -551,6 +570,12 @@ export interface PlanV3 {
   effective_recipe: EffectiveRecipeV3;
   claims: ValidationClaimsV3;
   subtitle: SubtitleDecisionV3;
+  /**
+   * Every audio track of the effective file as a session-scoped rendition of
+   * the same HLS generation. Present only in renditions delivery; an audio
+   * switch then selects a different rendition without changing the transport.
+   */
+  audio_renditions?: AudioRenditionV3[];
   transformations: TransformationV3[];
   applied_quirks: AppliedQuirkV3[];
   runtime_corrections: string[];
