@@ -812,6 +812,20 @@ type SubtitleDecisionV3 struct {
 	Inventory []SubtitleInventoryItemV3 `json:"inventory"`
 }
 
+// AudioRenditionV3 is one audio track of the effective file exposed as a
+// session-scoped rendition of the SAME HLS generation as the video stream.
+// An audio switch in renditions delivery selects a different rendition URL
+// without renegotiating the transport or restarting the encode.
+type AudioRenditionV3 struct {
+	Index     int      `json:"index"`              // combined ordinal; echoed back on track_change
+	TrackID   string   `json:"track_id,omitempty"` // file:<id>:audio:<n>
+	Language  string   `json:"language,omitempty"`
+	Languages []string `json:"languages,omitempty"`
+	Codec     string   `json:"codec,omitempty"`
+	URL       string   `json:"url,omitempty"` // session-scoped audio playlist URL
+	Default   bool     `json:"default,omitempty"`
+}
+
 type TransformationV3 struct {
 	Name            string   `json:"name"`
 	Executor        string   `json:"executor"`
@@ -871,16 +885,23 @@ type PlanV3 struct {
 	// PlanAttemptKey is the server-computed opaque loop-prevention token for
 	// this plan. Clients store the keys of attempted plans and echo them in
 	// attempted_plan_keys on replan; they never compute keys themselves.
-	PlanAttemptKey         string                 `json:"plan_attempt_key"`
-	SessionID              string                 `json:"session_id,omitempty"`
-	ExpiresAt              string                 `json:"expires_at,omitempty"`
-	Delivery               DeliveryV3             `json:"delivery"`
-	Stream                 StreamV3               `json:"stream"`
-	Timeline               TimelineV3             `json:"timeline"`
-	SelectedTracks         SelectedTracksV3       `json:"selected_tracks"`
-	EffectiveRecipe        EffectiveRecipeV3      `json:"effective_recipe"`
-	Claims                 ValidationClaimsV3     `json:"claims"`
-	Subtitle               SubtitleDecisionV3     `json:"subtitle"`
+	PlanAttemptKey  string             `json:"plan_attempt_key"`
+	SessionID       string             `json:"session_id,omitempty"`
+	ExpiresAt       string             `json:"expires_at,omitempty"`
+	Delivery        DeliveryV3         `json:"delivery"`
+	Stream          StreamV3           `json:"stream"`
+	Timeline        TimelineV3         `json:"timeline"`
+	SelectedTracks  SelectedTracksV3   `json:"selected_tracks"`
+	EffectiveRecipe EffectiveRecipeV3  `json:"effective_recipe"`
+	Claims          ValidationClaimsV3 `json:"claims"`
+	Subtitle        SubtitleDecisionV3 `json:"subtitle"`
+	// AudioRenditions lists every audio track of the effective file as a
+	// session-scoped rendition of the SAME HLS generation. Present only in
+	// renditions delivery; an audio switch then selects a different rendition
+	// without changing the transport. Additive and pre-lock: native clients
+	// ignore it today, and it is never emitted until renditions delivery is
+	// activated (AudioRenditionsEnabled).
+	AudioRenditions        []AudioRenditionV3     `json:"audio_renditions,omitempty"`
 	Transformations        []TransformationV3     `json:"transformations"`
 	AppliedQuirks          []AppliedQuirkV3       `json:"applied_quirks"`
 	RuntimeCorrections     []string               `json:"runtime_corrections"`

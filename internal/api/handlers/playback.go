@@ -2053,6 +2053,119 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	}
 }
 
+// HandleGetAudioRenditionManifest handles
+// GET /playback/transcode/{session_id}/audio_{rendition}/audio.m3u8 for the
+// alternate-audio renditions delivery. It mirrors HandleGetTranscodeManifest's
+// session loading and serving conventions; the rendition's media playlist is
+// produced by the renditions manifest producer with segment URIs namespaced to
+// the rendition's own segment route.
+//
+// DEAD PATH: the route is registered only while AudioRenditionsEnabled is
+// false; nothing reaches this handler until renditions delivery activates.
+func (h *PlaybackHandler) HandleGetAudioRenditionManifest(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "session_id")
+	rendition, parseErr := strconv.Atoi(chi.URLParam(r, "rendition"))
+	if parseErr != nil || rendition < 0 {
+		writeError(w, http.StatusNotFound, "not_found", "Audio rendition not found")
+		return
+	}
+	session, status, _, _, _ := h.loadTranscodeServeSession(r, sessionID, -1)
+	switch status {
+	case playback.SessionMissing:
+		writePlaybackSessionNotFound(w)
+		return
+	case playback.SessionLoadFailed:
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load playback session")
+		return
+	case playback.SessionForbidden:
+		writeError(w, http.StatusForbidden, "forbidden", "Session belongs to another user")
+		return
+	case playback.SessionUnauthorized:
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
+		return
+	case playback.SessionUnavailable:
+		writeError(w, http.StatusNotFound, "not_found", "Transcode session not found")
+		return
+	}
+	if !requireNativeSessionAPIEgressV3(w, session) {
+		return
+	}
+	transcodeSession := h.tm.GetTranscodeSession(sessionID)
+	if transcodeSession == nil {
+		writeError(w, http.StatusNotFound, "not_found", "Transcode session not found")
+		return
+	}
+	h.touchSessionActivity(sessionID)
+
+	manifest := transcodeSession.GenerateAudioRenditionManifest("segment/", r.URL.RawQuery)
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(manifest)
+}
+
+// HandleGetAudioRenditionSegment handles
+// GET /playback/transcode/{session_id}/audio_{rendition}/segment/{name} for the
+// alternate-audio renditions delivery. Rendition segments live under the
+// rendition's own namespace (<outputDir>/audio_<rendition>/) and are served
+// with the same headers as the primary segment route.
+//
+// DEAD PATH: the route is registered only while AudioRenditionsEnabled is
+// false; nothing reaches this handler until renditions delivery activates.
+func (h *PlaybackHandler) HandleGetAudioRenditionSegment(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "session_id")
+	rendition, parseErr := strconv.Atoi(chi.URLParam(r, "rendition"))
+	if parseErr != nil || rendition < 0 {
+		writeError(w, http.StatusNotFound, "not_found", "Audio rendition not found")
+		return
+	}
+	session, status, _, _, _ := h.loadTranscodeServeSession(r, sessionID, -1)
+	switch status {
+	case playback.SessionMissing:
+		writePlaybackSessionNotFound(w)
+		return
+	case playback.SessionLoadFailed:
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load playback session")
+		return
+	case playback.SessionForbidden:
+		writeError(w, http.StatusForbidden, "forbidden", "Session belongs to another user")
+		return
+	case playback.SessionUnauthorized:
+		writeError(w, http.StatusUnauthorized, "unauthorized", "Authentication required")
+		return
+	case playback.SessionUnavailable:
+		writeError(w, http.StatusNotFound, "not_found", "Transcode session not found")
+		return
+	}
+	if !requireNativeSessionAPIEgressV3(w, session) {
+		return
+	}
+	transcodeSession := h.tm.GetTranscodeSession(sessionID)
+	if transcodeSession == nil {
+		writeError(w, http.StatusNotFound, "not_found", "Transcode session not found")
+		return
+	}
+	h.touchSessionActivity(sessionID)
+
+	segmentName := chi.URLParam(r, "name")
+	segmentLease, err := transcodeSession.OpenAudioRenditionSegment(rendition, segmentName)
+	if err != nil {
+		if errors.Is(err, playback.ErrSegmentNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "Segment not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load segment")
+		return
+	}
+
+	w.Header().Set("Cache-Control", "no-store, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	defer func() { _ = segmentLease.Close() }()
+	sw := httpstream.NewRollingDeadlineWriter(w)
+	http.ServeContent(sw, r, segmentLease.Info.Name(), segmentLease.Info.ModTime(), segmentLease.File)
+}
+
 // buildProxyManifestURL signs a stream token carrying the session's full
 // reconstruction recipe and builds the manifest URL. proxyNode is the planner's
 // pick; when nil the URL falls back to the API-local path, where the token rides

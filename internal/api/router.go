@@ -3140,6 +3140,13 @@ func NewRouter(deps Dependencies) chi.Router {
 						// pattern as /stream/{session_id}.
 						r.Get("/transcode/{session_id}/master.m3u8", playbackHandler.HandleGetTranscodeManifest)
 						r.Get("/transcode/{session_id}/segment/{name}", playbackHandler.HandleGetTranscodeSegment)
+						// Alternate-audio renditions: session-scoped rendition
+						// playlist/segment routes. DEAD until
+						// playback.AudioRenditionsEnabled flips on.
+						if playback.AudioRenditionsEnabled {
+							r.Get("/transcode/{session_id}/audio_{rendition}/audio.m3u8", playbackHandler.HandleGetAudioRenditionManifest)
+							r.Get("/transcode/{session_id}/audio_{rendition}/segment/{name}", playbackHandler.HandleGetAudioRenditionSegment)
+						}
 
 						// Playback realtime control socket — needs auth but not profile.
 						r.Get("/sessions/{session_id}/control/ws", playbackHandler.HandleSessionWebSocket)

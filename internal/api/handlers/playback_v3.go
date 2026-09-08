@@ -2056,6 +2056,11 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		abort()
 		return playback.DecisionResponseV3{}, subtitleArtifactErrorV3("Failed to prepare the selected subtitle artifact.", err)
 	}
+	// Alternate-audio renditions are additive plan metadata minted only in
+	// renditions delivery. DEAD until AudioRenditionsEnabled flips on.
+	if playback.AudioRenditionsEnabled {
+		attachAudioRenditionsV3(session.ID, effectiveFile, result.Plan, plannedAudioTrackIndexV3(result, session.AudioTrackIndex))
+	}
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: playback.ServerFeaturesV3(), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
 	record := playback.AttemptRecordV3{PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, UserID: userID, ProfileID: profileID, RequestedMediaFileID: requestedFile.ID, EffectiveMediaFileID: effectiveFile.ID, CurrentPlanID: result.Plan.PlanID, CurrentPlan: *result.Plan, FrozenRecipe: frozenRecipe, NormalizedRequest: req, StartResponse: response, RequestDigest: requestDigests.current, ExpiresAt: time.Now().Add(playback.MaxTokenTTL)}
 	if err := h.updateV3SessionState(r.Context(), session, effectiveFile, result, transport, mode); err != nil {
@@ -4241,6 +4246,42 @@ func transportGenerationV3(sessionID, planID string) string {
 		planSuffix = planSuffix[:12]
 	}
 	return sessionID + "-" + planSuffix + "-" + uuid.NewString()[:8]
+}
+
+// attachAudioRenditionsV3 mints the plan's alternate-audio rendition list from
+// the effective file's audio tracks, mirroring the session-scoped URL scoping
+// of the subtitle artifact: each track becomes an audio_<i>/audio.m3u8 playlist
+// URL under the session's HLS namespace. The default rendition is the
+// currently-selected track, or index 0 when nothing specific is selected.
+// languages[] is copied so MULTi tracks render their full list.
+//
+// DEAD PATH: wired into the plan build only behind AudioRenditionsEnabled
+// (false); native clients ignore the field until renditions delivery activates.
+func attachAudioRenditionsV3(sessionID string, file *models.MediaFile, plan *playback.PlanV3, selectedAudioIndex int) {
+	if plan == nil || file == nil {
+		return
+	}
+	if len(file.AudioTracks) == 0 {
+		plan.AudioRenditions = nil
+		return
+	}
+	defaultIndex := 0
+	if selectedAudioIndex >= 0 && selectedAudioIndex < len(file.AudioTracks) {
+		defaultIndex = selectedAudioIndex
+	}
+	renditions := make([]playback.AudioRenditionV3, 0, len(file.AudioTracks))
+	for i, track := range file.AudioTracks {
+		renditions = append(renditions, playback.AudioRenditionV3{
+			Index:     i,
+			TrackID:   playback.TrackIDV3(file.ID, "audio", i),
+			Language:  track.Language,
+			Languages: append([]string(nil), track.Languages...),
+			Codec:     track.Codec,
+			URL:       fmt.Sprintf("/playback/transcode/%s/audio_%d/audio.m3u8", sessionID, i),
+			Default:   i == defaultIndex,
+		})
+	}
+	plan.AudioRenditions = renditions
 }
 
 // attachSubtitleArtifactV3 republishes the plan's subtitle inventory with
