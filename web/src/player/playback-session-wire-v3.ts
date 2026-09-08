@@ -73,6 +73,9 @@ export interface StartRequestInput {
   progressPersistence?: ProgressPersistenceV3;
   explicitAudioTrackIndex?: number | null;
   subtitleTrackIndex?: number | null;
+  /** File-bound audio track identity carried from the current plan into a
+   * replacement start (a version switch); remapped by family server-side. */
+  carriedAudioTrackID?: string | null;
   metered: boolean;
   bandwidthEstimateKbps?: number | null;
   bandwidthCapKbps?: number | null;
@@ -110,6 +113,7 @@ export function buildStartRequestV3(input: StartRequestInput): StartRequestV3 {
     ...(input.explicitAudioTrackIndex != null && input.explicitAudioTrackIndex >= 0
       ? { audio_track_index: input.explicitAudioTrackIndex }
       : {}),
+    ...(input.carriedAudioTrackID ? { carried_audio_track_id: input.carriedAudioTrackID } : {}),
     ...(input.subtitleTrackIndex != null && input.subtitleTrackIndex >= 0
       ? { subtitle_track_index: input.subtitleTrackIndex }
       : {}),

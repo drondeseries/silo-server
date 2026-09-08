@@ -566,6 +566,7 @@ export function usePlaybackSession(
       forceStartPosition: boolean,
       playbackAttemptId: string,
       subtitleTrackIndex: number | undefined,
+      carriedAudioTrackID: string | null,
     ): Promise<DecisionResponseV3> => {
       const body = buildStartRequestV3({
         extraClientFeatures: VIDEO_CLIENT_FEATURES_V3,
@@ -575,7 +576,11 @@ export function usePlaybackSession(
         qualityPreference: qualityRef.current,
         position,
         forceStartPosition,
-        explicitAudioTrackIndex,
+        // A carried audio track (version switch) names the file-bound identity
+        // explicitly; the mount-time ordinal is meaningless for the new file
+        // and must not be sent alongside it.
+        explicitAudioTrackIndex: carriedAudioTrackID ? null : explicitAudioTrackIndex,
+        carriedAudioTrackID,
         subtitleTrackIndex,
         metered: detectMeteredV3(),
         bandwidthEstimateKbps: detectBandwidthEstimateKbpsV3(),
@@ -588,6 +593,8 @@ export function usePlaybackSession(
         method: "POST",
         body: JSON.stringify(body),
       });
+      // carriedAudioTrackID is a per-call argument, not render-scope state, so
+      // it is intentionally absent from the deps array.
     },
     [clientCapabilities, clientPlaybackContext, config, explicitAudioTrackIndex, maxBitrateKbps],
   );
@@ -661,6 +668,7 @@ export function usePlaybackSession(
       allowPreserveExistingSessionOnError,
       replacementErrorMessage,
       initialErrorMessage,
+      carriedAudioTrackId,
     }: {
       preferredFileId?: number;
       position: number;
@@ -668,6 +676,10 @@ export function usePlaybackSession(
       allowPreserveExistingSessionOnError: boolean;
       replacementErrorMessage: string;
       initialErrorMessage: string;
+      // Audio track identity carried from the current plan into a replacement
+      // start (a version switch). The server remaps it by family to the new
+      // file instead of dropping the viewer's selection.
+      carriedAudioTrackId?: string | null;
     }) => {
       const previousState = stateRef.current;
       const previousSessionId = sessionIdRef.current;
@@ -747,6 +759,7 @@ export function usePlaybackSession(
           forceStartPosition,
           playbackAttemptId,
           initialSubtitleTrackIndexByFileId?.[selectedFileId],
+          carriedAudioTrackId ?? null,
         );
 
         if (loadSequence !== loadSequenceRef.current) {
@@ -782,6 +795,7 @@ export function usePlaybackSession(
             forceStartPosition,
             fallbackPlaybackAttemptId,
             undefined,
+            carriedAudioTrackId ?? null,
           );
           if (!decisionToAdopt.playback_plan) {
             initialSubtitleFailure = null;
@@ -1401,6 +1415,10 @@ export function usePlaybackSession(
             allowPreserveExistingSessionOnError: false,
             replacementErrorMessage: "Failed to switch playback version",
             initialErrorMessage: "Failed to switch version",
+            // Carry the current audio selection across the version switch: the
+            // server remaps the file-bound identity by track family onto the
+            // new file instead of dropping it and auto-picking.
+            carriedAudioTrackId: planRef.current?.selected_tracks.audio?.id ?? null,
           });
         } finally {
           switchingRef.current = false;

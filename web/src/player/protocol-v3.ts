@@ -303,6 +303,9 @@ export interface StartRequestV3 {
   progress_persistence?: ProgressPersistenceV3;
   audio_track_id?: string;
   audio_track_index?: number;
+  /** Audio track identity carried from the current plan into a replacement
+   * start (a version switch); remapped by family onto the new file server-side. */
+  carried_audio_track_id?: string;
   subtitle_track_id?: string;
   subtitle_track_index?: number;
   metered: boolean;

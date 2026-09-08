@@ -124,6 +124,16 @@ describe("buildStartRequestV3", () => {
     });
   });
 
+  it("maps a carried audio track id onto carried_audio_track_id", () => {
+    expect(
+      buildStartRequestV3({ ...startBase, carriedAudioTrackID: "file:7:audio:0" }),
+    ).toMatchObject({ carried_audio_track_id: "file:7:audio:0" });
+  });
+
+  it("omits carried_audio_track_id when no audio track is carried", () => {
+    expect(buildStartRequestV3(startBase)).not.toHaveProperty("carried_audio_track_id");
+  });
+
   it("includes the resolved subtitle track in the initial request", () => {
     expect(buildStartRequestV3({ ...startBase, subtitleTrackIndex: 0 })).toMatchObject({
       subtitle_track_index: 0,
@@ -1509,6 +1519,56 @@ describe("usePlaybackSession version switches", () => {
     expect(result.current.pendingSwitchFileId).toBeNull();
     expect(result.current.replacing).toBe(false);
     expect(startBodies.map((body) => body.file_id)).toEqual([7, 99]);
+
+    unmount();
+  });
+
+  it("carries the current audio track identity into a version-switch start", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        startBodies.push(body);
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: `session-${startBodies.length}`,
+            playback_plan: fixturePlanV3({
+              session_id: `session-${startBodies.length}`,
+              plan_id: `plan:switch-${startBodies.length}`,
+              requested_media_file_id: (body.file_id as number) ?? 7,
+              effective_media_file_id: (body.file_id as number) ?? 7,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto", null, undefined, 2),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    // The initial start sends the mount-time audio ordinal.
+    expect(startBodies[0]).toMatchObject({ file_id: 7, audio_track_index: 2 });
+
+    act(() => result.current.switchVersion(99, 120));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    const replacement = startBodies[1]!;
+    expect(replacement.file_id).toBe(99);
+    // The replacement start carries the current plan's file-bound audio identity
+    // (remapped by family server-side) and drops the mount-time ordinal, which
+    // is meaningless for the new file, in favor of the carried identity.
+    expect(replacement.carried_audio_track_id).toBe("file:7:audio:0");
+    expect(replacement).not.toHaveProperty("audio_track_index");
 
     unmount();
   });
