@@ -508,24 +508,30 @@ type ClientPlaybackContextV3 struct {
 }
 
 type StartRequestV3 struct {
-	ProtocolVersion            int                       `json:"protocol_version"`
-	ClientFeatures             []string                  `json:"client_features"`
-	FileID                     int                       `json:"file_id"`
-	ProfileID                  string                    `json:"profile_id"`
-	PlaybackAttemptID          string                    `json:"playback_attempt_id"`
-	QualityPreference          string                    `json:"quality_preference"`
-	SubtitleFidelityPreference SubtitleFidelityV3        `json:"subtitle_fidelity_preference"`
-	StartPosition              *float64                  `json:"start_position,omitempty"`
-	ProgressPersistence        ProgressPersistenceV3     `json:"progress_persistence,omitempty"`
-	AudioTrackID               string                    `json:"audio_track_id,omitempty"`
-	AudioTrackIndex            *int                      `json:"audio_track_index,omitempty"`
-	SubtitleTrackID            string                    `json:"subtitle_track_id,omitempty"`
-	SubtitleTrackIndex         *int                      `json:"subtitle_track_index,omitempty"`
-	Metered                    bool                      `json:"metered"`
-	BandwidthEstimateKbps      *int                      `json:"bandwidth_estimate_kbps,omitempty"`
-	BandwidthCapKbps           *int                      `json:"bandwidth_cap_kbps,omitempty"`
-	Capabilities               ClientCodecCapabilitiesV3 `json:"client_capabilities"`
-	ClientPlaybackContext      ClientPlaybackContextV3   `json:"client_playback_context"`
+	ProtocolVersion            int                   `json:"protocol_version"`
+	ClientFeatures             []string              `json:"client_features"`
+	FileID                     int                   `json:"file_id"`
+	ProfileID                  string                `json:"profile_id"`
+	PlaybackAttemptID          string                `json:"playback_attempt_id"`
+	QualityPreference          string                `json:"quality_preference"`
+	SubtitleFidelityPreference SubtitleFidelityV3    `json:"subtitle_fidelity_preference"`
+	StartPosition              *float64              `json:"start_position,omitempty"`
+	ProgressPersistence        ProgressPersistenceV3 `json:"progress_persistence,omitempty"`
+	AudioTrackID               string                `json:"audio_track_id,omitempty"`
+	AudioTrackIndex            *int                  `json:"audio_track_index,omitempty"`
+	// CarriedAudioTrackID is the file-bound audio identity (file:<id>:audio:<ordinal>)
+	// the viewer had selected on a previously playing version. The server re-resolves
+	// it onto the requested file's inventory by track family instead of raw ordinal.
+	// Optional and additive: absent means the server owns audio selection (profile or
+	// series preference), exactly as before.
+	CarriedAudioTrackID   string                    `json:"carried_audio_track_id,omitempty"`
+	SubtitleTrackID       string                    `json:"subtitle_track_id,omitempty"`
+	SubtitleTrackIndex    *int                      `json:"subtitle_track_index,omitempty"`
+	Metered               bool                      `json:"metered"`
+	BandwidthEstimateKbps *int                      `json:"bandwidth_estimate_kbps,omitempty"`
+	BandwidthCapKbps      *int                      `json:"bandwidth_cap_kbps,omitempty"`
+	Capabilities          ClientCodecCapabilitiesV3 `json:"client_capabilities"`
+	ClientPlaybackContext ClientPlaybackContextV3   `json:"client_playback_context"`
 }
 
 // ProgressPersistenceV3 declares which side owns durable item resume/history.
@@ -961,6 +967,9 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	}
 	if err := validateTrackPairV3(r.FileID, "audio", r.AudioTrackID, r.AudioTrackIndex); err != nil {
 		return nil, err
+	}
+	if len(r.CarriedAudioTrackID) > 128 {
+		return nil, errors.New("carried_audio_track_id is too long")
 	}
 	if err := validateTrackPairV3(r.FileID, "subtitle", r.SubtitleTrackID, r.SubtitleTrackIndex); err != nil {
 		return nil, err

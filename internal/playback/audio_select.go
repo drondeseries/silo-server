@@ -28,6 +28,24 @@ func langMatch(a, b string) bool {
 	return lang.Canonical(a) == lang.Canonical(b)
 }
 
+// trackHasLanguage reports whether the track carries the preferred language,
+// either as its primary code or anywhere in its MULTi language list.
+func trackHasLanguage(track models.AudioTrack, preferred string) bool {
+	if langMatch(track.Language, preferred) {
+		return true
+	}
+	if preferred == "" || len(track.Languages) == 0 {
+		return false
+	}
+	canonical := lang.Canonical(preferred)
+	for _, code := range track.Languages {
+		if lang.Canonical(code) == canonical {
+			return true
+		}
+	}
+	return false
+}
+
 // SelectAudioTrack determines which audio track to use based on preferences.
 //
 // Priority:
@@ -50,7 +68,7 @@ func SelectAudioTrack(tracks []models.AudioTrack, preferredLang string, seriesPr
 
 		// 2. Series preference: try exact index+language match.
 		if seriesPref.AudioTrackIndex >= 0 && seriesPref.AudioTrackIndex < len(tracks) {
-			if langMatch(tracks[seriesPref.AudioTrackIndex].Language, seriesPref.AudioLanguage) {
+			if trackHasLanguage(tracks[seriesPref.AudioTrackIndex], seriesPref.AudioLanguage) {
 				return seriesPref.AudioTrackIndex
 			}
 		}
@@ -58,7 +76,7 @@ func SelectAudioTrack(tracks []models.AudioTrack, preferredLang string, seriesPr
 		// 3. Series preference: fall back to language match.
 		if seriesPref.AudioLanguage != "" {
 			for i, t := range tracks {
-				if langMatch(t.Language, seriesPref.AudioLanguage) {
+				if trackHasLanguage(t, seriesPref.AudioLanguage) {
 					return i
 				}
 			}
@@ -68,7 +86,7 @@ func SelectAudioTrack(tracks []models.AudioTrack, preferredLang string, seriesPr
 	// 4. Profile language preference.
 	if preferredLang != "" {
 		for i, t := range tracks {
-			if langMatch(t.Language, preferredLang) {
+			if trackHasLanguage(t, preferredLang) {
 				return i
 			}
 		}

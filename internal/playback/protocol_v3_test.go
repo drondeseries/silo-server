@@ -84,6 +84,28 @@ func TestStartRequestV3Validation(t *testing.T) {
 	}
 }
 
+func TestStartRequestV3CarriedAudioTrackIDValidation(t *testing.T) {
+	req := validStartRequestV3()
+	req.CarriedAudioTrackID = strings.Repeat("a", 129)
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("oversized carried_audio_track_id accepted")
+	}
+
+	req = validStartRequestV3()
+	req.CarriedAudioTrackID = TrackIDV3(7, "audio", 2)
+	if _, err := req.NormalizeAndValidate(); err != nil {
+		t.Fatalf("well-formed carried audio track id rejected: %v", err)
+	}
+
+	// The carried identity deliberately names a different file than the request;
+	// it must not be run through the file-bound track pair validation.
+	req = validStartRequestV3()
+	req.CarriedAudioTrackID = TrackIDV3(99, "audio", 0)
+	if _, err := req.NormalizeAndValidate(); err != nil {
+		t.Fatalf("cross-file carried audio track id rejected: %v", err)
+	}
+}
+
 func TestStartRequestV3ProgressPersistenceValidation(t *testing.T) {
 	req := validStartRequestV3()
 	if _, err := req.NormalizeAndValidate(); err != nil {

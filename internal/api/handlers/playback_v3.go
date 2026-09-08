@@ -1622,6 +1622,16 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	if req.CarriedAudioTrackID != "" {
+		// Version switch: the viewer made an explicit audio choice on the previous
+		// version; carry it onto the requested file by track family rather than
+		// letting the server's preference override an explicit choice.
+		if carriedIndex, ok := h.resolveCarriedAudioTrackV3(r.Context(), req.CarriedAudioTrackID, requestedFile); ok {
+			audioIndex = carriedIndex
+			req.AudioTrackIndex = &carriedIndex
+			req.AudioTrackID = ""
+		}
+	}
 	if req.AudioTrackID == "" && req.AudioTrackIndex == nil {
 		audioIndex, err = h.preferredAudioTrackIndexV3(r.Context(), userID, profileID, deviceID, requestedFile)
 		if err != nil {
@@ -6504,16 +6514,10 @@ func resolveV3AudioIndex(file *models.MediaFile, trackID string, fallback *int) 
 }
 
 func remapAudioIndexV3(source, target *models.MediaFile, index int) int {
-	if source == nil || target == nil || index < 0 || index >= len(source.AudioTracks) {
+	if source == nil || target == nil {
 		return normalizeAudioTrackIndex(target, index)
 	}
-	wanted := source.AudioTracks[index]
-	for i, candidate := range target.AudioTracks {
-		if strings.EqualFold(candidate.Codec, wanted.Codec) && strings.EqualFold(candidate.Language, wanted.Language) && candidate.Channels == wanted.Channels {
-			return i
-		}
-	}
-	return normalizeAudioTrackIndex(target, index)
+	return playback.MatchAudioTrackAcrossVersions(source.AudioTracks, target.AudioTracks, index)
 }
 
 // remapAudioSelectionV3 rebinds the request's audio selection when the
@@ -6541,6 +6545,31 @@ func remapAudioSelectionV3(source, target *models.MediaFile, request *playback.S
 	request.AudioTrackIndex = &remapped
 	request.AudioTrackID = playback.TrackIDV3(target.ID, "audio", remapped)
 	return nil
+}
+
+// resolveCarriedAudioTrackV3 re-resolves the viewer's audio selection from a
+// previous version onto the requested file. The carried identity is file-bound,
+// so its ordinal is remapped by codec/language family (MatchAudioTrackAcrossVersions),
+// not by raw position, which is unstable across encodes. Falls back (ok=false)
+// to the server's preference when the source version is gone or the identity
+// cannot be parsed.
+func (h *PlaybackHandler) resolveCarriedAudioTrackV3(ctx context.Context, carriedID string, target *models.MediaFile) (int, bool) {
+	srcID, kind, ordinal, ok := playback.ParseTrackIDV3(carriedID)
+	if !ok || kind != "audio" || target == nil {
+		return 0, false
+	}
+	if srcID == target.ID {
+		// Same file: the ordinal is directly usable (normalize bounds).
+		return normalizeAudioTrackIndex(target, ordinal), true
+	}
+	if h.fileResolver == nil {
+		return 0, false
+	}
+	source, err := h.fileResolver.GetByID(ctx, srcID)
+	if err != nil || source == nil {
+		return 0, false
+	}
+	return playback.MatchAudioTrackAcrossVersions(source.AudioTracks, target.AudioTracks, ordinal), true
 }
 
 func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, target *models.MediaFile, request *playback.StartRequestV3) error {
