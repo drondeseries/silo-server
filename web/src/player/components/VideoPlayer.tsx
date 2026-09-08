@@ -1163,6 +1163,19 @@ export function VideoPlayer({
     );
   }, []);
 
+  // Dedupe signals per plan: a virtual release that rotated under this plan
+  // makes every subtitle URL stale. Refresh the plan's subtitle inventory
+  // exactly like the subtitle menu's "refresh" action — a track_change that
+  // changes nothing re-mints the URLs against the live layout while the A/V
+  // transport stays untouched. Once a plan is signaled, further 409s for it
+  // (windowed VTT and ASS both fire) are ignored until a new plan lands.
+  const subtitleSourceChangedPlanIdRef = useRef<string | null>(null);
+  const handleSubtitleSourceChanged = useCallback(() => {
+    if (subtitleSourceChangedPlanIdRef.current === plan.plan_id) return;
+    subtitleSourceChangedPlanIdRef.current = plan.plan_id;
+    onRefreshSubtitles?.(getSubtitleStartPosition());
+  }, [getSubtitleStartPosition, onRefreshSubtitles, plan.plan_id]);
+
   const resumeFromTranslationPause = useCallback(() => {
     if (translationResumeTimerRef.current !== null) {
       window.clearTimeout(translationResumeTimerRef.current);
@@ -2328,6 +2341,7 @@ export function VideoPlayer({
     liveTranslation?.trackKey ?? null,
     subtitleStreamGeneration,
     setTextSubtitleState,
+    handleSubtitleSourceChanged,
   );
 
   // -- ASS/SSA subtitle rendering via JASSUB (client-side libass) --
@@ -2339,6 +2353,7 @@ export function VideoPlayer({
     timelineOffsetSeconds,
     subtitleDelayMs,
     setASSSubtitleState,
+    handleSubtitleSourceChanged,
   );
   // Prefetch ASS font bundles at plan adoption so a later track selection hits
   // the in-memory font cache instead of a cold server extraction. Purely a

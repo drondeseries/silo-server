@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import type JASSUB from "jassub";
 import type { PlayerSubtitleInfo } from "../types";
 import { isASSCodec } from "../utils/subtitleCodecs";
+import { isSubtitleSourceChanged } from "../utils/subtitleSourceChanged";
 import {
   fallbackFontForSubtitle,
   forceASSFontFamily,
@@ -74,9 +75,16 @@ export function useASSSubtitles(
   streamOriginSeconds: number,
   subtitleDelayMs: number,
   onLoadState?: (state: "idle" | "loading" | "ready" | "error") => void,
+  // Fired when the server answers the subtitle fetch with
+  // `subtitle_source_changed` (409): a virtual release rotated under this plan
+  // and every URL for the active track is stale. The caller must refresh the
+  // plan's subtitle inventory; retrying the same URL can never succeed.
+  onSourceChanged?: () => void,
 ): { isActive: boolean } {
   const onLoadStateRef = useRef(onLoadState);
   onLoadStateRef.current = onLoadState;
+  const onSourceChangedRef = useRef(onSourceChanged);
+  onSourceChangedRef.current = onSourceChanged;
   const jassubRef = useRef<JASSUB | null>(null);
   const jassubImportRef = useRef<Promise<typeof JASSUB> | null>(null);
   // Effective JASSUB time offset. JASSUB renders the ASS event matching
@@ -119,6 +127,10 @@ export function useASSSubtitles(
     let controller = new AbortController();
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let timeout: ReturnType<typeof setTimeout> | null = null;
+    // Set when the subtitle fetch answers 409 subtitle_source_changed: the
+    // source rotated under this plan, so the outer retry must not re-run the
+    // whole pipeline against the same stale URL.
+    let sourceChangedSignaled = false;
 
     async function initJASSUB(signal: AbortSignal, progress: () => void) {
       if (!video || cancelled) return;
@@ -141,7 +153,14 @@ export function useASSSubtitles(
       let attachedFontData: Uint8Array[] = [];
       try {
         subContent = await fetch(activeUrl!, { signal }).then(async (response) => {
-          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          if (!response.ok) {
+            if (await isSubtitleSourceChanged(response)) {
+              sourceChangedSignaled = true;
+              onSourceChangedRef.current?.();
+              throw new DOMException("Subtitle source changed", "AbortError"); // bypass the retry
+            }
+            throw new Error(`HTTP ${response.status}`);
+          }
           progress();
           if (!response.body) return response.text();
           const reader = response.body.getReader();
@@ -255,6 +274,10 @@ export function useASSSubtitles(
         jassubRef.current?.destroy();
         jassubRef.current = null;
         onLoadStateRef.current?.("error");
+        // A signaled source change must not re-run the pipeline against the
+        // same stale URL; the rebuilt JASSUB comes from the main effect
+        // re-running when the refresh adopts a new plan and activeUrl changes.
+        if (sourceChangedSignaled) return;
         retryTimer = setTimeout(() => void load(), 5_000);
       } finally {
         if (timeout !== null) clearTimeout(timeout);

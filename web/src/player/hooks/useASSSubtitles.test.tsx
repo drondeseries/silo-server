@@ -447,3 +447,87 @@ describe("useASSSubtitles font budget", () => {
     }
   });
 });
+
+describe("useASSSubtitles subtitle source changed", () => {
+  it("signals onSourceChanged once on 409 subtitle_source_changed and schedules no retry", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const onSourceChanged = vi.fn();
+    vi.mocked(fetch).mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: vi.fn().mockResolvedValue({ error: "subtitle_source_changed" }),
+    } as unknown as Response);
+    const videoRef = makeVideoRef();
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(
+        videoRef,
+        [arabicTrack],
+        arabicTrack.index,
+        false,
+        0,
+        0,
+        undefined,
+        onSourceChanged,
+      ),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSourceChanged).toHaveBeenCalledTimes(1);
+      // The source-change signal bypasses the outer retry: the stale URL must
+      // not be fetched again.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(constructorOpts).toHaveLength(0);
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the 5s retry for a generic 500 subtitle fetch", async () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const onSourceChanged = vi.fn();
+    const state = vi.fn();
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: false, status: 500 } as unknown as Response)
+      .mockResolvedValue(mockFetchResponse("[Script Info]"));
+    const videoRef = makeVideoRef();
+    const { unmount } = renderHook(() =>
+      useASSSubtitles(
+        videoRef,
+        [arabicTrack],
+        arabicTrack.index,
+        false,
+        0,
+        0,
+        state,
+        onSourceChanged,
+      ),
+    );
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(onSourceChanged).not.toHaveBeenCalled();
+      expect(state).toHaveBeenLastCalledWith("error");
+      // The 5s retry is unchanged for generic failures and recovers.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(constructorOpts).toHaveLength(1);
+      expect(state).toHaveBeenLastCalledWith("ready");
+    } finally {
+      unmount();
+      error.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+});

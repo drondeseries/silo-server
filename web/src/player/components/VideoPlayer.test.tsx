@@ -36,6 +36,12 @@ const subtitleTimeline = vi.hoisted(() => ({
 }));
 const toastError = vi.hoisted(() => vi.fn());
 const hlsJS = vi.hoisted(() => ({ supported: false, constructed: vi.fn() }));
+// Captures the onSourceChanged handlers the mocked subtitle hooks receive, so
+// tests can drive a subtitle_source_changed (409) signal from the outside.
+const subtitleHooks = vi.hoisted(() => ({
+  vttSourceChanged: null as null | (() => void),
+  assSourceChanged: null as null | (() => void),
+}));
 
 vi.mock("sonner", () => ({ toast: { error: toastError, success: vi.fn(), message: vi.fn() } }));
 
@@ -55,12 +61,14 @@ vi.mock("../hooks/useRemuxSeeking", () => ({
 vi.mock("../hooks/useSubtitleTracks", () => ({
   useSubtitleTracks: (...args: unknown[]) => {
     subtitleTimeline.textOffsetSeconds = args[3] as number;
+    subtitleHooks.vttSourceChanged = (args[11] as (() => void) | undefined) ?? null;
     return [];
   },
 }));
 vi.mock("../hooks/useASSSubtitles", () => ({
   useASSSubtitles: (...args: unknown[]) => {
     subtitleTimeline.assOffsetSeconds = args[4] as number;
+    subtitleHooks.assSourceChanged = (args[7] as (() => void) | undefined) ?? null;
     return { isActive: false };
   },
 }));
@@ -191,6 +199,8 @@ describe("VideoPlayer plan failure recovery", () => {
     controls.current = null;
     subtitleTimeline.textOffsetSeconds = null;
     subtitleTimeline.assOffsetSeconds = null;
+    subtitleHooks.vttSourceChanged = null;
+    subtitleHooks.assSourceChanged = null;
     hlsJS.supported = false;
     hlsJS.constructed.mockClear();
     toastError.mockClear();
@@ -1013,6 +1023,27 @@ describe("VideoPlayer translation handoff", () => {
     } finally {
       removeAttrSpy.mockRestore();
     }
+  });
+
+  it("refreshes the subtitle inventory once per plan_id on a source-changed signal", async () => {
+    const onRefreshSubtitles = vi.fn();
+    const planA = fixturePlanV3({ plan_id: "plan:aaa", plan_attempt_key: "v3:aaa" });
+    const { rerenderPlayer } = renderPlayer({ plan: planA, onRefreshSubtitles });
+    expect(subtitleHooks.vttSourceChanged).toBeTypeOf("function");
+    expect(subtitleHooks.assSourceChanged).toBeTypeOf("function");
+
+    // The VTT window fetch and the ASS fetch can both see the rotation; both
+    // signals for the same plan must collapse into a single refresh.
+    act(() => subtitleHooks.vttSourceChanged?.());
+    act(() => subtitleHooks.assSourceChanged?.());
+    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
+
+    // A new plan (the refresh's own replan re-mints the URLs) re-arms the
+    // signal: the next rotation for it refreshes again.
+    const planB = fixturePlanV3({ plan_id: "plan:bbb", plan_attempt_key: "v3:bbb" });
+    rerenderPlayer({ plan: planB });
+    act(() => subtitleHooks.vttSourceChanged?.());
+    expect(onRefreshSubtitles).toHaveBeenCalledTimes(2);
   });
 
   it("does not reload when only player_start_seconds changes (reused-transport replan)", async () => {

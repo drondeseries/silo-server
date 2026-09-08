@@ -3,6 +3,7 @@ import { parseVTT, type ParsedCue } from "../utils/parseVTT";
 import type { PlayerSubtitleInfo } from "../types";
 import { isASSCodec, isBitmapCodec } from "../utils/subtitleCodecs";
 import { toMediaTime } from "../utils/mediaTimeline";
+import { isSubtitleSourceChanged } from "../utils/subtitleSourceChanged";
 
 // Explicitly bound each subtitle fetch to this many source-time seconds.
 const WINDOW_DURATION = 600;
@@ -135,10 +136,17 @@ export function useSubtitleTracks(
   // existing activeUrl-driven build.
   streamGeneration = 0,
   onLoadState?: (state: "idle" | "loading" | "ready" | "error") => void,
+  // Fired when the server answers a window fetch with `subtitle_source_changed`
+  // (409): a virtual release rotated under this plan, so every URL for the
+  // active track is stale. The caller must refresh the plan's subtitle
+  // inventory; retrying the same URL can never succeed.
+  onSourceChanged?: () => void,
 ): string[] {
   const [activeCueTexts, setActiveCueTexts] = useState<string[]>([]);
   const onLoadStateRef = useRef(onLoadState);
   onLoadStateRef.current = onLoadState;
+  const onSourceChangedRef = useRef(onSourceChanged);
+  onSourceChangedRef.current = onSourceChanged;
 
   // Latest stream origin, readable from stable callbacks (maybeFetch) without
   // retriggering the main effect.
@@ -244,6 +252,10 @@ export function useSubtitleTracks(
     // a short backoff before retrying the uncovered range.
     let lastFetchFailureAt = 0;
     let retryDelay = 0;
+    // Set when a window fetch answers 409 subtitle_source_changed: the source
+    // rotated under this plan and the URL is stale, so the failure branch must
+    // not schedule a backoff retry of a URL that can never succeed.
+    let sourceChangedSignaled = false;
 
     function handleCueChange() {
       const active = track.activeCues;
@@ -317,11 +329,16 @@ export function useSubtitleTracks(
         armStallTimer();
         const resp = await fetch(url, { signal: controller.signal });
         if (!resp.ok || !resp.body) {
-          // Non-ok responses (including 404/415) fall through to the finally
-          // block, which schedules a bounded exponential-backoff retry. A
-          // silent return here would let every timeupdate re-trigger the
-          // fetch and storm the server.
-          console.error(`[useSubtitleTracks] Failed to fetch ${url}: ${resp.status}`);
+          if (await isSubtitleSourceChanged(resp)) {
+            sourceChangedSignaled = true;
+            onSourceChangedRef.current?.();
+          } else {
+            // Non-ok responses (including 404/415) fall through to the finally
+            // block, which schedules a bounded exponential-backoff retry. A
+            // silent return here would let every timeupdate re-trigger the
+            // fetch and storm the server.
+            console.error(`[useSubtitleTracks] Failed to fetch ${url}: ${resp.status}`);
+          }
         } else {
           const reader = resp.body.getReader();
           const decoder = new TextDecoder();
@@ -390,7 +407,10 @@ export function useSubtitleTracks(
           }
         } else if (!succeeded && !superseded && !cancelled) {
           // Genuine failure (error, stall, or non-ok response) rather than a
-          // seek superseding this fetch — back off before retrying.
+          // seek superseding this fetch — back off before retrying. A signaled
+          // source change is not a retryable failure: the replan will re-mint
+          // the URL, so no backoff is scheduled here.
+          if (sourceChangedSignaled) return;
           lastFetchFailureAt = Date.now();
           onLoadStateRef.current?.("error");
           retryDelay = Math.min(
