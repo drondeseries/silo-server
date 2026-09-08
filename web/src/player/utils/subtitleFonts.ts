@@ -99,15 +99,17 @@ interface SubtitleFontBundleItem {
  * would not warm the selection of another). The fetch URL itself is unchanged.
  */
 export function fontBundleCacheKey(url: string): string {
+  // Parse with a base so relative URLs (the common case for API calls)
+  // work; fall back to the raw URL for truly unparseable inputs.
+  let parsed: URL;
   try {
-    const parsed = new URL(url);
-    const params = new URLSearchParams(parsed.searchParams);
-    params.delete("embedded_stream_index");
-    const qs = params.toString();
-    return qs ? `${parsed.pathname}?${qs}` : parsed.pathname;
+    parsed = new URL(url, "http://silo.local");
   } catch {
     return url;
   }
+  parsed.searchParams.delete("embedded_stream_index");
+  const qs = parsed.searchParams.toString();
+  return qs ? `${parsed.pathname}?${qs}` : parsed.pathname;
 }
 
 export function loadSubtitleFallbackFontData(font: SubtitleFallbackFont): Promise<Uint8Array[]> {
