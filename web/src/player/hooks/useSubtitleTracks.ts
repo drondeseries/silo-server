@@ -409,15 +409,17 @@ export function useSubtitleTracks(
           // Genuine failure (error, stall, or non-ok response) rather than a
           // seek superseding this fetch — back off before retrying. A signaled
           // source change is not a retryable failure: the replan will re-mint
-          // the URL, so no backoff is scheduled here.
-          if (sourceChangedSignaled) return;
-          lastFetchFailureAt = Date.now();
-          onLoadStateRef.current?.("error");
-          retryDelay = Math.min(
-            retryDelay ? retryDelay * 2 : FETCH_RETRY_BACKOFF_MS,
-            FETCH_RETRY_MAX_BACKOFF_MS,
-          );
-          retryTimer = setTimeout(maybeFetch, retryDelay);
+          // the URL, so no backoff is scheduled here. Guarded inline rather
+          // than with a `return` — this block runs inside a finally.
+          if (!sourceChangedSignaled) {
+            lastFetchFailureAt = Date.now();
+            onLoadStateRef.current?.("error");
+            retryDelay = Math.min(
+              retryDelay ? retryDelay * 2 : FETCH_RETRY_BACKOFF_MS,
+              FETCH_RETRY_MAX_BACKOFF_MS,
+            );
+            retryTimer = setTimeout(maybeFetch, retryDelay);
+          }
         }
       }
     }
