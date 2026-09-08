@@ -263,6 +263,14 @@ function isAutoplayNotAllowedError(error: unknown): boolean {
   );
 }
 
+// Compact, readable form of a file's release name for the version dropdown
+// ("Mission.Impossible.2023.2160p.Multi-AltMount" -> "Mission Impossible
+// 2023 2160p Multi-AltMount"), preserving hyphenated release-group tokens.
+function prettifyPlayerReleaseName(releaseName?: string): string {
+  if (!releaseName) return "";
+  return releaseName.replace(/[._]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
 function readStringPayload(
   payload: Record<string, unknown> | undefined,
   ...keys: string[]
@@ -574,11 +582,16 @@ export function VideoPlayer({
     () =>
       versions.map((v) => {
         // Compact audio languages for the version switcher so a
-        // MULTI/French track set is recognizable before playback.
+        // MULTI/French track set is recognizable before playback. A MULTi
+        // track advertises its full languages[] list; fall back to the
+        // single language field when the list is absent.
         const audioLangs = [
           ...new Set(
             (v.audio_tracks ?? [])
-              .map((track) => track.language?.trim())
+              .flatMap((track) => {
+                const languages = track.languages?.filter((l) => l?.trim());
+                return languages && languages.length > 0 ? languages : [track.language?.trim()];
+              })
               .filter((language): language is string => Boolean(language)),
           ),
         ].join("/");
@@ -590,6 +603,7 @@ export function VideoPlayer({
         return {
           fileId: v.file_id,
           label: `${v.resolution} ${v.codec_video.toUpperCase()}${v.hdr ? " HDR" : ""}${audioPart}`,
+          releaseName: prettifyPlayerReleaseName(v.release_name ?? v.file_name),
           isCurrentSource: v.file_id === plan.effective_media_file_id,
           isRequestedSource:
             (v.file_id === pendingSwitchFileId && v.file_id !== plan.effective_media_file_id) ||
