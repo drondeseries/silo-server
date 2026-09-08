@@ -3,10 +3,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { useSubtitleFontPrefetch } from "./useSubtitleFontPrefetch";
 import type { PlayerSubtitleInfo } from "../types";
 
-const loadSubtitleFontBundle = vi.hoisted(() => vi.fn(() => Promise.resolve([])));
+const loadSubtitleFontBundle = vi.hoisted(() =>
+  vi.fn((_url: string, _signal?: AbortSignal) => Promise.resolve([])),
+);
 
 vi.mock("../utils/subtitleFonts", () => ({
-  loadSubtitleFontBundle: (...args: unknown[]) => loadSubtitleFontBundle(...args),
+  loadSubtitleFontBundle: (url: string) => loadSubtitleFontBundle(url),
 }));
 
 function track(overrides: Partial<PlayerSubtitleInfo> = {}): PlayerSubtitleInfo {

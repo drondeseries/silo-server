@@ -99,7 +99,7 @@ interface SubtitleFontBundleItem {
  * would not warm the selection of another). The fetch URL itself is unchanged.
  */
 export function fontBundleCacheKey(url: string): string {
-  const [path, query = ""] = url.split("?");
+  const [path = "", query = ""] = url.split("?");
   const params = query
     .split("&")
     .filter((param) => param !== "" && param.split("=")[0] !== "embedded_stream_index");
