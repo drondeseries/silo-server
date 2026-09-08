@@ -728,6 +728,9 @@ func (c *SubtitleCache) storeFontBundle(key FontBundleKey, data []byte) error {
 	if err := os.Rename(tmpName, final); err != nil {
 		return fmt.Errorf("subtitle font bundle publish: %w", err)
 	}
+	// Evict stale font-bundle entries so they don't accumulate past the budget.
+	// The recognizer in evict already handles .fontbundle files.
+	c.evict(dir)
 	return nil
 }
 

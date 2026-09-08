@@ -2,10 +2,10 @@ package playback
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // fontBundleTestKey is a local-file key with a stable mtime/size.
@@ -123,8 +123,16 @@ func TestExtractFontBundleSingleFlight(t *testing.T) {
 	const n = 16
 	var calls atomic.Int64
 	release := make(chan struct{})
+	extractEntered := make(chan struct{})
 	extract := func(context.Context) ([]byte, error) {
 		calls.Add(1)
+		// Signal that the singleflight leader has entered the extract
+		// function, so the test can release the barrier without a fixed
+		// sleep that is flaky under CI load.
+		select {
+		case extractEntered <- struct{}{}:
+		default:
+		}
 		<-release
 		return []byte("shared bundle"), nil
 	}
@@ -148,9 +156,11 @@ func TestExtractFontBundleSingleFlight(t *testing.T) {
 	}
 
 	// Give every goroutine time to reach the singleflight flight before letting
-	// the single in-flight extractor complete.
+	// the single in-flight extractor complete. The extract function signals
+	// via extractEntered so we wait for the actual singleflight entry, not a
+	// fixed sleep that is flaky under CI load.
 	started.Wait()
-	time.Sleep(50 * time.Millisecond)
+	<-extractEntered
 	close(release)
 	finished.Wait()
 
@@ -191,7 +201,11 @@ func TestExtractFontBundleLeaderCancellationDoesNotFailWaiters(t *testing.T) {
 		waiterDone <- err
 	}()
 	// Let the waiter join the leader's flight before unblocking extraction.
-	time.Sleep(50 * time.Millisecond)
+	// The extract function closes `started` on first entry; wait for the
+	// waiter to join by checking that the leader has already entered, then
+	// yield to let the waiter join the singleflight.
+	<-started
+	runtime.Gosched()
 
 	// Cancelling the leader's request must not kill the shared extraction the
 	// waiter is blocked on.

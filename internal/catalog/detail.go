@@ -3390,6 +3390,15 @@ func (s *DetailService) effectiveAudioSelectionWith(
 	if file == nil || len(file.AudioTracks) == 0 {
 		return effectiveAudioSelection{}
 	}
+	// Backfill the languages array from embedded track titles before resolving
+	// the effective language: rows probed before MULTI/DUAL languages support
+	// carry an empty array or a "mul"/"und" tag, while the displayed
+	// FileVersion.AudioTracks are backfilled by ensureTrackLanguages. Resolving
+	// against a backfilled copy keeps EffectiveAudioLanguage consistent with
+	// the tracks the client renders without mutating the caller's file.
+	backfilled := *file
+	backfilled.AudioTracks = ensureTrackLanguages(append([]models.AudioTrack(nil), file.AudioTracks...))
+	file = &backfilled
 	if r == nil || !r.valid {
 		index := playback.SelectAudioTrack(file.AudioTracks, "", nil)
 		return effectiveAudioSelection{

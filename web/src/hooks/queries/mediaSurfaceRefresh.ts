@@ -204,7 +204,7 @@ export async function invalidateMediaSurfaceQueries(
   });
 }
 
-function isTerminalItemDetailNotFound(query: {
+export function isTerminalItemDetailNotFound(query: {
   queryKey: readonly unknown[];
   state?: { status?: string; error?: unknown };
 }): boolean {

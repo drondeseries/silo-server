@@ -99,11 +99,15 @@ interface SubtitleFontBundleItem {
  * would not warm the selection of another). The fetch URL itself is unchanged.
  */
 export function fontBundleCacheKey(url: string): string {
-  const [path = "", query = ""] = url.split("?");
-  const params = query
-    .split("&")
-    .filter((param) => param !== "" && param.split("=")[0] !== "embedded_stream_index");
-  return params.length > 0 ? `${path}?${params.join("&")}` : path;
+  try {
+    const parsed = new URL(url);
+    const params = new URLSearchParams(parsed.searchParams);
+    params.delete("embedded_stream_index");
+    const qs = params.toString();
+    return qs ? `${parsed.pathname}?${qs}` : parsed.pathname;
+  } catch {
+    return url;
+  }
 }
 
 export function loadSubtitleFallbackFontData(font: SubtitleFallbackFont): Promise<Uint8Array[]> {
@@ -126,7 +130,11 @@ export function loadSubtitleFallbackFontData(font: SubtitleFallbackFont): Promis
   return promise;
 }
 
-export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promise<Uint8Array[]> {
+export function loadSubtitleFontBundle(
+  url: string,
+  signal?: AbortSignal,
+  onSourceChanged?: () => void,
+): Promise<Uint8Array[]> {
   const cacheKey = fontBundleCacheKey(url);
   const cached = fontBundleCache.get(cacheKey);
   if (cached) {
@@ -142,6 +150,14 @@ export function loadSubtitleFontBundle(url: string, signal?: AbortSignal): Promi
   const promise = fetch(url, { signal })
     .then(async (response) => {
       if (!response.ok) {
+        if (response.status === 409) {
+          // Virtual release rotation made the font URL stale; signal the
+          // player to refresh the subtitle inventory. The text fetcher
+          // usually fires first, but the font prefetch at plan adoption
+          // can hit this before any text fetch.
+          onSourceChanged?.();
+          return [];
+        }
         throw new Error(`HTTP ${response.status}`);
       }
       return (await response.json()) as SubtitleFontBundleItem[];

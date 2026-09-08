@@ -71,6 +71,10 @@ import {
   endWatchTogetherRoom,
   setWatchTogetherGuestControl,
 } from "@/lib/watchTogetherActions";
+import {
+  collectLanguageLabels,
+  prettifyReleaseName,
+} from "@/pages/ItemDetail/components/versionFormatUtils";
 import { toast } from "sonner";
 
 let hlsJSModule: Promise<typeof HlsType> | null = null;
@@ -261,14 +265,6 @@ function isAutoplayNotAllowedError(error: unknown): boolean {
     error instanceof DOMException &&
     error.name === "NotAllowedError"
   );
-}
-
-// Compact, readable form of a file's release name for the version dropdown
-// ("Mission.Impossible.2023.2160p.Multi-AltMount" -> "Mission Impossible
-// 2023 2160p Multi-AltMount"), preserving hyphenated release-group tokens.
-function prettifyPlayerReleaseName(releaseName?: string): string {
-  if (!releaseName) return "";
-  return releaseName.replace(/[._]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function readStringPayload(
@@ -584,17 +580,15 @@ export function VideoPlayer({
         // Compact audio languages for the version switcher so a
         // MULTI/French track set is recognizable before playback. A MULTi
         // track advertises its full languages[] list; fall back to the
-        // single language field when the list is absent.
-        const audioLangs = [
-          ...new Set(
-            (v.audio_tracks ?? [])
-              .flatMap((track) => {
-                const languages = track.languages?.filter((l) => l?.trim());
-                return languages && languages.length > 0 ? languages : [track.language?.trim()];
-              })
-              .filter((language): language is string => Boolean(language)),
-          ),
-        ].join("/");
+        // single language field when the list is absent. Labels resolve
+        // through the same formatter as the item page, so raw ISO codes
+        // render as "English/French" rather than "en/fr".
+        const audioLangs = collectLanguageLabels(
+          (v.audio_tracks ?? []).flatMap((track) => {
+            const languages = track.languages?.filter((l) => l?.trim());
+            return languages && languages.length > 0 ? languages : [track.language?.trim()];
+          }),
+        ).join("/");
         const audioPart = v.codec_audio
           ? ` ${v.codec_audio.toUpperCase()}${audioLangs ? ` ${audioLangs}` : ""}`
           : audioLangs
@@ -603,7 +597,7 @@ export function VideoPlayer({
         return {
           fileId: v.file_id,
           label: `${v.resolution} ${v.codec_video.toUpperCase()}${v.hdr ? " HDR" : ""}${audioPart}`,
-          releaseName: prettifyPlayerReleaseName(v.release_name ?? v.file_name),
+          releaseName: prettifyReleaseName(v.release_name ?? v.file_name),
           isCurrentSource: v.file_id === plan.effective_media_file_id,
           isRequestedSource:
             (v.file_id === pendingSwitchFileId && v.file_id !== plan.effective_media_file_id) ||
@@ -2386,6 +2380,7 @@ export function VideoPlayer({
     subtitleDelayMs,
     setASSSubtitleState,
     handleSubtitleSourceChanged,
+    plan.plan_id,
   );
   // Prefetch ASS font bundles at plan adoption so a later track selection hits
   // the in-memory font cache instead of a cold server extraction. Purely a

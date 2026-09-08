@@ -124,9 +124,18 @@ func MatchAudioTrackAcrossVersions(
 	}
 
 	selected := requestedTracks[requestedIndex]
+	// A MULTi/undetermined track's primary Language is "mul"/"und" and matches
+	// nothing; fall back to the first concrete code in its Languages list so the
+	// cross-version language match can still find a counterpart.
+	lang := selected.Language
+	if lang == "" || lang == "und" || lang == "mul" {
+		if len(selected.Languages) > 0 {
+			lang = selected.Languages[0]
+		}
+	}
 	return SelectAudioTrack(effectiveTracks, "", &AudioTrackPreference{
 		AudioTrackIndex: requestedIndex,
-		AudioLanguage:   selected.Language,
+		AudioLanguage:   lang,
 		TrackSignature:  AudioTrackSignatureFromTrack(selected),
 	})
 }

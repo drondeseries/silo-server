@@ -53,6 +53,13 @@ export function isVirtualFileVersion(version: { container?: string; file_path?: 
   );
 }
 
+/** Turns a release-style name ("Movie.2023.2160p.Remux-GRP") into a readable
+ *  line ("Movie 2023 2160p Remux GRP"). */
+export function prettifyReleaseName(releaseName?: string): string {
+  if (!releaseName) return "";
+  return releaseName.replace(/[._]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
 export function formatPageCount(pages?: number): string {
   if (!pages || pages <= 0) return "";
   return `${pages.toLocaleString()} ${pages === 1 ? "page" : "pages"}`;

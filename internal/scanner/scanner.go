@@ -3328,6 +3328,11 @@ func needsCriticalProbeRepairScanState(file *scanStateFile) bool {
 	if file == nil {
 		return true
 	}
+	// Virtual files are never probed from disk; their track shape is declared
+	// by the provider, not discovered by ffprobe. Mirror isVirtualMediaFile.
+	if strings.HasPrefix(file.FilePath, "virtual://") || strings.EqualFold(file.Container, "virtual") {
+		return false
+	}
 	if file.DVProvenanceCurrent != nil && !*file.DVProvenanceCurrent {
 		return true
 	}

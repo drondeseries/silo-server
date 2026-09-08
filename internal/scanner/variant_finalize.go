@@ -103,6 +103,8 @@ func (s *Scanner) FinalizeVariantsByPathPrefix(
 				MultiEpisodeStart:     file.MultiEpisodeStart,
 				MultiEpisodeEnd:       file.MultiEpisodeEnd,
 			}
+			hints.ReleaseName = file.ReleaseName
+			hints.ReleaseGroup = file.ReleaseGroup
 		}
 		if hints == nil {
 			hints = &naming.VariantHints{}

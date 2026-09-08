@@ -61,6 +61,27 @@ func scanWebhooks(rows pgx.Rows) ([]Webhook, error) {
 	return hooks, rows.Err()
 }
 
+// HasRatingSubscribers reports whether the profile has at least one enabled
+// webhook with notify_ratings set. Used by the rating notifier's cheap
+// pre-check so a rating on a profile with no rating-enabled webhook never
+// creates a delivery row at all (C2/C8). Errors from the query surface as
+// false so the caller's best-effort path still degrades to dispatching.
+func (r *WebhookRepository) HasRatingSubscribers(ctx context.Context, profileID string) (bool, error) {
+	var has bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM notification_webhooks
+			WHERE profile_id = $1 AND enabled AND notify_ratings
+			LIMIT 1
+		)`,
+		profileID,
+	).Scan(&has)
+	if err != nil {
+		return false, fmt.Errorf("check rating webhook subscribers: %w", err)
+	}
+	return has, nil
+}
+
 // ListByProfile returns all of a profile's webhooks for the listing endpoint.
 func (r *WebhookRepository) ListByProfile(ctx context.Context, profileID string) ([]Webhook, error) {
 	rows, err := r.pool.Query(ctx,

@@ -211,9 +211,12 @@ func (h *AdminSubtitleHandler) HandleTestProvider(w http.ResponseWriter, r *http
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
-	// Providers that validate credentials through their own handshake (e.g.
-	// OpenSubtitles login) expose TestConnection; a search would not prove
-	// their account works. Prefer the credential test, fall back to a search.
+	// Providers implementing ConnectionTester define their own success
+	// criteria: OpenSubtitles validates via login, subdl/subsource validate
+	// via a search that carries the API key (empty results still count as
+	// connected — a valid key can return nothing for a title). The fallback
+	// search below preserves the stricter empty-results guard for providers
+	// that do not implement ConnectionTester.
 	if tester, ok := provider.(subtitles.ConnectionTester); ok {
 		if err := tester.TestConnection(ctx); err != nil {
 			writeJSON(w, http.StatusOK, map[string]interface{}{

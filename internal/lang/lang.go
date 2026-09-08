@@ -67,11 +67,11 @@ var languageNameCode = map[string]string{
 // language list in a track title ("AC3 5.1 English+French") and must be
 // filtered before language matching so they never read as a language.
 var audioJunkTokens = map[string]bool{
-	"ac3": true, "eac3": true, "dts": true, "truehd": true, "atmos": true,
+	"ac3": true, "eac3": true, "dts": true, "dts-hd": true, "truehd": true, "atmos": true,
 	"stereo": true, "mono": true, "surround": true, "commentary": true,
 	"dub": true, "original": true, "multi": true, "dual": true,
 	"audio": true, "track": true, "lang": true, "language": true,
-	"mix": true, "mixed": true,
+	"mix": true, "mixed": true, "hd": true, "ma": true,
 	"2.0": true, "5.1": true, "7.1": true, "5.1.2": true, "7.1.4": true,
 }
 

@@ -6966,10 +6966,25 @@ func (h *PlaybackHandler) lazyDVRPUStrippableV3(ctx context.Context, file *model
 	return func() bool {
 		once.Do(func() {
 			strippable = playback.DVRPUStrippable(ctx, h.playbackConfig().FFmpegPath, file.FilePath)
+			// DVRPUStrippable returns only a bool, so a transient probe failure
+			// (timeout, unreadable mount) is indistinguishable from a real
+			// verdict and pins `true` here — the safe default: the strip is
+			// attempted, and the transcoder handles failure gracefully.
 			if memoize {
 				h.v3DVRPUMu.Lock()
 				if h.v3DVRPUVerds == nil {
 					h.v3DVRPUVerds = make(map[dvRPUMemoKeyV3]bool)
+				}
+				// Bound the memo: evict a random entry when the map exceeds
+				// the cap so it never grows unbounded over the process
+				// lifetime. A full LRU is overkill for a probe-verdict cache
+				// whose entries are cheap to recompute on miss.
+				const dvRPUMemoMax = 256
+				if len(h.v3DVRPUVerds) >= dvRPUMemoMax {
+					for k := range h.v3DVRPUVerds {
+						delete(h.v3DVRPUVerds, k)
+						break
+					}
 				}
 				h.v3DVRPUVerds[memoKey] = strippable
 				h.v3DVRPUMu.Unlock()

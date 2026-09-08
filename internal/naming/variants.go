@@ -13,7 +13,7 @@ var (
 	plexEditionTagRe      = regexp.MustCompile(`(?i)\{edition-([^}]+)\}`)
 	multiEpisodeRangeRe   = regexp.MustCompile(`(?i)[Ss](\d{1,4})[Ee](\d{1,3})\s*[-_]\s*[Ee]?(\d{1,3})`)
 	presentationPartRe    = regexp.MustCompile(`(?i)(?:^|[.\-_\s])(cd|disc|part|pt)(?:\s*|[._-]?)(\d{1,2})(?:$|[.\-_\s])`)
-	variantReleaseGroupRe = regexp.MustCompile(`(?i)(?:^|[.\s_-])(?:remux|web[ ._-]?dl|webrip|bluray|bdrip|brrip|hdr|dv|2160p|1080p|720p|x264|x265|h\.?264|h\.?265|hevc|av1|aac|ac3|eac3|dts|truehd|atmos).*-([a-z0-9][a-z0-9-]{1,31})$`)
+	variantReleaseGroupRe = regexp.MustCompile(`(?i)(?:^|[.\s_-])(?:remux|web[ ._-]?dl|webrip|bluray|bdrip|brrip|hdr|dv|2160p|1080p|720p|x264|x265|h\.?264|h\.?265|hevc|av1|aac|ac3|eac3|dts|truehd|atmos|multi|dual|proper|repack|internal|vff|vostfr|subfrench).*-([a-z0-9][a-z0-9-]{1,31})$`)
 	variantCleanupSepRe   = regexp.MustCompile(`[.\-_]+`)
 	variantWhitespaceRe   = regexp.MustCompile(`\s+`)
 	variantQualityTokenRe = regexp.MustCompile(`(?i)\b(?:hdr|dv|sdr|3d|remux|web[ ._-]?dl|webrip|bluray|bdrip|brrip|2160p|1080p|720p|480p|x264|x265|h\.?264|h\.?265|hevc|av1|aac|ac3|eac3|dts|truehd|atmos|proper|repack|multi|dual|vff|german|internal|criterion|custom|hybrid)\b`)

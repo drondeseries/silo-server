@@ -66,10 +66,10 @@ func New(cfg Config) *Provider {
 
 func (p *Provider) Name() string { return "subsource" }
 
-// TestConnection verifies the API key by running a movie search: SubSource
-// rejects an invalid key with a non-200 response, so a successful search proves
-// the key is accepted. Empty results still count as connected — only an
-// HTTP/transport error fails the test.
+// TestConnection verifies the API key by running a search. A valid key
+// can legitimately return empty results for "The Matrix" (geographic
+// restrictions, temporary outages), so empty results count as connected
+// — only an HTTP/transport error fails the test.
 func (p *Provider) TestConnection(ctx context.Context) error {
 	_, err := p.Search(ctx, subtitles.SearchRequest{Title: "The Matrix", Year: 1999, Languages: []string{"en"}})
 	if err != nil {

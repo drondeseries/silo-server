@@ -434,6 +434,7 @@ export function useSubtitleTracks(
     //   - playback is nearing windowEnd and we haven't hit EOF → queue
     //     the next window, overlapping slightly with the previous
     function maybeFetch() {
+      if (sourceChangedSignaled) return; // stale URL; waiting for replan
       if (cancelled) return;
       // Until the element has media loaded, currentTime reads 0 rather than
       // the position playback will actually start at (resume target, or a

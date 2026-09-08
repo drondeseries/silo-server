@@ -944,6 +944,13 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	// Virtual keys without a pinned result= param are intentionally
+	// uncacheable: the identity would be unstable without the candidate
+	// anchor, so we fall through to the uncached extract path below.
+	if virtualFontSource && cacheKey.PinnedResult == "" {
+		slog.DebugContext(r.Context(), "virtual font bundle has no pinned result= param; skipping cache", "component", "api", "file_id", file.ID)
+	}
+
 	// A cache hit serves the encoded bundle immediately: no provider round-trip,
 	// no relay registration, no ffmpeg spawn.
 	if h.SubtitleCache != nil {

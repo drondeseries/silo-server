@@ -8,7 +8,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { formatFileSize, mapAudioLabel } from "@/lib/mediaFormat";
 import { videoRangeLabel } from "@/lib/videoRange";
-import { collectLanguageLabels, extractSourceHint } from "./versionFormatUtils";
+import {
+  collectLanguageLabels,
+  extractSourceHint,
+  prettifyReleaseName,
+} from "./versionFormatUtils";
 import { audioScore, resolutionScore } from "./versionRankingUtils";
 
 // ---------------------------------------------------------------------------
@@ -46,13 +50,6 @@ export function buildQualitySummary(version: FileVersion): string {
   }
 
   return parts.join(" · ");
-}
-
-/** Turns a release-style name ("Movie.2023.2160p.Remux-GRP") into a readable
- *  line ("Movie 2023 2160p Remux GRP"). */
-export function prettifyReleaseName(releaseName?: string): string {
-  if (!releaseName) return "";
-  return releaseName.replace(/[._]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 export function buildDetailLine(version: FileVersion): string {

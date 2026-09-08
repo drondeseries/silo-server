@@ -26,7 +26,7 @@ type genericWebhookBody struct {
 	ProfileID  string                 `json:"profile_id"`
 	LibraryID  *int                   `json:"library_id,omitempty"`
 	Type       string                 `json:"type"`
-	Reasons    ReasonFlags            `json:"reason_flags"`
+	Reasons    *ReasonFlags           `json:"reason_flags,omitempty"`
 	Series     *genericWebhookSeries  `json:"series,omitempty"`
 	Episode    *genericWebhookEpisode `json:"episode,omitempty"`
 	// Request is present for request.* deliveries. For request.fulfilled the
@@ -82,7 +82,14 @@ func BuildGenericWebhookPayload(row DeliveryRow, webhookID string, test bool) ([
 		ProfileID:  row.ProfileID,
 		LibraryID:  row.LibraryID,
 		Type:       row.Type,
-		Reasons:    parseReasonFlags(row.ReasonFlags),
+	}
+	// C4: reason_flags carries reason booleans (favorite, watchlist,
+	// continue_watching, next_up) that only apply to episode.available
+	// deliveries. rating.set decodes into all-false booleans, so omit the
+	// field for it; the rating itself rides in the rating block.
+	if row.Type != DeliveryTypeRatingSet {
+		flags := parseReasonFlags(row.ReasonFlags)
+		body.Reasons = &flags
 	}
 	if row.SeriesID != nil {
 		body.Series = &genericWebhookSeries{ID: *row.SeriesID, Title: row.SeriesTitle}
