@@ -58,7 +58,7 @@ import type {
   SeriesContext,
   SubtitleMode,
 } from "../types";
-import type { AudioRenditionV3, FailureV3, PlanV3, SubtitleInventoryItemV3 } from "../protocol-v3";
+import type { FailureV3, PlanV3, SubtitleInventoryItemV3 } from "../protocol-v3";
 import {
   mediaDurationSeconds,
   subtitleStartPositionSeconds,
@@ -74,20 +74,6 @@ import {
 import { toast } from "sonner";
 
 let hlsJSModule: Promise<typeof HlsType> | null = null;
-
-/**
- * Position of the plan-selected rendition within the plan's rendition order,
- * which is the hls.js audioTrack index (the server mints renditions in the
- * same order as the master playlist's audio groups). -1 when renditions are
- * absent or the selection is not among them.
- */
-function audioRenditionPositionV3(
-  renditions: AudioRenditionV3[] | undefined,
-  selectedIndex: number | null | undefined,
-): number {
-  if (!renditions || renditions.length === 0 || selectedIndex == null) return -1;
-  return renditions.findIndex((rendition) => rendition.index === selectedIndex);
-}
 
 function loadHLSJS(): Promise<typeof HlsType> {
   hlsJSModule ??= import("hls.js").then(
@@ -1803,9 +1789,6 @@ export function VideoPlayer({
                 default: retryingLoadPolicy,
               },
             });
-            // The handlers below run long after this point in time, when the
-            // closure variable may have been reassigned; pin the instance.
-            const hlsInstance = hls;
 
             hls.on(Hls.Events.ERROR, (_event, data) => {
               if (!data.fatal || destroyed) return;
@@ -1883,22 +1866,6 @@ export function VideoPlayer({
 
             hls.on(Hls.Events.MANIFEST_PARSED, () => {
               if (destroyed) return;
-              // Alternate-audio renditions delivery: select the rendition the
-              // plan names as soon as the master parses, before playback begins
-              // pulling fragments. The server marks the selected rendition as
-              // the default in the master too, so this is belt-and-suspenders;
-              // later switches land via the audio-selection effect below.
-              const planNow = planRef.current;
-              const renditions = planNow?.audio_renditions;
-              if (renditions && renditions.length > 0 && hlsInstance.audioTracks.length > 0) {
-                const position = audioRenditionPositionV3(
-                  renditions,
-                  planNow?.selected_tracks.audio?.index,
-                );
-                if (position >= 0) {
-                  hlsInstance.audioTrack = position;
-                }
-              }
               attemptAutoplayWhenReady();
             });
 
@@ -1977,21 +1944,6 @@ export function VideoPlayer({
     reportCurrentPlanFailure,
     shouldAutoPlay,
   ]);
-
-  // -- HLS alternate-audio renditions --
-  // In renditions delivery an audio switch selects a different rendition of the
-  // SAME HLS generation: the server re-adopts the selection onto the same
-  // transport (no transportRevision bump), so the seamless swap happens here —
-  // hand the new selection to hls.js directly, without touching the element.
-  useEffect(() => {
-    const renditions = plan.audio_renditions;
-    if (!renditions || renditions.length === 0) return;
-    const hls = hlsRef.current;
-    if (!hls || hls.audioTracks.length === 0) return;
-    const position = audioRenditionPositionV3(renditions, plan.selected_tracks.audio?.index);
-    if (position < 0 || hls.audioTrack === position) return;
-    hls.audioTrack = position;
-  }, [plan.audio_renditions, plan.selected_tracks.audio?.index]);
 
   // -- Video event listeners --
   useEffect(() => {

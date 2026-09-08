@@ -2056,15 +2056,6 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 		abort()
 		return playback.DecisionResponseV3{}, subtitleArtifactErrorV3("Failed to prepare the selected subtitle artifact.", err)
 	}
-	// Alternate-audio renditions are additive plan metadata minted only in
-	// renditions delivery (HLS remux carrying every audio track as a rendition).
-	// DEAD until AudioRenditionsEnabled flips on. The generation-level audio
-	// facts are frozen from the default rendition so a rendition switch keeps
-	// the frozen recipe and plan bytes identical.
-	if playback.AudioRenditionsEnabled && result.Plan.Delivery == playback.DeliveryRemuxHLSV3 {
-		attachAudioRenditionsV3(session.ID, effectiveFile, result.Plan, plannedAudioTrackIndexV3(result, session.AudioTrackIndex))
-		playback.FreezeRenditionsGenerationAudioV3(effectiveFile, result.Plan, req, &frozenRecipe)
-	}
 	response := playback.DecisionResponseV3{ProtocolVersion: playback.ProtocolV3, ServerFeatures: playback.ServerFeaturesV3(), Outcome: playback.OutcomePlayableV3, SessionID: session.ID, PlaybackPlan: result.Plan}
 	record := playback.AttemptRecordV3{PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, UserID: userID, ProfileID: profileID, RequestedMediaFileID: requestedFile.ID, EffectiveMediaFileID: effectiveFile.ID, CurrentPlanID: result.Plan.PlanID, CurrentPlan: *result.Plan, FrozenRecipe: frozenRecipe, NormalizedRequest: req, StartResponse: response, RequestDigest: requestDigests.current, ExpiresAt: time.Now().Add(playback.MaxTokenTTL)}
 	if err := h.updateV3SessionState(r.Context(), session, effectiveFile, result, transport, mode); err != nil {
@@ -4252,42 +4243,6 @@ func transportGenerationV3(sessionID, planID string) string {
 	return sessionID + "-" + planSuffix + "-" + uuid.NewString()[:8]
 }
 
-// attachAudioRenditionsV3 mints the plan's alternate-audio rendition list from
-// the effective file's audio tracks, mirroring the session-scoped URL scoping
-// of the subtitle artifact: each track becomes an audio_<i>/audio.m3u8 playlist
-// URL under the session's HLS namespace. The default rendition is the
-// currently-selected track, or index 0 when nothing specific is selected.
-// languages[] is copied so MULTi tracks render their full list.
-//
-// DEAD PATH: wired into the plan build only behind AudioRenditionsEnabled
-// (false); native clients ignore the field until renditions delivery activates.
-func attachAudioRenditionsV3(sessionID string, file *models.MediaFile, plan *playback.PlanV3, selectedAudioIndex int) {
-	if plan == nil || file == nil {
-		return
-	}
-	if len(file.AudioTracks) == 0 {
-		plan.AudioRenditions = nil
-		return
-	}
-	defaultIndex := 0
-	if selectedAudioIndex >= 0 && selectedAudioIndex < len(file.AudioTracks) {
-		defaultIndex = selectedAudioIndex
-	}
-	renditions := make([]playback.AudioRenditionV3, 0, len(file.AudioTracks))
-	for i, track := range file.AudioTracks {
-		renditions = append(renditions, playback.AudioRenditionV3{
-			Index:     i,
-			TrackID:   playback.TrackIDV3(file.ID, "audio", i),
-			Language:  track.Language,
-			Languages: append([]string(nil), track.Languages...),
-			Codec:     track.Codec,
-			URL:       fmt.Sprintf("/playback/transcode/%s/audio_%d/audio.m3u8", sessionID, i),
-			Default:   i == defaultIndex,
-		})
-	}
-	plan.AudioRenditions = renditions
-}
-
 // attachSubtitleArtifactV3 republishes the plan's subtitle inventory with
 // session-scoped URLs, then resolves the plan's selected ordinal against it and
 // stamps that entry's URL onto the artifact. Publishing and resolution share one
@@ -5518,14 +5473,6 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	if err := h.attachSubtitleArtifactV3(r.Context(), session.ID, effectiveFile, result.Plan, result.SubtitleTrackIndex, &artifactRecipe); err != nil {
 		return playback.DecisionResponseV3{}, *record, nil, subtitleArtifactErrorV3("Failed to prepare the selected subtitle artifact.", err)
 	}
-	// Renditions delivery: mint the rendition list and freeze the
-	// generation-level audio facts from the default rendition (same as the
-	// start path), so the reuse gate can compare a rendition switch as a
-	// same-generation change. DEAD until AudioRenditionsEnabled flips on.
-	if playback.AudioRenditionsEnabled && result.Plan.Delivery == playback.DeliveryRemuxHLSV3 {
-		attachAudioRenditionsV3(session.ID, effectiveFile, result.Plan, plannedAudioTrackIndexV3(result, session.AudioTrackIndex))
-		playback.FreezeRenditionsGenerationAudioV3(effectiveFile, result.Plan, start, &artifactRecipe)
-	}
 	if seekReanchor {
 		if err := validateSeekReanchorPlanV3(record, result.Plan); err != nil {
 			changedFields := seekReanchorIdentityChangesV3(record, result.Plan)
@@ -5980,20 +5927,8 @@ func sidecarOnlyReuseReplanV3(record *playback.AttemptRecordV3, candidate *playb
 		record.CurrentPlan.RequestedMediaFileID != candidate.RequestedMediaFileID ||
 		record.CurrentPlan.EffectiveMediaFileID != candidate.EffectiveMediaFileID ||
 		!reuseEligibleDeliveryV3(record.CurrentPlan.Delivery) || record.CurrentPlan.Delivery != candidate.Delivery ||
-		record.CurrentPlan.Subtitle.Mode == playback.SubtitleBurnInV3 || candidate.Subtitle.Mode == playback.SubtitleBurnInV3 {
-		return candidateRecipe, false
-	}
-	// A rendition-based audio switch is a same-generation change: when both
-	// plans carry the same rendition SET on the same HLS generation (same master
-	// URL), the generation's audio contract is the set, not the selected track —
-	// a different selected rendition does not change the A/V bytes. Any other
-	// audio identity change (progressive, single-audio HLS, or a genuinely
-	// different rendition set) still rebuilds, byte-identical to before.
-	sameAudioGeneration := len(record.CurrentPlan.AudioRenditions) > 0 &&
-		len(candidate.AudioRenditions) > 0 &&
-		playback.SameAudioRenditionSetV3(record.CurrentPlan.AudioRenditions, candidate.AudioRenditions) &&
-		record.CurrentPlan.Stream.URL == candidate.Stream.URL
-	if !sameAudioGeneration && !sameTrackIdentityV3(record.CurrentPlan.SelectedTracks.Audio, candidate.SelectedTracks.Audio) {
+		record.CurrentPlan.Subtitle.Mode == playback.SubtitleBurnInV3 || candidate.Subtitle.Mode == playback.SubtitleBurnInV3 ||
+		!sameTrackIdentityV3(record.CurrentPlan.SelectedTracks.Audio, candidate.SelectedTracks.Audio) {
 		return candidateRecipe, false
 	}
 	// The planner prefers hardware whenever both executors are currently

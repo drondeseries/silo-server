@@ -191,18 +191,7 @@ function isSameAVTransport(prev: PlanV3 | null, next: PlanV3): boolean {
   if (prev.stream.container !== next.stream.container) return false;
   if (prev.stream.mime_type !== next.stream.mime_type) return false;
   if (prev.effective_media_file_id !== next.effective_media_file_id) return false;
-  // HLS renditions delivery: an audio switch selects a different rendition of
-  // the SAME HLS generation, so the audio index is not a transport fact. As
-  // long as both plans carry a rendition set on the same stream URL, the audio
-  // selection may differ without bumping the transport (no element remount).
-  // A rendition-set change or a non-renditions audio switch still returns
-  // false here, bumping the transport conservatively.
-  const renditionsShared =
-    (prev.audio_renditions?.length ?? 0) > 0 &&
-    (next.audio_renditions?.length ?? 0) > 0 &&
-    prev.stream.url === next.stream.url;
-  if (!renditionsShared && prev.selected_tracks.audio?.index !== next.selected_tracks.audio?.index)
-    return false;
+  if (prev.selected_tracks.audio?.index !== next.selected_tracks.audio?.index) return false;
   if (prev.timeline.stream_origin_seconds !== next.timeline.stream_origin_seconds) return false;
   if (prev.timeline.can_seek_anywhere !== next.timeline.can_seek_anywhere) return false;
   if (prev.subtitle.mode === "burn_in" || next.subtitle.mode === "burn_in") {

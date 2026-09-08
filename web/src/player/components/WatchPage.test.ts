@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fixturePlanV3 } from "../protocol-v3.fixtures";
 import { derivePersistedSubtitleMode } from "../utils/subtitleMode";
 import type { UsePlaybackSessionResult } from "../hooks/usePlaybackSession";
-import type { PlayerAudioTrack, PlayerFileVersion, WatchPageProps } from "../types";
+import type { PlayerFileVersion, WatchPageProps } from "../types";
 import { WatchPage } from "./WatchPage";
 
 const playbackSessionMock = vi.hoisted(() => vi.fn());
@@ -53,7 +53,6 @@ const version: PlayerFileVersion = {
   duration: 3600,
   bitrate: 1,
   chapters: [{ index: 0, title: "Chapter", start_seconds: 0, end_seconds: 3600, source: "test" }],
-  audio_tracks: [{ language: "eng", title: "English (Catalog)" }],
 };
 
 const watchPageProps: WatchPageProps = {
@@ -204,42 +203,6 @@ describe("WatchPage playback state", () => {
 
     expect(updatePlaybackState).toHaveBeenCalledWith(321, true);
     expect(onPlaybackStateChange).toHaveBeenCalledWith(state);
-  });
-});
-
-describe("WatchPage audio menu source", () => {
-  it("feeds the audio menu from plan renditions when the plan carries them", () => {
-    const renditionPlan = fixturePlanV3({
-      audio_renditions: [
-        { index: 1, language: "eng", languages: ["eng", "fre", "deu"], codec: "aac" },
-        { index: 2, language: "fre", languages: ["fre"], codec: "aac" },
-      ],
-      selected_tracks: { audio: { id: "file:7:audio:0", index: 1 } },
-    });
-    playbackSessionMock.mockReturnValue(playbackSession({ plan: renditionPlan }));
-
-    render(createElement(WatchPage, watchPageProps));
-
-    const props = videoPlayerMock.mock.calls[0]?.[0] as { audioTracks?: PlayerAudioTrack[] };
-    // MULTi rendition: the title joins the formatted languages, and the raw
-    // language list rides along for AudioTrackMenu's describeTrack.
-    expect(props.audioTracks).toHaveLength(2);
-    expect(props.audioTracks?.[0]).toMatchObject({
-      title: "English/French/German",
-      language: "eng",
-      languages: ["eng", "fre", "deu"],
-      codec: "aac",
-    });
-    expect(props.audioTracks?.[1]).toMatchObject({ language: "fre", languages: ["fre"] });
-  });
-
-  it("falls back to the catalog audio tracks when the plan carries no renditions", () => {
-    playbackSessionMock.mockReturnValue(playbackSession());
-
-    render(createElement(WatchPage, watchPageProps));
-
-    const props = videoPlayerMock.mock.calls[0]?.[0] as { audioTracks?: PlayerAudioTrack[] };
-    expect(props.audioTracks).toEqual([{ language: "eng", title: "English (Catalog)" }]);
   });
 });
 

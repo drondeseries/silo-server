@@ -35,16 +35,7 @@ const subtitleTimeline = vi.hoisted(() => ({
   assOffsetSeconds: null as number | null,
 }));
 const toastError = vi.hoisted(() => vi.fn());
-const hlsJS = vi.hoisted(() => ({
-  supported: false,
-  constructed: vi.fn(),
-  instance: null as null | {
-    audioTracks: unknown[];
-    audioTrack: number;
-    destroyed: boolean;
-    emit: (event: string) => void;
-  },
-}));
+const hlsJS = vi.hoisted(() => ({ supported: false, constructed: vi.fn() }));
 // Captures the onSourceChanged handlers the mocked subtitle hooks receive, so
 // tests can drive a subtitle_source_changed (409) signal from the outside.
 const subtitleHooks = vi.hoisted(() => ({
@@ -100,27 +91,15 @@ vi.mock("hls.js", () => ({
     };
     static ErrorTypes = { NETWORK_ERROR: "networkError", MEDIA_ERROR: "mediaError" };
     static isSupported = () => hlsJS.supported;
-    audioTracks: unknown[] = [];
-    audioTrack = -1;
-    destroyed = false;
-    handlers: Record<string, (...args: unknown[]) => void> = {};
 
     constructor(config?: unknown) {
       hlsJS.constructed(config);
-      hlsJS.instance = this;
     }
 
-    on(event: string, handler: (...args: unknown[]) => void) {
-      this.handlers[event] = handler;
-    }
-    emit(event: string) {
-      this.handlers[event]?.();
-    }
+    on() {}
     loadSource() {}
     attachMedia() {}
-    destroy() {
-      this.destroyed = true;
-    }
+    destroy() {}
   },
 }));
 vi.mock("./PlayerControls", () => ({
@@ -224,7 +203,6 @@ describe("VideoPlayer plan failure recovery", () => {
     subtitleHooks.assSourceChanged = null;
     hlsJS.supported = false;
     hlsJS.constructed.mockClear();
-    hlsJS.instance = null;
     toastError.mockClear();
     playerSeek.mockClear();
     vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
@@ -1097,63 +1075,6 @@ describe("VideoPlayer translation handoff", () => {
     rerenderPlayer({ plan: planB });
     act(() => subtitleHooks.vttSourceChanged?.());
     expect(onRefreshSubtitles).toHaveBeenCalledTimes(2);
-  });
-
-  it("swaps hls audio renditions without touching the element", async () => {
-    const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
-    const renditions = [
-      { index: 1, track_id: "file:7:audio:0", language: "eng", codec: "aac" },
-      { index: 2, track_id: "file:7:audio:1", language: "fre", codec: "aac" },
-    ];
-    const stream = {
-      url: "/stream/session-1/master.m3u8",
-      protocol: "hls",
-      headers: {},
-      header_refresh: "none",
-    } as const;
-    const renditionsPlan = fixturePlanV3({
-      delivery: "server_transcode_hls",
-      plan_id: "plan:renditions",
-      plan_attempt_key: "v3:renditions",
-      stream,
-      audio_renditions: renditions,
-      selected_tracks: { audio: { id: "file:7:audio:0", index: 1 } },
-    });
-    try {
-      hlsJS.supported = true;
-      const { rerenderPlayer } = renderPlayer({
-        plan: renditionsPlan,
-        planRevision: 1,
-        transportRevision: 1,
-        streamUrl: "/api/v1/stream/session-1/master.m3u8?token=token",
-      });
-      await waitFor(() => expect(hlsJS.instance).not.toBeNull());
-      const hls = hlsJS.instance!;
-
-      // Master parsed with the plan's two audio groups; the plan names
-      // rendition index 1 as the selection (position 0 in the rendition order).
-      hls.audioTracks = [renditions[0], renditions[1]];
-      act(() => hls.emit("manifestParsed"));
-      expect(hls.audioTrack).toBe(0);
-      removeAttrSpy.mockClear();
-
-      // An audio-switch replan keeps the same transport and re-mints the
-      // selection onto the same rendition set: the swap applies via
-      // hls.audioTrack without ever tearing the element down.
-      const switchedPlan = fixturePlanV3({
-        delivery: "server_transcode_hls",
-        plan_id: "plan:renditions-2",
-        plan_attempt_key: "v3:renditions-2",
-        stream,
-        audio_renditions: renditions,
-        selected_tracks: { audio: { id: "file:7:audio:1", index: 2 } },
-      });
-      rerenderPlayer({ plan: switchedPlan, planRevision: 2, transportRevision: 1 });
-      expect(hls.audioTrack).toBe(1);
-      expect(removeAttrSpy).not.toHaveBeenCalled();
-    } finally {
-      removeAttrSpy.mockRestore();
-    }
   });
 
   it("does not reload when only player_start_seconds changes (reused-transport replan)", async () => {

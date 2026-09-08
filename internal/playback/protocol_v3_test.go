@@ -381,54 +381,6 @@ func TestReplanRequestV3RejectsInvalidNetworkAndTrackEvidence(t *testing.T) {
 	}
 }
 
-func TestPlanV3AudioRenditionsRoundTrip(t *testing.T) {
-	plan := PlanV3{
-		PlanID:    "plan:renditions",
-		SessionID: "sess-1",
-		Delivery:  DeliveryTranscodeHLSV3,
-		AudioRenditions: []AudioRenditionV3{
-			{Index: 0, TrackID: "file:42:audio:0", Language: "en", Languages: []string{"en", "fr", "de"}, Codec: "eac3", URL: "/playback/transcode/sess-1/audio_0/audio.m3u8", Default: false},
-			{Index: 1, TrackID: "file:42:audio:1", Language: "ja", Codec: "aac", URL: "/playback/transcode/sess-1/audio_1/audio.m3u8", Default: true},
-		},
-	}
-
-	encoded, err := json.Marshal(plan)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var decoded PlanV3
-	if err := json.Unmarshal(encoded, &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(decoded.AudioRenditions) != 2 {
-		t.Fatalf("AudioRenditions = %d, want 2", len(decoded.AudioRenditions))
-	}
-	if !reflect.DeepEqual(decoded.AudioRenditions, plan.AudioRenditions) {
-		t.Fatalf("round-tripped AudioRenditions = %#v, want %#v", decoded.AudioRenditions, plan.AudioRenditions)
-	}
-
-	// Absent renditions marshal away (omitempty) so single-rendition plans are
-	// wire-identical to before the field existed.
-	bare := PlanV3{PlanID: "plan:bare", Delivery: DeliveryTranscodeHLSV3}
-	encodedBare, err := json.Marshal(bare)
-	if err != nil {
-		t.Fatalf("marshal bare: %v", err)
-	}
-	if strings.Contains(string(encodedBare), "audio_renditions") {
-		t.Fatalf("bare plan leaked audio_renditions: %s", encodedBare)
-	}
-}
-
-func TestPlanV3AudioRenditionsOmitEmptyWhenNil(t *testing.T) {
-	encoded, err := json.Marshal(PlanV3{PlanID: "plan:x", Delivery: DeliveryTranscodeHLSV3})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(encoded), "audio_renditions") {
-		t.Fatalf("nil AudioRenditions leaked into JSON: %s", encoded)
-	}
-}
-
 func TestPlanAttemptKeyV3Fixture(t *testing.T) {
 	type fixture struct {
 		Name                 string   `json:"name"`
@@ -2823,13 +2775,7 @@ func TestPlanPlaybackV3NonDefaultAudioSelectionCannotUseOriginalHTTP(t *testing.
 	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
 
 	result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 1, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: testTransformationRegistryV3()})
-	// With renditions enabled, a multi-audio file prefers the renditions HLS
-	// remux delivery (every audio track rides one generation as a rendition),
-	// so a non-default selection still cannot use original HTTP — it lands on
-	// the HLS remux instead of progressive. Rendition URLs are minted by the
-	// handler layer (attachAudioRenditionsV3), not by the planner, so the plan
-	// carries the delivery choice here and the renditions in the handler test.
-	if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxHLSV3 || result.PlayMethod != PlayRemux || result.TranscodeAudio {
+	if result.Plan == nil || result.Plan.Delivery != DeliveryRemuxProgressiveV3 || result.PlayMethod != PlayRemux || result.TranscodeAudio {
 		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
 	}
 	if result.Plan.SelectedTracks.Audio == nil || result.Plan.SelectedTracks.Audio.Index == nil || *result.Plan.SelectedTracks.Audio.Index != 1 {

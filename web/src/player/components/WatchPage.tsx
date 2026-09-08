@@ -15,7 +15,6 @@ import { itemKeys } from "@/hooks/queries/keys";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
 import { useWatchTogetherRoomConnection } from "../hooks/useWatchTogetherRoomConnection";
 import { toast } from "sonner";
-import { formatLanguageName } from "@/pages/ItemDetail/components/versionFormatUtils";
 
 function patchChapterThumbnail(
   versions: PlayerFileVersion[],
@@ -147,27 +146,10 @@ export function WatchPage({
     });
   }, [session.initialSubtitleError, session.initialSubtitleErrorTitle, session.playbackAttemptId]);
 
-  const audioTracks = useMemo(() => {
-    // In renditions delivery the plan owns the audio menu: every track of the
-    // effective file is a session-scoped rendition of the same HLS generation,
-    // and the catalog version list may not reflect it. Fall back to the catalog
-    // only when the plan carries no renditions (single-audio / progressive /
-    // pre-session).
-    const renditions = session.plan?.audio_renditions;
-    if (renditions && renditions.length > 0) {
-      return renditions.map((rendition) => ({
-        title:
-          rendition.languages && rendition.languages.length > 0
-            ? rendition.languages.map(formatLanguageName).filter(Boolean).join("/")
-            : formatLanguageName(rendition.language),
-        language: rendition.language,
-        languages: rendition.languages,
-        codec: rendition.codec,
-        default: rendition.default,
-      }));
-    }
-    return playbackVersions.find((v) => v.file_id === session.mediaFileId)?.audio_tracks ?? [];
-  }, [playbackVersions, session.mediaFileId, session.plan]);
+  const audioTracks = useMemo(
+    () => playbackVersions.find((v) => v.file_id === session.mediaFileId)?.audio_tracks ?? [],
+    [playbackVersions, session.mediaFileId],
+  );
   const playableSubtitles = useMemo(
     () => resolvePlayableSubtitles(session.subtitleUrls, subtitles),
     [session.subtitleUrls, subtitles],

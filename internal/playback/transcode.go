@@ -31,19 +31,6 @@ func init() {
 	_ = mime.AddExtensionType(".m4s", "video/mp4")
 }
 
-// AudioRenditionsEnabled gates the HLS alternate-audio renditions capability.
-// Step 2 of the work lands the data model and plumbing only: the protocol
-// AudioRenditionsEnabled gates the HLS alternate-audio renditions delivery:
-// multi-audio items stream via an HLS generation that carries every audio
-// track as a rendition, so a same-version audio switch becomes a rendition
-// swap (hls.js audioTrack) instead of a transport rebuild. When on, the
-// delivery policy prefers the renditions HLS remux for multi-audio, the
-// minting + generation-level freeze run on start and replan, the reuse gate
-// allows a same-generation rendition switch, and the audio rendition
-// playlist/segment routes are registered. When off, everything is dead path
-// and behavior is unchanged (single-audio and progressive untouched).
-const AudioRenditionsEnabled = true
-
 // TranscodeOpts holds configuration for an HLS transcode session.
 type TranscodeOpts struct {
 	// InputPath is the concrete source opened by FFmpeg for this process.
@@ -150,12 +137,6 @@ type TranscodeOpts struct {
 	NodeType        string
 	ExecutionMode   string
 	FFmpegLogSink   FFmpegLogSink
-	// AudioRenditions is the alternate-audio rendition list for renditions
-	// delivery: one entry per effective-file audio track, in track order. It is
-	// runtime context for the renditions recipe and master manifest; it is
-	// ignored by the single-rendition recipe and never populated while
-	// AudioRenditionsEnabled is false.
-	AudioRenditions []AudioRenditionV3
 }
 
 // DV7ToHDR10BitstreamFilter strips Dolby Vision RPU metadata during a
@@ -758,11 +739,18 @@ func classifyToneMapPreflightError(err error) error {
 	return fmt.Errorf("tone-map source preflight failed: %w", err)
 }
 
-// appendFFmpegInputArgs appends the shared input-side arguments: hardware
-// acceleration setup, input probing flags, the pre-input seek, and the input
-// file itself. Used by both the single-rendition recipe and the
-// alternate-audio renditions recipe so their input handling cannot drift.
-func appendFFmpegInputArgs(args []string, opts TranscodeOpts, isVideoCopy, isAudioCopy bool) []string {
+// buildFFmpegArgs constructs the full ffmpeg argument list from TranscodeOpts.
+func buildFFmpegArgs(opts TranscodeOpts) []string {
+	opts = normalizeTranscodeOpts(opts)
+
+	isVideoCopy := strings.EqualFold(opts.TargetCodecVideo, "copy")
+	isAudioCopy := opts.TargetCodecAudio == "copy"
+
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+	}
+
 	// Hardware acceleration — skip when copying video (no encoding needed).
 	if !isVideoCopy {
 		args = appendHWAccelArgs(args, opts)
@@ -808,22 +796,6 @@ func appendFFmpegInputArgs(args []string, opts TranscodeOpts, isVideoCopy, isAud
 	args = append(args, "-i", opts.InputPath)
 	args = append(args, "-map_metadata", "-1")
 	args = append(args, "-map_chapters", "-1")
-	return args
-}
-
-// buildFFmpegArgs constructs the full ffmpeg argument list from TranscodeOpts.
-func buildFFmpegArgs(opts TranscodeOpts) []string {
-	opts = normalizeTranscodeOpts(opts)
-
-	isVideoCopy := strings.EqualFold(opts.TargetCodecVideo, "copy")
-	isAudioCopy := opts.TargetCodecAudio == "copy"
-
-	args := []string{
-		"-hide_banner",
-		"-loglevel", "error",
-	}
-
-	args = appendFFmpegInputArgs(args, opts, isVideoCopy, isAudioCopy)
 	args = appendStreamSelectionArgs(args, opts)
 	args = appendTimestampNormalizationArgs(args, opts)
 
@@ -917,83 +889,6 @@ func buildFFmpegArgs(opts TranscodeOpts) []string {
 	args = append(args, manifestPath)
 
 	return args
-}
-
-// buildAudioRenditionsFFmpegArgs builds the multi-output HLS recipe for the
-// alternate-audio renditions delivery. When enabled, ffmpeg maps the video
-// stream plus EVERY audio track and emits one HLS generation per rendition:
-// a muxed video rendition carrying the default audio track into
-// <outputDir>/video/, and one audio-only rendition per track into
-// <outputDir>/audio_<i>/, each with its own segment namespace and playlist.
-// The copy-audio path (no encoder) is the primary target; audio encoding is
-// future work.
-//
-// DEAD PATH: gated by AudioRenditionsEnabled (false). No caller invokes this
-// builder while the flag is off, so the existing single-rendition recipe is
-// untouched.
-func buildAudioRenditionsFFmpegArgs(opts TranscodeOpts) []string {
-	if !AudioRenditionsEnabled {
-		return nil
-	}
-	opts = normalizeTranscodeOpts(opts)
-	count := len(opts.AudioRenditions)
-	if count == 0 {
-		return nil
-	}
-	defaultAudio := opts.AudioTrackIndex
-	if defaultAudio < 0 || defaultAudio >= count {
-		defaultAudio = 0
-	}
-
-	args := appendFFmpegInputArgs([]string{
-		"-hide_banner",
-		"-loglevel", "error",
-	}, opts, true, true)
-
-	// Muxed video rendition: video + default audio, copied.
-	args = append(args,
-		"-map", "0:v:0",
-		"-map", fmt.Sprintf("0:a:%d?", defaultAudio),
-		"-sn", "-dn",
-		"-c:v", "copy",
-		"-c:a", "copy",
-	)
-	args = appendTimestampNormalizationArgs(args, opts)
-	args = appendAudioRenditionsHLSOutputArgs(args, opts, "video", "video.m3u8")
-
-	// One audio-only rendition per track, each with its own segment namespace.
-	for i := 0; i < count; i++ {
-		args = append(args,
-			"-map", fmt.Sprintf("0:a:%d?", i),
-			"-c:a", "copy",
-		)
-		args = appendTimestampNormalizationArgs(args, opts)
-		args = appendAudioRenditionsHLSOutputArgs(args, opts, fmt.Sprintf("audio_%d", i), "audio.m3u8")
-	}
-	return args
-}
-
-// appendAudioRenditionsHLSOutputArgs appends the per-output HLS muxer options
-// for one rendition in the alternate-audio recipe. Segments land under
-// <outputDir>/<subdir>/ with the rendition's own playlist; each rendition is a
-// distinct ffmpeg output, so muxer options are repeated per output.
-func appendAudioRenditionsHLSOutputArgs(args []string, opts TranscodeOpts, subdir, playlistName string) []string {
-	segmentPattern := filepath.Join(opts.OutputDir, subdir, "seg_%05d.ts")
-	manifestPath := filepath.Join(opts.OutputDir, subdir, playlistName)
-	args = append(args,
-		"-max_muxing_queue_size", "2048",
-		"-max_delay", "5000000",
-		"-f", "hls",
-		"-hls_time", fmt.Sprintf("%d", opts.SegmentDuration),
-		"-hls_list_size", strconv.Itoa(maxSyntheticManifestSegments),
-		"-hls_segment_type", "mpegts",
-		"-hls_flags", "independent_segments+temp_file",
-		"-hls_segment_filename", segmentPattern,
-	)
-	if opts.StartSegmentNumber > 0 {
-		args = append(args, "-start_number", fmt.Sprintf("%d", opts.StartSegmentNumber))
-	}
-	return append(args, manifestPath)
 }
 
 // resolveEffectiveTranscodeHWAccel returns the backend that will actually execute the recipe.
@@ -2744,24 +2639,7 @@ func (s *TranscodeSession) SegmentRecoveryDecision(segNum int, now time.Time) Se
 // segPrefix is prepended to each segment filename (e.g. "segment/") and
 // rawQuery is appended as a query string (e.g. auth tokens).
 func (s *TranscodeSession) GenerateFullManifest(segPrefix, rawQuery string) []byte {
-	return syntheticFullVODManifest(s.Opts(), segPrefix, rawQuery)
-}
-
-// GenerateAudioRenditionManifest mirrors GenerateFullManifest for one rendition
-// of the alternate-audio delivery: the same complete VOD timeline, with segment
-// URIs namespaced to the rendition's own serving route by the caller's
-// segPrefix (e.g. "segment/" under /audio_<i>/audio.m3u8). One producer serves
-// every rendition because the segment names are identical across namespaces.
-//
-// DEAD PATH: reachable only through the audio-rendition routes, which are
-// gated by AudioRenditionsEnabled (false).
-func (s *TranscodeSession) GenerateAudioRenditionManifest(segPrefix, rawQuery string) []byte {
-	return syntheticFullVODManifest(s.Opts(), segPrefix, rawQuery)
-}
-
-// syntheticFullVODManifest is the shared full-source VOD playlist producer used
-// by both the primary HLS manifest and the alternate-audio rendition playlists.
-func syntheticFullVODManifest(opts TranscodeOpts, segPrefix, rawQuery string) []byte {
+	opts := s.Opts()
 	totalDur := opts.TotalDuration
 	segDur := opts.SegmentDuration
 	if segDur <= 0 {
@@ -2813,59 +2691,6 @@ func syntheticFullVODManifest(opts TranscodeOpts, segPrefix, rawQuery string) []
 	}
 
 	buf.WriteString("#EXT-X-ENDLIST\n")
-	return buf.Bytes()
-}
-
-// audioRenditionsDefaultVideoBandwidth is the BANDWIDTH estimate published on
-// the renditions master when the session carries no explicit bitrate target.
-// Dead-path placeholder; the activation commit may refine it from the recipe.
-const audioRenditionsDefaultVideoBandwidth = 5_000_000
-
-// BuildAudioRenditionsMasterManifest produces the HLS master playlist for the
-// alternate-audio renditions delivery: one EXT-X-MEDIA audio-group entry per
-// track (DEFAULT/AUTOSELECT marking the session's default rendition) and a
-// single EXT-X-STREAM-INF referencing the muxed video rendition. The rendition
-// playlist URIs are relative to the master route and follow the same session
-// scoping; rawQuery (e.g. a signed stream token) is preserved on each
-// reference, matching the synthetic manifest convention.
-//
-// DEAD PATH: produced only by tests while AudioRenditionsEnabled is false; the
-// master is not routed until renditions delivery activates.
-func (s *TranscodeSession) BuildAudioRenditionsMasterManifest(renditions []AudioRenditionV3, rawQuery string) []byte {
-	opts := s.Opts()
-	bandwidth := opts.TargetBitrateKbps * 1000
-	if bandwidth <= 0 {
-		bandwidth = audioRenditionsDefaultVideoBandwidth
-	}
-	suffix := ""
-	if rawQuery != "" {
-		suffix = "?" + rawQuery
-	}
-
-	var buf bytes.Buffer
-	buf.WriteString("#EXTM3U\n")
-	buf.WriteString("#EXT-X-VERSION:3\n")
-	for _, rendition := range renditions {
-		language := rendition.Language
-		if language == "" && len(rendition.Languages) > 0 {
-			language = rendition.Languages[0]
-		}
-		name := language
-		if name == "" {
-			name = fmt.Sprintf("Audio %d", rendition.Index)
-		}
-		defaultAttr := "NO"
-		autoSelect := "NO"
-		if rendition.Default {
-			defaultAttr = "YES"
-			autoSelect = "YES"
-		}
-		uri := fmt.Sprintf("audio_%d/audio.m3u8", rendition.Index)
-		fmt.Fprintf(&buf, "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=%q,DEFAULT=%s,AUTOSELECT=%s,LANGUAGE=%q,URI=%q%s\n",
-			name, defaultAttr, autoSelect, language, uri, suffix)
-	}
-	fmt.Fprintf(&buf, "#EXT-X-STREAM-INF:BANDWIDTH=%d,AUDIO=\"aud\"\n", bandwidth)
-	fmt.Fprintf(&buf, "video/video.m3u8%s\n", suffix)
 	return buf.Bytes()
 }
 
@@ -2941,48 +2766,6 @@ func (s *TranscodeSession) OpenSegment(name string) (*SegmentLease, error) {
 	if err != nil {
 		_ = segment.Close()
 		return nil, fmt.Errorf("stat segment: %w", err)
-	}
-	if info.Size() <= 0 {
-		_ = segment.Close()
-		return nil, ErrSegmentNotFound
-	}
-	if s.segmentIncarnation == "" {
-		s.segmentIncarnation = uuid.NewString()
-	}
-	return &SegmentLease{
-		File:            segment,
-		Info:            info,
-		Generation:      s.segmentGeneration,
-		GenerationToken: s.segmentGenerationTokenLocked(),
-	}, nil
-}
-
-// OpenAudioRenditionSegment opens a completed segment of one alternate-audio
-// rendition (rendition <i> writes into <outputDir>/audio_<i>/) for serving,
-// with the same generation guard as OpenSegment. DEAD PATH behind
-// AudioRenditionsEnabled.
-func (s *TranscodeSession) OpenAudioRenditionSegment(rendition int, name string) (*SegmentLease, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.restarting != nil {
-		return nil, ErrSegmentNotFound
-	}
-	if rendition < 0 {
-		return nil, ErrSegmentNotFound
-	}
-
-	clean := filepath.Base(name)
-	segment, err := os.Open(filepath.Join(s.outputDir, fmt.Sprintf("audio_%d", rendition), clean))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrSegmentNotFound
-		}
-		return nil, fmt.Errorf("open audio rendition segment: %w", err)
-	}
-	info, err := segment.Stat()
-	if err != nil {
-		_ = segment.Close()
-		return nil, fmt.Errorf("stat audio rendition segment: %w", err)
 	}
 	if info.Size() <= 0 {
 		_ = segment.Close()

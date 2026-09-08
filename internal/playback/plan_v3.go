@@ -588,23 +588,6 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 			return PlannerResultV3{}, false
 		}
 		progressiveFirst := !progressiveTranscodeAudio || hlsTranscodeAudio || hlsAudioQuirkOK
-		// Alternate-audio renditions delivery prefers the HLS remux generation for
-		// multi-audio sources: the same HLS generation carries every audio track as
-		// a rendition, so a same-version audio switch selects a different rendition
-		// without renegotiating the transport. Gated by AudioRenditionsEnabled
-		// (false until the activation lands) plus the client advertising HLS and
-		// the audio being deliverable by the renditions recipe (native copy, or AAC
-		// conversion within the HLS remux budget). Single-audio items keep the
-		// current progressive-first ordering.
-		renditionsPreferred := AudioRenditionsEnabled && audioRenditionsDeliveryConditionsV3(
-			file, hlsDeliveryOK, hlsTranscodeAudio,
-			input.hlsRemuxRegistry().Available(TransformationAudioToAACV3),
-		)
-		if renditionsPreferred {
-			// Renditions mode tries the HLS generation first; progressive remains
-			// the fallback when the HLS branch cannot serve this plan.
-			progressiveFirst = false
-		}
 		if progressiveFirst {
 			if result, ok := tryProgressive(); ok {
 				return result
