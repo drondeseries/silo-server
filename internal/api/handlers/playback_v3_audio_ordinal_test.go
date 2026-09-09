@@ -1,0 +1,210 @@
+package handlers
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/nodepool"
+	"github.com/Silo-Server/silo-server/internal/playback"
+	"github.com/Silo-Server/silo-server/internal/transcodenode"
+)
+
+// audioOrdinalFixtureFileV3 builds a probed file whose audio tracks carry
+// ABSOLUTE container stream indices (the domain the scanner stores), with
+// subtitles interleaved between the audio streams — the shape that breaks a
+// naive array-position or absolute-index mapping.
+func audioOrdinalFixtureFileV3(t *testing.T) *models.MediaFile {
+	t.Helper()
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = []models.AudioTrack{
+		{Index: 1, Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+		{Index: 3, Language: "fra", Codec: "aac", Channels: 2, Layout: "stereo"},
+	}
+	file.SubtitleTracks = []models.SubtitleTrack{{Index: 2, Language: "eng", Codec: "srt"}}
+	return file
+}
+
+// audioOrdinalPlanV3 is a transcode plan whose SelectedTracks.Audio.Index is
+// the array position of the selected audio track (the protocol domain).
+func audioOrdinalPlanV3(selectedAudioIndex int) *playback.PlanV3 {
+	index := selectedAudioIndex
+	return &playback.PlanV3{
+		PlanID:   "plan:audio-ordinal",
+		Delivery: playback.DeliveryTranscodeHLSV3,
+		SelectedTracks: playback.SelectedTracksV3{
+			Audio: &playback.TrackIdentityV3{ID: playback.TrackIDV3(42, "audio", selectedAudioIndex), Index: &index},
+		},
+	}
+}
+
+func audioOrdinalResultV3(selectedAudioIndex int) playback.PlannerResultV3 {
+	return playback.PlannerResultV3{
+		Plan: audioOrdinalPlanV3(selectedAudioIndex), PlayMethod: playback.PlayTranscode,
+		TargetVideoCodec: "h264", TargetAudioCodec: "aac", TargetResolution: "1080p",
+		SubtitleTrackIndex: -1, SubtitleTransportTrackIndex: -1,
+	}
+}
+
+// TestAudioStreamOrdinalV3MapsAbsoluteIndexToAudioOnlyOrdinal verifies the
+// conversion at the unit level: the selected track's array position is mapped
+// to its rank among the file's audio tracks ordered by absolute stream Index,
+// and tracks without a usable Index fall back to the array position.
+func TestAudioStreamOrdinalV3MapsAbsoluteIndexToAudioOnlyOrdinal(t *testing.T) {
+	file := audioOrdinalFixtureFileV3(t)
+	tests := []struct {
+		name          string
+		selectedIndex int
+		want          int
+	}{
+		{name: "first audio at stream 1 maps to ordinal 0", selectedIndex: 0, want: 0},
+		{name: "second audio at stream 3 maps to ordinal 1", selectedIndex: 1, want: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := audioStreamOrdinalV3(file, tt.selectedIndex); got != tt.want {
+				t.Fatalf("audioStreamOrdinalV3(file, %d) = %d, want %d", tt.selectedIndex, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAudioStreamOrdinalV3FallsBackToArrayPositionForSynthesizedTracks verifies
+// the legacy synthesized case: virtual-source tracks carry no container stream
+// index, so the array position is the ordinal.
+func TestAudioStreamOrdinalV3FallsBackToArrayPositionForSynthesizedTracks(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = []models.AudioTrack{
+		{Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+		{Language: "fra", Codec: "aac", Channels: 2, Layout: "stereo"},
+	}
+	for _, tt := range []struct {
+		selectedIndex int
+		want          int
+	}{
+		{selectedIndex: 0, want: 0},
+		{selectedIndex: 1, want: 1},
+	} {
+		if got := audioStreamOrdinalV3(file, tt.selectedIndex); got != tt.want {
+			t.Fatalf("audioStreamOrdinalV3(file, %d) = %d, want %d", tt.selectedIndex, got, tt.want)
+		}
+	}
+}
+
+// TestPrepareLocalTransportV3AudioTrackIndexIsAudioOnlyOrdinal drives the
+// local start path (playback_v3.go:3667) and asserts the FFmpeg args emitted
+// for the selected track use the audio-only ordinal ffmpeg's `0:a:N` expects.
+func TestPrepareLocalTransportV3AudioTrackIndexIsAudioOnlyOrdinal(t *testing.T) {
+	tests := []struct {
+		name          string
+		selectedIndex int
+		wantMap       string
+	}{
+		{name: "first audio at stream 1", selectedIndex: 0, wantMap: "0:a:0?"},
+		{name: "second audio at stream 3", selectedIndex: 1, wantMap: "0:a:1?"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			file := audioOrdinalFixtureFileV3(t)
+			transcodeDir := t.TempDir()
+			argsPath := filepath.Join(t.TempDir(), tt.name+"-args.txt")
+			ffmpegPath := writePlaybackArgsRecordingFFmpegV3(t, argsPath)
+			handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+			handler.PlaybackConfig = func() config.PlaybackConfig {
+				return config.PlaybackConfig{FFmpegPath: ffmpegPath, TranscodeDir: transcodeDir, TranscodeEnabled: true, HWAccel: playback.HWAccelNone}
+			}
+			result := audioOrdinalResultV3(tt.selectedIndex)
+			transport, transportErr := handler.prepareLocalTransportV3(
+				httptest.NewRequest(http.MethodPost, "/", nil),
+				&playback.Session{ID: "session-audio-ordinal-local", UserID: 7, ProfileID: "profile-1"},
+				file, result, preparedTimelineV3{}, mediaAuthModeV3{},
+			)
+			if transportErr != nil {
+				t.Fatalf("prepare local transport: %v (cause: %v)", transportErr, transportErr.cause)
+			}
+			transport.rollback()
+			args, readErr := os.ReadFile(argsPath)
+			if readErr != nil {
+				t.Fatalf("read local FFmpeg args: %v", readErr)
+			}
+			// The recording script writes one arg per line, so the map specifier
+			// appears as its own line following the -map flag.
+			if !strings.Contains(string(args), "-map\n"+tt.wantMap+"\n") {
+				t.Fatalf("local FFmpeg args missing -map %s: %s", tt.wantMap, string(args))
+			}
+		})
+	}
+}
+
+// TestPrepareRemoteTransportV3AudioTrackIndexIsAudioOnlyOrdinal drives the
+// remote start path (playback_v3.go:3888) and asserts the TranscodeStartRequest
+// sent to the node carries the audio-only ordinal.
+func TestPrepareRemoteTransportV3AudioTrackIndexIsAudioOnlyOrdinal(t *testing.T) {
+	tests := []struct {
+		name          string
+		selectedIndex int
+		wantOrdinal   int
+	}{
+		{name: "first audio at stream 1", selectedIndex: 0, wantOrdinal: 0},
+		{name: "second audio at stream 3", selectedIndex: 1, wantOrdinal: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got transcodenode.TranscodeStartRequest
+			node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/transcode/start":
+					if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+						t.Errorf("decode remote start: %v", err)
+					}
+					writeJSON(w, http.StatusAccepted, transcodenode.TranscodeStartResponse{SessionID: got.SessionID, Status: "started"})
+				default:
+					w.WriteHeader(http.StatusNoContent)
+				}
+			}))
+			defer node.Close()
+
+			handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+			handler.JWTSecret = "test-secret"
+			file := audioOrdinalFixtureFileV3(t)
+			result := audioOrdinalResultV3(tt.selectedIndex)
+			transport, transportErr := handler.prepareRemoteTransportV3(
+				httptest.NewRequest(http.MethodPost, "/", nil),
+				&playback.Session{ID: "session-audio-ordinal-remote", UserID: 7, ProfileID: "profile-1"},
+				file, result,
+				nodepool.Plan{TranscodeNode: &nodepool.Node{URL: node.URL}}, preparedTimelineV3{}, mediaAuthModeV3{},
+			)
+			if transportErr != nil {
+				t.Fatalf("prepare remote transport: %v (cause: %v)", transportErr, transportErr.cause)
+			}
+			defer transport.rollback()
+			if got.AudioTrackIndex != tt.wantOrdinal {
+				t.Fatalf("remote AudioTrackIndex = %d, want audio-only ordinal %d", got.AudioTrackIndex, tt.wantOrdinal)
+			}
+		})
+	}
+}
+
+// TestAudioStreamOrdinalV3PlanRoundTripKeepsProtocolDomain verifies the plan's
+// SelectedTracks.Audio.Index round-trip stays in the array-position domain:
+// plannedAudioTrackIndexV3 returns the plan's stored index verbatim, and only
+// audioStreamOrdinalV3 converts it to the ffmpeg ordinal at the transport edge.
+func TestAudioStreamOrdinalV3PlanRoundTripKeepsProtocolDomain(t *testing.T) {
+	file := audioOrdinalFixtureFileV3(t)
+	result := audioOrdinalResultV3(1) // plan stores array position 1 (the French track)
+	if planned := plannedAudioTrackIndexV3(result, 0); planned != 1 {
+		t.Fatalf("plannedAudioTrackIndexV3 = %d, want 1 (array position preserved)", planned)
+	}
+	if ordinal := audioStreamOrdinalV3(file, plannedAudioTrackIndexV3(result, 0)); ordinal != 1 {
+		t.Fatalf("audioStreamOrdinalV3 = %d, want 1 (audio-only ordinal for stream 3)", ordinal)
+	}
+	if !strings.Contains(result.Plan.SelectedTracks.Audio.ID, "audio:") {
+		t.Fatalf("plan audio identity malformed: %q", result.Plan.SelectedTracks.Audio.ID)
+	}
+}
