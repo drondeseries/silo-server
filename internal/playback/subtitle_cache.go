@@ -147,7 +147,7 @@ func (c *SubtitleCache) ServeExtract(w http.ResponseWriter, r *http.Request, opt
 			fill.Discard()
 			return nil
 		}
-	} else if !opts.DisableBackgroundWarm {
+	} else {
 		// Windowed text fetches are position-dependent slices, so they are
 		// never cached themselves — but the cache still speeds them up,
 		// exactly like serveWindowedSUP does for PGS: when a committed
@@ -155,12 +155,16 @@ func (c *SubtitleCache) ServeExtract(w http.ResponseWriter, r *http.Request, opt
 		// to that small artifact (the -ss scan reads kilobytes instead of
 		// re-demuxing a multi-GB remote source), and when it doesn't, a
 		// detached warm is kicked off so later windows hit the fast path.
+		// The committed-entry lookup always runs: virtual relay sources
+		// disable only the background warm (a detached fill must not outlive
+		// the request-scoped relay registration) while an already-populated
+		// entry must still be served instead of re-demuxing the source.
 		if cachedPath, _, ok := c.cachedFormatEntryPath(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format); ok {
 			slog.DebugContext(r.Context(), "windowed text subtitle extract using cached full track",
 				"input", opts.InputPath, "track", opts.TrackIndex, "cache_entry", cachedPath)
 			opts.InputPath = cachedPath
 			opts.InputIsExtractedText = format
-		} else {
+		} else if !opts.DisableBackgroundWarm {
 			c.WarmTrackInBackground(opts, extract)
 		}
 	}
