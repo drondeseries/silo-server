@@ -20,6 +20,12 @@ import (
 func TestHandleReplanPlaybackV3DemotedDeliveryStaysDisabledAcrossReplans(t *testing.T) {
 	file := v3HandlerFixtureFile(t)
 	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	stubCopySeekAnchorV3(handler)
+	handler.PlaybackConfig = playbackTestConfig(writePlaybackTestFFmpeg(t), t.TempDir())
+	presetLocalRegistryV3(handler, playback.NewTransformationRegistryV3([]playback.TransformationSpecV3{
+		{Name: "audio_to_aac", RecipeVersion: "2", Available: true},
+		{Name: "video_to_h264", RecipeVersion: "2", Available: true},
+	}))
 	handler.ItemAccess = allowAllPlaybackItemAccess{}
 	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
 
