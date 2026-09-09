@@ -16,6 +16,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/pathscope"
 	"github.com/Silo-Server/silo-server/internal/scanbatch"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -2317,12 +2318,33 @@ func (r *FileRepository) ClearVirtualResultPin(ctx context.Context, fileID int) 
 // ReplaceVirtualResultPin conditionally updates a virtual file's path if it still
 // matches expectedPath. This prevents concurrent playback sessions or stale attempts
 // from clobbering a newer or already-updated file path.
+//
+// Collision semantics: the unique index media_files_virtual_file_owner_key
+// (file_path, virtual_owner_installation_id, media_folder_id) means a replacement
+// path can only be written to this row if no sibling row already owns that tuple.
+// A unique violation (SQLSTATE 23505) therefore means the winning candidate is a
+// separate live row that a concurrent scan/refresh already re-listed — repointing
+// this row would duplicate it. In that case the dead pin on this row is simply
+// stripped (reverted to the neutral no-pin path so it re-lists next time) and
+// (false, nil) is returned: the pin was not moved, this row was unpinned instead.
 func (r *FileRepository) ReplaceVirtualResultPin(ctx context.Context, fileID int, expectedPath, replacementPath string) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE media_files
 		SET file_path = $1
 		WHERE id = $2 AND file_path = $3`, replacementPath, fileID, expectedPath)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			// Another row already owns the (replacementPath, owner, folder) tuple.
+			// Strip this row's pin instead of repointing it at the live candidate.
+			if _, unpinErr := r.pool.Exec(ctx, `
+				UPDATE media_files
+				SET file_path = regexp_replace(file_path, '\?result=[^&]*$', '')
+				WHERE id = $1 AND file_path = $2`, fileID, expectedPath); unpinErr != nil {
+				return false, fmt.Errorf("replace virtual result pin for file %d: %w", fileID, unpinErr)
+			}
+			return false, nil
+		}
 		return false, fmt.Errorf("replace virtual result pin for file %d: %w", fileID, err)
 	}
 	return tag.RowsAffected() > 0, nil
