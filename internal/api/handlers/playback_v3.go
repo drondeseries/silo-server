@@ -6748,13 +6748,17 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 // transportFailureClassificationsV3 are the client failure classifications
 // that mean the route itself did not deliver bytes the device could render —
 // as opposed to benign signals (quality_changed, track changes) that leave
-// the previous route fully eligible. A failure recovery reporting one of
-// these after abandoning a delivery is server evidence that the delivery
-// failed for this attempt.
+// the previous route fully eligible. The vocabulary is the Android/iOS/web
+// client failure taxonomy; a failure recovery reporting one of these after
+// abandoning a delivery is server evidence that the delivery failed for this
+// attempt. Unclassified failures do NOT demote: several benign recovery
+// paths send no classification, and demoting on those would retire the only
+// viable route for a healthy stream.
 var transportFailureClassificationsV3 = map[string]bool{
-	"playback_error":       true,
 	"decoder_failure":      true,
 	"decode_error":         true,
+	"player_failure":       true,
+	"http_failure":         true,
 	"audio_renderer_error": true,
 	"parser_failure":       true,
 }
@@ -6767,20 +6771,14 @@ func failureClassificationKeyV3(classification string) string {
 
 // failureRecoveryAbandonedDeliveryV3 reports whether this replan is a failure
 // recovery (or its seek-scoped variant) that abandoned the current plan's
-// delivery — the moment the attempt learns, durably, that the delivery
-// failed. An unclassified failure counts too: the client reported the attempt
-// broken and asked the server to recover, which is evidence enough to demote
-// the route that was just playing.
+// delivery with an explicit transport-failure classification — the moment
+// the attempt learns, durably, that the delivery failed.
 func failureRecoveryAbandonedDeliveryV3(operation playback.ReplanOperationV3, failureClassification string) bool {
 	if operation != playback.ReplanOperationFailureRecoveryV3 &&
 		operation != playback.ReplanOperationSeekFailureRecoveryV3 {
 		return false
 	}
-	key := failureClassificationKeyV3(failureClassification)
-	if key == "" {
-		return true
-	}
-	return transportFailureClassificationsV3[key]
+	return transportFailureClassificationsV3[failureClassificationKeyV3(failureClassification)]
 }
 
 // demoteDeliveryCapabilityV3 disables one delivery class in the context's
