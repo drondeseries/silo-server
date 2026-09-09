@@ -3663,7 +3663,7 @@ func (h *PlaybackHandler) prepareLocalTransportV3(r *http.Request, session *play
 		FFmpegPath:                       cfg.FFmpegPath,
 		HWAccel:                          cfg.HWAccel,
 		HWDevice:                         cfg.HWDevice,
-		AudioTrackIndex:                  plannedAudioTrackIndexV3(result, session.AudioTrackIndex),
+		AudioTrackIndex:                  audioStreamOrdinalV3(file, plannedAudioTrackIndexV3(result, session.AudioTrackIndex)),
 		SubtitleTrackIndex:               result.SubtitleTransportTrackIndex,
 		SubtitleBurnIn:                   result.SubtitleBurnIn,
 		SubtitleCodec:                    result.SubtitleCodec,
@@ -3884,7 +3884,7 @@ func (h *PlaybackHandler) prepareRemoteTransportV3(r *http.Request, session *pla
 			hwAccel = playback.HWAccelNone
 		}
 	}
-	req := transcodenode.TranscodeStartRequest{SessionID: transportID, InputPath: file.FilePath, SourceVideoCodec: sourceMetadata.VideoCodec, SourceVideoProfile: sourceProfile, SourceVideoBitDepth: sourceBitDepth, SourceAudioChannels: result.SourceAudioChannels, SoftwareVideoDecode: sourceMetadata.SoftwareVideoDecode, ToneMapPolicy: result.ToneMapPolicy, ToneMapMode: result.ToneMapMode, ToneMapSourceKind: result.ToneMapSourceKind, ToneMapRecipeVersion: result.ToneMapRecipeVersion, ToneMapPreflightRequired: result.ToneMapPreflightRequired, ToneMapSourceRevision: result.ToneMapSourceRevision, VideoBitstreamFilter: videoBitstreamFilterForPlanV3(result.Plan), VideoSampleEntry: videoSampleEntryForPlanV3(result.Plan), SeekSeconds: timeline.seekSeconds, StreamOriginSeconds: timeline.streamOriginSeconds, CopySeekAnchorResolved: timeline.copySeekAnchorResolved, StartSegmentNumber: timeline.startSegmentNumber, TargetResolution: result.TargetResolution, TargetCodecVideo: videoCodec, TargetCodecAudio: result.TargetAudioCodec, TargetAudioChannels: result.TargetAudioChannels, TargetAudioBitrateKbps: result.TargetAudioBitrateKbps, TargetBitrateKbps: result.TargetBitrateKbps, SegmentDuration: playback.DefaultSegmentDuration, HWAccel: hwAccel, AudioTrackIndex: plannedAudioTrackIndexV3(result, session.AudioTrackIndex), SubtitleTrackIndex: result.SubtitleTransportTrackIndex, SubtitleBurnIn: result.SubtitleBurnIn, SubtitleCodec: result.SubtitleCodec, TotalDuration: sourceMetadata.DurationSeconds, RequireReady: true}
+	req := transcodenode.TranscodeStartRequest{SessionID: transportID, InputPath: file.FilePath, SourceVideoCodec: sourceMetadata.VideoCodec, SourceVideoProfile: sourceProfile, SourceVideoBitDepth: sourceBitDepth, SourceAudioChannels: result.SourceAudioChannels, SoftwareVideoDecode: sourceMetadata.SoftwareVideoDecode, ToneMapPolicy: result.ToneMapPolicy, ToneMapMode: result.ToneMapMode, ToneMapSourceKind: result.ToneMapSourceKind, ToneMapRecipeVersion: result.ToneMapRecipeVersion, ToneMapPreflightRequired: result.ToneMapPreflightRequired, ToneMapSourceRevision: result.ToneMapSourceRevision, VideoBitstreamFilter: videoBitstreamFilterForPlanV3(result.Plan), VideoSampleEntry: videoSampleEntryForPlanV3(result.Plan), SeekSeconds: timeline.seekSeconds, StreamOriginSeconds: timeline.streamOriginSeconds, CopySeekAnchorResolved: timeline.copySeekAnchorResolved, StartSegmentNumber: timeline.startSegmentNumber, TargetResolution: result.TargetResolution, TargetCodecVideo: videoCodec, TargetCodecAudio: result.TargetAudioCodec, TargetAudioChannels: result.TargetAudioChannels, TargetAudioBitrateKbps: result.TargetAudioBitrateKbps, TargetBitrateKbps: result.TargetBitrateKbps, SegmentDuration: playback.DefaultSegmentDuration, HWAccel: hwAccel, AudioTrackIndex: audioStreamOrdinalV3(file, plannedAudioTrackIndexV3(result, session.AudioTrackIndex)), SubtitleTrackIndex: result.SubtitleTransportTrackIndex, SubtitleBurnIn: result.SubtitleBurnIn, SubtitleCodec: result.SubtitleCodec, TotalDuration: sourceMetadata.DurationSeconds, RequireReady: true}
 	req.ThrottleSeconds = playback.ConfiguredTranscodeThrottleSeconds(r.Context(), h.SettingsRepo)
 	if strings.EqualFold(videoCodec, "copy") {
 		req.CopyFMP4RecipeVersion = playback.CopyFMP4RecipeVersion
@@ -4300,6 +4300,23 @@ func plannedAudioTrackIndexV3(result playback.PlannerResultV3, fallback int) int
 		return *result.Plan.SelectedTracks.Audio.Index
 	}
 	return fallback
+}
+
+// audioStreamOrdinalV3 translates a selected audio track's array position in
+// file.AudioTracks to the container stream ordinal ffmpeg's `0:a:N` expects.
+// The probed/synthesized track list order can differ from the container order
+// (MULTi releases, virtual sources), so mapping by array position alone would
+// select the wrong language. When the track carries a real Index it wins;
+// otherwise the array position is used as the ordinal (the legacy behavior for
+// tracks without a recorded stream index).
+func audioStreamOrdinalV3(file *models.MediaFile, selectedIndex int) int {
+	if file == nil || selectedIndex < 0 || selectedIndex >= len(file.AudioTracks) {
+		return selectedIndex
+	}
+	if idx := file.AudioTracks[selectedIndex].Index; idx > 0 {
+		return idx
+	}
+	return selectedIndex
 }
 
 func transportGenerationV3(sessionID, planID string) string {

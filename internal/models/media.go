@@ -394,6 +394,11 @@ func (v *VideoTrack) UnmarshalJSON(data []byte) error {
 
 // AudioTrack represents a probed audio stream stored as JSONB.
 type AudioTrack struct {
+	// Index is the container stream ordinal (ffmpeg's `0:a:N`). Preserved so
+	// the selected track maps to the real stream even when the track list
+	// order differs from the container order (MULTi releases, virtual
+	// sources). -1/0 when unknown (synthesized tracks).
+	Index         int    `json:"index,omitempty"`
 	Title         string `json:"title,omitempty"`
 	EmbeddedTitle string `json:"embedded_title,omitempty"`
 	Language      string `json:"language,omitempty"`

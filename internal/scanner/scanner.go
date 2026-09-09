@@ -3916,6 +3916,7 @@ func applyProbeData(mf *models.MediaFile, probe *ProbeData, probeSource string) 
 	audioTracks := make([]models.AudioTrack, len(probe.AudioTracks))
 	for i, at := range probe.AudioTracks {
 		audioTracks[i] = models.AudioTrack{
+			Index:         at.Index,
 			Title:         at.Title,
 			EmbeddedTitle: at.EmbeddedTitle,
 			Language:      at.Language,

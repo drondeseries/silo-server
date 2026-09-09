@@ -89,6 +89,11 @@ type VideoTrackInfo struct {
 
 // AudioTrackInfo describes a probed audio track.
 type AudioTrackInfo struct {
+	// Index is the container stream ordinal (ffmpeg's `0:a:N`), preserved so
+	// the selected track can be mapped to the real stream even when the
+	// probed/synthesized track list order differs from the container order
+	// (common for MULTi releases and virtual sources).
+	Index         int
 	Title         string
 	EmbeddedTitle string
 	Language      string

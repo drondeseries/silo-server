@@ -477,7 +477,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		if dvProfile == 0 {
 			dvProfile = file.PrimaryDVProfile()
 		}
-		remuxErr := playback.ServeRemuxWithOptions(w, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, dvProfile, playback.RemuxServeOptions{
+		remuxErr := playback.ServeRemuxWithOptions(w, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, audioStreamOrdinalV3(file, session.AudioTrackIndex), dvProfile, playback.RemuxServeOptions{
 			DVMode:                 session.RemuxDVMode,
 			FFmpegPath:             h.ffmpegPath(),
 			ContentType:            playback.RemuxContentType(file.IsAudioOnly()),
@@ -511,7 +511,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					if parseErr == nil && retryURL.Scheme == "http" {
 						retryHost := retryURL.Hostname()
 						if retryHost == "127.0.0.1" || retryHost == "::1" || retryHost == "[::1]" {
-							remuxErr = playback.ServeRemuxWithOptions(w, r, retried.URL, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, dvProfile, playback.RemuxServeOptions{
+							remuxErr = playback.ServeRemuxWithOptions(w, r, retried.URL, "mp4", seekSeconds, session.TranscodeAudio, audioStreamOrdinalV3(file, session.AudioTrackIndex), dvProfile, playback.RemuxServeOptions{
 								DVMode:                 session.RemuxDVMode,
 								FFmpegPath:             h.ffmpegPath(),
 								ContentType:            playback.RemuxContentType(file.IsAudioOnly()),

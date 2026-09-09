@@ -1401,6 +1401,9 @@ func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualP
 			}
 			existing[strings.ToLower(lang)] = true
 			probed.AudioTracks = append(probed.AudioTracks, models.AudioTrack{
+				// Synthesized tracks carry no real container stream index; the
+				// array position is the ordinal (audioStreamOrdinalV3 falls back
+				// to it when Index <= 0).
 				Language: lang,
 				Codec:    audioCodec,
 				Channels: channels,

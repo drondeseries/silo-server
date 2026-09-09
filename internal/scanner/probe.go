@@ -240,6 +240,7 @@ func convertProbeData(raw *ffprobeOutput) *ProbeData {
 				}
 			}
 			track := AudioTrackInfo{
+				Index:         s.Index,
 				Title:         firstNonEmpty(s.Tags["title"], s.CodecLongName, strings.ToUpper(s.CodecName)),
 				EmbeddedTitle: s.Tags["title"],
 				Language:      rawLang,
