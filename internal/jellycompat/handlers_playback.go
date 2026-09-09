@@ -2955,8 +2955,44 @@ func compatAudioSpatialFormat(profile string) string {
 	}
 }
 
+// compatAudioLanguagePlaceholders carry no real identity and are skipped in
+// display summaries, mirroring the web client's LANGUAGE_PLACEHOLDERS set.
+var compatAudioLanguagePlaceholders = map[string]bool{
+	"und": true, "unknown": true, "unk": true, "": true,
+}
+
+// compatAudioLanguageSummary renders the track's full advertised language list
+// ("English/French") the same way the web client summarizes MULTi tracks:
+// resolved through compatLanguageName, deduplicated on the display label
+// ("eng", "en", and "English" all collapse to "English"), with placeholder
+// codes like und/unknown skipped. An empty result means "no language
+// information" — callers keep their single-language fallback then.
+func compatAudioLanguageSummary(languages []string) string {
+	seen := make(map[string]bool, len(languages))
+	var labels []string
+	for _, code := range languages {
+		trimmed := strings.ToLower(strings.TrimSpace(code))
+		if compatAudioLanguagePlaceholders[trimmed] {
+			continue
+		}
+		label := compatLanguageName(trimmed)
+		identity := strings.ToLower(label)
+		if seen[identity] {
+			continue
+		}
+		seen[identity] = true
+		labels = append(labels, label)
+	}
+	return strings.Join(labels, "/")
+}
+
 func audioTrackDisplayTitle(track models.AudioTrack) string {
-	lang := compatLanguageName(track.Language)
+	lang := compatAudioLanguageSummary(track.Languages)
+	if lang == "" {
+		// Probe data predating multi-audio support carries no Languages list;
+		// preserve the historical single-language rendering verbatim.
+		lang = compatLanguageName(track.Language)
+	}
 	// Jellyfin prefers the ffprobe profile over the codec name in audio display
 	// titles (e.g. "DTS-HD MA", "Dolby Digital Plus + Dolby Atmos"), except the
 	// uninformative AAC "LC" profile.
