@@ -112,6 +112,7 @@ type collectionCapabilitiesResponse struct {
 	CollectionDefaultSort     bool                           `json:"collection_default_sort"`
 	CollectionSortPreferences bool                           `json:"collection_sort_preferences"`
 	EffectiveCollectionSort   bool                           `json:"effective_collection_sort"`
+	AdminItemMaterialize      bool                           `json:"admin_item_materialize"`
 	// SortPreferenceKinds are the collection_kind values this server accepts on
 	// the sort-preference endpoints. CollectionSortPreferences alone cannot
 	// distinguish a server that also stores the personal-list kinds
@@ -245,6 +246,7 @@ func (h *CollectionHandler) HandleCapabilities(w http.ResponseWriter, r *http.Re
 		CollectionDefaultSort:     true,
 		CollectionSortPreferences: true,
 		EffectiveCollectionSort:   true,
+		AdminItemMaterialize:      true,
 		SortPreferenceKinds:       sortPreferenceKinds,
 	})
 }

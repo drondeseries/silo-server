@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,7 +22,26 @@ func newVirtualMediaTestPool(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatalf("failed to connect to db: %v", err)
 	}
+	var databaseName string
+	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&databaseName); err != nil {
+		t.Fatalf("identify test database: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(databaseName), "test") && !strings.Contains(strings.ToLower(databaseName), "purge") {
+		t.Fatalf("refusing destructive catalog fixture database %q", databaseName)
+	}
+	lockConn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire test database lock: %v", err)
+	}
+	if _, err := lockConn.Exec(ctx, "SELECT pg_advisory_lock($1)", int64(0x53494c4f5f544553)); err != nil {
+		lockConn.Release()
+		t.Fatalf("lock test database fixtures: %v", err)
+	}
 	t.Cleanup(func() { pool.Close() })
+	t.Cleanup(func() {
+		_, _ = lockConn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", int64(0x53494c4f5f544553))
+		lockConn.Release()
+	})
 
 	// Clean out related tables for isolation.
 	for _, statement := range []string{
@@ -757,7 +777,7 @@ func TestCleanupUnreferencedCollectionVirtualItemsIsCandidateScoped(t *testing.T
 	materialize("movie-tmdb-70", "70")
 	materialize("movie-tmdb-71", "71")
 
-	deleted, err := repo.CleanupUnreferencedCollectionVirtualItems(ctx, []string{"movie-tmdb-70"})
+	deleted, err := repo.CleanupUnreferencedCollectionVirtualItems(ctx, "collection-70", []string{"movie-tmdb-70"})
 	if err != nil {
 		t.Fatalf("cleanup failed sync candidates: %v", err)
 	}
@@ -785,6 +805,13 @@ func TestReleasedEpisodeReconciliationSkipsFutureEpisodes(t *testing.T) {
 		VALUES(990,'ReleaseSchedule','series',true)`); err != nil {
 		t.Fatalf("seed folder: %v", err)
 	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO library_collections(id,slug,title,collection_type,library_id)
+		VALUES('release-schedule','release-schedule','Release Schedule','tmdb',990);
+		INSERT INTO library_collection_libraries(collection_id,library_id)
+		VALUES('release-schedule',990)`); err != nil {
+		t.Fatalf("seed collection: %v", err)
+	}
 	repo := NewItemRepository(pool)
 	const seriesID = "series-tvdb-80"
 	created, err := repo.MaterializeVirtualPlaybackItemWithVariants(ctx, &models.MediaItem{
@@ -796,6 +823,21 @@ func TestReleasedEpisodeReconciliationSkipsFutureEpisodes(t *testing.T) {
 	}})
 	if err != nil || !created {
 		t.Fatalf("materialize series: created=%v err=%v", created, err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO virtual_media_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,owns_item_metadata)
+		VALUES(11,'collection:release-schedule',$1,990,false)`, seriesID); err != nil {
+		t.Fatalf("seed collection claim: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO virtual_media_file_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,file_path)
+		VALUES(11,'collection:release-schedule',$1,990,'virtual://series/tvdb/80')`, seriesID); err != nil {
+		t.Fatalf("seed collection file claim: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO library_collection_items(collection_id,media_item_id,position)
+		VALUES('release-schedule',$1,1)`, seriesID); err != nil {
+		t.Fatalf("seed collection membership: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO seasons(content_id,series_id,season_number,title)
@@ -1254,7 +1296,7 @@ func TestFailedCollectionCleanupRemovesVirtualAdditionsFromExistingItem(t *testi
 	}, []int{977}, []VirtualPlaybackVariant{{VirtualURI: "virtual://movie/tt205", OwnerInstallationID: 11}}); err != nil {
 		t.Fatalf("materialize existing item: %v", err)
 	}
-	if _, err := repo.CleanupUnreferencedCollectionVirtualItems(ctx, []string{"movie-tmdb-205"}); err != nil {
+	if _, err := repo.CleanupUnreferencedCollectionVirtualItems(ctx, "collection-205", []string{"movie-tmdb-205"}); err != nil {
 		t.Fatalf("cleanup failed collection effects: %v", err)
 	}
 	var localFiles, virtualFiles, localLinks, virtualLinks int
