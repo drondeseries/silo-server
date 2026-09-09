@@ -2588,6 +2588,7 @@ func main() {
 		}
 		if itemRepo != nil {
 			taskMgr.Register(tasks.NewReconcileVirtualEpisodesTask(itemRepo))
+			taskMgr.Register(tasks.NewCleanupLegacyCollectionClaimsTask(itemRepo))
 		}
 		if metadataImageCacheProcessor != nil {
 			cacheImagesTask := tasks.NewCacheMetadataImagesTask(metadataImageCacheProcessor)

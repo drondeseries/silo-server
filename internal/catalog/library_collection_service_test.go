@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -590,6 +591,98 @@ func TestTraktCandidatesByPriority_MovieUsesTMDBBeforeIMDb(t *testing.T) {
 	}
 }
 
+func TestCollectionPreparationDoesNotRequireRepository(t *testing.T) {
+	tracker := &collectionVirtualCreationTracker{}
+	ctx := context.WithValue(context.Background(), collectionVirtualCreationTrackerKey{}, tracker)
+	service := &LibraryCollectionService{VirtualVariants: func(_ context.Context, uri, _ string) ([]VirtualPlaybackVariant, error) {
+		return []VirtualPlaybackVariant{{OwnerInstallationID: 11, VirtualURI: uri}}, nil
+	}}
+	collection := &models.LibraryCollection{ID: "prepared", LibraryIDs: []int{1}, SourceConfig: json.RawMessage(`{"virtual_playback":true}`)}
+	item, err := service.createVirtualCollectionItem(ctx, collection, "movie", "Prepared", 2000, "tt1234567", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := tracker.items[item.ContentID]; got.item == nil || len(got.variants) != 1 {
+		t.Fatalf("prepared state = %+v", got)
+	}
+	service.VirtualVariants = func(context.Context, string, string) ([]VirtualPlaybackVariant, error) {
+		return nil, errors.New("profile preparation failed")
+	}
+	if _, err := service.createVirtualCollectionItem(ctx, collection, "series", "Failure", 2000, "tt7654321", 0, 0); err == nil {
+		t.Fatal("expected preparation failure")
+	}
+	if err := service.acceptCollectionItems(ctx, collection, nil); err == nil || !strings.Contains(err.Error(), "profile preparation failed") {
+		t.Fatalf("acceptance did not fail before repository access: %v", err)
+	}
+}
+
+func TestAcceptPreparedItemsDisabledPlaybackClearsRetainedClaims(t *testing.T) {
+	for _, mode := range []string{"disabled-virtual", "disabled-physical", "enabled-physical"} {
+		t.Run(mode, func(t *testing.T) {
+			physical := mode != "disabled-virtual"
+			pool := newVirtualMediaTestPool(t)
+			ctx := context.Background()
+			_, err := pool.Exec(ctx, `
+				INSERT INTO media_folders(id,name,type,enabled) VALUES(3101,'Acceptance','movies',true);
+				INSERT INTO library_collections(id,slug,title,collection_type,library_id,source_config)
+				VALUES('accept-disabled','accept-disabled','Acceptance','manual',3101,'{"virtual_playback":false}');
+				INSERT INTO library_collection_libraries(collection_id,library_id) VALUES('accept-disabled',3101);
+				INSERT INTO media_items(content_id,type,title,sort_title,status,virtual_owner_installation_id,virtual_source)
+				VALUES('movie-accept-disabled','movie','Acceptance','Acceptance','matched',11,'collection:accept-disabled');
+				INSERT INTO library_collection_items(collection_id,media_item_id,position) VALUES('accept-disabled','movie-accept-disabled',0);
+				INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id)
+				VALUES('movie-accept-disabled',3101,'virtual://movie/tmdb/3101',0,'virtual',11);
+				INSERT INTO virtual_media_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,owns_item_metadata)
+				VALUES(11,'collection:accept-disabled','movie-accept-disabled',3101,true),(11,'request:keep','movie-accept-disabled',3101,false);
+				INSERT INTO virtual_media_file_source_claims(plugin_installation_id,source_key,content_id,media_folder_id,file_path)
+				VALUES(11,'collection:accept-disabled','movie-accept-disabled',3101,'virtual://movie/tmdb/3101'),(11,'request:keep','movie-accept-disabled',3101,'virtual://movie/tmdb/3101')`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if physical {
+				if _, err := pool.Exec(ctx, `INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container) VALUES('movie-accept-disabled',3101,'/local/movie.mkv',1024,NULL)`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			repo := NewLibraryCollectionRepository(pool)
+			snapshot := &models.LibraryCollection{ID: "accept-disabled", LibraryID: 3101, LibraryIDs: []int{3101}, CollectionType: "manual", SourceConfig: json.RawMessage(`{"virtual_playback":false}`)}
+			if mode == "enabled-physical" {
+				snapshot.SourceConfig = json.RawMessage(`{"virtual_playback":true}`)
+				if _, err := pool.Exec(ctx, `UPDATE library_collections SET source_config=$1 WHERE id=$2`, snapshot.SourceConfig, snapshot.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			service := NewLibraryCollectionService(repo, NewItemRepository(pool), NewLibraryItemRepository(pool), nil)
+			service.VirtualVariants = func(context.Context, string, string) ([]VirtualPlaybackVariant, error) {
+				t.Fatal("physical acceptance called provider")
+				return nil, errors.New("provider unavailable")
+			}
+			ctx = context.WithValue(ctx, collectionVirtualCreationTrackerKey{}, &collectionVirtualCreationTracker{})
+			if err := service.acceptCollectionItems(ctx, snapshot, []LibraryCollectionItemInput{{MediaItemID: "movie-accept-disabled", SourceRank: 7}}); err != nil {
+				t.Fatal(err)
+			}
+			var claims, fileClaims, members, files, owners int
+			var source string
+			if err := pool.QueryRow(ctx, `SELECT
+				(SELECT count(*) FROM virtual_media_source_claims WHERE source_key='collection:accept-disabled'),
+				(SELECT count(*) FROM virtual_media_file_source_claims WHERE source_key='collection:accept-disabled'),
+				(SELECT count(*) FROM library_collection_items WHERE collection_id='accept-disabled' AND source_rank=7),
+				(SELECT count(*) FROM media_files WHERE content_id='movie-accept-disabled'),
+				(SELECT count(*) FROM virtual_media_source_claims WHERE content_id='movie-accept-disabled' AND owns_item_metadata),
+				virtual_source FROM media_items WHERE content_id='movie-accept-disabled'`).Scan(&claims, &fileClaims, &members, &files, &owners, &source); err != nil {
+				t.Fatal(err)
+			}
+			wantFiles, wantOwners, wantSource := 1, 1, "request:keep"
+			if physical {
+				wantFiles, wantOwners, wantSource = 2, 0, ""
+			}
+			if claims != 0 || fileClaims != 0 || members != 1 || files != wantFiles || owners != wantOwners || source != wantSource {
+				t.Fatalf("claims=%d fileClaims=%d members=%d files=%d owners=%d source=%q", claims, fileClaims, members, files, owners, source)
+			}
+		})
+	}
+}
+
 func TestMaterializeVirtualPlaybackPropagatesError(t *testing.T) {
 	service := &LibraryCollectionService{
 		VirtualVariants: func(_ context.Context, _, _ string) ([]VirtualPlaybackVariant, error) {
@@ -600,7 +693,12 @@ func TestMaterializeVirtualPlaybackPropagatesError(t *testing.T) {
 	contentID, _ := virtualPlaybackContentID(item)
 	item.ContentID = contentID
 
-	err := service.materializeVirtualPlayback(context.Background(), item, []int{1})
+	collection := &models.LibraryCollection{
+		ID:           "test-collection",
+		LibraryIDs:   []int{1},
+		SourceConfig: json.RawMessage(`{"virtual_playback": true}`),
+	}
+	err := service.materializeVirtualPlayback(context.Background(), collection, item)
 	if err == nil || !strings.Contains(err.Error(), "getting virtual profile variants: plugin connection failure") {
 		t.Fatalf("expected getting virtual profile variants error, got: %v", err)
 	}

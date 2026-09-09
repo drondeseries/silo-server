@@ -3594,6 +3594,7 @@ func NewRouter(deps Dependencies) chi.Router {
 									r.Put("/{id}", libraryCollectionHandler.HandleUpdateAdminCollection)
 									r.Delete("/{id}", libraryCollectionHandler.HandleDeleteAdminCollection)
 									r.Post("/{id}/sync", libraryCollectionHandler.HandleSyncAdminCollection)
+									r.Post("/{id}/materialize/{item_id}", libraryCollectionHandler.HandleMaterializeAdminCollectionItem)
 									r.Delete("/{id}/image", libraryCollectionHandler.HandleDeleteCollectionImage)
 									r.Put("/{id}/items/order", libraryCollectionHandler.HandleReorderAdminCollectionItems)
 									r.Put("/{id}/items/{item_id}", libraryCollectionHandler.HandleAddAdminCollectionItem)

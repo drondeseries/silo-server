@@ -20,6 +20,7 @@ import (
 
 	"log/slog"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/access"
@@ -1594,6 +1595,15 @@ func (h *LibraryCollectionHandler) HandleRemoveAdminCollectionItem(w http.Respon
 		return
 	}
 	if err := h.repo.RemoveItem(r.Context(), collectionID, itemID); err != nil {
+		if errors.Is(err, catalog.ErrLibraryCollectionNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "Collection not found")
+			return
+		}
+		if errors.Is(err, catalog.ErrCollectionItemNotMember) {
+			writeError(w, http.StatusNotFound, "not_found", "Item is not in this collection")
+			return
+		}
+		slog.ErrorContext(r.Context(), "failed to remove collection item", "collection_id", collectionID, "item_id", itemID, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to remove collection item")
 		return
 	}
@@ -3863,5 +3873,133 @@ func (h *LibraryCollectionHandler) PurgeVirtualPlaybackItems(w http.ResponseWrit
 		"message": fmt.Sprintf("%s %d virtual files and %d virtual media items (%d stale playback-state rows)",
 			map[bool]string{true: "Would purge", false: "Purged"}[dryRun],
 			purgeResult.FilesDeleted, purgeResult.ItemsDeleted, purgeResult.StateRowsDeleted),
+	})
+}
+
+// HandleMaterializeAdminCollectionItem handles
+// POST /api/v1/admin/collections/{id}/materialize/{item_id}.
+//
+// This is the recovery path when a virtual playback item is in a collection
+// (so it's authoritative) but never received its placeholder virtual file.
+// Typical causes:
+//
+//   - the owning provider installation was disabled or removed at the time
+//     the original TMDB/Trakt sync ran, so the per-row check rejected
+//     "virtual playback item requires an owning provider installation";
+//   - a prior purge reset the media_files row without re-creating it.
+//
+// The endpoint materializes the item (and, for series, its released
+// episodes) idempotently. Re-runs are safe and report zero new rows when
+// nothing changed.
+func (h *LibraryCollectionHandler) HandleMaterializeAdminCollectionItem(w http.ResponseWriter, r *http.Request) {
+	if h.itemRepo == nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "item repository unavailable")
+		return
+	}
+	collectionID := chi.URLParam(r, "id")
+	itemID := chi.URLParam(r, "item_id")
+	if collectionID == "" || itemID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "collection id and item id are required")
+		return
+	}
+
+	// Verify the collection and membership so this cannot be used as a side
+	// door to materialize arbitrary catalog entries outside its collection.
+	if h.repo == nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "collection repository unavailable")
+		return
+	}
+	collection, err := h.repo.GetByID(r.Context(), collectionID)
+	if err != nil {
+		if errors.Is(err, catalog.ErrLibraryCollectionNotFound) || errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "not_found", "collection not found")
+			return
+		}
+		slog.ErrorContext(r.Context(), "failed to look up collection for materialization", "collection_id", collectionID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to look up collection")
+		return
+	}
+	member, err := h.repo.HasItem(r.Context(), collectionID, itemID)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "failed to check collection membership", "collection_id", collectionID, "item_id", itemID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to check collection membership")
+		return
+	}
+	if !member {
+		writeError(w, http.StatusNotFound, "not_found", "item is not in this collection")
+		return
+	}
+
+	item, err := h.itemRepo.GetByID(r.Context(), itemID)
+	if err != nil {
+		if errors.Is(err, catalog.ErrItemNotFound) || errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "not_found", "item not found")
+			return
+		}
+		slog.ErrorContext(r.Context(), "failed to look up item for materialization", "item_id", itemID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to look up item")
+		return
+	}
+	if item == nil {
+		writeError(w, http.StatusNotFound, "not_found", "item not found")
+		return
+	}
+	// Only virtual playback media types can be materialized through the
+	// virtual pipeline. Other media is fully resolved on demand; trying to
+	// create a virtual placeholder for it would silently desynchronize the
+	// catalog from the actual playable file.
+	if item.Type != "movie" && item.Type != "series" {
+		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("item type %q is not eligible for virtual materialization", item.Type))
+		return
+	}
+
+	if !catalog.SourceEnablesVirtualPlayback(collection.SourceConfig) {
+		writeError(w, http.StatusBadRequest, "bad_request", catalog.ErrVirtualPlaybackDisabled.Error())
+		return
+	}
+
+	if h.service == nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "collection service unavailable")
+		return
+	}
+	workCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
+	defer cancel()
+	res, err := h.service.EnsureCollectionItemMaterialized(workCtx, collection, item)
+	if err != nil {
+		if errors.Is(err, catalog.ErrCollectionItemNotMember) {
+			writeError(w, http.StatusNotFound, "not_found", "item is not in this collection")
+			return
+		}
+		if errors.Is(err, catalog.ErrLibraryCollectionNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "collection not found")
+			return
+		}
+		if errors.Is(err, catalog.ErrIncompatibleLibrary) || errors.Is(err, catalog.ErrVirtualPlaybackDisabled) {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		if errors.Is(err, catalog.ErrProviderUnavailable) ||
+			strings.Contains(err.Error(), "provider unavailable") ||
+			strings.Contains(err.Error(), "owning provider installation") {
+			writeError(w, http.StatusServiceUnavailable, "provider_unavailable", err.Error())
+			return
+		}
+		slog.ErrorContext(r.Context(), "failed to materialize virtual item", "collection_id", collectionID, "item_id", itemID, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to materialize virtual item")
+		return
+	}
+
+	// Cached watch responses and resolved lists may have cached a
+	// pre-materialization "no playback target" answer.
+	sections.InvalidateResolvedListCache()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":               true,
+		"content_id":            res.ContentID,
+		"media_type":            res.MediaType,
+		"files_created":         res.FilesCreated,
+		"files_existing":        res.FilesExisting,
+		"episodes_materialized": res.EpisodesMaterialized,
+		"message":               fmt.Sprintf("Materialized %d virtual files (%d existing) for %s (%s)", res.FilesCreated, res.FilesExisting, res.ContentID, res.MediaType),
 	})
 }
