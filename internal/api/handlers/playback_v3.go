@@ -6279,12 +6279,21 @@ func terminalAllowsAlternateFileV3(terminal *playback.TerminalV3) bool {
 
 func replanAllowsAlternateFileV3(operation playback.ReplanOperationV3, qualityPreference string) bool {
 	switch operation {
-	case playback.ReplanOperationFailureRecoveryV3, playback.ReplanOperationQualityChangeV3, playback.ReplanOperationOutputChangeV3, playback.ReplanOperationTrackChangeV3:
-		// Quality, output, and track changes can make another version the only
-		// viable route. In particular, a bitmap subtitle can require video burn-in
+	case playback.ReplanOperationFailureRecoveryV3, playback.ReplanOperationQualityChangeV3, playback.ReplanOperationOutputChangeV3:
+		// Quality and output changes can make another version the only viable
+		// route. In particular, a bitmap subtitle can require video burn-in
 		// that an HDR source cannot support while an SDR alternate can. The
-		// subtitle identity is remapped before the alternate is adopted; seek-only
-		// operations remain pinned to the mounted source.
+		// subtitle identity is remapped before the alternate is adopted.
+		//
+		// A track_change deliberately does NOT fall back to another version:
+		// the viewer chose a subtitle or audio track from THIS version's
+		// dropdown, which is scoped to the currently playing file. If that
+		// track cannot be delivered on this version, the replan refuses with a
+		// terminal instead of silently swapping the video underneath the
+		// selection — a track that "doesn't work" must not change which
+		// version is playing. Only a video that itself failed to load
+		// (unreadable/corrupted, surfaced as a failure recovery) can move the
+		// version. Seek operations stay pinned to the mounted source.
 		return shouldTryAlternateFileV3(qualityPreference)
 	default:
 		return false

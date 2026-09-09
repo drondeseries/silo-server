@@ -539,7 +539,7 @@ func TestReplanAllowsAlternateFileV3PinsSeekOperations(t *testing.T) {
 	}{
 		{name: "ordinary failure may use another version", operation: playback.ReplanOperationFailureRecoveryV3, quality: "auto", want: true},
 		{name: "output change may use another version", operation: playback.ReplanOperationOutputChangeV3, quality: "auto", want: true},
-		{name: "track change may use another version", operation: playback.ReplanOperationTrackChangeV3, quality: "auto", want: true},
+		{name: "track change stays pinned to the mounted version", operation: playback.ReplanOperationTrackChangeV3, quality: "auto", want: false},
 		{name: "original quality remains pinned", operation: playback.ReplanOperationFailureRecoveryV3, quality: "original", want: false},
 		{name: "exact seek reanchor pins current version", operation: playback.ReplanOperationSeekReanchorV3, quality: "auto", want: false},
 		{name: "failed seek recovery pins current version", operation: playback.ReplanOperationSeekFailureRecoveryV3, quality: "auto", want: false},
@@ -4309,14 +4309,16 @@ func TestHandleReplanPlaybackV3BitmapSubtitleFallsBackFromHDRToSDRVersion(t *tes
 		},
 		Capabilities: startRequest.Capabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
 	})
-	if replanned.PlaybackPlan == nil || replanned.Terminal != nil {
-		t.Fatalf("subtitle replan = %#v", replanned)
+	// A subtitle track_change must never move the version underneath the
+	// selection: the bitmap track cannot be delivered on the mounted HDR
+	// source, so the replan refuses with a terminal instead of silently
+	// swapping to the SDR alternate. Only an unreadable/corrupted video
+	// (surfaced as a failure_recovery) may fall back to another version.
+	if replanned.PlaybackPlan != nil || replanned.Terminal == nil {
+		t.Fatalf("subtitle track_change should refuse with a terminal, got plan=%#v terminal=%#v", replanned.PlaybackPlan, replanned.Terminal)
 	}
-	if replanned.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
-		t.Fatalf("subtitle effective file = %d, want SDR alternate %d", replanned.PlaybackPlan.EffectiveMediaFileID, alternate.ID)
-	}
-	if replanned.PlaybackPlan.Subtitle.Mode != playback.SubtitleBurnInV3 || replanned.PlaybackPlan.SelectedTracks.Subtitle == nil {
-		t.Fatalf("subtitle plan = %#v, want burn-in selection", replanned.PlaybackPlan)
+	if replanned.Terminal.Reason != "subtitle_conversion_unsupported" {
+		t.Fatalf("subtitle track_change terminal = %#v, want subtitle_conversion_unsupported", replanned.Terminal)
 	}
 	t.Cleanup(func() { handler.tm.CloseTranscodeSession(started.SessionID, "") })
 }
