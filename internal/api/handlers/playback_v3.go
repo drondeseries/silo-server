@@ -6576,6 +6576,17 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	if request == nil || source == nil || target == nil || source.ID == target.ID {
 		return nil
 	}
+	// A virtual parent row (virtual://movie/ttNNNN with no result= param) is a
+	// catalog placeholder with no probed streams. Its subtitle inventory is
+	// empty, so there is nothing to remap FROM: any selection the client made
+	// was against a resolved candidate's track list, not this placeholder.
+	// Skip the remap and let the target file's own default subtitle selection
+	// apply, mirroring resolveV3AudioIndex's graceful empty-tracks fallback.
+	if len(source.ExternalSubtitles) == 0 && len(source.SubtitleTracks) == 0 {
+		request.SubtitleTrackIndex = nil
+		request.SubtitleTrackID = ""
+		return nil
+	}
 	if request.SubtitleTrackIndex == nil {
 		// ID-only selections are equally file-bound: the stale ID would be
 		// parsed against the alternate file's track list downstream, so
