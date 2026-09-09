@@ -5032,6 +5032,22 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	trackChange := operation == playback.ReplanOperationTrackChangeV3
 	qualityChange := operation == playback.ReplanOperationQualityChangeV3
 	outputChange := operation == playback.ReplanOperationOutputChangeV3
+	// A failure recovery that abandoned a delivery for a transport reason
+	// demotes that delivery on the durable request, so every later replan in
+	// this attempt plans with it disabled. Without the stickiness a
+	// track_change replan re-reads the client's still-advertised claims and
+	// steers straight back to a route that just failed, thrashing the player
+	// between direct play and remux (each flip reloading the stream and
+	// orphaning the client's subtitle track state — the field symptom where a
+	// menu shows a selection that is not actually playing).
+	//
+	// The demotion is a server-side evidence write on the durable attempt, not
+	// a client-authority change: a fresh start of the same file still negotiates
+	// normally, and an explicit user retry can re-enable the route by going
+	// through a new start.
+	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) {
+		demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
+	}
 	// User-intent operations replace the legacy audio PATCH and client-recipe
 	// transcode start. Nothing failed, so their previous route stays eligible:
 	// neither attempted-key history nor the failed-plan exclusion applies.
@@ -5104,6 +5120,11 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 		start.BandwidthCapKbps = copyOptionalIntV3(req.BandwidthCapKbps)
 		start.Capabilities = req.Capabilities
 		start.ClientPlaybackContext = req.ClientPlaybackContext
+		// The client's capability payload just replaced the seeded one.
+		// Re-apply the durable record's server-side delivery demotions so a
+		// route a previous failure recovery abandoned stays disabled — the
+		// client cannot advertise itself back into a route that failed.
+		reapplyDeliveryDemotionsV3(&start, record.NormalizedRequest)
 		if req.ClientFeatures != nil {
 			// Feature advertisement is single-location (top-level); a replan
 			// that sends it refreshes the durable request's copy alongside the
@@ -6722,6 +6743,110 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 	request.SubtitleTrackIndex = &targetIndex
 	request.SubtitleTrackID = playback.TrackIDV3(target.ID, "subtitle", targetIndex)
 	return nil
+}
+
+// transportFailureClassificationsV3 are the client failure classifications
+// that mean the route itself did not deliver bytes the device could render —
+// as opposed to benign signals (quality_changed, track changes) that leave
+// the previous route fully eligible. A failure recovery reporting one of
+// these after abandoning a delivery is server evidence that the delivery
+// failed for this attempt.
+var transportFailureClassificationsV3 = map[string]bool{
+	"playback_error":       true,
+	"decoder_failure":      true,
+	"decode_error":         true,
+	"audio_renderer_error": true,
+	"parser_failure":       true,
+}
+
+// failureClassificationKeyV3 lowercases and trims a client-reported failure
+// classification so the transport-failure lookup is spelling-insensitive.
+func failureClassificationKeyV3(classification string) string {
+	return strings.ToLower(strings.TrimSpace(classification))
+}
+
+// failureRecoveryAbandonedDeliveryV3 reports whether this replan is a failure
+// recovery (or its seek-scoped variant) that abandoned the current plan's
+// delivery — the moment the attempt learns, durably, that the delivery
+// failed. An unclassified failure counts too: the client reported the attempt
+// broken and asked the server to recover, which is evidence enough to demote
+// the route that was just playing.
+func failureRecoveryAbandonedDeliveryV3(operation playback.ReplanOperationV3, failureClassification string) bool {
+	if operation != playback.ReplanOperationFailureRecoveryV3 &&
+		operation != playback.ReplanOperationSeekFailureRecoveryV3 {
+		return false
+	}
+	key := failureClassificationKeyV3(failureClassification)
+	if key == "" {
+		return true
+	}
+	return transportFailureClassificationsV3[key]
+}
+
+// demoteDeliveryCapabilityV3 disables one delivery class in the context's
+// capability payload and clears its validated claims (the DV base-layer
+// fallback among them), so the planner cannot reselect the delivery for the
+// rest of this attempt. Idempotent and nil-safe.
+func demoteDeliveryCapabilityV3(request *playback.StartRequestV3, delivery playback.DeliveryV3) {
+	if request == nil || delivery == "" {
+		return
+	}
+	class := playback.DeliveryClassV3(delivery)
+	if request.ClientPlaybackContext.Deliveries == nil {
+		return
+	}
+	capability, ok := request.ClientPlaybackContext.Deliveries[class]
+	if !ok || !capability.Enabled {
+		return
+	}
+	capability.Enabled = false
+	capability.SupportedOnDevice = false
+	capability.ValidatedClaims = nil
+	capability.FailureReason = demoteDeliveryReasonV3
+	request.ClientPlaybackContext.Deliveries[class] = capability
+	slog.Debug("playback delivery demoted after transport failure",
+		"component", "api", "delivery_class", class)
+}
+
+// demoteDeliveryReasonV3 is the marker demoteDeliveryCapabilityV3 stamps on a
+// capability's FailureReason, distinguishing a server-side route demotion
+// from a delivery the client itself advertised as unsupported (also
+// Enabled=false). Only the marker form is re-applied across replans.
+const demoteDeliveryReasonV3 = "transport_failed_demoted_by_server"
+
+// demotedDeliveryClassesV3 lists the delivery classes the durable request
+// demotes (server-side demotion marker written by a previous failure
+// recovery). The client cannot advertise itself back into a route the server
+// demoted: the demotion is server-side evidence, so it must survive the
+// client capability overlay every replan performs.
+func demotedDeliveryClassesV3(durable playback.StartRequestV3) []string {
+	var demoted []string
+	for class, capability := range durable.ClientPlaybackContext.Deliveries {
+		if strings.EqualFold(strings.TrimSpace(capability.FailureReason), demoteDeliveryReasonV3) {
+			demoted = append(demoted, class)
+		}
+	}
+	return demoted
+}
+
+// reapplyDeliveryDemotionsV3 writes the durable record's delivery demotions
+// onto a freshly overlaid request. Called after the client's capability
+// payload replaces the seeded one, so a delivery a previous failure recovery
+// demoted stays disabled for the rest of the attempt. The replan commit
+// writes the seeded request back to the record (updated.NormalizedRequest),
+// so the demotion also persists through the store round-trip.
+func reapplyDeliveryDemotionsV3(start *playback.StartRequestV3, durable playback.StartRequestV3) {
+	if start == nil {
+		return
+	}
+	for _, class := range demotedDeliveryClassesV3(durable) {
+		if capability, ok := start.ClientPlaybackContext.Deliveries[class]; ok && capability.Enabled {
+			capability.Enabled = false
+			capability.SupportedOnDevice = false
+			capability.ValidatedClaims = nil
+			start.ClientPlaybackContext.Deliveries[class] = capability
+		}
+	}
 }
 
 func sessionStartErrorV3(err error) *transportErrorV3 {

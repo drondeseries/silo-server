@@ -1,0 +1,99 @@
+package handlers
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/playback"
+)
+
+// The prod thrash this guards against: a Dolby Vision Profile 8 movie starts
+// via direct play (client_dv8_base_layer), the decoder fails, a failure
+// recovery moves to remux HLS — and the next track_change replan reads the
+// client's still-advertised direct-play claim and flips right back, each flip
+// reloading the stream and orphaning the client's subtitle track state (a
+// menu that shows a selection that is not actually playing). The server's
+// delivery demotion must stick across replans.
+func TestHandleReplanPlaybackV3DemotedDeliveryStaysDisabledAcrossReplans(t *testing.T) {
+	file := v3HandlerFixtureFile(t)
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0), testPlaybackFileResolver{file: file})
+	handler.ItemAccess = allowAllPlaybackItemAccess{}
+	handler.SettingsRepo = &mutablePlaybackSettingsV3{values: map[string]string{"allow_4k_transcode": "true"}}
+
+	start := v3HandlerStartRequest()
+	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = playback.DeliveryCapabilityV3{
+		Enabled: true, SupportedOnDevice: true,
+		VideoCodecs: []string{"h264"},
+	}
+	rr := httptest.NewRecorder()
+	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
+	var started playback.DecisionResponseV3
+	if rr.Code != http.StatusCreated || json.Unmarshal(rr.Body.Bytes(), &started) != nil || started.PlaybackPlan == nil {
+		t.Fatalf("start: %d %s", rr.Code, rr.Body.String())
+	}
+	plan := started.PlaybackPlan
+	if plan.Delivery != playback.DeliveryOriginalHTTPV3 {
+		t.Fatalf("fixture expected a direct-play start, got %s (%s)", plan.Delivery, plan.DecisionReason)
+	}
+
+	// The decoder fails: a failure recovery abandons the delivery and demotes
+	// it on the durable request.
+	recoveryReq := playback.ReplanRequestV3{
+		ProtocolVersion: playback.ProtocolV3, ClientFeatures: start.ClientFeatures,
+		Operation: playback.ReplanOperationFailureRecoveryV3, PlaybackAttemptID: start.PlaybackAttemptID,
+		ReplanRequestID: "demote-recovery-0001", FailedPlanID: plan.PlanID, PlanAttemptID: "demote-attempt-0001",
+		PlanAttemptKey: plan.PlanAttemptKey, AttemptedPlanKeys: []string{plan.PlanAttemptKey}, AttemptCount: 1,
+		PositionSeconds: 10, SelectedTracks: plan.SelectedTracks,
+		Failure:               playback.FailureV3{Classification: "decoder_failure"},
+		Capabilities:          start.Capabilities,
+		ClientPlaybackContext: start.ClientPlaybackContext,
+	}
+	recovered := postPlaybackReplanV3(t, handler, started.SessionID, recoveryReq)
+	if recovered.Terminal != nil {
+		t.Fatalf("failure recovery returned a terminal: %#v", recovered.Terminal)
+	}
+	recoveredPlan := recovered.PlaybackPlan
+	if recoveredPlan == nil {
+		t.Fatal("failure recovery returned no plan")
+	}
+	if playback.DeliveryClassV3(recoveredPlan.Delivery) == playback.DeliveryClassOriginalHTTPV3 {
+		t.Fatalf("failure recovery returned the delivery it just abandoned: %s", recoveredPlan.Delivery)
+	}
+
+	// A later track_change replan re-sends the client's full capability
+	// advertisement (Enabled direct play). The server-side demotion must
+	// survive the overlay: the plan must not flip back to the failed delivery.
+	trackChangeReq := recoveryReq
+	trackChangeReq.Operation = playback.ReplanOperationTrackChangeV3
+	trackChangeReq.ReplanRequestID = "demote-track-0002"
+	trackChangeReq.FailedPlanID = recoveredPlan.PlanID
+	trackChangeReq.PlanAttemptID = "demote-attempt-0002"
+	trackChangeReq.PlanAttemptKey = recoveredPlan.PlanAttemptKey
+	trackChangeReq.AttemptedPlanKeys = nil
+	trackChangeReq.Failure = playback.FailureV3{}
+	trackChangeReq.SelectedTracks = recoveredPlan.SelectedTracks
+	next := postPlaybackReplanV3(t, handler, started.SessionID, trackChangeReq)
+	if next.Terminal != nil {
+		t.Fatalf("track_change replan returned a terminal: %#v", next.Terminal)
+	}
+	nextPlan := next.PlaybackPlan
+	if nextPlan == nil {
+		t.Fatal("track_change replan returned no plan")
+	}
+	if playback.DeliveryClassV3(nextPlan.Delivery) == playback.DeliveryClassOriginalHTTPV3 {
+		t.Fatalf("track_change replan flipped back to the demoted direct-play route: %s (%s)", nextPlan.Delivery, nextPlan.DecisionReason)
+	}
+
+	// The demotion is durable on the attempt record, not just in-flight.
+	record, err := handler.PlanStoreV3.GetAttempt(t.Context(), started.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caps := record.NormalizedRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	if caps.Enabled || caps.FailureReason != demoteDeliveryReasonV3 {
+		t.Fatalf("demotion did not persist on the attempt record: %+v", caps)
+	}
+}
