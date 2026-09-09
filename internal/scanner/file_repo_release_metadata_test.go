@@ -17,6 +17,14 @@ import (
 // round-trips the release metadata and probe-version columns added for the
 // MULTI-audio + release name/group work: the languages array on audio tracks,
 // release_name/release_group, and probe_version.
+//
+// The scanner upsert is a full-row write from probe data: the DO UPDATE path
+// unconditionally assigns EXCLUDED values for every column, so a re-scan that
+// omits a field clears it rather than retaining the previous value. This
+// matches the real callers — the scanner always re-derives release fields from
+// the filename (scanner.go populateScanIdentity) and variant finalization
+// re-parses them (variant_finalize.go), so an omitted field means "no longer
+// present", not "keep the old value".
 func TestFileRepositoryUpsertRoundTripReleaseMetadata(t *testing.T) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -93,8 +101,10 @@ func TestFileRepositoryUpsertRoundTripReleaseMetadata(t *testing.T) {
 		t.Fatalf("ProbeVersion = %d, want 1", file.ProbeVersion)
 	}
 
-	// A re-scan without the new fields keeps them (the DO UPDATE path does not
-	// blank columns the caller did not set).
+	// A re-scan that omits the release fields clears them: the DO UPDATE path
+	// unconditionally assigns EXCLUDED values, and the scanner always re-derives
+	// release fields from the filename on every scan, so an omitted field means
+	// "no longer present", not "retain the previous value".
 	rescanned, err := repo.Upsert(scanbatch.WithRunID(ctx, runID), models.MediaFile{
 		ContentID:     movieID,
 		MediaFolderID: folderID,
@@ -107,13 +117,39 @@ func TestFileRepositoryUpsertRoundTripReleaseMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rescan upsert: %v", err)
 	}
-	if rescanned.ReleaseName != "Movie.2023.2160p.Multi-AltMount" {
-		t.Fatalf("rescan ReleaseName = %q, want retained", rescanned.ReleaseName)
+	if rescanned.ReleaseName != "" {
+		t.Fatalf("rescan ReleaseName = %q, want cleared when omitted", rescanned.ReleaseName)
 	}
-	if rescanned.ReleaseGroup != "AltMount" {
-		t.Fatalf("rescan ReleaseGroup = %q, want retained", rescanned.ReleaseGroup)
+	if rescanned.ReleaseGroup != "" {
+		t.Fatalf("rescan ReleaseGroup = %q, want cleared when omitted", rescanned.ReleaseGroup)
 	}
 	if rescanned.ProbeVersion != 0 {
 		t.Fatalf("rescan ProbeVersion = %d, want 0 (default when unset)", rescanned.ProbeVersion)
+	}
+
+	// A re-scan that supplies the release fields updates them in place.
+	updated, err := repo.Upsert(scanbatch.WithRunID(ctx, runID), models.MediaFile{
+		ContentID:     movieID,
+		MediaFolderID: folderID,
+		FilePath:      filePath,
+		FileSize:      4096,
+		AudioTracks: []models.AudioTrack{
+			{Language: "mul", Languages: []string{"en", "fr", "es"}, Codec: "eac3"},
+		},
+		ReleaseName:  "Movie.2024.2160p.Multi-NewGroup",
+		ReleaseGroup: "NewGroup",
+		ProbeVersion: 2,
+	})
+	if err != nil {
+		t.Fatalf("update upsert: %v", err)
+	}
+	if updated.ReleaseName != "Movie.2024.2160p.Multi-NewGroup" {
+		t.Fatalf("update ReleaseName = %q, want Movie.2024.2160p.Multi-NewGroup", updated.ReleaseName)
+	}
+	if updated.ReleaseGroup != "NewGroup" {
+		t.Fatalf("update ReleaseGroup = %q, want NewGroup", updated.ReleaseGroup)
+	}
+	if updated.ProbeVersion != 2 {
+		t.Fatalf("update ProbeVersion = %d, want 2", updated.ProbeVersion)
 	}
 }

@@ -1191,6 +1191,12 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 		}
 		var id int
 		err = tx.QueryRow(ctx, `
+			-- The provider display label is display-only metadata: it lives in
+			-- edition_raw (the version flyout's fallback). Virtual files have no
+			-- filename to parse a release name from, so release_name and
+			-- release_group stay empty (the column default) on both insert and
+			-- conflict update, matching upsertVirtualFileVariant and the cleanup
+			-- migration 20260908140000_cleanup_virtual_release_metadata.sql.
 			INSERT INTO media_files (
 				content_id, episode_id, media_folder_id, file_path, file_size,
 				resolution, codec_video, codec_audio, hdr, container, bitrate,
@@ -1199,7 +1205,7 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 			) VALUES (
 				$1, NULLIF($2,''), $3, $4, $5,
 				NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), $9, 'virtual',
-				NULLIF($10,0), $11, $11, $11, $12, $13, 'virtual', NOW(), $14
+				NULLIF($10,0), $11, '', '', $12, $13, 'virtual', NOW(), $14
 			)
 			ON CONFLICT (file_path, virtual_owner_installation_id, media_folder_id)
 				WHERE virtual_owner_installation_id IS NOT NULL
@@ -1215,8 +1221,8 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 				container='virtual',
 				bitrate=EXCLUDED.bitrate,
 				edition_raw=EXCLUDED.edition_raw,
-				release_name=EXCLUDED.release_name,
-				release_group=EXCLUDED.release_group,
+				release_name='',
+				release_group='',
 				audio_tracks=EXCLUDED.audio_tracks,
 				subtitle_tracks=EXCLUDED.subtitle_tracks,
 				probe_source='virtual',
