@@ -306,6 +306,13 @@ export interface StartRequestV3 {
   /** Audio track identity carried from the current plan into a replacement
    * start (a version switch); remapped by family onto the new file server-side. */
   carried_audio_track_id?: string;
+  /**
+   * How the requested file was chosen. `explicit` means the viewer picked a
+   * specific version; the server must not silently substitute another one.
+   * `auto` (or omitted) lets the server adapt the file when the plan is
+   * terminal for a capability reason.
+   */
+  file_selection?: "auto" | "explicit";
   subtitle_track_id?: string;
   subtitle_track_index?: number;
   metered: boolean;

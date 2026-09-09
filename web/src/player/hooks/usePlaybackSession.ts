@@ -303,6 +303,9 @@ export function usePlaybackSession(
   explicitAudioTrackIndex?: number | null,
   initialSubtitleTrackIndexByFileId?: Record<number, number>,
   initialBitmapSubtitleTrackIndexByFileId?: Record<number, number>,
+  /** True when the initial `fileId` was explicitly chosen by the viewer (not
+   * auto-selected); the server must not silently substitute another version. */
+  explicitFileSelection = false,
 ): UsePlaybackSessionResult {
   const config = usePlayerConfig();
   const probe = useCodecDetection();
@@ -567,6 +570,7 @@ export function usePlaybackSession(
       playbackAttemptId: string,
       subtitleTrackIndex: number | undefined,
       carriedAudioTrackID: string | null,
+      fileSelection: "auto" | "explicit",
     ): Promise<DecisionResponseV3> => {
       const body = buildStartRequestV3({
         extraClientFeatures: VIDEO_CLIENT_FEATURES_V3,
@@ -581,6 +585,7 @@ export function usePlaybackSession(
         // and must not be sent alongside it.
         explicitAudioTrackIndex: carriedAudioTrackID ? null : explicitAudioTrackIndex,
         carriedAudioTrackID,
+        fileSelection,
         subtitleTrackIndex,
         metered: detectMeteredV3(),
         bandwidthEstimateKbps: detectBandwidthEstimateKbpsV3(),
@@ -669,6 +674,7 @@ export function usePlaybackSession(
       replacementErrorMessage,
       initialErrorMessage,
       carriedAudioTrackId,
+      fileSelection,
     }: {
       preferredFileId?: number;
       position: number;
@@ -680,6 +686,9 @@ export function usePlaybackSession(
       // start (a version switch). The server remaps it by family to the new
       // file instead of dropping the viewer's selection.
       carriedAudioTrackId?: string | null;
+      /** How the requested file was chosen; `explicit` forbids silent
+       * server-side version substitution. */
+      fileSelection?: "auto" | "explicit";
     }) => {
       const previousState = stateRef.current;
       const previousSessionId = sessionIdRef.current;
@@ -760,6 +769,7 @@ export function usePlaybackSession(
           playbackAttemptId,
           initialSubtitleTrackIndexByFileId?.[selectedFileId],
           carriedAudioTrackId ?? null,
+          fileSelection ?? "auto",
         );
 
         if (loadSequence !== loadSequenceRef.current) {
@@ -796,6 +806,7 @@ export function usePlaybackSession(
             fallbackPlaybackAttemptId,
             undefined,
             carriedAudioTrackId ?? null,
+            fileSelection ?? "auto",
           );
           if (!decisionToAdopt.playback_plan) {
             initialSubtitleFailure = null;
@@ -902,10 +913,12 @@ export function usePlaybackSession(
       allowPreserveExistingSessionOnError: false,
       replacementErrorMessage: "Failed to replace playback request",
       initialErrorMessage: "Failed to start playback",
+      fileSelection: explicitFileSelection ? "explicit" : "auto",
     });
   }, [
     capabilityRequestKey,
     capabilitiesSettled,
+    explicitFileSelection,
     fileId,
     forceInitialPosition,
     initialPosition,
@@ -1419,6 +1432,9 @@ export function usePlaybackSession(
             // server remaps the file-bound identity by track family onto the
             // new file instead of dropping it and auto-picking.
             carriedAudioTrackId: planRef.current?.selected_tracks.audio?.id ?? null,
+            // A version switch is always an explicit user action: the server
+            // must not silently substitute yet another version.
+            fileSelection: "explicit",
           });
         } finally {
           switchingRef.current = false;

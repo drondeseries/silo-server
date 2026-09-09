@@ -128,6 +128,31 @@ func TestStartRequestV3ProgressPersistenceValidation(t *testing.T) {
 	}
 }
 
+func TestStartRequestV3FileSelectionValidation(t *testing.T) {
+	req := validStartRequestV3()
+	if _, err := req.NormalizeAndValidate(); err != nil {
+		t.Fatal(err)
+	}
+	if req.FileSelection != FileSelectionAutoV3 {
+		t.Fatalf("omitted file_selection normalized to %q, want %q", req.FileSelection, FileSelectionAutoV3)
+	}
+
+	req = validStartRequestV3()
+	req.FileSelection = FileSelectionExplicitV3
+	if _, err := req.NormalizeAndValidate(); err != nil {
+		t.Fatalf("explicit file_selection rejected: %v", err)
+	}
+	if req.FileSelection != FileSelectionExplicitV3 {
+		t.Fatalf("explicit file_selection normalized to %q", req.FileSelection)
+	}
+
+	req = validStartRequestV3()
+	req.FileSelection = FileSelectionV3("user-picked")
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("invalid file_selection accepted")
+	}
+}
+
 func TestStartRequestV3UnknownQualityFallsBackToAuto(t *testing.T) {
 	req := validStartRequestV3()
 	req.QualityPreference = "future-super-quality"

@@ -250,6 +250,9 @@ export interface WatchPageProps {
   /** Bandwidth cap in kbps from playback.max_bitrate_kbps; null/undefined is uncapped. */
   maxBitrateKbps?: number | null;
   explicitAudioTrackIndex?: number | null;
+  /** True when the initial `fileId` was explicitly chosen by the viewer; the
+   * server must not silently substitute another version. */
+  explicitFileSelection?: boolean;
   /** Initial server subtitle ordinal keyed by file ID. Missing entries mean subtitles start off. */
   initialSubtitleTrackIndexByFileId?: Record<number, number>;
   /**

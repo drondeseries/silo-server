@@ -524,9 +524,14 @@ type StartRequestV3 struct {
 	// it onto the requested file's inventory by track family instead of raw ordinal.
 	// Optional and additive: absent means the server owns audio selection (profile or
 	// series preference), exactly as before.
-	CarriedAudioTrackID   string                    `json:"carried_audio_track_id,omitempty"`
-	SubtitleTrackID       string                    `json:"subtitle_track_id,omitempty"`
-	SubtitleTrackIndex    *int                      `json:"subtitle_track_index,omitempty"`
+	CarriedAudioTrackID string `json:"carried_audio_track_id,omitempty"`
+	SubtitleTrackID     string `json:"subtitle_track_id,omitempty"`
+	SubtitleTrackIndex  *int   `json:"subtitle_track_index,omitempty"`
+	// FileSelection distinguishes an explicit user version pick from an
+	// auto/default selection. Absent means auto, preserving existing client
+	// behavior; an explicit pick pins the requested file and disables the
+	// start-path alternate-file fallback.
+	FileSelection         FileSelectionV3           `json:"file_selection,omitempty"`
 	Metered               bool                      `json:"metered"`
 	BandwidthEstimateKbps *int                      `json:"bandwidth_estimate_kbps,omitempty"`
 	BandwidthCapKbps      *int                      `json:"bandwidth_cap_kbps,omitempty"`
@@ -542,6 +547,17 @@ type ProgressPersistenceV3 string
 const (
 	ProgressPersistenceServerV3 ProgressPersistenceV3 = "server"
 	ProgressPersistenceClientV3 ProgressPersistenceV3 = "client"
+)
+
+// FileSelectionV3 declares whether the requested file_id is an explicit user
+// version pick or an auto/default selection. An explicit pick must not be
+// silently swapped for an alternate version when the plan is terminal; the
+// server refuses instead and points the client at the version list.
+type FileSelectionV3 string
+
+const (
+	FileSelectionAutoV3     FileSelectionV3 = "auto"
+	FileSelectionExplicitV3 FileSelectionV3 = "explicit"
 )
 
 type TrackIdentityV3 struct {
@@ -944,6 +960,12 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	}
 	if r.ProgressPersistence == ProgressPersistenceClientV3 && r.StartPosition == nil {
 		return nil, errors.New("start_position is required when progress_persistence is client")
+	}
+	if r.FileSelection == "" {
+		r.FileSelection = FileSelectionAutoV3
+	}
+	if r.FileSelection != FileSelectionAutoV3 && r.FileSelection != FileSelectionExplicitV3 {
+		return nil, errors.New("file_selection is invalid")
 	}
 	if err := validateOptionalBoundedIntV3(r.BandwidthEstimateKbps, 100, 1_000_000, "bandwidth_estimate_kbps"); err != nil {
 		return nil, err

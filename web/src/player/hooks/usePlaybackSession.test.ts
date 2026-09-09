@@ -134,6 +134,16 @@ describe("buildStartRequestV3", () => {
     expect(buildStartRequestV3(startBase)).not.toHaveProperty("carried_audio_track_id");
   });
 
+  it("emits file_selection when the file was explicitly chosen", () => {
+    expect(buildStartRequestV3({ ...startBase, fileSelection: "explicit" })).toMatchObject({
+      file_selection: "explicit",
+    });
+  });
+
+  it("omits file_selection when the file choice is server-owned", () => {
+    expect(buildStartRequestV3(startBase)).not.toHaveProperty("file_selection");
+  });
+
   it("includes the resolved subtitle track in the initial request", () => {
     expect(buildStartRequestV3({ ...startBase, subtitleTrackIndex: 0 })).toMatchObject({
       subtitle_track_index: 0,
@@ -1569,6 +1579,51 @@ describe("usePlaybackSession version switches", () => {
     // is meaningless for the new file, in favor of the carried identity.
     expect(replacement.carried_audio_track_id).toBe("file:7:audio:0");
     expect(replacement).not.toHaveProperty("audio_track_index");
+
+    unmount();
+  });
+
+  it("marks a version-switch start as an explicit file selection", async () => {
+    const startBodies: Array<Record<string, unknown>> = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/playback/start")) {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        startBodies.push(body);
+        return jsonResponse(
+          {
+            protocol_version: 3,
+            server_features: ["playback_plan_v3"],
+            outcome: "playable",
+            session_id: `session-${startBodies.length}`,
+            playback_plan: fixturePlanV3({
+              session_id: `session-${startBodies.length}`,
+              plan_id: `plan:switch-${startBodies.length}`,
+              requested_media_file_id: (body.file_id as number) ?? 7,
+              effective_media_file_id: (body.file_id as number) ?? 7,
+            }),
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/playback/route-events")) return new Response(null, { status: 202 });
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result, unmount } = renderHook(
+      () => usePlaybackSession("request-1", [], [], 7, 0, false, "auto"),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.plan).not.toBeNull());
+    // The auto-selected initial start declares the server-owned choice.
+    expect(startBodies[0]).toMatchObject({ file_id: 7, file_selection: "auto" });
+
+    act(() => result.current.switchVersion(99, 0));
+    await waitFor(() => expect(startBodies).toHaveLength(2));
+    // A version switch is always an explicit user action.
+    expect(startBodies[1]).toMatchObject({ file_id: 99, file_selection: "explicit" });
 
     unmount();
   });

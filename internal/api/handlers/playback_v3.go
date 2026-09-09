@@ -1663,7 +1663,7 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 		AdditionalSubtitles: h.downloadedSubtitleInventoryV3(r.Context(), effectiveFile),
 	})
 	timings.mark("planning")
-	if terminalAllowsAlternateFileV3(result.Terminal) && shouldTryAlternateFileV3(req.QualityPreference) {
+	if terminalAllowsAlternateFileV3(result.Terminal) && shouldTryAlternateFileV3(req.QualityPreference) && req.FileSelection != playback.FileSelectionExplicitV3 {
 		if alternates, alternateErr := h.findAlternateFiles(r.Context(), requestedFile); alternateErr == nil {
 			baseReq := req
 			baseAudioIndex := audioIndex
@@ -1733,6 +1733,7 @@ func (h *PlaybackHandler) handleStartPlaybackV3(w http.ResponseWriter, r *http.R
 	result = retryIncompleteToneMapPlanningV3(result, toneMapCapabilityErr)
 	result = retryIncompletePlaybackSettingsV3(result, settingsErr)
 	h.clarifyOriginalQuality4KTerminalV3(r.Context(), result.Terminal, requestedFile, !shouldTryAlternateFileV3(req.QualityPreference))
+	hintExplicitSelectionAlternateAvailableV3(result.Terminal, req.FileSelection)
 	// The exact app identity is logged with every decision so a route or
 	// terminal reported against one build is attributable without asking the
 	// user which version they are running.
@@ -6331,6 +6332,22 @@ func (h *PlaybackHandler) clarifyOriginalQuality4KTerminalV3(ctx context.Context
 	if alternate, err := h.findAlternateFile(ctx, requestedFile); err == nil && alternate != nil && !playback.Is4KMediaFileV3(alternate) {
 		terminal.Message = "4K transcoding is disabled and quality 'original' pins the 4K version; a compatible lower-resolution version of this title is available."
 	}
+}
+
+// hintExplicitSelectionAlternateAvailableV3 appends a version-list hint to a
+// terminal when the viewer explicitly picked a version that cannot be delivered
+// but another version of the same title could. The explicit pick is never
+// silently swapped (the start-path fallback is gated off), so the client is
+// pointed at the version list instead. The terminal reason and retryable flag
+// are left untouched.
+func hintExplicitSelectionAlternateAvailableV3(terminal *playback.TerminalV3, fileSelection playback.FileSelectionV3) {
+	if terminal == nil || fileSelection != playback.FileSelectionExplicitV3 || !terminalAllowsAlternateFileV3(terminal) {
+		return
+	}
+	if terminal.Message != "" {
+		terminal.Message += " "
+	}
+	terminal.Message += "A compatible version of this title is available; choose it from the version list."
 }
 
 func (h *PlaybackHandler) lockReplanV3(sessionID string) func() {

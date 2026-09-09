@@ -128,6 +128,9 @@ export interface ActionBarProps {
   qualityPreference?: string | null;
   audioSelectionMode?: "auto" | "explicit";
   explicitAudioTrackIndex?: number | null;
+  /** True when the play target version was explicitly chosen by the viewer;
+   * the server must not silently substitute another version. */
+  explicitFileSelection?: boolean;
   onSelectAudioTrack?: (trackIndex: number) => void;
   onResetAudioSelection?: () => void;
   prePlaySubtitleMode?: "auto" | "off" | "explicit";
@@ -179,6 +182,7 @@ export default function ActionBar({
   onRatingChange,
   audioSelectionMode = "auto",
   explicitAudioTrackIndex = null,
+  explicitFileSelection = false,
   onSelectAudioTrack,
   onResetAudioSelection,
   prePlaySubtitleMode = "auto",
@@ -246,8 +250,15 @@ export default function ActionBar({
       prePlaySubtitleMode,
       prePlaySubtitleSelection:
         prePlaySubtitleMode === "explicit" ? explicitSubtitleSelection : null,
+      explicitFileSelection,
     }),
-    [audioSelectionMode, explicitAudioTrackIndex, explicitSubtitleSelection, prePlaySubtitleMode],
+    [
+      audioSelectionMode,
+      explicitAudioTrackIndex,
+      explicitSubtitleSelection,
+      explicitFileSelection,
+      prePlaySubtitleMode,
+    ],
   );
   const startPlaybackFromHref = useCallback(
     (href: string, restartOverride?: boolean) => {

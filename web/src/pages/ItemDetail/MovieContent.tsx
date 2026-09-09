@@ -293,6 +293,7 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
             playbackVariants={item.playback_variants}
             selectedVersion={selectedVersion}
             onSelectVersion={handleSelectVersion}
+            explicitFileSelection={manualSelectedFileId != null}
             onDownload={
               user?.download_allowed && item.versions.length > 0
                 ? () => setDownloadOpen(true)

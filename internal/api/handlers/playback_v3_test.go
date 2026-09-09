@@ -243,6 +243,37 @@ func TestTerminalAllowsAlternateFileV3IncludesHDRIncompatibility(t *testing.T) {
 	}
 }
 
+func TestHintExplicitSelectionAlternateAvailableV3(t *testing.T) {
+	const hint = "A compatible version of this title is available; choose it from the version list."
+
+	// Explicit selection on an alternate-allowing terminal appends the hint.
+	terminal := &playback.TerminalV3{Reason: "hdr_transcode_unsupported", Message: "This HDR source requires video encoding.", Retryable: false}
+	hintExplicitSelectionAlternateAvailableV3(terminal, playback.FileSelectionExplicitV3)
+	if !strings.Contains(terminal.Message, hint) {
+		t.Fatalf("explicit selection terminal message = %q, want hint appended", terminal.Message)
+	}
+	if terminal.Reason != "hdr_transcode_unsupported" || terminal.Retryable {
+		t.Fatalf("hint must not change reason/retryable: %#v", terminal)
+	}
+
+	// Auto selection must not be touched.
+	terminal = &playback.TerminalV3{Reason: "hdr_transcode_unsupported", Message: "This HDR source requires video encoding."}
+	hintExplicitSelectionAlternateAvailableV3(terminal, playback.FileSelectionAutoV3)
+	if strings.Contains(terminal.Message, hint) {
+		t.Fatalf("auto selection terminal message = %q, want untouched", terminal.Message)
+	}
+
+	// A terminal that does not allow alternates must not be touched.
+	terminal = &playback.TerminalV3{Reason: "client_hls_unsupported", Message: "The client cannot execute HLS."}
+	hintExplicitSelectionAlternateAvailableV3(terminal, playback.FileSelectionExplicitV3)
+	if strings.Contains(terminal.Message, hint) {
+		t.Fatalf("non-alternate terminal message = %q, want untouched", terminal.Message)
+	}
+
+	// Nil terminal is a no-op.
+	hintExplicitSelectionAlternateAvailableV3(nil, playback.FileSelectionExplicitV3)
+}
+
 func TestValidateAdvertisedTransformationsV3RejectsOldVideoRecipe(t *testing.T) {
 	plan := &playback.PlanV3{Transformations: []playback.TransformationV3{{
 		Name:          playback.TransformationVideoToH264V3,
