@@ -239,7 +239,7 @@ func (r *Repository) CreateRequest(ctx context.Context, input CreateRequestRecor
 	if lockKey, ok := requestlock.MediaKey(
 		string(input.Input.MediaType), input.Input.TMDBID, requestTVDBID, input.Input.IMDbID,
 	); ok {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, lockKey); err != nil {
+		if err := requestlock.LockItem(ctx, tx, lockKey); err != nil {
 			return nil, fmt.Errorf("acquire request media lock: %w", err)
 		}
 	}

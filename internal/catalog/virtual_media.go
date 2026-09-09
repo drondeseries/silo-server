@@ -16,6 +16,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Silo-Server/silo-server/internal/requestlock"
 )
 
 var ErrInvalidVirtualMedia = errors.New("invalid virtual media")
@@ -225,7 +227,7 @@ func (r *VirtualMediaRegistrar) UpsertVirtualMedia(ctx context.Context, installa
 }
 
 func upsertVirtualMediaItem(ctx context.Context, tx pgx.Tx, installationID int, source, contentID string, in VirtualMedia) (bool, error) {
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, contentID); err != nil {
+	if err := requestlock.LockItem(ctx, tx, contentID); err != nil {
 		return false, fmt.Errorf("lock virtual media identity: %w", err)
 	}
 	status := "unmatched"
@@ -468,6 +470,19 @@ func (r *VirtualMediaRegistrar) ReconcileVirtualMedia(ctx context.Context, insta
 		installationID, source, keepIDs, libraryIDs); err != nil {
 		return result, fmt.Errorf("identify stale virtual source claims: %w", err)
 	}
+	itemRows, err := tx.Query(ctx, `SELECT DISTINCT content_id FROM stale_virtual_source_claims ORDER BY content_id`)
+	if err != nil {
+		return result, err
+	}
+	itemIDs, err := pgx.CollectRows(itemRows, pgx.RowTo[string])
+	if err != nil {
+		return result, err
+	}
+	for _, id := range itemIDs {
+		if err := requestlock.LockItem(ctx, tx, id); err != nil {
+			return result, err
+		}
+	}
 	if _, err := tx.Exec(ctx, `
 		CREATE TEMP TABLE stale_virtual_file_claims ON COMMIT DROP AS
 		SELECT vmfsc.plugin_installation_id,vmfsc.content_id,vmfsc.media_folder_id,vmfsc.file_path
@@ -658,9 +673,15 @@ func RemoveVirtualMediaInstallation(ctx context.Context, tx pgx.Tx, installation
 	// Upserts lock the canonical content ID while changing virtual ownership.
 	// Take the same locks before deleting files or claims so uninstall cannot
 	// interleave with a registration for one of the affected items.
+	// Dual-lock old and new namespaces for rolling-deploy compatibility.
 	if _, err := tx.Exec(ctx, `
 		SELECT pg_advisory_xact_lock(hashtext(content_id))
-		FROM affected_virtual_content`); err != nil {
+		FROM affected_virtual_content ORDER BY content_id`); err != nil {
+		return result, fmt.Errorf("lock affected virtual media: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtext('catalog:item:' || content_id))
+		FROM affected_virtual_content ORDER BY content_id`); err != nil {
 		return result, fmt.Errorf("lock affected virtual media: %w", err)
 	}
 
@@ -872,7 +893,7 @@ func (r *VirtualMediaRegistrar) RemoveInstallationVirtualMedia(ctx context.Conte
 
 func lockVirtualMediaSource(ctx context.Context, tx pgx.Tx, installationID int, source string) error {
 	lockKey := fmt.Sprintf("silo:virtual-media-source:%d:%s", installationID, source)
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, lockKey); err != nil {
+	if err := requestlock.LockVirtual(ctx, tx, lockKey); err != nil {
 		return fmt.Errorf("lock virtual media source: %w", err)
 	}
 	return nil
@@ -880,7 +901,7 @@ func lockVirtualMediaSource(ctx context.Context, tx pgx.Tx, installationID int, 
 
 func lockVirtualMediaInstallation(ctx context.Context, tx pgx.Tx, installationID int) error {
 	lockKey := fmt.Sprintf("silo:virtual-media-installation:%d", installationID)
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, lockKey); err != nil {
+	if err := requestlock.LockVirtual(ctx, tx, lockKey); err != nil {
 		return fmt.Errorf("lock virtual media installation: %w", err)
 	}
 	return nil
@@ -1403,7 +1424,7 @@ func upsertVirtualFileWithMeta(ctx context.Context, tx pgx.Tx, contentID, episod
 	if isUnplayableVirtualURI(uri) {
 		return nil
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, uri); err != nil {
+	if err := requestlock.LockVirtual(ctx, tx, uri); err != nil {
 		return err
 	}
 	isHDR := in.HDR != ""
@@ -1488,7 +1509,7 @@ func upsertVirtualFileVariant(ctx context.Context, tx pgx.Tx, contentID, episode
 	if isUnplayableVirtualURI(v.VirtualURI) {
 		return nil
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, v.VirtualURI); err != nil {
+	if err := requestlock.LockVirtual(ctx, tx, v.VirtualURI); err != nil {
 		return err
 	}
 	isHDR := v.HDR != ""
