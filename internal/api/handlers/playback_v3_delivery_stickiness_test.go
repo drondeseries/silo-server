@@ -39,9 +39,10 @@ func TestHandleReplanPlaybackV3DemotedDeliveryStaysDisabledAcrossReplans(t *test
 	// a terminal instead of the replacement plan the thrash fix promises.
 	start.ClientPlaybackContext.Deliveries[playback.DeliveryClassHLSV3] = playback.DeliveryCapabilityV3{
 		Enabled: true, SupportedOnDevice: true,
-		Containers:  []string{"mkv", "mp4"},
-		VideoCodecs: []string{"h264"},
-		Subtitles:   playback.DeliverySubtitleCapabilitiesV3{EmbeddedText: true, SidecarText: true},
+		Containers:        []string{"hls"},
+		VideoCodecs:       []string{"h264"},
+		AudioDecodeCodecs: []string{"aac"},
+		Subtitles:         playback.DeliverySubtitleCapabilitiesV3{EmbeddedText: true, SidecarText: true},
 	}
 	rr := httptest.NewRecorder()
 	handler.HandleStartPlayback(rr, httptest.NewRequest(http.MethodPost, "/api/v1/playback/start", strings.NewReader(marshalV3StartRequest(t, start))).WithContext(newAuthorizedPlaybackContext()))
