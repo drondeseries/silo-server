@@ -209,7 +209,7 @@ func TestExtractFontBundleLeaderCancellationDoesNotFailWaiters(t *testing.T) {
 	<-started
 	time.Sleep(50 * time.Millisecond)
 
-	// Cancelling the leader's request must not kill the shared extraction the
+	// Canceling the leader's request must not kill the shared extraction the
 	// waiter is blocked on.
 	cancelLeader()
 	close(release)

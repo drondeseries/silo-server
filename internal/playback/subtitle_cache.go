@@ -722,7 +722,7 @@ func (c *SubtitleCache) LookupFontBundle(key FontBundleKey) ([]byte, bool) {
 // a committed disk entry when present and otherwise running extract once under
 // single-flight and writing the result through to disk for every waiter. The
 // extraction runs on a context detached from the leading request (bounded to
-// subtitleFontBundleExtractTimeout), so a cancelling leader does not fail the
+// subtitleFontBundleExtractTimeout), so a canceled leader does not fail the
 // shared work other callers are waiting on.
 func (c *SubtitleCache) ExtractFontBundle(ctx context.Context, key FontBundleKey, extract func(context.Context) ([]byte, error)) ([]byte, error) {
 	if c == nil {
@@ -753,7 +753,7 @@ func (c *SubtitleCache) ExtractFontBundle(ctx context.Context, key FontBundleKey
 			return nil, extractErr
 		}
 		if storeErr := c.storeFontBundle(key, data); storeErr != nil {
-			slog.Warn("subtitle font bundle cache store failed", "error", storeErr)
+			slog.WarnContext(ctx, "subtitle font bundle cache store failed", "error", storeErr)
 		}
 		return data, nil
 	})
