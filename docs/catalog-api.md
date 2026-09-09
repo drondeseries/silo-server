@@ -1,5 +1,33 @@
 # Catalog API
 
+## Multi-audio language support and release metadata
+
+MULTi/DUAL releases — a single audio stream tagged `und`/`mul`/empty whose
+languages live in the track title (e.g. "English / French / Spanish") — now
+carry real language identity instead of being collapsed to a single code.
+
+- **`FileVersion.audio_tracks[].languages`** — the full advertised language
+  list for a MULTi/DUAL track, parsed from the track title at probe time when
+  the container language tag is absent, undetermined, or multiple. `language`
+  keeps the primary code (the first concrete one when the tag was
+  undetermined). Rows probed before this support are backfilled at read time
+  from the embedded title until the probe-version re-probe catches up.
+- **`FileVersion.audio_tracks[].index`** — the container stream ordinal
+  (ffmpeg's `0:a:N`). Track list order can differ from container order on
+  MULTi releases, so this is the identity a client should use when it needs
+  the real stream position.
+- **`FileVersion.release_name`** / **`FileVersion.release_group`** — the file
+  stem (basename without extension) and the trailing group tag on
+  release-style names (`Movie.2023.2160p.AltMount` → group `AltMount`), so
+  clients can show which release a version is. `release_group` is empty when no
+  group tag is present.
+
+`GET /api/v1/catalog/filters` reports the language facets on
+`audio_languages` and `subtitle_languages` (alongside `resolutions`) when
+`include_technical` is true (the default). A MULTi track satisfies the
+audio-language browse filter for any of its `languages[]` codes, not just its
+primary `language`.
+
 ## Saved browse sort
 
 `PUT /api/v1/collections/sort-preference` saves the active profile's sort for a

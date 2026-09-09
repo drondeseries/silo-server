@@ -222,6 +222,26 @@ would have chosen for the resume point. A client that resolves resume state
 itself and sends the position explicitly gets identical behaviour — that is the
 supported way to override the server's policy.
 
+**Carrying an audio selection across a version switch.** `carried_audio_track_id`
+is the file-bound audio identity (`file:{file_id}:audio:{ordinal}`, §8) the
+viewer had selected on a previously playing version. When present, the server
+re-resolves it onto the requested file's inventory by *track family* — codec and
+language, honoring a MULTi track's full `languages[]` — rather than by raw
+ordinal, which is unstable across encodes. It is additive and optional: absent
+means the server owns audio selection (profile or series preference), exactly as
+before. It is not feature-gated; any v3 client may send it. When the carried
+identity cannot be resolved (the source version is gone, or the identity does
+not parse), the server falls back to its normal preference resolution.
+
+**Pinning an explicit version pick.** `file_selection` distinguishes an explicit
+user version pick from an auto/default selection. `explicit` pins the requested
+`file_id`: the start-path alternate-version fallback is disabled, and a terminal
+that another version of the same title could satisfy carries a version-list hint
+in its `message` instead of silently swapping files. Absent (or `auto`) keeps
+the historical behavior — the server may substitute an alternate version when
+the requested one cannot be delivered. The field is optional and
+unconditionally available; existing clients that omit it are unchanged.
+
 ### 2.3 `POST /playback/{session_id}/replan`
 
 Asks for a different plan for an existing session — after a failure, or because
@@ -300,6 +320,27 @@ Event names are the eleven in §7.4. `diagnostics` is a string→string map, cap
 at 32 entries, and the server keeps only the keys on its allowlist (§7.5),
 truncating each value to 256 characters. Unknown keys are dropped silently; a
 client sending them is not an error, it just achieves nothing.
+
+### 2.5 `POST /playback/{session_id}/progress`
+
+Reports the live playback position and pause state for a session. Auth +
+`X-Profile-Id` required. Body: `{"position": <seconds>, "is_paused": <bool>}`.
+
+| Status | Meaning |
+| --- | --- |
+| `204` | Accepted. **No response body.** |
+| `400` | `bad_request` | Malformed body or missing `session_id` |
+| `401` | `unauthorized` | No authenticated user |
+| `403` | `forbidden` | The session belongs to another user |
+| `500` | `internal_error` | Store outage |
+
+Progress for a session that is already gone — for example a version switch
+deleted it while a 10-second progress tick was in flight — is a **benign
+no-op**, not an error: the endpoint answers `204` for a missing or expired
+session, and the client must not treat it as a failure or tear playback down.
+This is deliberate and differs from the other session-scoped endpoints, where
+an unknown session is an error. A `403` still means the session exists but is
+not the caller's; a `500` is retryable.
 
 ---
 
