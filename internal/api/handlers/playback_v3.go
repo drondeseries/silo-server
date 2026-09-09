@@ -6839,9 +6839,11 @@ func demotedDeliveryClassesV3(durable playback.StartRequestV3) []string {
 // reapplyDeliveryDemotionsV3 writes the durable record's delivery demotions
 // onto a freshly overlaid request. Called after the client's capability
 // payload replaces the seeded one, so a delivery a previous failure recovery
-// demoted stays disabled for the rest of the attempt. The replan commit
-// writes the seeded request back to the record (updated.NormalizedRequest),
-// so the demotion also persists through the store round-trip.
+// demoted stays disabled for the rest of the attempt. The re-application
+// re-stamps the demotion marker: the overlay replaced the seeded payload's
+// map, and without the stamp the commit would persist an Enabled=false entry
+// the next replan can no longer distinguish from a client-advertised
+// unsupported delivery — the stickiness would die after one hop.
 func reapplyDeliveryDemotionsV3(start *playback.StartRequestV3, durable playback.StartRequestV3) {
 	if start == nil {
 		return
@@ -6851,6 +6853,7 @@ func reapplyDeliveryDemotionsV3(start *playback.StartRequestV3, durable playback
 			capability.Enabled = false
 			capability.SupportedOnDevice = false
 			capability.ValidatedClaims = nil
+			capability.FailureReason = demoteDeliveryReasonV3
 			start.ClientPlaybackContext.Deliveries[class] = capability
 		}
 	}
