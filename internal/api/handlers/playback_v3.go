@@ -2091,6 +2091,7 @@ func (h *PlaybackHandler) startPlannedPlaybackV3(r *http.Request, userID int, pr
 	// retries that lose the idempotency race must not emit duplicate provider
 	// scrobbles or analysis work for the short-lived session they roll back.
 	h.raceCopySafetyV3(effectiveFile.ID, result.Plan)
+	h.warmVirtualSubtitlesV3(r.Context(), session, effectiveFile)
 	h.enqueuePlaybackStartSideEffectsV3(r.Context(), session, effectiveFile, userID, profileID, plannedAudioTrackIndexV3(result, audioIndex))
 	h.enqueueRouteEventV3(playback.RouteEventRecordV3{RouteEventV3: playback.RouteEventV3{ProtocolVersion: playback.ProtocolV3, PlaybackAttemptID: req.PlaybackAttemptID, SessionID: session.ID, PlanID: result.Plan.PlanID, Event: playback.RouteEventPlanSelectedV3, AppliedQuirkIDs: appliedQuirkIDsV3(result.Plan), QuirkRegistryRevision: appliedQuirkRevisionV3(result.Plan), OutputContextID: req.ClientPlaybackContext.Output.OutputContextID}, UserID: userID, ProfileID: profileID, ClientName: clientInfo.Name, ClientVersion: clientInfo.Version, ClientBuild: clientInfo.Build, ClientChannel: clientInfo.Channel, ClientModel: req.ClientPlaybackContext.Device.Model})
 	return response, nil
@@ -4226,6 +4227,72 @@ func (h *PlaybackHandler) v3SessionStreamState(ctx context.Context, session *pla
 
 func (h *PlaybackHandler) updateV3SessionState(ctx context.Context, session *playback.Session, file *models.MediaFile, result playback.PlannerResultV3, transport preparedTransportV3, mode mediaAuthModeV3) error {
 	return h.sessionMgr.UpdateStreamState(session.ID, h.v3SessionStreamState(ctx, session, file, result, transport, mode))
+}
+
+// warmVirtualSubtitlesV3 pre-warms the subtitle cache for a virtual source's
+// embedded tracks right after a successful plan + transport commit. The serve
+// path always fetches text subtitles windowed (the client appends
+// position/duration), so a first click otherwise pays a full remote demux
+// against a fresh relay registration; a committed full-track entry turns
+// every windowed fetch into a near-instant scan of a small cached artifact
+// instead. PGS already gets this fast path from serveWindowedSUP; this warm
+// supplies the entry so both classes start instant.
+//
+// The warm resolves its own relay registration (the transport's is held by
+// the transcode session, not shareable) and holds it open until every track's
+// warm finishes — a relay URL released mid-warm would 404 under ffmpeg.
+// Best-effort by design: resolution failure, warm-slot exhaustion, and cache
+// misses (the 10-minute generation bucket rotates) all degrade to the
+// existing cold-serve path with no user-visible error. The selected plan
+// ordinal is warmed first so the initial default-track click benefits even
+// when the warm semaphore drops later tracks.
+func (h *PlaybackHandler) warmVirtualSubtitlesV3(ctx context.Context, session *playback.Session, file *models.MediaFile) {
+	if h == nil || h.SubtitleCache == nil || file == nil || session == nil {
+		return
+	}
+	if !isVirtualPlaybackFile(file) || session.VirtualSourceURI == "" {
+		return
+	}
+	tracks := session.VirtualSubtitleTracks
+	if len(tracks) == 0 {
+		// Fall back to the catalog row's inventory when the session carries
+		// no virtual evidence (a drift remap or a rotated candidate).
+		tracks = file.SubtitleTracks
+	}
+	if len(tracks) == 0 {
+		return
+	}
+	resolved, cleanup, err := h.resolveVirtualInputURI(
+		ctx, file.FilePath, file.VirtualOwnerInstallationID,
+		session.UserID, session.ProfileID, false, nil, "",
+	)
+	if err != nil {
+		slog.DebugContext(ctx, "virtual subtitle pre-warm skipped: resolve failed",
+			"component", "api", "file_id", file.ID, "error", err)
+		return
+	}
+	var wg sync.WaitGroup
+	for i := range tracks {
+		wg.Add(1)
+		done := h.SubtitleCache.WarmTrackInBackground(playback.StreamExtractOpts{
+			InputPath:     resolved.URL,
+			CacheIdentity: playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, i),
+			TrackIndex:    i,
+			SourceCodec:   tracks[i].Codec,
+			FFmpegPath:    h.playbackConfig().FFmpegPath,
+		}, playback.StreamExtractSubtitle)
+		go func() {
+			<-done
+			wg.Done()
+		}()
+	}
+	// Release the relay registration exactly once, after every warm settled
+	// (ran, failed, or was skipped). The entry itself is also bounded by the
+	// relay's 24h lifetime, so a lost release never pins a slot forever.
+	go func() {
+		wg.Wait()
+		cleanup()
+	}()
 }
 
 func plannedAudioTrackIndexV3(result playback.PlannerResultV3, fallback int) int {

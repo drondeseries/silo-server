@@ -302,22 +302,27 @@ type PlaybackHandler struct {
 	// CopySafetyRacer resolves an unknown H.264 copy-safety verdict behind an
 	// already-issued stream-copy plan. Optional: nil keeps unknown verdicts
 	// unknown and never withdraws a copy route.
-	CopySafetyRacer              PlaybackCopySafetyRacer
-	ChapterThumbnailQueuer       PlaybackChapterThumbnailQueuer
-	IntroAnalyzer                IntroEpisodeAnalyzer
-	IntroRepository              PlaybackIntroEligibilityChecker
-	MarkerRegistry               *markers.Registry
-	MarkerResolver               markers.ExternalIDResolver
-	MarkerUpserter               PlaybackMarkerUpserter
-	MarkerUpdateNotifier         PlaybackMarkerUpdateNotifier
-	StartTranscodeFunc           func(context.Context, playback.TranscodeOpts) (*playback.TranscodeSession, error)
-	MarkerLazyContext            context.Context
-	MarkerLazyInFlight           sync.Map
-	v3StartEffectsOnce           sync.Once
-	v3StartEffectsQueue          chan playbackStartSideEffectsV3
-	v3StartEffectsMu             sync.Mutex
-	v3StartEffectsPending        map[string]*playbackStartSideEffectsStateV3
-	SubtitleRepo                 subtitles.Repository // optional; enables downloaded subtitles in playback
+	CopySafetyRacer        PlaybackCopySafetyRacer
+	ChapterThumbnailQueuer PlaybackChapterThumbnailQueuer
+	IntroAnalyzer          IntroEpisodeAnalyzer
+	IntroRepository        PlaybackIntroEligibilityChecker
+	MarkerRegistry         *markers.Registry
+	MarkerResolver         markers.ExternalIDResolver
+	MarkerUpserter         PlaybackMarkerUpserter
+	MarkerUpdateNotifier   PlaybackMarkerUpdateNotifier
+	StartTranscodeFunc     func(context.Context, playback.TranscodeOpts) (*playback.TranscodeSession, error)
+	MarkerLazyContext      context.Context
+	MarkerLazyInFlight     sync.Map
+	v3StartEffectsOnce     sync.Once
+	v3StartEffectsQueue    chan playbackStartSideEffectsV3
+	v3StartEffectsMu       sync.Mutex
+	v3StartEffectsPending  map[string]*playbackStartSideEffectsStateV3
+	SubtitleRepo           subtitles.Repository // optional; enables downloaded subtitles in playback
+	// SubtitleCache warms virtual subtitle extracts at plan time so the
+	// first subtitle click is served from cache instead of paying a full
+	// remote demux. Shared with StreamHandler's serve path — wired in the
+	// router from the single NewSubtitleCache instance.
+	SubtitleCache                *playback.SubtitleCache
 	RealtimeHub                  *playback.RealtimeHub
 	CommandTracker               *playback.CommandTracker
 	CommandDispatcher            *playback.CommandDispatcher

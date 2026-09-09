@@ -69,6 +69,15 @@ type StreamExtractOpts struct {
 	// absolute timestamps, so windowed output is byte-compatible with a
 	// window cut from the original file.
 	InputIsExtractedSup bool
+	// InputIsExtractedText marks InputPath as a cached full-track text
+	// artifact (vtt/ass) produced by a previous non-windowed extract rather
+	// than the original media container. The demuxer is forced to the
+	// artifact's format and the mapping to `0:s:0` (same single-stream
+	// reasoning as InputIsExtractedSup), and a windowed re-extract from it
+	// carries absolute timestamps exactly like the .sup path, so a window
+	// cut from the cache is byte-compatible with one cut from the source.
+	// Empty means InputPath is the original container.
+	InputIsExtractedText string
 	// FFmpegPath overrides the ffmpeg binary lookup.
 	FFmpegPath string
 	// Writer receives ffmpeg's stdout bytes as they arrive. When it
@@ -179,9 +188,21 @@ func streamExtractArgs(opts StreamExtractOpts) []string {
 
 	// A cached .sup input has no container magic worth probing and exactly
 	// one stream: force the demuxer and remap to the sole stream ordinal.
+	// A cached text artifact (vtt/ass) is the same shape: force the demuxer
+	// and remap to its single stream. ffmpeg's WebVTT demuxer is registered
+	// as "webvtt" (the cache key spells it "vtt", the muxer name), and the
+	// ass demuxer accepts the artifact directly.
 	trackIndex := opts.TrackIndex
-	if opts.InputIsExtractedSup {
+	switch {
+	case opts.InputIsExtractedSup:
 		args = append(args, "-f", "sup")
+		trackIndex = 0
+	case opts.InputIsExtractedText != "":
+		inputFormat := opts.InputIsExtractedText
+		if inputFormat == SubtitleFormatVTTV3 {
+			inputFormat = subtitleMuxerWebVTT
+		}
+		args = append(args, "-f", inputFormat)
 		trackIndex = 0
 	}
 	args = append(args,

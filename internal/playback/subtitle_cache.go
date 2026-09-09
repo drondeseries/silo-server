@@ -147,6 +147,22 @@ func (c *SubtitleCache) ServeExtract(w http.ResponseWriter, r *http.Request, opt
 			fill.Discard()
 			return nil
 		}
+	} else if !opts.DisableBackgroundWarm {
+		// Windowed text fetches are position-dependent slices, so they are
+		// never cached themselves — but the cache still speeds them up,
+		// exactly like serveWindowedSUP does for PGS: when a committed
+		// full-track entry exists, the windowed extract's input is rewritten
+		// to that small artifact (the -ss scan reads kilobytes instead of
+		// re-demuxing a multi-GB remote source), and when it doesn't, a
+		// detached warm is kicked off so later windows hit the fast path.
+		if cachedPath, _, ok := c.cachedFormatEntryPath(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format); ok {
+			slog.DebugContext(r.Context(), "windowed text subtitle extract using cached full track",
+				"input", opts.InputPath, "track", opts.TrackIndex, "cache_entry", cachedPath)
+			opts.InputPath = cachedPath
+			opts.InputIsExtractedText = format
+		} else {
+			c.WarmTrackInBackground(opts, extract)
+		}
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
@@ -321,6 +337,87 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 			"input", opts.InputPath, "track", opts.TrackIndex,
 			"elapsed_ms", time.Since(start).Milliseconds())
 	}()
+}
+
+// WarmTrackInBackground starts a detached full-track extract for one subtitle
+// track in any output format (text VTT/ASS or bitmap .sup), so the first
+// client fetch — full-track or windowed — hits the cache instead of paying a
+// full remote demux. The returned channel closes exactly once when the warm
+// finished (success or failure) or was skipped (warm slots busy, another fill
+// in flight, cache disabled, already cached); callers use it to release a
+// request-scoped relay registration the warm held open.
+//
+// Staleness for identity-keyed (virtual) sources follows the same 10-minute
+// generation bucket as every other cache lookup: an entry committed under an
+// earlier bucket is not found by later lookups, so a warm that loses its
+// bucket race is simply re-kicked by the next windowed miss.
+func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SUPExtractFunc) <-chan struct{} {
+	done := make(chan struct{})
+	_, format := streamExtractOutput(opts.SourceCodec, opts.TargetFormat)
+	if format == subtitleMuxerWebVTT {
+		format = SubtitleFormatVTTV3
+	}
+	if c == nil || extract == nil || c.dir() == "" || format == "" {
+		close(done)
+		return done
+	}
+	// Already committed under the current bucket: nothing to warm.
+	if _, _, ok := c.cachedFormatEntryPath(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format); ok {
+		close(done)
+		return done
+	}
+	select {
+	case c.warmSem <- struct{}{}:
+	default:
+		slog.Debug("subtitle cache warm skipped: all warm slots busy",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		close(done)
+		return done
+	}
+	fill := c.beginFill(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+	if fill == nil {
+		// Another fill (client-driven or a previous warm) is already in
+		// flight, or the cache is unusable — either way, nothing to do.
+		<-c.warmSem
+		close(done)
+		return done
+	}
+
+	// Full-track options: the warm ignores the triggering request's window
+	// and writes only to the cache temp file (no response writer).
+	opts.SeekSeconds = 0
+	opts.DurationSeconds = 0
+	opts.AllowWindow = false
+	opts.InputIsExtractedSup = false
+	opts.InputIsExtractedText = ""
+	opts.Writer = fill.Tee(io.Discard)
+
+	go func() {
+		defer close(done)
+		defer func() { <-c.warmSem }()
+		ctx, cancel := context.WithTimeout(context.Background(), subtitleCacheWarmTimeout)
+		defer cancel()
+
+		start := time.Now()
+		slog.Info("subtitle cache warm started",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		if err := extract(ctx, opts); err != nil {
+			fill.Discard()
+			slog.Warn("subtitle cache warm failed",
+				"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
+				"elapsed_ms", time.Since(start).Milliseconds(), "error", err)
+			return
+		}
+		if err := fill.Commit(); err != nil {
+			slog.Warn("subtitle cache warm commit failed",
+				"input", opts.InputPath, "track", opts.TrackIndex, "error", err)
+			return
+		}
+		slog.Info("subtitle cache warm finished",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
+			"elapsed_ms", time.Since(start).Milliseconds())
+	}()
+	return done
 }
 
 // dir resolves the cache directory, or "" when caching is disabled.

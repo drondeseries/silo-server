@@ -1515,9 +1515,15 @@ func NewRouter(deps Dependencies) chi.Router {
 		streamHandler.PlaybackConfig = func() config.PlaybackConfig {
 			return deps.CurrentConfig().Playback
 		}
-		streamHandler.SubtitleCache = playback.NewSubtitleCache(func() string {
+		subtitleCache := playback.NewSubtitleCache(func() string {
 			return deps.CurrentConfig().Playback.TranscodeDir
 		})
+		streamHandler.SubtitleCache = subtitleCache
+		// Share the serve-path cache with the playback handler so a plan
+		// can pre-warm virtual subtitle extracts before the first fetch.
+		if playbackHandler != nil {
+			playbackHandler.SubtitleCache = subtitleCache
+		}
 	}
 
 	restartStatus := deps.ServerRestartStatus
