@@ -5046,7 +5046,14 @@ func (h *PlaybackHandler) executeReplanV3(r *http.Request, record *playback.Atte
 	// normally, and an explicit user retry can re-enable the route by going
 	// through a new start.
 	if failureRecoveryAbandonedDeliveryV3(operation, req.Failure.Classification) {
+		// Demote on both copies: the record (the durable attempt this replan
+		// may still terminal-persist) and the seeded start, whose payload the
+		// success commit writes back via updated.NormalizedRequest. Demoting
+		// only the record would be wiped by that write-back — the seed was
+		// copied before the demotion and the overlay re-enables the client's
+		// still-advertised claim.
 		demoteDeliveryCapabilityV3(&record.NormalizedRequest, record.CurrentPlan.Delivery)
+		demoteDeliveryCapabilityV3(&start, record.CurrentPlan.Delivery)
 	}
 	// User-intent operations replace the legacy audio PATCH and client-recipe
 	// transcode start. Nothing failed, so their previous route stays eligible:
