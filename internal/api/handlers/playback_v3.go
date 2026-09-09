@@ -6748,19 +6748,21 @@ func (h *PlaybackHandler) remapSubtitleSelectionV3(ctx context.Context, source, 
 // transportFailureClassificationsV3 are the client failure classifications
 // that mean the route itself did not deliver bytes the device could render —
 // as opposed to benign signals (quality_changed, track changes) that leave
-// the previous route fully eligible. The vocabulary is the Android/iOS/web
-// client failure taxonomy; a failure recovery reporting one of these after
-// abandoning a delivery is server evidence that the delivery failed for this
-// attempt. Unclassified failures do NOT demote: several benign recovery
-// paths send no classification, and demoting on those would retire the only
-// viable route for a healthy stream.
+// the previous route fully eligible. The vocabulary is the client failure
+// taxonomy; prod route events name decoder_failure, player_failure, and
+// http_failure as the observed direct-play failure classes.
+// audio_renderer_error is deliberately excluded: a client-local audio hiccup
+// does not indict the video route, and demoting on it would retire the only
+// viable delivery for a session that is otherwise direct-playing fine.
+// Unclassified failures do NOT demote either: several benign recovery paths
+// send no classification, and demoting on those would retire the only viable
+// route for a healthy stream.
 var transportFailureClassificationsV3 = map[string]bool{
-	"decoder_failure":      true,
-	"decode_error":         true,
-	"player_failure":       true,
-	"http_failure":         true,
-	"audio_renderer_error": true,
-	"parser_failure":       true,
+	"decoder_failure": true,
+	"decode_error":    true,
+	"player_failure":  true,
+	"http_failure":    true,
+	"parser_failure":  true,
 }
 
 // failureClassificationKeyV3 lowercases and trims a client-reported failure
