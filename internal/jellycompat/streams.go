@@ -287,7 +287,7 @@ func compatSourceHasSurroundAudio(source PlaybackMediaSource) bool {
 func compatRecipeMatchesSource(recipe *playback.RecipeCard, source PlaybackMediaSource) bool {
 	return recipe != nil &&
 		recipe.MediaFileID == source.FileID &&
-		recipe.AudioTrackIndex == compatAudioTrackIndexOrDefault(source) &&
+		recipe.AudioTrackIndex == compatAudioOrdinalOrDefault(source) &&
 		recipe.SourceAudioChannels == compatHLSRecipeSourceAudioChannels(source) &&
 		recipe.CopyVideoMPEGTS == source.HLSRemuxMPEGTS
 }
@@ -571,7 +571,7 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 		switch method {
 		case "remux":
 			audioTrackIndex := -1
-			if resolvedAudioTrackIndex, ok := compatAudioTrackIndex(*source); ok {
+			if resolvedAudioTrackIndex, ok := compatAudioOrdinal(*source); ok {
 				audioTrackIndex = resolvedAudioTrackIndex
 			}
 			sourceAudioChannels := 0
@@ -687,7 +687,7 @@ func (h *PlaybackHandler) HandleVideoStream(w http.ResponseWriter, r *http.Reque
 	switch method {
 	case "remux":
 		audioTrackIndex := -1
-		if resolvedAudioTrackIndex, ok := compatAudioTrackIndex(*source); ok {
+		if resolvedAudioTrackIndex, ok := compatAudioOrdinal(*source); ok {
 			audioTrackIndex = resolvedAudioTrackIndex
 		}
 		sourceAudioChannels := 0
@@ -2322,7 +2322,7 @@ func (h *PlaybackHandler) handlePlaybackReport(w http.ResponseWriter, r *http.Re
 				"error", selectionErr,
 			)
 		} else if updatedSource != nil {
-			if resolvedAudioTrackIndex, ok := compatAudioTrackIndex(*updatedSource); ok {
+			if resolvedAudioTrackIndex, ok := compatAudioOrdinal(*updatedSource); ok {
 				audioTrackIndex = resolvedAudioTrackIndex
 			}
 			audioRestarted = restarted
@@ -2413,7 +2413,7 @@ func (h *PlaybackHandler) upstreamRecipeCard(ps *PlaybackSession, cs *Session, s
 	if ps != nil && ps.Recipe != nil {
 		card = *ps.Recipe
 	} else if method == "remux" {
-		card = playback.NewRemuxRecipeCard(ps.UpstreamSessionID, cs.StreamAppUserID, cs.ProfileID, source.FileID, source.TranscodeAudio, compatAudioTrackIndexOrDefault(source))
+		card = playback.NewRemuxRecipeCard(ps.UpstreamSessionID, cs.StreamAppUserID, cs.ProfileID, source.FileID, source.TranscodeAudio, compatAudioOrdinalOrDefault(source))
 		if source.TranscodeAudio {
 			card.SourceAudioChannels = compatSourceAudioChannels(source)
 		}
@@ -2727,7 +2727,7 @@ func (h *PlaybackHandler) ensureTranscodeSessionWithToneMapMode(
 	requiredToneMapMode tonemap.Mode,
 ) (*playback.TranscodeSession, error) {
 	sourceAudioChannels := compatHLSRecipeSourceAudioChannels(source)
-	audioTrackIndex := compatAudioTrackIndexOrDefault(source)
+	audioTrackIndex := compatAudioOrdinalOrDefault(source)
 	if existing := h.tm.GetTranscodeSession(upstreamSessionID); existing != nil && compatTranscodeSessionUsesToneMapMode(existing, requiredToneMapMode) {
 		if compatLiveTranscodeMatchesAudioSource(existing, source) {
 			return existing, nil
@@ -2999,7 +2999,7 @@ func compatLiveTranscodeMatchesAudioSource(transcodeSession *playback.TranscodeS
 		return false
 	}
 	opts := transcodeSession.Opts()
-	return opts.AudioTrackIndex == compatAudioTrackIndexOrDefault(source) &&
+	return opts.AudioTrackIndex == compatAudioOrdinalOrDefault(source) &&
 		opts.SourceAudioChannels == compatHLSRecipeSourceAudioChannels(source) &&
 		opts.CopyVideoMPEGTS == source.HLSRemuxMPEGTS
 }
@@ -3239,7 +3239,7 @@ func (h *PlaybackHandler) syncUpstreamAudioSelection(playSession *PlaybackSessio
 	if h.sessionMgr == nil || playSession == nil || playSession.UpstreamSessionID == "" {
 		return nil
 	}
-	audioTrackIndex, ok := compatAudioTrackIndex(source)
+	audioTrackIndex, ok := compatAudioOrdinal(source)
 	if !ok {
 		return nil
 	}
@@ -3260,7 +3260,7 @@ func (h *PlaybackHandler) restartCompatTranscodeForAudioSelection(
 		return false, nil
 	}
 
-	audioTrackIndex, ok := compatAudioTrackIndex(source)
+	audioTrackIndex, ok := compatAudioOrdinal(source)
 	if !ok {
 		return false, nil
 	}

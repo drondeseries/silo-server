@@ -111,7 +111,10 @@ func TestStartRemoteCopyTranscodeDoesNotAdoptUnversionedRecipe(t *testing.T) {
 		TranscodeNodeURL: node.URL, PlayMethod: playback.PlayTranscode,
 		InputPath: "/media/movie.mkv", TargetCodecVideo: "copy", TargetCodecAudio: "copy",
 		SegmentDuration: compatSegmentDuration,
-		AudioTrackIndex: compatAudioTrackIndexOrDefault(source),
+		// Recipe cards carry the audio-only ffmpeg ordinal (jellycompat audio
+		// ordinal parity fix); the fixture tracks are synthesized (Index 0), so
+		// the ordinal equals the array position.
+		AudioTrackIndex: compatAudioOrdinalOrDefault(source),
 	}
 	playbackStore.Put(PlaybackSession{
 		ID: "play-1", UpstreamSessionID: "upstream-1", TranscodeStarted: true, Recipe: legacy,
@@ -625,7 +628,7 @@ func TestMasterManifestGatesUnhealthyRemoteAdoption(t *testing.T) {
 				Recipe: &playback.RecipeCard{
 					TranscodeNodeURL:    adoptedURL,
 					MediaFileID:         source.FileID,
-					AudioTrackIndex:     compatAudioTrackIndexOrDefault(source),
+					AudioTrackIndex:     compatAudioOrdinalOrDefault(source),
 					SourceAudioChannels: compatSourceAudioChannels(source),
 				},
 			})
@@ -687,7 +690,7 @@ func TestMasterManifestReplansRouteAroundDifferentAdoptedRemote(t *testing.T) {
 		Recipe: &playback.RecipeCard{
 			TranscodeNodeURL:    adoptedURL + "/",
 			MediaFileID:         source.FileID,
-			AudioTrackIndex:     compatAudioTrackIndexOrDefault(source),
+			AudioTrackIndex:     compatAudioOrdinalOrDefault(source),
 			SourceAudioChannels: compatSourceAudioChannels(source),
 		},
 	})
@@ -761,7 +764,7 @@ func TestMasterManifestWrapsRemoteCopyMediaPlaylistAsVariant(t *testing.T) {
 		SessionID: "upstream-1", InputPath: "/media/movie.mkv",
 		TargetCodecVideo: "copy", TargetCodecAudio: "copy",
 		SegmentDuration: compatSegmentDuration,
-		AudioTrackIndex: compatAudioTrackIndexOrDefault(source),
+		AudioTrackIndex: compatAudioOrdinalOrDefault(source),
 	})
 	playbackStore.Put(PlaybackSession{
 		ID: "play-1", CompatToken: "compat-token", RouteItemID: "item",

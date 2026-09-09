@@ -1267,7 +1267,7 @@ func (h *PlaybackHandler) buildProxyRedirectURL(
 	}
 
 	audioTrackIndex := 0
-	if resolvedAudioTrackIndex, ok := compatAudioTrackIndex(source); ok {
+	if resolvedAudioTrackIndex, ok := compatAudioOrdinal(source); ok {
 		audioTrackIndex = resolvedAudioTrackIndex
 	}
 
@@ -1449,7 +1449,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	}
 	if h.playbackStore != nil {
 		expectedSourceAudioChannels := compatHLSRecipeSourceAudioChannels(source)
-		expectedAudioTrackIndex := compatAudioTrackIndexOrDefault(source)
+		expectedAudioTrackIndex := compatAudioOrdinalOrDefault(source)
 		if current, ok := h.playbackStore.Get(playSessionID); ok && current.TranscodeStarted && current.Recipe != nil && current.Recipe.TranscodeNodeURL != "" &&
 			current.Recipe.MediaFileID == source.FileID &&
 			current.Recipe.SourceAudioChannels == expectedSourceAudioChannels &&
@@ -1557,7 +1557,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		TargetCodecAudio:    compatTargetAudioCodec,
 		SegmentDuration:     segmentDuration,
 		HWAccel:             h.remoteDispatchHWAccel(transcodeNodeURL),
-		AudioTrackIndex:     compatAudioTrackIndexOrDefault(source),
+		AudioTrackIndex:     compatAudioOrdinalOrDefault(source),
 		SourceAudioChannels: compatHLSRecipeSourceAudioChannels(source),
 		TotalDuration:       float64(source.Version.Duration),
 		RequireReady:        toneMapRecipe.mode != "",
@@ -2764,6 +2764,30 @@ func compatAudioTrackIndex(source PlaybackMediaSource) (int, bool) {
 func compatAudioTrackIndexOrDefault(source PlaybackMediaSource) int {
 	if audioTrackIndex, ok := compatAudioTrackIndex(source); ok {
 		return audioTrackIndex
+	}
+	return 0
+}
+
+// compatAudioOrdinal resolves the selected audio track's array position via
+// compatAudioTrackIndex and converts it to the audio-only stream ordinal
+// ffmpeg's `0:a:N` expects (see playback.AudioStreamOrdinal). Every value fed
+// to playback — TranscodeOpts.AudioTrackIndex, remux recipe cards, stream
+// tokens, and node start requests — must be this ordinal, never the array
+// position: the catalog can order AudioTracks differently from the container
+// order (MULTi releases, virtual sources), and `0:a:N` counts audio streams
+// only. The DTO stream-index domain (len(VideoTracks)+position) is resolved by
+// compatAudioTrackIndex and stays untouched.
+func compatAudioOrdinal(source PlaybackMediaSource) (int, bool) {
+	audioTrackIndex, ok := compatAudioTrackIndex(source)
+	if !ok {
+		return 0, false
+	}
+	return playback.AudioStreamOrdinal(source.Version.AudioTracks, audioTrackIndex), true
+}
+
+func compatAudioOrdinalOrDefault(source PlaybackMediaSource) int {
+	if ordinal, ok := compatAudioOrdinal(source); ok {
+		return ordinal
 	}
 	return 0
 }
