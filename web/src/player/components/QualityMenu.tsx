@@ -7,6 +7,7 @@ import { PlayerMenuSurface } from "./PlayerMenuSurface";
 export interface VersionInfo {
   fileId: number;
   label: string;
+  releaseName?: string;
   isCurrentSource: boolean;
   isRequestedSource: boolean;
   failed?: boolean;
@@ -147,7 +148,14 @@ export function QualityMenu({
                     }}
                   >
                     <span className="flex min-w-0 items-center gap-2">
-                      <span className="truncate">{v.label}</span>
+                      <span className="min-w-0">
+                        <span className="block truncate">{v.label}</span>
+                        {v.releaseName && (
+                          <span className="block truncate text-[11px] text-white/50">
+                            {v.releaseName}
+                          </span>
+                        )}
+                      </span>
                       {statusLabels.length > 0 && (
                         <span className="flex flex-wrap gap-1">
                           {statusLabels.map((status) => (

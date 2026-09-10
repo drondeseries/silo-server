@@ -36,6 +36,12 @@ const subtitleTimeline = vi.hoisted(() => ({
 }));
 const toastError = vi.hoisted(() => vi.fn());
 const hlsJS = vi.hoisted(() => ({ supported: false, constructed: vi.fn() }));
+// Captures the onSourceChanged handlers the mocked subtitle hooks receive, so
+// tests can drive a subtitle_source_changed (409) signal from the outside.
+const subtitleHooks = vi.hoisted(() => ({
+  vttSourceChanged: null as null | (() => void),
+  assSourceChanged: null as null | (() => void),
+}));
 
 vi.mock("sonner", () => ({ toast: { error: toastError, success: vi.fn(), message: vi.fn() } }));
 
@@ -55,12 +61,14 @@ vi.mock("../hooks/useRemuxSeeking", () => ({
 vi.mock("../hooks/useSubtitleTracks", () => ({
   useSubtitleTracks: (...args: unknown[]) => {
     subtitleTimeline.textOffsetSeconds = args[3] as number;
+    subtitleHooks.vttSourceChanged = (args[11] as (() => void) | undefined) ?? null;
     return [];
   },
 }));
 vi.mock("../hooks/useASSSubtitles", () => ({
   useASSSubtitles: (...args: unknown[]) => {
     subtitleTimeline.assOffsetSeconds = args[4] as number;
+    subtitleHooks.assSourceChanged = (args[7] as (() => void) | undefined) ?? null;
     return { isActive: false };
   },
 }));
@@ -191,6 +199,8 @@ describe("VideoPlayer plan failure recovery", () => {
     controls.current = null;
     subtitleTimeline.textOffsetSeconds = null;
     subtitleTimeline.assOffsetSeconds = null;
+    subtitleHooks.vttSourceChanged = null;
+    subtitleHooks.assSourceChanged = null;
     hlsJS.supported = false;
     hlsJS.constructed.mockClear();
     toastError.mockClear();
@@ -1006,6 +1016,147 @@ describe("VideoPlayer translation handoff", () => {
 
       rerenderPlayer({
         plan: nextPlan,
+        planRevision: 3,
+        transportRevision: 2,
+      });
+      expect(removeAttrSpy).toHaveBeenCalledWith("src");
+    } finally {
+      removeAttrSpy.mockRestore();
+    }
+  });
+
+  it("warms the new transport once when transportRevision bumps and not on first load", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    try {
+      const { rerenderPlayer } = renderPlayer({
+        planRevision: 1,
+        transportRevision: 0,
+      });
+      // First load with transportRevision 0: the transport did not change, so
+      // no warm fetch fires.
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // A transport-changing replan (same URL, bumped revision) warms the
+      // stream exactly once, before the transport effect reloads the element.
+      rerenderPlayer({ planRevision: 2, transportRevision: 2 });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/stream/session-1?token=token",
+        expect.objectContaining({ method: "GET", signal: expect.any(AbortSignal) }),
+      );
+
+      // The same transportRevision across a further plan revision must not
+      // refire the warm fetch.
+      rerenderPlayer({ planRevision: 3, transportRevision: 2 });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("refreshes the subtitle inventory once per plan_id on a source-changed signal", async () => {
+    const onRefreshSubtitles = vi.fn();
+    const planA = fixturePlanV3({ plan_id: "plan:aaa", plan_attempt_key: "v3:aaa" });
+    const { rerenderPlayer } = renderPlayer({ plan: planA, onRefreshSubtitles });
+    expect(subtitleHooks.vttSourceChanged).toBeTypeOf("function");
+    expect(subtitleHooks.assSourceChanged).toBeTypeOf("function");
+
+    // The VTT window fetch and the ASS fetch can both see the rotation; both
+    // signals for the same plan must collapse into a single refresh.
+    act(() => subtitleHooks.vttSourceChanged?.());
+    act(() => subtitleHooks.assSourceChanged?.());
+    expect(onRefreshSubtitles).toHaveBeenCalledTimes(1);
+
+    // A new plan (the refresh's own replan re-mints the URLs) re-arms the
+    // signal: the next rotation for it refreshes again.
+    const planB = fixturePlanV3({ plan_id: "plan:bbb", plan_attempt_key: "v3:bbb" });
+    rerenderPlayer({ plan: planB });
+    act(() => subtitleHooks.vttSourceChanged?.());
+    expect(onRefreshSubtitles).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not reload when only player_start_seconds changes (reused-transport replan)", async () => {
+    const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
+    try {
+      const startPlan = fixturePlanV3({
+        ...directPlan,
+        timeline: {
+          ...directPlan.timeline,
+          player_start_seconds: 100,
+        },
+      });
+      const { rerenderPlayer } = renderPlayer({
+        plan: startPlan,
+        planRevision: 1,
+        transportRevision: 1,
+      });
+      removeAttrSpy.mockClear();
+
+      // A reused-transport subtitle replan rewrites player_start_seconds to the
+      // live playhead; the stream URL and transport identity are unchanged.
+      const driftedPlan = fixturePlanV3({
+        ...directPlan,
+        timeline: {
+          ...directPlan.timeline,
+          player_start_seconds: 148,
+        },
+      });
+      rerenderPlayer({
+        plan: driftedPlan,
+        planRevision: 2,
+        transportRevision: 1,
+      });
+      expect(removeAttrSpy).not.toHaveBeenCalled();
+
+      // A genuine transport change must still tear the element down.
+      rerenderPlayer({
+        plan: driftedPlan,
+        planRevision: 3,
+        transportRevision: 2,
+      });
+      expect(removeAttrSpy).toHaveBeenCalledWith("src");
+    } finally {
+      removeAttrSpy.mockRestore();
+    }
+  });
+
+  it("does not reload when only player_start_seconds changes on a reused HLS transport", async () => {
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime) =>
+      mime === "application/vnd.apple.mpegurl" ? "probably" : "",
+    );
+    const removeAttrSpy = vi.spyOn(HTMLMediaElement.prototype, "removeAttribute");
+    try {
+      const startPlan = fixturePlanV3({
+        timeline: {
+          ...fixturePlanV3().timeline,
+          player_start_seconds: 100,
+        },
+      });
+      const { rerenderPlayer } = renderPlayer({
+        plan: startPlan,
+        planRevision: 1,
+        transportRevision: 1,
+        streamUrl: "/api/v1/stream/session-1/master.m3u8?token=token",
+      });
+      removeAttrSpy.mockClear();
+
+      const driftedPlan = fixturePlanV3({
+        timeline: {
+          ...fixturePlanV3().timeline,
+          player_start_seconds: 148,
+        },
+      });
+      rerenderPlayer({
+        plan: driftedPlan,
+        planRevision: 2,
+        transportRevision: 1,
+      });
+      expect(removeAttrSpy).not.toHaveBeenCalled();
+
+      rerenderPlayer({
+        plan: driftedPlan,
         planRevision: 3,
         transportRevision: 2,
       });

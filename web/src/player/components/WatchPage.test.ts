@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { createElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -80,6 +80,7 @@ function playbackSession(
     audioTrackIndex: 0,
     durationSeconds: 3600,
     subtitleUrls: [],
+    planAudioTracks: [],
     qualityPreference: "original",
     shouldAutoPlay: true,
     loading: false,
@@ -206,6 +207,39 @@ describe("WatchPage playback state", () => {
   });
 });
 
+describe("WatchPage audio menu", () => {
+  it("prefers the plan's audio inventory over item metadata", () => {
+    const planAudioTracks = [
+      { language: "eng", codec: "aac", channels: 2, default: true },
+      { language: "spa", codec: "ac3", channels: 6, default: false },
+    ];
+    playbackSessionMock.mockReturnValue(playbackSession({ planAudioTracks }));
+
+    render(createElement(WatchPage, watchPageProps));
+
+    const props = videoPlayerMock.mock.calls[0]?.[0] as { audioTracks?: unknown[] };
+    expect(props.audioTracks).toEqual(planAudioTracks);
+  });
+
+  it("falls back to the version's item metadata when the plan publishes no inventory", () => {
+    const versionWithTracks: PlayerFileVersion = {
+      ...version,
+      audio_tracks: [{ language: "eng", codec: "aac", channels: 2, default: true }],
+    };
+    playbackSessionMock.mockReturnValue(playbackSession({ planAudioTracks: [] }));
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [versionWithTracks],
+      }),
+    );
+
+    const props = videoPlayerMock.mock.calls[0]?.[0] as { audioTracks?: unknown[] };
+    expect(props.audioTracks).toEqual(versionWithTracks.audio_tracks);
+  });
+});
+
 describe("WatchPage version switch feedback", () => {
   it("shows a non-blocking switching indicator while replacing with an active plan", () => {
     playbackSessionMock.mockReturnValue(playbackSession({ replacing: true }));
@@ -250,5 +284,61 @@ describe("WatchPage version switch feedback", () => {
     };
     expect(props.replanningQuality).toBe(true);
     expect(props.pendingSwitchFileId).toBe(99);
+  });
+
+  it("shows a dismissible notice when the server played a different version than auto-selected", () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: fixturePlanV3({ requested_media_file_id: 7, effective_media_file_id: 8 }),
+      }),
+    );
+
+    render(createElement(WatchPage, watchPageProps));
+
+    expect(
+      screen.getByText(
+        "Playing a different version than selected — the requested version isn't playable on this device.",
+      ),
+    ).toBeInTheDocument();
+
+    // Dismissing hides the notice.
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss version notice" }));
+    expect(
+      screen.queryByText(
+        "Playing a different version than selected — the requested version isn't playable on this device.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not show the version-swap notice when the selection was explicit", () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: fixturePlanV3({ requested_media_file_id: 7, effective_media_file_id: 8 }),
+      }),
+    );
+
+    render(createElement(WatchPage, { ...watchPageProps, explicitFileSelection: true }));
+
+    expect(
+      screen.queryByText(
+        "Playing a different version than selected — the requested version isn't playable on this device.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not show the version-swap notice when the plan kept the requested file", () => {
+    playbackSessionMock.mockReturnValue(
+      playbackSession({
+        plan: fixturePlanV3({ requested_media_file_id: 7, effective_media_file_id: 7 }),
+      }),
+    );
+
+    render(createElement(WatchPage, watchPageProps));
+
+    expect(
+      screen.queryByText(
+        "Playing a different version than selected — the requested version isn't playable on this device.",
+      ),
+    ).not.toBeInTheDocument();
   });
 });

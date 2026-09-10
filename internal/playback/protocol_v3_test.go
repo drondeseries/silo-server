@@ -84,6 +84,28 @@ func TestStartRequestV3Validation(t *testing.T) {
 	}
 }
 
+func TestStartRequestV3CarriedAudioTrackIDValidation(t *testing.T) {
+	req := validStartRequestV3()
+	req.CarriedAudioTrackID = strings.Repeat("a", 129)
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("oversized carried_audio_track_id accepted")
+	}
+
+	req = validStartRequestV3()
+	req.CarriedAudioTrackID = TrackIDV3(7, "audio", 2)
+	if _, err := req.NormalizeAndValidate(); err != nil {
+		t.Fatalf("well-formed carried audio track id rejected: %v", err)
+	}
+
+	// The carried identity deliberately names a different file than the request;
+	// it must not be run through the file-bound track pair validation.
+	req = validStartRequestV3()
+	req.CarriedAudioTrackID = TrackIDV3(99, "audio", 0)
+	if _, err := req.NormalizeAndValidate(); err != nil {
+		t.Fatalf("cross-file carried audio track id rejected: %v", err)
+	}
+}
+
 func TestStartRequestV3ProgressPersistenceValidation(t *testing.T) {
 	req := validStartRequestV3()
 	if _, err := req.NormalizeAndValidate(); err != nil {
@@ -103,6 +125,31 @@ func TestStartRequestV3ProgressPersistenceValidation(t *testing.T) {
 	req.StartPosition = &zero
 	if _, err := req.NormalizeAndValidate(); err != nil {
 		t.Fatalf("explicit zero must remain distinguishable and valid: %v", err)
+	}
+}
+
+func TestStartRequestV3FileSelectionValidation(t *testing.T) {
+	req := validStartRequestV3()
+	if _, err := req.NormalizeAndValidate(); err != nil {
+		t.Fatal(err)
+	}
+	if req.FileSelection != FileSelectionAutoV3 {
+		t.Fatalf("omitted file_selection normalized to %q, want %q", req.FileSelection, FileSelectionAutoV3)
+	}
+
+	req = validStartRequestV3()
+	req.FileSelection = FileSelectionExplicitV3
+	if _, err := req.NormalizeAndValidate(); err != nil {
+		t.Fatalf("explicit file_selection rejected: %v", err)
+	}
+	if req.FileSelection != FileSelectionExplicitV3 {
+		t.Fatalf("explicit file_selection normalized to %q", req.FileSelection)
+	}
+
+	req = validStartRequestV3()
+	req.FileSelection = FileSelectionV3("user-picked")
+	if _, err := req.NormalizeAndValidate(); err == nil {
+		t.Fatal("invalid file_selection accepted")
 	}
 }
 
@@ -1892,6 +1939,27 @@ func TestPlanAttemptKeyV3IgnoresTheSubtitleInventory(t *testing.T) {
 	}
 }
 
+// The audio inventory is a menu, not a route input: attaching it must not
+// perturb plan identity, or replans would miss the cache and clients would see
+// spurious new attempts.
+func TestPlanAttemptKeyV3IgnoresTheAudioInventory(t *testing.T) {
+	file := detailedFixtureFileV3()
+	req := validStartRequestV3()
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
+	req.Capabilities.HDRDetails = &HDRCapabilitiesV3{HDR10: true}
+	result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}})
+	if result.Plan == nil {
+		t.Fatalf("result = %#v, want a plan", result)
+	}
+
+	before := PlanAttemptKeyV3(*result.Plan, "output-1", nil)
+	withInventory := *result.Plan
+	withInventory.AudioTracks = []models.AudioTrack{{Codec: "ac3", Channels: 6, Layout: "5.1", Language: "spa"}}
+	if after := PlanAttemptKeyV3(withInventory, "output-1", nil); after != before {
+		t.Errorf("attempt key changed with the audio inventory attached: %q -> %q", before, after)
+	}
+}
+
 func TestSubtitleBurnInUsesEmbeddedOrdinalAndRejectsUnsupportedSources(t *testing.T) {
 	file := detailedFixtureFileV3()
 	file.ExternalSubtitles = []models.ExternalSubtitle{{Format: "ass"}}
@@ -2693,6 +2761,9 @@ func TestPlanPlaybackV3AudioOnlyPlansOriginalHTTP(t *testing.T) {
 	}
 	if len(result.Plan.AvailableQualities) != 1 || result.Plan.AvailableQualities[0].Label != "original" || !result.Plan.AvailableQualities[0].PreservesSource {
 		t.Fatalf("audio-only qualities = %#v", result.Plan.AvailableQualities)
+	}
+	if len(result.Plan.AudioTracks) != 1 || result.Plan.AudioTracks[0].Codec != "aac" || result.Plan.AudioTracks[0].Channels != 2 {
+		t.Fatalf("audio-only plan lost the effective source's audio inventory: %#v", result.Plan.AudioTracks)
 	}
 	if !strings.HasPrefix(result.Plan.PlanAttemptKey, "v3:") {
 		t.Fatalf("attempt key = %q", result.Plan.PlanAttemptKey)
@@ -3511,5 +3582,75 @@ func TestPlanPlaybackV3AudioOnlyHonorsAttemptedKeys(t *testing.T) {
 	third := PlanPlaybackV3(input)
 	if third.Terminal == nil || third.Terminal.Reason != "adaptation_exhausted" {
 		t.Fatalf("third = %s", ExplainPlannerResultV3(third))
+	}
+}
+
+// The plan publishes the effective source's probed audio tracks verbatim, in
+// container order, so a client renders its audio menu from the plan rather than
+// from item metadata that can be stale after a version fallback.
+func TestPlanPlaybackV3PublishesTheEffectiveAudioInventory(t *testing.T) {
+	file := detailedFixtureFileV3()
+	file.VideoTracks[0].VideoRange = "SDR"
+	file.VideoTracks[0].VideoRangeType = "SDR"
+	file.AudioTracks = []models.AudioTrack{
+		{Index: 0, Codec: "aac", Channels: 2, Layout: "stereo", Language: "eng", Default: true},
+		{Index: 1, Codec: "ac3", Channels: 6, Layout: "5.1", Language: "spa"},
+		{Index: 2, Codec: "truehd", Channels: 8, Layout: "7.1", Language: "jpn"},
+	}
+	req := validStartRequestV3()
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
+
+	result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: file, EffectiveFile: file, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: testTransformationRegistryV3()})
+	if result.Plan == nil {
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+	if len(result.Plan.AudioTracks) != 3 {
+		t.Fatalf("audio inventory = %+v, want all 3 probed tracks", result.Plan.AudioTracks)
+	}
+	for i, want := range file.AudioTracks {
+		got := result.Plan.AudioTracks[i]
+		if got.Index != want.Index || got.Codec != want.Codec || got.Channels != want.Channels || got.Layout != want.Layout || got.Language != want.Language || got.Default != want.Default {
+			t.Errorf("inventory[%d] = %+v, want %+v (container order preserved)", i, got, want)
+		}
+	}
+}
+
+// After a version fallback the effective file differs from the requested
+// catalog row, and the audio inventory must come from the effective file —
+// the same rule the subtitle inventory already follows.
+func TestPlanPlaybackV3AudioInventoryComesFromTheEffectiveFile(t *testing.T) {
+	requested := detailedFixtureFileV3()
+	requested.VideoTracks[0].VideoRange = "SDR"
+	requested.VideoTracks[0].VideoRangeType = "SDR"
+	requested.AudioTracks = []models.AudioTrack{
+		{Index: 0, Codec: "aac", Channels: 2, Layout: "stereo", Language: "eng"},
+	}
+	effectiveValue := *requested
+	effective := &effectiveValue
+	effective.ID = 84
+	effective.AudioTracks = []models.AudioTrack{
+		{Index: 0, Codec: "aac", Channels: 2, Layout: "stereo", Language: "eng"},
+		{Index: 1, Codec: "ac3", Channels: 6, Layout: "5.1", Language: "spa"},
+		{Index: 2, Codec: "dts", Channels: 6, Layout: "5.1", Language: "fre"},
+	}
+	req := validStartRequestV3()
+	req.FileID = requested.ID
+	req.Capabilities.VideoDecode = []VideoDecodeCapabilityV3{{Codec: "hevc", Profiles: []string{"main 10"}, Levels: []int{153}, BitDepths: []int{10}, MaxWidth: 3840, MaxHeight: 2160, MaxFrameRate: 60, MaxBitrateKbps: 80_000, Hardware: true}}
+
+	result := PlanPlaybackV3(PlannerInputV3{Request: req, RequestedFile: requested, EffectiveFile: effective, AudioTrackIndex: 0, Settings: PlannerSettingsV3{TranscodeEnabled: true, Allow4KTranscode: true}, Registry: testTransformationRegistryV3()})
+	if result.Plan == nil {
+		t.Fatalf("result = %s", ExplainPlannerResultV3(result))
+	}
+	if result.Plan.EffectiveMediaFileID != effective.ID {
+		t.Fatalf("effective file = %d, want %d", result.Plan.EffectiveMediaFileID, effective.ID)
+	}
+	if len(result.Plan.AudioTracks) != 3 {
+		t.Fatalf("audio inventory = %+v, want the effective file's 3 tracks, not the requested file's 1", result.Plan.AudioTracks)
+	}
+	for i, want := range effective.AudioTracks {
+		got := result.Plan.AudioTracks[i]
+		if got.Index != want.Index || got.Codec != want.Codec || got.Language != want.Language {
+			t.Errorf("inventory[%d] = %+v, want %+v (from the effective file)", i, got, want)
+		}
 	}
 }

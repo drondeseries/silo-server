@@ -1,5 +1,80 @@
 # Catalog API
 
+## Version liveness
+
+`FileVersion.available` reports the durable per-version health signal on the
+item detail and item-versions responses: a virtual candidate is available when
+it has not been stamped failed (`failed_at` is NULL), a local file when it is
+not marked missing (`missing_since` is NULL). The field is omitted when the
+version is available, so an absent `available` means available/unknown; `false`
+means the version is currently unavailable. `FileVersion.failed` remains the
+virtual-only "produced no bytes at stream-open" flag.
+
+`POST /api/v1/catalog/versions/check` batch-tests a set of media file IDs and
+stamps the durable signal. The request is:
+
+```json
+{
+  "file_ids": [123, 456]
+}
+```
+
+At most 40 IDs are accepted per request (413 `too_large` beyond that; 400
+`bad_request` when the body is missing or the list is empty). Each file is
+tested cheaply — virtual rows resolve their pinned `?result=` candidate through
+the provider (no media transfer), local rows are read from `missing_since` with
+no probe — with bounded concurrency and a per-file timeout. A confirmed dead
+pin stamps `failed_at`; a successful resolution clears it. Ambiguous provider
+errors (provider down, timeout) leave the stamp unchanged and report the row's
+current computed availability, so a provider outage cannot mass-tag versions.
+
+**Response** (200 OK):
+
+```json
+{
+  "results": [
+    { "file_id": 123, "available": true },
+    { "file_id": 456, "available": false }
+  ]
+}
+```
+
+Unknown or deleted file IDs are reported as `available: false`.
+
+## Multi-audio language support and release metadata
+
+MULTi/DUAL releases — a single audio stream tagged `und`/`mul`/empty whose
+languages live in the track title (e.g. "English / French / Spanish") — now
+carry real language identity instead of being collapsed to a single code.
+
+- **`FileVersion.audio_tracks[].languages`** — the full advertised language
+  list for a MULTi/DUAL track, parsed from the track title at probe time when
+  the container language tag is absent, undetermined, or multiple. `language`
+  keeps the primary code (the first concrete one when the tag was
+  undetermined). Rows probed before this support are backfilled at read time
+  from the embedded title until the probe-version re-probe catches up.
+- **`FileVersion.audio_tracks[].index`** — the **absolute container stream
+  index** as ffprobe reported it (video is typically stream 0, the first
+  audio stream 1, subtitles interleaved between them). It is NOT the
+  audio-only FFmpeg ordinal used by `0:a:N` map specifiers, and NOT the
+  track's position in the `audio_tracks` array. Track list order can differ
+  from container order on MULTi releases; clients that need to select a
+  track for ffmpeg must convert this index to the audio-only ordinal
+  (the rank of the selected track among tracks ordered by absolute index —
+  see `playback.AudioStreamOrdinal` server-side) rather than sending this
+  value directly.
+- **`FileVersion.release_name`** / **`FileVersion.release_group`** — the file
+  stem (basename without extension) and the trailing group tag on
+  release-style names (`Movie.2023.2160p.AltMount` → group `AltMount`), so
+  clients can show which release a version is. `release_group` is empty when no
+  group tag is present.
+
+`GET /api/v1/catalog/filters` reports the language facets on
+`audio_languages` and `subtitle_languages` (alongside `resolutions`) when
+`include_technical` is true (the default). A MULTi track satisfies the
+audio-language browse filter for any of its `languages[]` codes, not just its
+primary `language`.
+
 ## Saved browse sort
 
 `PUT /api/v1/collections/sort-preference` saves the active profile's sort for a

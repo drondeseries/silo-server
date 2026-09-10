@@ -32,7 +32,10 @@ export function collectLanguageLabels(
 
 /** Compact, deduplicated audio language list ("Multi/French") or null. */
 export function audioLanguageSummary(tracks: VersionAudioTrack[] | undefined): string | null {
-  const labels = collectLanguageLabels(tracks?.map((track) => track.language) ?? []);
+  const languages = tracks?.flatMap((track) =>
+    track.languages?.length ? track.languages : [track.language],
+  );
+  const labels = collectLanguageLabels(languages ?? []);
   return labels.length > 0 ? labels.join("/") : null;
 }
 
@@ -48,6 +51,13 @@ export function isVirtualFileVersion(version: { container?: string; file_path?: 
     version.container === "virtual" ||
     Boolean(version.file_path?.toLowerCase().startsWith("virtual://"))
   );
+}
+
+/** Turns a release-style name ("Movie.2023.2160p.Remux-GRP") into a readable
+ *  line ("Movie 2023 2160p Remux GRP"). */
+export function prettifyReleaseName(releaseName?: string): string {
+  if (!releaseName) return "";
+  return releaseName.replace(/[._]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 export function formatPageCount(pages?: number): string {

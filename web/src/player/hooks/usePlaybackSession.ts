@@ -32,6 +32,7 @@ import {
   type ReplanOptions,
 } from "../playback-session-wire-v3";
 import type {
+  PlayerAudioTrack,
   PlayerFileVersion,
   PlayerPlaybackVariant,
   PlayerSubtitleInfo,
@@ -59,6 +60,12 @@ interface PlaybackSessionState {
   audioTrackIndex: number;
   durationSeconds: number | null;
   subtitleUrls: PlayerSubtitleInfo[];
+  /**
+   * The plan's authoritative audio inventory for the effective source, when
+   * the server publishes one. Consumers render the audio menu from this in
+   * preference to item metadata, which can be stale after a version fallback.
+   */
+  planAudioTracks: PlayerAudioTrack[];
   qualityPreference: string;
   shouldAutoPlay: boolean;
   loading: boolean;
@@ -222,6 +229,7 @@ function planToSessionState(
     initialPosition: plan.timeline.player_start_seconds,
     audioTrackIndex: plan.selected_tracks.audio?.index ?? 0,
     durationSeconds: plan.source.duration_seconds ?? null,
+    planAudioTracks: plan.audio_tracks ?? [],
     subtitleUrls: mapSubtitleInventory(
       plan.subtitle.inventory,
       plan.effective_media_file_id,
@@ -303,6 +311,9 @@ export function usePlaybackSession(
   explicitAudioTrackIndex?: number | null,
   initialSubtitleTrackIndexByFileId?: Record<number, number>,
   initialBitmapSubtitleTrackIndexByFileId?: Record<number, number>,
+  /** True when the initial `fileId` was explicitly chosen by the viewer (not
+   * auto-selected); the server must not silently substitute another version. */
+  explicitFileSelection = false,
 ): UsePlaybackSessionResult {
   const config = usePlayerConfig();
   const probe = useCodecDetection();
@@ -326,6 +337,7 @@ export function usePlaybackSession(
     audioTrackIndex: 0,
     durationSeconds: null,
     subtitleUrls: [],
+    planAudioTracks: [],
     qualityPreference: qualityPreference?.trim() || "auto",
     shouldAutoPlay: true,
     loading: true,
@@ -483,6 +495,7 @@ export function usePlaybackSession(
     (
       decision: DecisionResponseV3,
       initialSubtitleFailure?: PlaybackSessionErrorState | null,
+      forceTransportBump?: boolean,
     ): boolean => {
       serverFeaturesRef.current = decision.server_features;
       const plan = decision.playback_plan;
@@ -513,7 +526,11 @@ export function usePlaybackSession(
       planRef.current = plan;
       sessionIdRef.current = sessionId ?? null;
       planRevisionRef.current += 1;
-      if (!isSameAVTransport(prevPlan, plan)) {
+      // A failure recovery always prepares a fresh server generation, even when
+      // the replacement plan reuses the same session-scoped URL and transport
+      // shape; the A/V-byte heuristic cannot see that regeneration. Force a
+      // transport revision bump so the player reloads and re-fetches the stream.
+      if (forceTransportBump || !isSameAVTransport(prevPlan, plan)) {
         transportRevisionRef.current += 1;
       }
       hasAdoptedPlanRef.current = true;
@@ -561,6 +578,8 @@ export function usePlaybackSession(
       forceStartPosition: boolean,
       playbackAttemptId: string,
       subtitleTrackIndex: number | undefined,
+      carriedAudioTrackID: string | null,
+      fileSelection: "auto" | "explicit",
     ): Promise<DecisionResponseV3> => {
       const body = buildStartRequestV3({
         extraClientFeatures: VIDEO_CLIENT_FEATURES_V3,
@@ -570,7 +589,12 @@ export function usePlaybackSession(
         qualityPreference: qualityRef.current,
         position,
         forceStartPosition,
-        explicitAudioTrackIndex,
+        // A carried audio track (version switch) names the file-bound identity
+        // explicitly; the mount-time ordinal is meaningless for the new file
+        // and must not be sent alongside it.
+        explicitAudioTrackIndex: carriedAudioTrackID ? null : explicitAudioTrackIndex,
+        carriedAudioTrackID,
+        fileSelection,
         subtitleTrackIndex,
         metered: detectMeteredV3(),
         bandwidthEstimateKbps: detectBandwidthEstimateKbpsV3(),
@@ -583,6 +607,8 @@ export function usePlaybackSession(
         method: "POST",
         body: JSON.stringify(body),
       });
+      // carriedAudioTrackID is a per-call argument, not render-scope state, so
+      // it is intentionally absent from the deps array.
     },
     [clientCapabilities, clientPlaybackContext, config, explicitAudioTrackIndex, maxBitrateKbps],
   );
@@ -618,6 +644,7 @@ export function usePlaybackSession(
           audioTrackIndex: 0,
           durationSeconds: null,
           subtitleUrls: [],
+          planAudioTracks: [],
           loading: false,
           replacing: false,
           replanning: false,
@@ -656,6 +683,8 @@ export function usePlaybackSession(
       allowPreserveExistingSessionOnError,
       replacementErrorMessage,
       initialErrorMessage,
+      carriedAudioTrackId,
+      fileSelection,
     }: {
       preferredFileId?: number;
       position: number;
@@ -663,6 +692,13 @@ export function usePlaybackSession(
       allowPreserveExistingSessionOnError: boolean;
       replacementErrorMessage: string;
       initialErrorMessage: string;
+      // Audio track identity carried from the current plan into a replacement
+      // start (a version switch). The server remaps it by family to the new
+      // file instead of dropping the viewer's selection.
+      carriedAudioTrackId?: string | null;
+      /** How the requested file was chosen; `explicit` forbids silent
+       * server-side version substitution. */
+      fileSelection?: "auto" | "explicit";
     }) => {
       const previousState = stateRef.current;
       const previousSessionId = sessionIdRef.current;
@@ -719,6 +755,7 @@ export function usePlaybackSession(
           audioTrackIndex: 0,
           durationSeconds: null,
           subtitleUrls: [],
+          planAudioTracks: [],
           loading: false,
           replacing: false,
           replanning: false,
@@ -742,6 +779,8 @@ export function usePlaybackSession(
           forceStartPosition,
           playbackAttemptId,
           initialSubtitleTrackIndexByFileId?.[selectedFileId],
+          carriedAudioTrackId ?? null,
+          fileSelection ?? "auto",
         );
 
         if (loadSequence !== loadSequenceRef.current) {
@@ -777,6 +816,8 @@ export function usePlaybackSession(
             forceStartPosition,
             fallbackPlaybackAttemptId,
             undefined,
+            carriedAudioTrackId ?? null,
+            fileSelection ?? "auto",
           );
           if (!decisionToAdopt.playback_plan) {
             initialSubtitleFailure = null;
@@ -883,10 +924,12 @@ export function usePlaybackSession(
       allowPreserveExistingSessionOnError: false,
       replacementErrorMessage: "Failed to replace playback request",
       initialErrorMessage: "Failed to start playback",
+      fileSelection: explicitFileSelection ? "explicit" : "auto",
     });
   }, [
     capabilityRequestKey,
     capabilitiesSettled,
+    explicitFileSelection,
     fileId,
     forceInitialPosition,
     initialPosition,
@@ -1068,6 +1111,7 @@ export function usePlaybackSession(
         const adopted = adoptDecision(
           decision,
           options.operation === "track_change" && options.subtitle !== undefined ? null : undefined,
+          isFailureRecovery,
         );
         if (!adopted && retireSessionOnRefusal) {
           const pending = pendingReplanRef.current;
@@ -1395,6 +1439,13 @@ export function usePlaybackSession(
             allowPreserveExistingSessionOnError: false,
             replacementErrorMessage: "Failed to switch playback version",
             initialErrorMessage: "Failed to switch version",
+            // Carry the current audio selection across the version switch: the
+            // server remaps the file-bound identity by track family onto the
+            // new file instead of dropping it and auto-picking.
+            carriedAudioTrackId: planRef.current?.selected_tracks.audio?.id ?? null,
+            // A version switch is always an explicit user action: the server
+            // must not silently substitute yet another version.
+            fileSelection: "explicit",
           });
         } finally {
           switchingRef.current = false;

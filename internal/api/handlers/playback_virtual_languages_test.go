@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -156,8 +157,8 @@ func TestMergeVirtualCandidateLanguagesKeepsProbedTracks(t *testing.T) {
 
 	mergeVirtualCandidateTracks(probed, candidate)
 
-	if len(probed.AudioTracks) != 2 {
-		t.Fatalf("audio tracks: got %d, want 2", len(probed.AudioTracks))
+	if len(probed.AudioTracks) != 1 {
+		t.Fatalf("audio tracks: got %d, want 1", len(probed.AudioTracks))
 	}
 	if got := probed.AudioTracks[0].Codec; got != "aac" {
 		t.Errorf("probed track codec overwritten: got %q, want aac", got)
@@ -165,8 +166,34 @@ func TestMergeVirtualCandidateLanguagesKeepsProbedTracks(t *testing.T) {
 	if got := probed.AudioTracks[0].Channels; got != 2 {
 		t.Errorf("probed track channels overwritten: got %d, want 2", got)
 	}
-	if got := probed.AudioTracks[1].Language; got != "ita" {
-		t.Errorf("audio[1].language: got %q, want ita", got)
+}
+
+func TestMergeVirtualCandidateLanguagesAuthoritativeInventory(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		tracks []models.AudioTrack
+		want   int
+	}{
+		{"index zero", []models.AudioTrack{{Index: 0, Language: "en", Codec: "aac", Channels: 2, Default: true}}, 0},
+		{"default beats hint", []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2}, {Index: 2, Language: "de", Codec: "aac", Channels: 2, Default: true}}, 1},
+		{"audio first", []models.AudioTrack{{Index: 0, Language: "en", Codec: "aac", Channels: 2}, {Index: 1, Language: "de", Codec: "aac", Channels: 2, Default: true}}, 1},
+		{"genuine multi", []models.AudioTrack{{Index: 0, Language: "en", Languages: []string{"en", "fr"}, Codec: "aac", Channels: 2}, {Index: 1, Language: "de", Codec: "aac", Channels: 2, Default: true}}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, _ := json.Marshal(tc.tracks)
+			file := &models.MediaFile{AudioTracks: tc.tracks}
+			mergeVirtualCandidateTracks(file, VirtualPlaybackStream{AudioLanguages: []string{"ENG", "FRA"}})
+			after, _ := json.Marshal(file.AudioTracks)
+			if string(before) != string(after) {
+				t.Fatalf("inventory changed: %s -> %s", before, after)
+			}
+			if got := playback.SelectAudioTrack(file.AudioTracks, "fr", nil); got != tc.want {
+				t.Fatalf("selected %d, want %d", got, tc.want)
+			}
+			if got := playback.AudioStreamOrdinal(file.AudioTracks, tc.want); got != tc.want {
+				t.Fatalf("ordinal %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -708,4 +735,159 @@ func (a *atomicInt) get() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.v
+}
+
+// The user-reported scenario: probe fails (background probe deadline), the
+// candidate is the only one ("show one stream with failover"), and the plugin
+// declares languages with a leading release marker. The merged inventory must
+// end up with one track per real language — no anonymous generic track, the
+// marker filtered — so the player's audio menu shows labeled choices.
+func TestMergeVirtualCandidateTracksProbeFailureYieldsLabeledPerLanguageTracks(t *testing.T) {
+	probed := &models.MediaFile{Resolution: "2160p", CodecVideo: "hevc"}
+	candidate := VirtualPlaybackStream{
+		CodecAudio:     "eac3",
+		AudioLanguages: []string{"MULTI", "eng", "fre"},
+	}
+
+	mergeVirtualCandidateTracks(probed, candidate)
+
+	got := make([]string, 0, len(probed.AudioTracks))
+	for _, track := range probed.AudioTracks {
+		got = append(got, track.Language)
+		if track.Language == "" {
+			t.Fatalf("anonymous audio track leaked into the inventory: %#v", probed.AudioTracks)
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("audio tracks = %v, want exactly [eng fre]", got)
+	}
+	if got[0] != "eng" || got[1] != "fre" {
+		t.Fatalf("audio tracks = %v, want declaration order [eng fre]", got)
+	}
+	if !probed.AudioTracks[0].Default || probed.AudioTracks[1].Default {
+		t.Fatalf("default must mark only the first declared language: %#v", probed.AudioTracks)
+	}
+	for i := range probed.AudioTracks {
+		if probed.AudioTracks[i].Codec != "eac3" {
+			t.Errorf("audio[%d].codec = %q, want eac3", i, probed.AudioTracks[i].Codec)
+		}
+		if probed.AudioTracks[i].Channels <= 0 {
+			t.Errorf("audio[%d].channels = %d, want > 0", i, probed.AudioTracks[i].Channels)
+		}
+	}
+}
+
+// No declared languages (all filtered): the single anonymous generic track is
+// the preserved fallback so a release without usable language metadata still
+// has a playable default.
+func TestMergeVirtualCandidateTracksProbeFailureWithoutLanguagesKeepsGenericTrack(t *testing.T) {
+	probed := &models.MediaFile{Resolution: "2160p", CodecVideo: "hevc"}
+	candidate := VirtualPlaybackStream{
+		CodecAudio:     "aac",
+		AudioLanguages: []string{"MULTI", "DUAL"},
+	}
+
+	mergeVirtualCandidateTracks(probed, candidate)
+
+	if len(probed.AudioTracks) != 1 {
+		t.Fatalf("audio tracks = %#v, want exactly the one generic fallback", probed.AudioTracks)
+	}
+	if probed.AudioTracks[0].Language != "" {
+		t.Fatalf("generic track language = %q, want empty", probed.AudioTracks[0].Language)
+	}
+	if !probed.AudioTracks[0].Default {
+		t.Fatal("generic track should be marked default")
+	}
+}
+
+// The user-reported scenario (file 887387): the probe found real tracks with
+// ISO 639-1 codes (it/ko/en), while the provider declares the same languages
+// as 639-2/3 codes (ITA/KOR/ENG). Exact-string dedup appended all three again,
+// producing a 6-row audio menu where the synthesized rows mapped to the same
+// or out-of-range ffmpeg ordinals (same-ita-sound / silent rows). Dedup must
+// be language-normalized: the declared list adds nothing the probe already has.
+func TestMergeVirtualCandidateLanguagesDedupsByNormalizedLanguage(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "1080p",
+		CodecVideo: "hevc",
+		AudioTracks: []models.AudioTrack{
+			{Index: 1, Language: "it", Codec: "aac", Channels: 2, Default: true},
+			{Index: 2, Language: "ko", Codec: "aac", Channels: 2},
+			{Index: 3, Language: "en", Codec: "aac", Channels: 2},
+		},
+	}
+	candidate := VirtualPlaybackStream{
+		CodecAudio:     "aac",
+		AudioLanguages: []string{"ITA", "KOR", "ENG"},
+	}
+
+	mergeVirtualCandidateTracks(probed, candidate)
+
+	if len(probed.AudioTracks) != 3 {
+		t.Fatalf("audio tracks = %#v, want the 3 probed tracks with no synthesized duplicates", probed.AudioTracks)
+	}
+	got := make([]string, 0, len(probed.AudioTracks))
+	for _, track := range probed.AudioTracks {
+		got = append(got, track.Language)
+		if track.Index <= 0 {
+			t.Errorf("synthesized duplicate leaked into the inventory: %#v", probed.AudioTracks)
+		}
+	}
+	want := []string{"it", "ko", "en"}
+	for i, want := range want {
+		if got[i] != want {
+			t.Fatalf("audio[%d].language = %q, want %q (probed tracks untouched)", i, got[i], want)
+		}
+	}
+}
+
+// Mixed-script dedup: a provider language that resolves to a base subtag the
+// probe already covers in a different code form ("en-US" vs "en") also dedups.
+func TestMergeVirtualCandidateLanguagesDedupsRegionalVariants(t *testing.T) {
+	probed := &models.MediaFile{
+		AudioTracks: []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2, Default: true}},
+	}
+	candidate := VirtualPlaybackStream{
+		CodecAudio:     "aac",
+		AudioLanguages: []string{"EN", "en-US", "FRA"},
+	}
+
+	mergeVirtualCandidateTracks(probed, candidate)
+
+	if len(probed.AudioTracks) != 1 {
+		t.Fatalf("audio tracks = %#v, want the single probed track — EN and en-US dedup to the same base subtag and FRA is metadata, not a fabricated stream", probed.AudioTracks)
+	}
+	track := probed.AudioTracks[0]
+	if track.Language != "en" {
+		t.Fatalf("audio[0].language = %q, want the probed en untouched", track.Language)
+	}
+	if len(track.Languages) != 0 {
+		t.Fatalf("provider hints changed real track languages: %#v", track.Languages)
+	}
+}
+
+func TestMergeVirtualCandidateLanguagesHintsStayOnCandidate(t *testing.T) {
+	probed := &models.MediaFile{
+		AudioTracks: []models.AudioTrack{
+			{Index: 1, Language: "en", Codec: "aac", Channels: 2, Default: true},
+		},
+	}
+	candidate := VirtualPlaybackStream{
+		CodecAudio:     "aac",
+		AudioLanguages: []string{"ENG", "FRA"},
+	}
+
+	mergeVirtualCandidateTracks(probed, candidate)
+
+	if len(probed.AudioTracks) != 1 {
+		t.Fatalf("audio tracks = %#v, want exactly the probed English track (FRA is metadata, not a stream)", probed.AudioTracks)
+	}
+	// The merged inventory ranks through the real ordinal math: English keeps
+	// its audio ordinal 0 (emitted as 0:a:0?), and there is no ordinal 1.
+	if ordinal := playback.AudioStreamOrdinal(probed.AudioTracks, 0); ordinal != 0 {
+		t.Fatalf("English ordinal = %d, want 0", ordinal)
+	}
+	if len(probed.AudioTracks) > 1 {
+		t.Fatal("a French ordinal would exist — the hint became a stream")
+	}
 }

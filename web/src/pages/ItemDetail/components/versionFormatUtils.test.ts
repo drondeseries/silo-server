@@ -92,6 +92,20 @@ describe("audioLanguageSummary", () => {
     expect(audioLanguageSummary([{ language: "eng" }, { language: "fra" }])).toBe("English/French");
   });
 
+  it("joins the languages array when present", () => {
+    expect(audioLanguageSummary([{ languages: ["en", "fr", "es"] }])).toBe(
+      "English/French/Spanish",
+    );
+    expect(audioLanguageSummary([{ languages: ["en", "fr", "es"] }, { language: "deu" }])).toBe(
+      "English/French/Spanish/German",
+    );
+  });
+
+  it("falls back to the single language tag when languages is absent", () => {
+    expect(audioLanguageSummary([{ language: "eng" }])).toBe("English");
+    expect(audioLanguageSummary([{}])).toBeNull();
+  });
+
   it("renders release markers like MULTI and DUAL as-is", () => {
     expect(audioLanguageSummary([{ language: "MULTI" }, { language: "fra" }])).toBe("Multi/French");
   });

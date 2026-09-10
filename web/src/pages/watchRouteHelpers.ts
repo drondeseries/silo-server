@@ -26,6 +26,8 @@ export interface WatchRouteRequest {
   prePlaySubtitleSelection?: PrePlaySubtitleSelection | null;
   returnHref?: string;
   requestKey: string;
+  /** True when `fileId` was explicitly chosen by the viewer on the media page. */
+  explicitFileSelection?: boolean;
 }
 
 export interface WatchPlaybackStartInput {
@@ -39,6 +41,7 @@ export interface WatchPlaybackStartInput {
   prePlaySubtitleMode?: "auto" | "off" | "explicit";
   prePlaySubtitleSelection?: PrePlaySubtitleSelection | null;
   returnHref?: string;
+  explicitFileSelection?: boolean;
 }
 
 function parseOptionalInt(value: string | null): number | undefined {
@@ -58,6 +61,7 @@ function buildWatchRouteRequestKey(
   audioTrackIndex: number | undefined,
   prePlaySubtitleMode: "auto" | "off" | "explicit" | undefined,
   prePlaySubtitleSelection: PrePlaySubtitleSelection | null | undefined,
+  explicitFileSelection: boolean | undefined,
 ): string {
   return JSON.stringify([
     contentId,
@@ -69,6 +73,7 @@ function buildWatchRouteRequestKey(
     audioTrackIndex ?? null,
     prePlaySubtitleMode ?? null,
     prePlaySubtitleSelection ?? null,
+    explicitFileSelection ?? null,
   ]);
 }
 
@@ -83,6 +88,7 @@ export function createWatchRouteRequest({
   prePlaySubtitleMode,
   prePlaySubtitleSelection,
   returnHref,
+  explicitFileSelection,
 }: WatchPlaybackStartInput): WatchRouteRequest {
   return {
     contentId,
@@ -95,6 +101,7 @@ export function createWatchRouteRequest({
     prePlaySubtitleMode,
     prePlaySubtitleSelection,
     returnHref,
+    explicitFileSelection,
     requestKey: buildWatchRouteRequestKey(
       contentId,
       fileId,
@@ -105,6 +112,7 @@ export function createWatchRouteRequest({
       audioTrackIndex,
       prePlaySubtitleMode,
       prePlaySubtitleSelection,
+      explicitFileSelection,
     ),
   };
 }
@@ -400,6 +408,7 @@ export function buildWatchPageProps({
     forceInitialPosition: request.restart,
     qualityPreference,
     explicitAudioTrackIndex: request.audioTrackIndex ?? null,
+    explicitFileSelection: request.explicitFileSelection,
     initialSubtitleTrackIndexByFileId: initialSubtitleTrackIndexes.start,
     initialBitmapSubtitleTrackIndexByFileId: initialSubtitleTrackIndexes.bitmap,
     preferredSubtitleLanguage,

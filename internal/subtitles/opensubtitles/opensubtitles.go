@@ -63,6 +63,17 @@ func New(cfg Config) *Provider {
 
 func (p *Provider) Name() string { return "opensubtitles" }
 
+// TestConnection verifies the configured username/password by logging in. A
+// search would not prove anything: it runs with the shared default API key and
+// never touches the account, so a search can succeed while downloads fail with
+// 401.
+func (p *Provider) TestConnection(ctx context.Context) error {
+	if _, err := p.ensureToken(ctx); err != nil {
+		return fmt.Errorf("opensubtitles login failed: %w", err)
+	}
+	return nil
+}
+
 func (p *Provider) Search(ctx context.Context, req subtitles.SearchRequest) ([]subtitles.SubtitleResult, error) {
 	if err := p.limiter.Wait(ctx); err != nil {
 		return nil, err

@@ -23,6 +23,8 @@ export interface PlayerFileVersion {
   bitrate: number;
   failed?: boolean;
   edition_key?: string;
+  release_name?: string;
+  release_group?: string;
   presentation_kind?: string;
   presentation_group_key?: string;
   presentation_part_index?: number;
@@ -93,6 +95,7 @@ export interface PlayerAudioTrack {
   title?: string;
   embedded_title?: string;
   language?: string;
+  languages?: string[];
   codec?: string;
   layout?: string;
   channels?: number;
@@ -247,6 +250,9 @@ export interface WatchPageProps {
   /** Bandwidth cap in kbps from playback.max_bitrate_kbps; null/undefined is uncapped. */
   maxBitrateKbps?: number | null;
   explicitAudioTrackIndex?: number | null;
+  /** True when the initial `fileId` was explicitly chosen by the viewer; the
+   * server must not silently substitute another version. */
+  explicitFileSelection?: boolean;
   /** Initial server subtitle ordinal keyed by file ID. Missing entries mean subtitles start off. */
   initialSubtitleTrackIndexByFileId?: Record<number, number>;
   /**

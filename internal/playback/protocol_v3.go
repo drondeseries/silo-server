@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 const (
@@ -508,24 +510,35 @@ type ClientPlaybackContextV3 struct {
 }
 
 type StartRequestV3 struct {
-	ProtocolVersion            int                       `json:"protocol_version"`
-	ClientFeatures             []string                  `json:"client_features"`
-	FileID                     int                       `json:"file_id"`
-	ProfileID                  string                    `json:"profile_id"`
-	PlaybackAttemptID          string                    `json:"playback_attempt_id"`
-	QualityPreference          string                    `json:"quality_preference"`
-	SubtitleFidelityPreference SubtitleFidelityV3        `json:"subtitle_fidelity_preference"`
-	StartPosition              *float64                  `json:"start_position,omitempty"`
-	ProgressPersistence        ProgressPersistenceV3     `json:"progress_persistence,omitempty"`
-	AudioTrackID               string                    `json:"audio_track_id,omitempty"`
-	AudioTrackIndex            *int                      `json:"audio_track_index,omitempty"`
-	SubtitleTrackID            string                    `json:"subtitle_track_id,omitempty"`
-	SubtitleTrackIndex         *int                      `json:"subtitle_track_index,omitempty"`
-	Metered                    bool                      `json:"metered"`
-	BandwidthEstimateKbps      *int                      `json:"bandwidth_estimate_kbps,omitempty"`
-	BandwidthCapKbps           *int                      `json:"bandwidth_cap_kbps,omitempty"`
-	Capabilities               ClientCodecCapabilitiesV3 `json:"client_capabilities"`
-	ClientPlaybackContext      ClientPlaybackContextV3   `json:"client_playback_context"`
+	ProtocolVersion            int                   `json:"protocol_version"`
+	ClientFeatures             []string              `json:"client_features"`
+	FileID                     int                   `json:"file_id"`
+	ProfileID                  string                `json:"profile_id"`
+	PlaybackAttemptID          string                `json:"playback_attempt_id"`
+	QualityPreference          string                `json:"quality_preference"`
+	SubtitleFidelityPreference SubtitleFidelityV3    `json:"subtitle_fidelity_preference"`
+	StartPosition              *float64              `json:"start_position,omitempty"`
+	ProgressPersistence        ProgressPersistenceV3 `json:"progress_persistence,omitempty"`
+	AudioTrackID               string                `json:"audio_track_id,omitempty"`
+	AudioTrackIndex            *int                  `json:"audio_track_index,omitempty"`
+	// CarriedAudioTrackID is the file-bound audio identity (file:<id>:audio:<ordinal>)
+	// the viewer had selected on a previously playing version. The server re-resolves
+	// it onto the requested file's inventory by track family instead of raw ordinal.
+	// Optional and additive: absent means the server owns audio selection (profile or
+	// series preference), exactly as before.
+	CarriedAudioTrackID string `json:"carried_audio_track_id,omitempty"`
+	SubtitleTrackID     string `json:"subtitle_track_id,omitempty"`
+	SubtitleTrackIndex  *int   `json:"subtitle_track_index,omitempty"`
+	// FileSelection distinguishes an explicit user version pick from an
+	// auto/default selection. Absent means auto, preserving existing client
+	// behavior; an explicit pick pins the requested file and disables the
+	// start-path alternate-file fallback.
+	FileSelection         FileSelectionV3           `json:"file_selection,omitempty"`
+	Metered               bool                      `json:"metered"`
+	BandwidthEstimateKbps *int                      `json:"bandwidth_estimate_kbps,omitempty"`
+	BandwidthCapKbps      *int                      `json:"bandwidth_cap_kbps,omitempty"`
+	Capabilities          ClientCodecCapabilitiesV3 `json:"client_capabilities"`
+	ClientPlaybackContext ClientPlaybackContextV3   `json:"client_playback_context"`
 }
 
 // ProgressPersistenceV3 declares which side owns durable item resume/history.
@@ -536,6 +549,17 @@ type ProgressPersistenceV3 string
 const (
 	ProgressPersistenceServerV3 ProgressPersistenceV3 = "server"
 	ProgressPersistenceClientV3 ProgressPersistenceV3 = "client"
+)
+
+// FileSelectionV3 declares whether the requested file_id is an explicit user
+// version pick or an auto/default selection. An explicit pick must not be
+// silently swapped for an alternate version when the plan is terminal; the
+// server refuses instead and points the client at the version list.
+type FileSelectionV3 string
+
+const (
+	FileSelectionAutoV3     FileSelectionV3 = "auto"
+	FileSelectionExplicitV3 FileSelectionV3 = "explicit"
 )
 
 type TrackIdentityV3 struct {
@@ -885,6 +909,12 @@ type PlanV3 struct {
 	EffectiveMediaFileID   int                    `json:"effective_media_file_id"`
 	Source                 SourceDescriptorV3     `json:"source"`
 	SubtitleFidelityPolicy string                 `json:"subtitle_fidelity_policy"`
+	// AudioTracks is the authoritative per-track audio inventory of the
+	// effective source, mirroring the subtitle inventory. Clients should
+	// prefer it over item metadata: after a version fallback the effective
+	// file can differ from the requested catalog row, and only this list
+	// reflects the tracks the plan actually plays.
+	AudioTracks []models.AudioTrack `json:"audio_tracks,omitempty"`
 }
 
 type TerminalV3 struct {
@@ -939,6 +969,12 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	if r.ProgressPersistence == ProgressPersistenceClientV3 && r.StartPosition == nil {
 		return nil, errors.New("start_position is required when progress_persistence is client")
 	}
+	if r.FileSelection == "" {
+		r.FileSelection = FileSelectionAutoV3
+	}
+	if r.FileSelection != FileSelectionAutoV3 && r.FileSelection != FileSelectionExplicitV3 {
+		return nil, errors.New("file_selection is invalid")
+	}
 	if err := validateOptionalBoundedIntV3(r.BandwidthEstimateKbps, 100, 1_000_000, "bandwidth_estimate_kbps"); err != nil {
 		return nil, err
 	}
@@ -961,6 +997,9 @@ func (r *StartRequestV3) NormalizeAndValidate() ([]DegradationWarningV3, error) 
 	}
 	if err := validateTrackPairV3(r.FileID, "audio", r.AudioTrackID, r.AudioTrackIndex); err != nil {
 		return nil, err
+	}
+	if len(r.CarriedAudioTrackID) > 128 {
+		return nil, errors.New("carried_audio_track_id is too long")
 	}
 	if err := validateTrackPairV3(r.FileID, "subtitle", r.SubtitleTrackID, r.SubtitleTrackIndex); err != nil {
 		return nil, err

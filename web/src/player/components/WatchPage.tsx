@@ -76,6 +76,7 @@ export function WatchPage({
   explicitAudioTrackIndex,
   initialSubtitleTrackIndexByFileId,
   initialBitmapSubtitleTrackIndexByFileId,
+  explicitFileSelection = false,
   preferredSubtitleLanguage,
   preferredSubtitleTrackSignature,
   subtitleMode,
@@ -107,6 +108,7 @@ export function WatchPage({
   const handledSelectionRevisionRef = useRef<number | null>(null);
   const markerRealtimeReconcileKeyRef = useRef<string | null>(null);
   const [playbackVersions, setPlaybackVersions] = useState(versions);
+  const [versionSwapNoticeDismissed, setVersionSwapNoticeDismissed] = useState(false);
   const [realtimeConnectionState, setRealtimeConnectionState] = useState<
     "disconnected" | "connecting" | "connected"
   >("disconnected");
@@ -133,6 +135,7 @@ export function WatchPage({
     explicitAudioTrackIndex,
     initialSubtitleTrackIndexByFileId,
     initialBitmapSubtitleTrackIndexByFileId,
+    explicitFileSelection,
   );
 
   const initialSubtitleErrorKeyRef = useRef<string | null>(null);
@@ -146,9 +149,15 @@ export function WatchPage({
     });
   }, [session.initialSubtitleError, session.initialSubtitleErrorTitle, session.playbackAttemptId]);
 
+  // The plan's audio inventory is authoritative for the effective source after
+  // a version fallback; item metadata can be stale. Fall back to the version's
+  // probed tracks only when the plan publishes none (old plans, audiobooks).
   const audioTracks = useMemo(
-    () => playbackVersions.find((v) => v.file_id === session.mediaFileId)?.audio_tracks ?? [],
-    [playbackVersions, session.mediaFileId],
+    () =>
+      session.planAudioTracks.length > 0
+        ? session.planAudioTracks
+        : (playbackVersions.find((v) => v.file_id === session.mediaFileId)?.audio_tracks ?? []),
+    [playbackVersions, session.mediaFileId, session.planAudioTracks],
   );
   const playableSubtitles = useMemo(
     () => resolvePlayableSubtitles(session.subtitleUrls, subtitles),
@@ -448,6 +457,33 @@ export function WatchPage({
     </div>
   ) : null;
 
+  // The server may substitute a different version (e.g. HDR→SDR) when the
+  // requested one is not playable on this device. Only the auto path allows
+  // that, so surface a dismissible notice when it happened.
+  const plan = session.plan;
+  const versionSwapNotice =
+    plan &&
+    plan.requested_media_file_id !== plan.effective_media_file_id &&
+    !explicitFileSelection &&
+    !versionSwapNoticeDismissed ? (
+      <div className="absolute top-[max(4.5rem,calc(env(safe-area-inset-top)+3.5rem))] left-1/2 z-50 -translate-x-1/2">
+        <div className="flex items-center gap-2 rounded-full border border-white/15 bg-black/70 px-3 py-1.5 text-xs font-medium text-white/80 shadow-lg backdrop-blur">
+          <span>
+            Playing a different version than selected — the requested version isn't playable on this
+            device.
+          </span>
+          <button
+            type="button"
+            aria-label="Dismiss version notice"
+            onClick={() => setVersionSwapNoticeDismissed(true)}
+            className="cursor-pointer rounded-full px-1 text-white/60 transition-colors hover:text-white"
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+    ) : null;
+
   // Find the duration of the selected file so the player knows the total
   // length even when the stream is chunked (no Content-Length header).
   const selectedDuration =
@@ -464,6 +500,7 @@ export function WatchPage({
   return (
     <>
       {switchingIndicator}
+      {versionSwapNotice}
       <VideoPlayer
         title={title}
         year={year}

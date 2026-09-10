@@ -935,9 +935,15 @@ export interface FileVersion {
   file_size: number;
   duration: number;
   bitrate: number;
+  /** Liveness for virtual versions. Absent means available/unknown; false
+   *  means the version is currently unavailable (e.g. the provider no longer
+   *  serves it). Populated by the catalog versions/check endpoint. */
+  available?: boolean;
   added_at?: string;
   edition_raw?: string;
   edition_key?: string;
+  release_name?: string;
+  release_group?: string;
   presentation_kind?: string;
   presentation_group_key?: string;
   presentation_part_index?: number;
@@ -954,6 +960,16 @@ export interface FileVersion {
   credits?: TimeRange | null;
   recap?: TimeRange | null;
   preview?: TimeRange | null;
+}
+
+// Batched liveness check for virtual versions (POST /catalog/versions/check).
+export interface VersionLivenessResult {
+  file_id: number;
+  available: boolean;
+}
+
+export interface VersionLivenessResponse {
+  results: VersionLivenessResult[];
 }
 
 export interface PlaybackVariantPart {
@@ -1016,6 +1032,7 @@ export interface VersionAudioTrack {
   title?: string;
   embedded_title?: string;
   language?: string;
+  languages?: string[];
   codec?: string;
   profile?: string;
   layout?: string;
@@ -2855,6 +2872,7 @@ export interface NotificationWebhook {
   notify_continue_watching: boolean;
   notify_next_up: boolean;
   notify_requests: boolean;
+  notify_ratings: boolean;
   consecutive_failures: number;
   disabled_reason: string | null;
   last_success_at: string | null;
@@ -2875,6 +2893,7 @@ export interface NotificationWebhookInput {
   notify_continue_watching?: boolean;
   notify_next_up?: boolean;
   notify_requests?: boolean;
+  notify_ratings?: boolean;
 }
 
 export interface NotificationWebhookTestResult {

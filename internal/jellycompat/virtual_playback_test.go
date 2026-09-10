@@ -677,6 +677,113 @@ func TestHandlePlaybackInfoMultiVersionVirtualFailure(t *testing.T) {
 	}
 }
 
+type pinRecordingFileResolver struct {
+	file         *models.MediaFile
+	replaceCalls int
+	replacedOld  string
+	replacedNew  string
+}
+
+func (r *pinRecordingFileResolver) GetByID(context.Context, int) (*models.MediaFile, error) {
+	return r.file, nil
+}
+
+func (r *pinRecordingFileResolver) ReplaceVirtualResultPin(_ context.Context, _ int, oldPath, newPath string) (bool, error) {
+	r.replaceCalls++
+	r.replacedOld = oldPath
+	r.replacedNew = newPath
+	return true, nil
+}
+
+func TestResolveVirtualTransportRecoversFromStalePinnedCandidate(t *testing.T) {
+	boundURI := "virtual://series/tt0813715/1/1?result=dead"
+	neutralURI := "virtual://series/tt0813715/1/1"
+	liveURI := "virtual://series/tt0813715/1/1?result=live"
+
+	var calls []string
+	h := &PlaybackHandler{
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, forceRefresh bool, excluded []string, _ string) (ResolvedVirtualMedia, error) {
+			calls = append(calls, uri)
+			if uri == boundURI {
+				return ResolvedVirtualMedia{}, errors.New("virtual stream provider returned no matching candidate")
+			}
+			if uri == neutralURI {
+				if !forceRefresh {
+					t.Fatalf("forceRefresh = false, want true on recovery")
+				}
+				if len(excluded) != 1 || excluded[0] != "dead" {
+					t.Fatalf("excluded = %v, want [dead]", excluded)
+				}
+				return ResolvedVirtualMedia{URL: "https://provider.example/live", URI: liveURI, CandidateID: "live"}, nil
+			}
+			return ResolvedVirtualMedia{}, errors.New("unexpected uri " + uri)
+		}),
+	}
+	source := PlaybackMediaSource{FileID: 42, VirtualSourceURI: boundURI, VirtualSourceOwnerInstallationID: 5}
+	resolved, err := h.resolveVirtualTransportForIdentity(context.Background(), 1, "profile-1", source, false)
+	if err != nil {
+		t.Fatalf("resolveVirtualTransportForIdentity: %v", err)
+	}
+	if resolved.URI != liveURI {
+		t.Fatalf("resolved URI = %q, want %q", resolved.URI, liveURI)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("resolver calls = %d, want 2 (pinned then neutral recovery)", len(calls))
+	}
+}
+
+func TestResolveVirtualTransportRepairsPinAfterRecovery(t *testing.T) {
+	boundURI := "virtual://series/tt0813715/1/1?result=dead"
+	liveURI := "virtual://series/tt0813715/1/1?result=live"
+
+	resolver := &pinRecordingFileResolver{file: &models.MediaFile{ID: 42, FilePath: boundURI}}
+	h := &PlaybackHandler{
+		fileResolver: resolver,
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			if uri == boundURI {
+				return ResolvedVirtualMedia{}, errors.New("no matching candidate")
+			}
+			return ResolvedVirtualMedia{URL: "https://provider.example/live", URI: liveURI, CandidateID: "live"}, nil
+		}),
+	}
+	source := PlaybackMediaSource{FileID: 42, VirtualSourceURI: boundURI, VirtualSourceOwnerInstallationID: 5}
+	if _, err := h.resolveVirtualTransportForIdentity(context.Background(), 1, "profile-1", source, false); err != nil {
+		t.Fatalf("resolveVirtualTransportForIdentity: %v", err)
+	}
+	if resolver.replaceCalls != 1 || resolver.replacedOld != boundURI || resolver.replacedNew != liveURI {
+		t.Fatalf("pin repair = calls %d old %q new %q", resolver.replaceCalls, resolver.replacedOld, resolver.replacedNew)
+	}
+}
+
+func TestResolveVirtualTransportFailsWhenProviderFullyDown(t *testing.T) {
+	boundURI := "virtual://series/tt0813715/1/1?result=dead"
+	h := &PlaybackHandler{
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{}, errors.New("provider down")
+		}),
+	}
+	source := PlaybackMediaSource{FileID: 42, VirtualSourceURI: boundURI, VirtualSourceOwnerInstallationID: 5}
+	if _, err := h.resolveVirtualTransportForIdentity(context.Background(), 1, "profile-1", source, false); err == nil {
+		t.Fatal("expected error when the provider is fully down")
+	}
+}
+
+func TestResolveVirtualTransportNoRetryWithoutPinnedCandidate(t *testing.T) {
+	neutralURI := "virtual://series/tt0813715/1/1"
+	calls := 0
+	h := &PlaybackHandler{
+		VirtualMediaDetailedResolver: VirtualMediaDetailedResolverFunc(func(_ context.Context, _ string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			calls++
+			return ResolvedVirtualMedia{}, errors.New("provider down")
+		}),
+	}
+	source := PlaybackMediaSource{FileID: 42, VirtualSourceURI: neutralURI, VirtualSourceOwnerInstallationID: 5}
+	_, _ = h.resolveVirtualTransportForIdentity(context.Background(), 1, "profile-1", source, false)
+	if calls != 1 {
+		t.Fatalf("resolver calls = %d, want 1 (no retry without a pinned result)", calls)
+	}
+}
+
 func TestHandleVideoStreamVirtualRelayFailureReturns502(t *testing.T) {
 	codec := NewResourceIDCodec()
 	contentID := "ep-fail"

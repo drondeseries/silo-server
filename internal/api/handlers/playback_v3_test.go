@@ -243,6 +243,37 @@ func TestTerminalAllowsAlternateFileV3IncludesHDRIncompatibility(t *testing.T) {
 	}
 }
 
+func TestHintExplicitSelectionAlternateAvailableV3(t *testing.T) {
+	const hint = "A compatible version of this title is available; choose it from the version list."
+
+	// Explicit selection on an alternate-allowing terminal appends the hint.
+	terminal := &playback.TerminalV3{Reason: "hdr_transcode_unsupported", Message: "This HDR source requires video encoding.", Retryable: false}
+	hintExplicitSelectionAlternateAvailableV3(terminal, playback.FileSelectionExplicitV3)
+	if !strings.Contains(terminal.Message, hint) {
+		t.Fatalf("explicit selection terminal message = %q, want hint appended", terminal.Message)
+	}
+	if terminal.Reason != "hdr_transcode_unsupported" || terminal.Retryable {
+		t.Fatalf("hint must not change reason/retryable: %#v", terminal)
+	}
+
+	// Auto selection must not be touched.
+	terminal = &playback.TerminalV3{Reason: "hdr_transcode_unsupported", Message: "This HDR source requires video encoding."}
+	hintExplicitSelectionAlternateAvailableV3(terminal, playback.FileSelectionAutoV3)
+	if strings.Contains(terminal.Message, hint) {
+		t.Fatalf("auto selection terminal message = %q, want untouched", terminal.Message)
+	}
+
+	// A terminal that does not allow alternates must not be touched.
+	terminal = &playback.TerminalV3{Reason: "client_hls_unsupported", Message: "The client cannot execute HLS."}
+	hintExplicitSelectionAlternateAvailableV3(terminal, playback.FileSelectionExplicitV3)
+	if strings.Contains(terminal.Message, hint) {
+		t.Fatalf("non-alternate terminal message = %q, want untouched", terminal.Message)
+	}
+
+	// Nil terminal is a no-op.
+	hintExplicitSelectionAlternateAvailableV3(nil, playback.FileSelectionExplicitV3)
+}
+
 func TestValidateAdvertisedTransformationsV3RejectsOldVideoRecipe(t *testing.T) {
 	plan := &playback.PlanV3{Transformations: []playback.TransformationV3{{
 		Name:          playback.TransformationVideoToH264V3,
@@ -539,7 +570,7 @@ func TestReplanAllowsAlternateFileV3PinsSeekOperations(t *testing.T) {
 	}{
 		{name: "ordinary failure may use another version", operation: playback.ReplanOperationFailureRecoveryV3, quality: "auto", want: true},
 		{name: "output change may use another version", operation: playback.ReplanOperationOutputChangeV3, quality: "auto", want: true},
-		{name: "track change may use another version", operation: playback.ReplanOperationTrackChangeV3, quality: "auto", want: true},
+		{name: "track change stays pinned to the mounted version", operation: playback.ReplanOperationTrackChangeV3, quality: "auto", want: false},
 		{name: "original quality remains pinned", operation: playback.ReplanOperationFailureRecoveryV3, quality: "original", want: false},
 		{name: "exact seek reanchor pins current version", operation: playback.ReplanOperationSeekReanchorV3, quality: "auto", want: false},
 		{name: "failed seek recovery pins current version", operation: playback.ReplanOperationSeekFailureRecoveryV3, quality: "auto", want: false},
@@ -4309,14 +4340,16 @@ func TestHandleReplanPlaybackV3BitmapSubtitleFallsBackFromHDRToSDRVersion(t *tes
 		},
 		Capabilities: startRequest.Capabilities, ClientPlaybackContext: startRequest.ClientPlaybackContext,
 	})
-	if replanned.PlaybackPlan == nil || replanned.Terminal != nil {
-		t.Fatalf("subtitle replan = %#v", replanned)
+	// A subtitle track_change must never move the version underneath the
+	// selection: the bitmap track cannot be delivered on the mounted HDR
+	// source, so the replan refuses with a terminal instead of silently
+	// swapping to the SDR alternate. Only an unreadable/corrupted video
+	// (surfaced as a failure_recovery) may fall back to another version.
+	if replanned.PlaybackPlan != nil || replanned.Terminal == nil {
+		t.Fatalf("subtitle track_change should refuse with a terminal, got plan=%#v terminal=%#v", replanned.PlaybackPlan, replanned.Terminal)
 	}
-	if replanned.PlaybackPlan.EffectiveMediaFileID != alternate.ID {
-		t.Fatalf("subtitle effective file = %d, want SDR alternate %d", replanned.PlaybackPlan.EffectiveMediaFileID, alternate.ID)
-	}
-	if replanned.PlaybackPlan.Subtitle.Mode != playback.SubtitleBurnInV3 || replanned.PlaybackPlan.SelectedTracks.Subtitle == nil {
-		t.Fatalf("subtitle plan = %#v, want burn-in selection", replanned.PlaybackPlan)
+	if replanned.Terminal.Reason != "subtitle_conversion_unsupported" {
+		t.Fatalf("subtitle track_change terminal = %#v, want subtitle_conversion_unsupported", replanned.Terminal)
 	}
 	t.Cleanup(func() { handler.tm.CloseTranscodeSession(started.SessionID, "") })
 }
@@ -4714,12 +4747,123 @@ func TestSidecarOnlyHLSReplanKeepsEffectiveToneMapFallback(t *testing.T) {
 	}
 	record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID = "output-context"
 
-	reusedRecipe, ok := sidecarOnlyHLSReplanV3(record, &candidatePlan, candidateRecipe, "output-context")
+	reusedRecipe, ok := sidecarOnlyReuseReplanV3(record, &candidatePlan, candidateRecipe, "output-context")
 	if !ok {
 		t.Fatal("byte-identical sidecar replan did not reuse the active transport")
 	}
 	if reusedRecipe.ToneMapMode != tonemap.ModeSoftware {
 		t.Fatalf("reused tone-map mode = %q, want active software fallback", reusedRecipe.ToneMapMode)
+	}
+}
+
+func TestSidecarOnlyReuseReplanProgressiveDelivery(t *testing.T) {
+	currentPlan := playback.PlanV3{
+		PlanID:               "current-plan",
+		Delivery:             playback.DeliveryRemuxProgressiveV3,
+		Stream:               playback.StreamV3{URL: "/stream/session-1"},
+		RequestedMediaFileID: 1,
+		EffectiveMediaFileID: 1,
+	}
+	candidatePlan := currentPlan
+	candidatePlan.PlanID = "candidate-plan"
+	currentRecipe := playback.FreezeExecutableRecipeV3(playback.PlannerResultV3{
+		Plan: &currentPlan, PlayMethod: playback.PlayRemux,
+	})
+	candidateRecipe := playback.FreezeExecutableRecipeV3(playback.PlannerResultV3{
+		Plan: &candidatePlan, PlayMethod: playback.PlayRemux,
+	})
+	record := &playback.AttemptRecordV3{
+		EffectiveMediaFileID: 1,
+		CurrentPlan:          currentPlan,
+		FrozenRecipe:         currentRecipe,
+	}
+	record.NormalizedRequest.ClientPlaybackContext.Output.OutputContextID = "output-context"
+
+	if _, ok := sidecarOnlyReuseReplanV3(record, &candidatePlan, candidateRecipe, "output-context"); !ok {
+		t.Fatal("byte-identical progressive sidecar replan did not reuse the active transport")
+	}
+
+	// A delivery mismatch must still refuse reuse.
+	drifted := candidatePlan
+	drifted.Delivery = playback.DeliveryRemuxHLSV3
+	if _, ok := sidecarOnlyReuseReplanV3(record, &drifted, candidateRecipe, "output-context"); ok {
+		t.Fatal("progressive sidecar replan reused across a delivery change")
+	}
+}
+
+func TestHasActiveReusableTransportV3Progressive(t *testing.T) {
+	manager := playback.NewSessionManager(0, 0)
+	handler := NewPlaybackHandler(manager)
+
+	localProgressive := &playback.Session{
+		ID:               "progressive-local",
+		RoutingWorkload:  string(noderouting.WorkloadRemux),
+		RoutingExecution: string(noderouting.ExecutionAPI),
+	}
+	if !handler.hasActiveReusableTransportV3(localProgressive, playback.DeliveryRemuxProgressiveV3) {
+		t.Fatal("local progressive remux with committed routing was not reusable")
+	}
+	// The committed routing facts are the only evidence for local progressive;
+	// an uncommitted routing shape must not be treated as an active transport.
+	uncommitted := &playback.Session{
+		ID:              "progressive-uncommitted",
+		RoutingWorkload: string(noderouting.WorkloadRemux),
+	}
+	if handler.hasActiveReusableTransportV3(uncommitted, playback.DeliveryRemuxProgressiveV3) {
+		t.Fatal("progressive remux without committed routing execution was reusable")
+	}
+	// A remote transcode node is active evidence for any reuse-eligible delivery.
+	remote := &playback.Session{ID: "progressive-remote", TranscodeNodeURL: "http://node:8096"}
+	if !handler.hasActiveReusableTransportV3(remote, playback.DeliveryRemuxProgressiveV3) {
+		t.Fatal("progressive remux on a transcode node was not reusable")
+	}
+	// The progressive branch must not leak into HLS deliveries: those rely on a
+	// transcode-manager session or node URL alone.
+	if handler.hasActiveReusableTransportV3(localProgressive, playback.DeliveryRemuxHLSV3) {
+		t.Fatal("HLS delivery was deemed reusable from progressive-only routing evidence")
+	}
+}
+
+func TestLazyDVRPUStrippableV3MemoizesOnFileRowIdentity(t *testing.T) {
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	// A missing binary would make any real probe fail open to true; the memo
+	// hit must return the memoized verdict without ever consulting it.
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{FFmpegPath: "/nonexistent/ffmpeg"}
+	}
+	mtime := time.Now()
+	key := dvRPUMemoKeyV3{fileID: 7, size: 12345, mtimeUnixNano: mtime.UnixNano()}
+	handler.v3DVRPUMu.Lock()
+	handler.v3DVRPUVerds = map[dvRPUMemoKeyV3]bool{key: false}
+	handler.v3DVRPUMu.Unlock()
+
+	file := &models.MediaFile{
+		ID: 7, FileSize: 12345, FileModifiedAt: &mtime,
+		FilePath: "/media/movie.mkv",
+	}
+	verdict := handler.lazyDVRPUStrippableV3(context.Background(), file)
+	if verdict == nil {
+		t.Fatal("memoized non-virtual file returned nil probe")
+	}
+	if verdict() {
+		t.Fatal("memoized false verdict was not returned without probing")
+	}
+
+	// A rotated transport URL must still hit the same file-row memo: the URL is
+	// not part of the key, exactly what the relay-registration churn needs.
+	rotated := *file
+	rotated.FilePath = "/relay/registration/42/movie.mkv"
+	if verdict := handler.lazyDVRPUStrippableV3(context.Background(), &rotated); verdict == nil || verdict() {
+		t.Fatal("URL-rotated file did not reuse the file-row memoized verdict")
+	}
+
+	// A different mtime is a different source: it must miss the memo (a fresh
+	// closure), never inherit the old verdict.
+	stale := *file
+	changed := mtime.Add(time.Second)
+	stale.FileModifiedAt = &changed
+	if verdict := handler.lazyDVRPUStrippableV3(context.Background(), &stale); verdict == nil {
+		t.Fatal("changed mtime unexpectedly hit the memo")
 	}
 }
 
@@ -4810,7 +4954,7 @@ func TestSidecarOnlyHLSReplanRejectsSourceVideoExecutionFactDrift(t *testing.T) 
 				TargetVideoCodec: "h264", TargetAudioCodec: "aac",
 				FrozenSourceMetadata: &candidateSource,
 			})
-			if _, reused := sidecarOnlyHLSReplanV3(record, &candidatePlan, candidateRecipe, "output-context"); reused {
+			if _, reused := sidecarOnlyReuseReplanV3(record, &candidatePlan, candidateRecipe, "output-context"); reused {
 				t.Fatalf("sidecar-only replan reused A/V bytes after source video %s changed", test.name)
 			}
 		})

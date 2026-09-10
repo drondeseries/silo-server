@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/text/language"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/httpstream"
@@ -416,7 +419,8 @@ func mergeCompatCandidateTracks(probed *models.MediaFile, candidate VirtualPlayb
 	if probed.CodecAudio == "" {
 		probed.CodecAudio = audioCodec
 	}
-	if len(probed.AudioTracks) == 0 {
+	synthesizeAudio := len(probed.AudioTracks) == 0
+	if synthesizeAudio {
 		probed.AudioTracks = append(probed.AudioTracks, models.AudioTrack{
 			Codec:    audioCodec,
 			Channels: channels,
@@ -432,19 +436,22 @@ func mergeCompatCandidateTracks(probed *models.MediaFile, candidate VirtualPlayb
 		}
 	}
 
-	if len(candidate.AudioLanguages) > 0 {
-		existing := make(map[string]bool, len(probed.AudioTracks))
-		for _, track := range probed.AudioTracks {
-			if language := strings.TrimSpace(track.Language); language != "" {
-				existing[strings.ToLower(language)] = true
-			}
-		}
+	if synthesizeAudio && len(candidate.AudioLanguages) > 0 {
+		existing := make(map[string]bool, len(candidate.AudioLanguages))
 		for _, language := range candidate.AudioLanguages {
 			language = strings.TrimSpace(language)
-			if language == "" || existing[strings.ToLower(language)] {
+			// Release markers like MULTI/DUAL are not language tags; filter
+			// them here exactly like the native surface's
+			// isRealVirtualLanguageTag, so a Jellyfin-protocol client gets the
+			// same labeled per-language inventory as the native one.
+			if language == "" || !isRealCompatLanguageTag(language) {
 				continue
 			}
-			existing[strings.ToLower(language)] = true
+			canonical := compatLanguageBaseSubtag(language)
+			if existing[canonical] {
+				continue
+			}
+			existing[canonical] = true
 			assigned := false
 			for i := range probed.AudioTracks {
 				if strings.TrimSpace(probed.AudioTracks[i].Language) == "" {
@@ -541,6 +548,33 @@ func mediaFileHDRString(file *models.MediaFile) string {
 		return "true"
 	}
 	return ""
+}
+
+// isRealCompatLanguageTag reports whether a provider-declared language token
+// parses as a real ISO language subtag. It mirrors the native surface's
+// isRealVirtualLanguageTag so release markers like MULTI/DUAL are filtered
+// from the synthesized audio inventory on both protocol surfaces.
+func isRealCompatLanguageTag(value string) bool {
+	tag, err := language.Parse(value)
+	if err != nil {
+		return false
+	}
+	base, conf := tag.Base()
+	return conf != language.No && base.String() != ""
+}
+
+// compatLanguageBaseSubtag canonicalizes a language token to its ISO base
+// subtag ("ITA" → "it"), mirroring the native surface's
+// virtualLanguageBaseSubtag so probe-recorded codes and provider-declared
+// codes dedup against the same key on both protocol surfaces.
+func compatLanguageBaseSubtag(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if tag, err := language.Parse(trimmed); err == nil {
+		if base, conf := tag.Base(); conf != language.No && base.String() != "" {
+			return base.String()
+		}
+	}
+	return strings.ToLower(trimmed)
 }
 
 func compatVirtualDVProfileMarker(raw string) bool {
@@ -708,8 +742,35 @@ func (h *PlaybackHandler) resolveVirtualTransportForIdentity(ctx context.Context
 	if !isCompatVirtualPath(uri) {
 		return ResolvedVirtualMedia{}, errors.New("virtual playback source is not bound")
 	}
+	resolved, err := h.resolveVirtualTransportOnce(ctx, userID, profileID, source, uri, forceRefresh, nil, "")
+	if err == nil {
+		return resolved, nil
+	}
+	// A pinned ?result= candidate can go stale when the provider re-lists: the
+	// catalog row survives but the provider no longer returns that result, so
+	// direct play would surface a 502. Re-resolve provider-neutrally, excluding
+	// the dead candidate, so the same quality selection recovers to a live
+	// result instead of failing. Bounded to a single retry: a fully-down
+	// provider still fails with the original error.
+	failedID := compatVirtualResultCandidateID(uri)
+	if failedID == "" {
+		return resolved, err
+	}
+	neutralURI := compatVirtualNeutralURI(uri)
+	if neutralURI == uri {
+		return resolved, err
+	}
+	recovered, recoverErr := h.resolveVirtualTransportOnce(ctx, userID, profileID, source, neutralURI, true, []string{failedID}, "")
+	if recoverErr != nil {
+		return resolved, err
+	}
+	h.repairCompatVirtualPin(ctx, source, uri, recovered)
+	return recovered, nil
+}
+
+func (h *PlaybackHandler) resolveVirtualTransportOnce(ctx context.Context, userID int, profileID string, source PlaybackMediaSource, uri string, forceRefresh bool, excludedCandidateIDs []string, preferredCandidateID string) (ResolvedVirtualMedia, error) {
 	if h.VirtualMediaDetailedResolver != nil {
-		res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(ctx, uri, source.VirtualSourceOwnerInstallationID, userID, profileID, forceRefresh, nil, "")
+		res, err := h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(ctx, uri, source.VirtualSourceOwnerInstallationID, userID, profileID, forceRefresh, excludedCandidateIDs, preferredCandidateID)
 		res.RequestHeaders = cloneHeaderMap(res.RequestHeaders)
 		return res, err
 	}
@@ -722,6 +783,61 @@ func (h *PlaybackHandler) resolveVirtualTransportForIdentity(ctx context.Context
 		return ResolvedVirtualMedia{URL: url, URI: uri}, err
 	}
 	return ResolvedVirtualMedia{}, errors.New("virtual playback resolver is not configured")
+}
+
+// compatVirtualPinReplacer is the subset of the file repository the recovery
+// path needs to CAS-repair a dead pin after a successful re-resolve. The
+// concrete *scanner.FileRepository implements it; the interface keeps the
+// dependency optional so tests and non-DB resolvers need not provide it.
+type compatVirtualPinReplacer interface {
+	ReplaceVirtualResultPin(context.Context, int, string, string) (bool, error)
+}
+
+// repairCompatVirtualPin re-pins the catalog row to the recovered candidate
+// after a stale-pin recovery, so the next playback does not re-resolve the dead
+// result. Best-effort: a collision (the winning candidate already exists as a
+// sibling row) is handled by ReplaceVirtualResultPin itself, and any error is
+// logged without failing the in-flight stream.
+func (h *PlaybackHandler) repairCompatVirtualPin(ctx context.Context, source PlaybackMediaSource, oldURI string, recovered ResolvedVirtualMedia) {
+	if source.FileID <= 0 || recovered.URI == "" || recovered.URI == oldURI {
+		return
+	}
+	replacer, ok := h.fileResolver.(compatVirtualPinReplacer)
+	if !ok {
+		return
+	}
+	repairCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if _, err := replacer.ReplaceVirtualResultPin(repairCtx, source.FileID, oldURI, recovered.URI); err != nil {
+		slog.WarnContext(ctx, "failed to repair virtual result pin after compat recovery", "component", "jellycompat", "file_id", source.FileID, "error", err)
+	}
+}
+
+// compatVirtualNeutralURI strips the concrete ?result= pick from a virtual URI,
+// preserving scheme/host/path and profile so a stale candidate can be
+// re-resolved provider-neutrally within the same quality selection.
+func compatVirtualNeutralURI(virtualPath string) string {
+	parsed, err := url.Parse(virtualPath)
+	if err != nil {
+		return virtualPath
+	}
+	q := parsed.Query()
+	if strings.TrimSpace(q.Get("result")) == "" {
+		return virtualPath
+	}
+	q.Del("result")
+	parsed.RawQuery = q.Encode()
+	return parsed.String()
+}
+
+// compatVirtualResultCandidateID returns the concrete "result=" candidate ID
+// bound to a virtual URI, or "" when the URI carries no explicit pick.
+func compatVirtualResultCandidateID(virtualPath string) string {
+	parsed, err := url.Parse(virtualPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parsed.Query().Get("result"))
 }
 
 func (h *PlaybackHandler) registerVirtualInput(ctx context.Context, session *Session, source PlaybackMediaSource, forceRefresh bool) (string, func(), error) {

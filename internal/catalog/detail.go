@@ -428,37 +428,45 @@ type PersonCredit struct {
 
 // FileVersion represents a single file version available for playback.
 type FileVersion struct {
-	FileID                   int                    `json:"file_id"`
-	FileName                 string                 `json:"file_name,omitempty"`
-	FilePath                 string                 `json:"file_path,omitempty"`
-	Resolution               string                 `json:"resolution"`
-	CodecVideo               string                 `json:"codec_video"`
-	CodecAudio               string                 `json:"codec_audio"`
-	HDR                      bool                   `json:"hdr"`
-	Container                string                 `json:"container"`
-	FileSize                 int64                  `json:"file_size"`
-	Duration                 int                    `json:"duration"`
-	Bitrate                  int                    `json:"bitrate"`
-	AddedAt                  time.Time              `json:"added_at"`
-	EditionRaw               string                 `json:"edition_raw,omitempty"`
-	EditionKey               string                 `json:"edition_key,omitempty"`
-	PresentationKind         string                 `json:"presentation_kind,omitempty"`
-	PresentationGroupKey     string                 `json:"presentation_group_key,omitempty"`
-	PresentationPartIndex    int                    `json:"presentation_part_index,omitempty"`
-	PresentationPartTotal    int                    `json:"presentation_part_total,omitempty"`
-	MultiEpisodeStart        int                    `json:"multi_episode_start,omitempty"`
-	MultiEpisodeEnd          int                    `json:"multi_episode_end,omitempty"`
-	EffectiveAudioTrackIndex *int                   `json:"effective_audio_track_index,omitempty"`
-	EffectiveAudioLanguage   string                 `json:"effective_audio_language,omitempty"`
-	Failed                   bool                   `json:"failed,omitempty"`
-	VideoTracks              []models.VideoTrack    `json:"video_tracks,omitempty"`
-	AudioTracks              []models.AudioTrack    `json:"audio_tracks,omitempty"`
-	SubtitleTracks           []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
-	Chapters                 []VersionChapter       `json:"chapters,omitempty"`
-	Intro                    *Marker                `json:"intro,omitempty"`
-	Credits                  *Marker                `json:"credits,omitempty"`
-	Recap                    *Marker                `json:"recap,omitempty"`
-	Preview                  *Marker                `json:"preview,omitempty"`
+	FileID                   int       `json:"file_id"`
+	FileName                 string    `json:"file_name,omitempty"`
+	FilePath                 string    `json:"file_path,omitempty"`
+	Resolution               string    `json:"resolution"`
+	CodecVideo               string    `json:"codec_video"`
+	CodecAudio               string    `json:"codec_audio"`
+	HDR                      bool      `json:"hdr"`
+	Container                string    `json:"container"`
+	FileSize                 int64     `json:"file_size"`
+	Duration                 int       `json:"duration"`
+	Bitrate                  int       `json:"bitrate"`
+	AddedAt                  time.Time `json:"added_at"`
+	EditionRaw               string    `json:"edition_raw,omitempty"`
+	EditionKey               string    `json:"edition_key,omitempty"`
+	ReleaseName              string    `json:"release_name,omitempty"`
+	ReleaseGroup             string    `json:"release_group,omitempty"`
+	PresentationKind         string    `json:"presentation_kind,omitempty"`
+	PresentationGroupKey     string    `json:"presentation_group_key,omitempty"`
+	PresentationPartIndex    int       `json:"presentation_part_index,omitempty"`
+	PresentationPartTotal    int       `json:"presentation_part_total,omitempty"`
+	MultiEpisodeStart        int       `json:"multi_episode_start,omitempty"`
+	MultiEpisodeEnd          int       `json:"multi_episode_end,omitempty"`
+	EffectiveAudioTrackIndex *int      `json:"effective_audio_track_index,omitempty"`
+	EffectiveAudioLanguage   string    `json:"effective_audio_language,omitempty"`
+	Failed                   bool      `json:"failed,omitempty"`
+	// Available reports the durable per-version health signal: a virtual
+	// candidate is available when it has not been stamped failed (failed_at is
+	// NULL), a local file when it is not marked missing (missing_since is
+	// NULL). Omitted when the version is available, so an absent field means
+	// available/unknown; false means the version is currently unavailable.
+	Available      *bool                  `json:"available,omitempty"`
+	VideoTracks    []models.VideoTrack    `json:"video_tracks,omitempty"`
+	AudioTracks    []models.AudioTrack    `json:"audio_tracks,omitempty"`
+	SubtitleTracks []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
+	Chapters       []VersionChapter       `json:"chapters,omitempty"`
+	Intro          *Marker                `json:"intro,omitempty"`
+	Credits        *Marker                `json:"credits,omitempty"`
+	Recap          *Marker                `json:"recap,omitempty"`
+	Preview        *Marker                `json:"preview,omitempty"`
 }
 
 // PlaybackVariant is one logical watch choice, optionally spanning multiple ordered parts.
@@ -3388,6 +3396,15 @@ func (s *DetailService) effectiveAudioSelectionWith(
 	if file == nil || len(file.AudioTracks) == 0 {
 		return effectiveAudioSelection{}
 	}
+	// Backfill the languages array from embedded track titles before resolving
+	// the effective language: rows probed before MULTI/DUAL languages support
+	// carry an empty array or a "mul"/"und" tag, while the displayed
+	// FileVersion.AudioTracks are backfilled by ensureTrackLanguages. Resolving
+	// against a backfilled copy keeps EffectiveAudioLanguage consistent with
+	// the tracks the client renders without mutating the caller's file.
+	backfilled := *file
+	backfilled.AudioTracks = ensureTrackLanguages(append([]models.AudioTrack(nil), file.AudioTracks...))
+	file = &backfilled
 	if r == nil || !r.valid {
 		index := playback.SelectAudioTrack(file.AudioTracks, "", nil)
 		return effectiveAudioSelection{
@@ -3528,6 +3545,54 @@ func sortAudiobookMediaFiles(files []*models.MediaFile) {
 	})
 }
 
+// ensureTrackLanguages backfills the languages array from a track's embedded
+// title when the track carries no explicit list and its language tag is absent,
+// undetermined, or multiple. Rows probed before the MULTI/DUAL languages
+// support were scanned with an empty array; re-deriving it at read time keeps
+// the version flyout complete until the probe-version re-probe catches up.
+func ensureTrackLanguages(tracks []models.AudioTrack) []models.AudioTrack {
+	for i := range tracks {
+		track := &tracks[i]
+		if len(track.Languages) > 0 {
+			continue
+		}
+		if track.Language != "" && track.Language != "und" && track.Language != "mul" {
+			continue
+		}
+		if languages := lang.ParseLanguages(track.EmbeddedTitle); len(languages) > 0 {
+			track.Languages = languages
+			if track.Language == "" || track.Language == "und" || track.Language == "mul" {
+				track.Language = languages[0]
+			}
+		}
+	}
+	return tracks
+}
+
+// isVirtualMediaFile reports whether a media file row is a zero-storage
+// virtual candidate (provider-backed) rather than a local file. Virtual rows
+// carry a virtual:// path; local liveness (missing_since) never applies to
+// them, and their health signal is the failed_at stamp instead.
+func isVirtualMediaFile(f *models.MediaFile) bool {
+	return f != nil && strings.HasPrefix(f.FilePath, "virtual://")
+}
+
+// versionAvailability returns the durable per-version health signal as a
+// pointer so the JSON field is omitted when the version is available (absent
+// means available/unknown) and false when it is not: a virtual candidate is
+// unavailable when stamped failed (failed_at set), a local file when marked
+// missing (missing_since set).
+func versionAvailability(f *models.MediaFile) *bool {
+	if f == nil {
+		return nil
+	}
+	available := isVirtualMediaFile(f) && f.FailedAt == nil || !isVirtualMediaFile(f) && f.MissingSince == nil
+	if available {
+		return nil
+	}
+	return boolPtr(false)
+}
+
 func (s *DetailService) buildPlaybackInfo(
 	ctx context.Context,
 	files []*models.MediaFile,
@@ -3578,6 +3643,8 @@ func (s *DetailService) buildPlaybackInfo(
 			}
 		}
 
+		audioTracks := ensureTrackLanguages(append([]models.AudioTrack(nil), f.AudioTracks...))
+
 		versions = append(versions, FileVersion{
 			FileID:                   f.ID,
 			FileName:                 filepath.Base(f.FilePath),
@@ -3593,6 +3660,8 @@ func (s *DetailService) buildPlaybackInfo(
 			AddedAt:                  f.CreatedAt,
 			EditionRaw:               f.EditionRaw,
 			EditionKey:               f.EditionKey,
+			ReleaseName:              f.ReleaseName,
+			ReleaseGroup:             f.ReleaseGroup,
 			PresentationKind:         f.PresentationKind,
 			PresentationGroupKey:     f.PresentationGroupKey,
 			PresentationPartIndex:    f.PresentationPartIndex,
@@ -3602,14 +3671,20 @@ func (s *DetailService) buildPlaybackInfo(
 			EffectiveAudioTrackIndex: intPtr(effectiveAudioSelection.Index),
 			EffectiveAudioLanguage:   effectiveAudioSelection.Language,
 			Failed:                   f.FailedAt != nil,
-			VideoTracks:              append([]models.VideoTrack(nil), f.VideoTracks...),
-			AudioTracks:              append([]models.AudioTrack(nil), f.AudioTracks...),
-			SubtitleTracks:           buildVersionSubtitleTracks(f),
-			Chapters:                 s.buildVersionChapters(ctx, f),
-			Intro:                    versionIntro,
-			Credits:                  versionCredits,
-			Recap:                    versionRecap,
-			Preview:                  versionPreview,
+			// Available is the durable per-version health signal: a virtual
+			// candidate is available when it has not been stamped failed
+			// (failed_at IS NULL), a local file when it is not marked missing
+			// (missing_since IS NULL). Omitted when available, so an absent
+			// field means available/unknown; false means unavailable.
+			Available:      versionAvailability(f),
+			VideoTracks:    append([]models.VideoTrack(nil), f.VideoTracks...),
+			AudioTracks:    audioTracks,
+			SubtitleTracks: buildVersionSubtitleTracks(f),
+			Chapters:       s.buildVersionChapters(ctx, f),
+			Intro:          versionIntro,
+			Credits:        versionCredits,
+			Recap:          versionRecap,
+			Preview:        versionPreview,
 		})
 
 		for _, sub := range f.SubtitleTracks {

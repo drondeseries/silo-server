@@ -1267,7 +1267,7 @@ func (h *PlaybackHandler) buildProxyRedirectURL(
 	}
 
 	audioTrackIndex := 0
-	if resolvedAudioTrackIndex, ok := compatAudioTrackIndex(source); ok {
+	if resolvedAudioTrackIndex, ok := compatAudioOrdinal(source); ok {
 		audioTrackIndex = resolvedAudioTrackIndex
 	}
 
@@ -1449,7 +1449,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 	}
 	if h.playbackStore != nil {
 		expectedSourceAudioChannels := compatHLSRecipeSourceAudioChannels(source)
-		expectedAudioTrackIndex := compatAudioTrackIndexOrDefault(source)
+		expectedAudioTrackIndex := compatAudioOrdinalOrDefault(source)
 		if current, ok := h.playbackStore.Get(playSessionID); ok && current.TranscodeStarted && current.Recipe != nil && current.Recipe.TranscodeNodeURL != "" &&
 			current.Recipe.MediaFileID == source.FileID &&
 			current.Recipe.SourceAudioChannels == expectedSourceAudioChannels &&
@@ -1557,7 +1557,7 @@ func (h *PlaybackHandler) startRemoteTranscodeWithToneMapMode(
 		TargetCodecAudio:    compatTargetAudioCodec,
 		SegmentDuration:     segmentDuration,
 		HWAccel:             h.remoteDispatchHWAccel(transcodeNodeURL),
-		AudioTrackIndex:     compatAudioTrackIndexOrDefault(source),
+		AudioTrackIndex:     compatAudioOrdinalOrDefault(source),
 		SourceAudioChannels: compatHLSRecipeSourceAudioChannels(source),
 		TotalDuration:       float64(source.Version.Duration),
 		RequireReady:        toneMapRecipe.mode != "",
@@ -2768,6 +2768,30 @@ func compatAudioTrackIndexOrDefault(source PlaybackMediaSource) int {
 	return 0
 }
 
+// compatAudioOrdinal resolves the selected audio track's array position via
+// compatAudioTrackIndex and converts it to the audio-only stream ordinal
+// ffmpeg's `0:a:N` expects (see playback.AudioStreamOrdinal). Every value fed
+// to playback — TranscodeOpts.AudioTrackIndex, remux recipe cards, stream
+// tokens, and node start requests — must be this ordinal, never the array
+// position: the catalog can order AudioTracks differently from the container
+// order (MULTi releases, virtual sources), and `0:a:N` counts audio streams
+// only. The DTO stream-index domain (len(VideoTracks)+position) is resolved by
+// compatAudioTrackIndex and stays untouched.
+func compatAudioOrdinal(source PlaybackMediaSource) (int, bool) {
+	audioTrackIndex, ok := compatAudioTrackIndex(source)
+	if !ok {
+		return 0, false
+	}
+	return playback.AudioStreamOrdinal(source.Version.AudioTracks, audioTrackIndex), true
+}
+
+func compatAudioOrdinalOrDefault(source PlaybackMediaSource) int {
+	if ordinal, ok := compatAudioOrdinal(source); ok {
+		return ordinal
+	}
+	return 0
+}
+
 func compatSourceAudioChannels(source PlaybackMediaSource) int {
 	audioTrackIndex := compatAudioTrackIndexOrDefault(source)
 	if audioTrackIndex < 0 || audioTrackIndex >= len(source.Version.AudioTracks) {
@@ -2931,8 +2955,44 @@ func compatAudioSpatialFormat(profile string) string {
 	}
 }
 
+// compatAudioLanguagePlaceholders carry no real identity and are skipped in
+// display summaries, mirroring the web client's LANGUAGE_PLACEHOLDERS set.
+var compatAudioLanguagePlaceholders = map[string]bool{
+	"und": true, "unknown": true, "unk": true, "": true,
+}
+
+// compatAudioLanguageSummary renders the track's full advertised language list
+// ("English/French") the same way the web client summarizes MULTi tracks:
+// resolved through compatLanguageName, deduplicated on the display label
+// ("eng", "en", and "English" all collapse to "English"), with placeholder
+// codes like und/unknown skipped. An empty result means "no language
+// information" — callers keep their single-language fallback then.
+func compatAudioLanguageSummary(languages []string) string {
+	seen := make(map[string]bool, len(languages))
+	var labels []string
+	for _, code := range languages {
+		trimmed := strings.ToLower(strings.TrimSpace(code))
+		if compatAudioLanguagePlaceholders[trimmed] {
+			continue
+		}
+		label := compatLanguageName(trimmed)
+		identity := strings.ToLower(label)
+		if seen[identity] {
+			continue
+		}
+		seen[identity] = true
+		labels = append(labels, label)
+	}
+	return strings.Join(labels, "/")
+}
+
 func audioTrackDisplayTitle(track models.AudioTrack) string {
-	lang := compatLanguageName(track.Language)
+	lang := compatAudioLanguageSummary(track.Languages)
+	if lang == "" {
+		// Probe data predating multi-audio support carries no Languages list;
+		// preserve the historical single-language rendering verbatim.
+		lang = compatLanguageName(track.Language)
+	}
 	// Jellyfin prefers the ffprobe profile over the codec name in audio display
 	// titles (e.g. "DTS-HD MA", "Dolby Digital Plus + Dolby Atmos"), except the
 	// uninformative AAC "LC" profile.

@@ -11,9 +11,10 @@ import { videoRangeLabel } from "@/lib/videoRange";
 import {
   collectLanguageLabels,
   extractSourceHint,
-  isVirtualFileVersion,
+  prettifyReleaseName,
 } from "./versionFormatUtils";
 import { audioScore, resolutionScore } from "./versionRankingUtils";
+import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
 
 // ---------------------------------------------------------------------------
 // Exported helper functions (also used by tests)
@@ -55,18 +56,18 @@ export function buildQualitySummary(version: FileVersion): string {
 export function buildDetailLine(version: FileVersion): string {
   const parts: string[] = [];
 
-  // Virtual candidates carry the provider's release name in edition_raw; it
-  // is the only human-readable identity a zero-storage version has, so it
-  // takes the lead over the generic size/source scan.
-  if (isVirtualFileVersion(version)) {
-    const releaseName = version.edition_raw?.trim();
-    if (releaseName) parts.push(releaseName);
-  }
+  // The release name (provider label for virtual candidates, file stem for
+  // local files) leads the line; edition_raw is the fallback for rows scanned
+  // before release_name existed.
+  const releaseName = prettifyReleaseName(version.release_name || version.edition_raw);
+  if (releaseName) parts.push(releaseName);
 
   const size = formatFileSize(version.file_size);
   if (size) parts.push(size);
 
-  const textToScan = [version.file_name, version.edition_raw].filter(Boolean).join(" ");
+  const textToScan = [version.file_name, version.edition_raw, version.release_name]
+    .filter(Boolean)
+    .join(" ");
   const hint = textToScan ? extractSourceHint(textToScan) : null;
   if (hint) parts.push(hint);
 
@@ -94,24 +95,29 @@ interface VersionFlyoutItemsProps {
 
 export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionFlyoutItemsProps) {
   const sorted = sortByResolution(versions);
+  const { visibleVersions, hiddenUnavailableCount, setShowUnavailable } = useVersionVisibility(
+    sorted,
+    null,
+  );
 
   return (
     <>
       <DropdownMenuLabel>Play Version</DropdownMenuLabel>
       <DropdownMenuSeparator />
 
-      {sorted.map((version) => {
+      {visibleVersions.map((version) => {
         const qualitySummary = buildQualitySummary(version);
         const detailLine = buildDetailLine(version);
         const isMoreAction = qualitySummary === "More results…";
         const isVirtual =
           version.container === "virtual" ||
           Boolean(version.file_path?.toLowerCase().startsWith("virtual://"));
+        const unavailable = isVersionUnavailable(version);
 
         return (
           <DropdownMenuItem
             key={version.file_id}
-            className="flex items-center gap-3 rounded-lg py-2.5"
+            className={`flex items-center gap-3 rounded-lg py-2.5 ${unavailable ? "opacity-60" : ""}`}
             onSelect={() => onPlayVersion(version.file_id)}
           >
             <span className="bg-accent/70 flex size-7 shrink-0 items-center justify-center rounded-full">
@@ -132,6 +138,14 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
                       className="shrink-0 px-1.5 py-0 text-[10px] font-medium"
                     >
                       Virtual
+                    </Badge>
+                  )}
+                  {unavailable && (
+                    <Badge
+                      variant="destructive"
+                      className="shrink-0 px-1.5 py-0 text-[10px] font-medium uppercase"
+                    >
+                      Unavailable
                     </Badge>
                   )}
                 </span>
@@ -173,6 +187,15 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
           </DropdownMenuItem>
         );
       })}
+      {hiddenUnavailableCount > 0 && (
+        <DropdownMenuItem
+          className="text-muted-foreground justify-center text-xs font-medium"
+          onSelect={() => setShowUnavailable(true)}
+        >
+          Show {hiddenUnavailableCount} unavailable{" "}
+          {hiddenUnavailableCount === 1 ? "version" : "versions"}
+        </DropdownMenuItem>
+      )}
     </>
   );
 }

@@ -87,6 +87,14 @@ type StreamHandler struct {
 	// after a transport produced no bytes, so the auto-pick skips it on the
 	// next play while the dropdown still shows it for a manual retry.
 	VirtualCandidateFailMarker func(ctx context.Context, fileID int) error
+	// VirtualCandidateRecoveredMarker clears a known-bad stamp after the
+	// candidate actually delivered media bytes to a client — the only evidence
+	// that forgives a transport failure. The callback is fenced on the
+	// delivered candidate identity and the failure state observed when the
+	// transport started, so a rotation or a newer failure is never cleared.
+	// Metadata-only liveness checks resolve URLs without opening media and
+	// must never clear it.
+	VirtualCandidateRecoveredMarker func(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error
 }
 
 // ffmpegPath returns the currently configured ffmpeg binary path.
@@ -175,6 +183,15 @@ func hasUsableSubtitleTracks(file *models.MediaFile) bool {
 	return false
 }
 
+func resolvedVirtualCandidatePath(resolved ResolvedVirtualMedia) string {
+	uri := strings.TrimSpace(resolved.URI)
+	id := virtualResultCandidateID(uri)
+	if !strings.HasPrefix(uri, "virtual://") || id == "" || resolved.CandidateID == "" || resolved.CandidateID != id {
+		return ""
+	}
+	return uri
+}
+
 func hasVirtualMediaResolver(h *StreamHandler) bool {
 	return h != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil || h.VirtualMediaRefreshResolver != nil)
 }
@@ -201,7 +218,7 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 	forceRefresh bool,
 	excludedCandidateIDs []string,
 ) (ResolvedVirtualMedia, func(), error) {
-	resolved := ResolvedVirtualMedia{URI: file.FilePath}
+	resolved := ResolvedVirtualMedia{}
 	var err error
 	if h.VirtualMediaDetailedResolver != nil {
 		resolved, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
@@ -340,7 +357,21 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	// the exact URI that was resolved and probed during planning.
 	file = bindSessionVirtualSource(file, session)
 
+	// Capture the delivered identity and observed health state at transport
+	// start: the delivered candidate is the path the transport will serve
+	// (retained by the session even if the row rotates mid-stream), and the
+	// failure stamp seen now is the only health state a successful delivery
+	// may clear. A rotation to B or a newer failure on A that lands while the
+	// stream is being served is preserved.
+	virtualObservedFailedAt := (*time.Time)(nil)
+	if file != nil && isVirtualPlaybackFile(file) {
+		if current, err := h.fileResolver.GetByID(r.Context(), file.ID); err == nil && current != nil {
+			virtualObservedFailedAt = current.FailedAt
+		}
+	}
+
 	inputPath := file.FilePath
+	deliveredPath := ""
 	releaseInput := func() {}
 	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
@@ -349,6 +380,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		inputPath = resolved.URL
+		deliveredPath = resolvedVirtualCandidatePath(resolved)
 		releaseInput = cleanup
 	}
 	defer func() {
@@ -411,7 +443,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					// The pinned candidate served no bytes (corrupted NZB, dead
 					// provider URL). Mark it failed and re-resolve with it
 					// excluded so the next-ranked release is tried.
-					failedID := virtualResultCandidateID(file.FilePath)
+					failedID := virtualResultCandidateID(deliveredPath)
 					if failedID != "" {
 						h.markVirtualCandidateFailed(r.Context(), file, failedID)
 					}
@@ -437,6 +469,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 								refreshedHost := refreshedURL.Hostname()
 								if refreshedHost == "127.0.0.1" || refreshedHost == "::1" || refreshedHost == "[::1]" {
 									targetURL = refreshedURL
+									deliveredPath = resolvedVirtualCandidatePath(refreshedMedia)
 									lastProxyErr = nil
 									proxy.ServeHTTP(streamWriter, r)
 								}
@@ -450,6 +483,9 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 						writeError(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source")
 					}
 				}
+			}
+			if lastProxyErr == nil && virtualCandidateDeliveryEvidence(streamWriter.StatusCode(), streamWriter.BytesWritten()) {
+				h.clearVirtualCandidateRecovered(r.Context(), file, deliveredPath, virtualObservedFailedAt)
 			}
 			return
 		}
@@ -477,22 +513,39 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		if dvProfile == 0 {
 			dvProfile = file.PrimaryDVProfile()
 		}
-		remuxErr := playback.ServeRemuxWithOptions(w, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, dvProfile, playback.RemuxServeOptions{
-			DVMode:                 session.RemuxDVMode,
-			FFmpegPath:             h.ffmpegPath(),
-			ContentType:            playback.RemuxContentType(file.IsAudioOnly()),
-			AudioOnly:              file.IsAudioOnly(),
-			SourceAudioChannels:    session.SourceAudioChannels,
-			TargetAudioChannels:    session.TargetAudioChannels,
-			TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
-		})
+		serveRemux := func() error {
+			// The remux writes through the raw writer; wrap it to observe how
+			// many bytes actually reached the client. nil return is NOT
+			// delivery evidence (remux.go can return nil when the first
+			// client write fails) — recovery is gated on positive bytes.
+			remuxWriter := httpstream.NewRollingDeadlineWriter(w)
+			err := playback.ServeRemuxWithOptions(remuxWriter, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, audioStreamOrdinalV3(file, session.AudioTrackIndex), dvProfile, playback.RemuxServeOptions{
+				DVMode:                 session.RemuxDVMode,
+				FFmpegPath:             h.ffmpegPath(),
+				ContentType:            playback.RemuxContentType(file.IsAudioOnly()),
+				AudioOnly:              file.IsAudioOnly(),
+				SourceAudioChannels:    session.SourceAudioChannels,
+				TargetAudioChannels:    session.TargetAudioChannels,
+				TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
+			})
+			if err == nil && isVirtualPlaybackFile(file) &&
+				virtualCandidateDeliveryEvidence(http.StatusOK, remuxWriter.BytesWritten()) {
+				// Media bytes actually flowed to the client for the candidate
+				// the session planned — the only evidence that forgives a
+				// transport failure. Fenced on the delivered identity and the
+				// health state observed at transport start.
+				h.clearVirtualCandidateRecovered(r.Context(), file, deliveredPath, virtualObservedFailedAt)
+			}
+			return err
+		}
+		remuxErr := serveRemux()
 		if remuxErr != nil {
 			// The remux only commits 200 after FFmpeg produces media bytes, so
 			// a failure here means the provider release served no output
 			// (corrupted NZB, dead URL). Mark the candidate failed and retry
 			// once with it excluded so the next-ranked release is tried.
 			if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
-				failedID := virtualResultCandidateID(file.FilePath)
+				failedID := virtualResultCandidateID(deliveredPath)
 				if failedID != "" {
 					h.markVirtualCandidateFailed(r.Context(), file, failedID)
 				}
@@ -511,15 +564,9 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					if parseErr == nil && retryURL.Scheme == "http" {
 						retryHost := retryURL.Hostname()
 						if retryHost == "127.0.0.1" || retryHost == "::1" || retryHost == "[::1]" {
-							remuxErr = playback.ServeRemuxWithOptions(w, r, retried.URL, "mp4", seekSeconds, session.TranscodeAudio, session.AudioTrackIndex, dvProfile, playback.RemuxServeOptions{
-								DVMode:                 session.RemuxDVMode,
-								FFmpegPath:             h.ffmpegPath(),
-								ContentType:            playback.RemuxContentType(file.IsAudioOnly()),
-								AudioOnly:              file.IsAudioOnly(),
-								SourceAudioChannels:    session.SourceAudioChannels,
-								TargetAudioChannels:    session.TargetAudioChannels,
-								TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
-							})
+							inputPath = retried.URL
+							deliveredPath = resolvedVirtualCandidatePath(retried)
+							remuxErr = serveRemux()
 						}
 					}
 				}
@@ -918,9 +965,51 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Build the font-bundle cache key before any virtual resolve: the identity
+	// must never depend on the resolved relay URL, which rotates per
+	// registration. Virtual rows key on the pinned "result=" candidate id (the
+	// 10-minute generation bucket bounds staleness); local rows key on the file
+	// row's mtime+size so a re-probed or replaced file reads as a miss.
+	virtualFontSource := isVirtualPlaybackFile(file) && session.VirtualSourceURI != ""
+	var cacheKey playback.FontBundleKey
+	if virtualFontSource {
+		cacheKey = playback.FontBundleKey{
+			FileID:       file.ID,
+			PinnedResult: virtualResultCandidateID(session.VirtualSourceURI),
+			FFmpegPath:   h.ffmpegPath(),
+		}
+	} else {
+		mtimeUnixNano := int64(0)
+		if file.FileModifiedAt != nil {
+			mtimeUnixNano = file.FileModifiedAt.UnixNano()
+		}
+		cacheKey = playback.FontBundleKey{
+			FileID:        file.ID,
+			Size:          file.FileSize,
+			MtimeUnixNano: mtimeUnixNano,
+			FFmpegPath:    h.ffmpegPath(),
+		}
+	}
+
+	// Virtual keys without a pinned result= param are intentionally
+	// uncacheable: the identity would be unstable without the candidate
+	// anchor, so we fall through to the uncached extract path below.
+	if virtualFontSource && cacheKey.PinnedResult == "" {
+		slog.DebugContext(r.Context(), "virtual font bundle has no pinned result= param; skipping cache", "component", "api", "file_id", file.ID)
+	}
+
+	// A cache hit serves the encoded bundle immediately: no provider round-trip,
+	// no relay registration, no ffmpeg spawn.
+	if h.SubtitleCache != nil {
+		if cached, ok := h.SubtitleCache.LookupFontBundle(cacheKey); ok {
+			writeFontBundleResponse(w, cached)
+			return
+		}
+	}
+
 	inputPath := file.FilePath
 	releaseInput := func() {}
-	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
+	if virtualFontSource && hasVirtualMediaResolver(h) {
 		var resolved ResolvedVirtualMedia
 		resolved, releaseInput, err = h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
 		if err != nil {
@@ -931,7 +1020,34 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 	}
 	defer releaseInput()
 
-	fonts, err := playback.ExtractAttachedSubtitleFonts(r.Context(), inputPath, h.ffmpegPath())
+	if h.SubtitleCache == nil {
+		// No cache configured: keep the historical uncached path.
+		fonts, err := playback.ExtractAttachedSubtitleFonts(r.Context(), inputPath, h.ffmpegPath())
+		if err != nil {
+			slog.WarnContext(r.Context(), "subtitle font extraction failed", "component", "api",
+				"file_id", file.ID,
+				"track", trackIndex,
+				"error", err,
+			)
+			writeError(w, http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Cache-Control", "no-store")
+		if err := json.NewEncoder(w).Encode(playback.EncodeSubtitleFontBundle(fonts)); err != nil {
+			slog.WarnContext(r.Context(), "subtitle font response encode failed", "component", "api", "error", err)
+		}
+		return
+	}
+
+	bundle, err := h.SubtitleCache.ExtractFontBundle(r.Context(), cacheKey, func(ctx context.Context) ([]byte, error) {
+		fonts, extractErr := playback.ExtractAttachedSubtitleFonts(ctx, inputPath, h.ffmpegPath())
+		if extractErr != nil {
+			return nil, extractErr
+		}
+		return json.Marshal(playback.EncodeSubtitleFontBundle(fonts))
+	})
 	if err != nil {
 		slog.WarnContext(r.Context(), "subtitle font extraction failed", "component", "api",
 			"file_id", file.ID,
@@ -941,13 +1057,17 @@ func (h *StreamHandler) HandleSubtitleFonts(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, "font_extract_failed", "Failed to extract subtitle fonts")
 		return
 	}
+	writeFontBundleResponse(w, bundle)
+}
 
+// writeFontBundleResponse writes an encoded font-bundle payload with the
+// shared cache headers. Both the cache-hit and cache-miss paths serve the same
+// bytes, so the response is identical whichever path produced them.
+func writeFontBundleResponse(w http.ResponseWriter, bundle []byte) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Cache-Control", "no-store")
-	if err := json.NewEncoder(w).Encode(playback.EncodeSubtitleFontBundle(fonts)); err != nil {
-		slog.WarnContext(r.Context(), "subtitle font response encode failed", "component", "api", "error", err)
-	}
+	w.Header().Set("Cache-Control", "private, max-age=600")
+	_, _ = w.Write(bundle)
 }
 
 func (h *StreamHandler) syncSessionsNow(ctx context.Context, reason string) {
@@ -1011,7 +1131,7 @@ func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session
 // on the next play while the dropdown still shows it (clickable) for a manual
 // retry. Best-effort: a persistence failure must not turn a 502 into a 500.
 func (h *StreamHandler) markVirtualCandidateFailed(ctx context.Context, file *models.MediaFile, candidateID string) {
-	if h == nil || file == nil || candidateID == "" {
+	if h == nil || file == nil || candidateID == "" || candidateID != virtualResultCandidateID(file.FilePath) {
 		return
 	}
 	if h.VirtualCandidateFailMarker == nil {
@@ -1022,6 +1142,42 @@ func (h *StreamHandler) markVirtualCandidateFailed(ctx context.Context, file *mo
 	if err := h.VirtualCandidateFailMarker(markCtx, file.ID); err != nil {
 		slog.WarnContext(ctx, "mark virtual candidate failed", "component", "api", "file_id", file.ID, "candidate", candidateID, "error", err)
 	}
+}
+
+// clearVirtualCandidateRecovered clears a virtual candidate's known-bad stamp
+// after the candidate actually delivered media bytes to a client. This is the
+// only evidence that forgives a transport failure: a resolved URL (liveness
+// check) is not, because resolution never opens the media, and written
+// response headers alone are not either (the relay forwards header-only 204,
+// 304, 416, and zero-length 200 responses). The clear is fenced on the
+// DELIVERED candidate identity (the file path the transport served, which the
+// session retains even after the catalog row rotates) and the failure state
+// observed when the transport started, so a late delivery of candidate A never
+// clears a rotation to B or a newer failure on A.
+// Best-effort: a persistence failure must not fail a delivering stream.
+func (h *StreamHandler) clearVirtualCandidateRecovered(ctx context.Context, file *models.MediaFile, deliveredFilePath string, observedFailedAt *time.Time) {
+	if h == nil || file == nil || strings.TrimSpace(deliveredFilePath) == "" {
+		return
+	}
+	if h.VirtualCandidateRecoveredMarker == nil {
+		return
+	}
+	clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := h.VirtualCandidateRecoveredMarker(clearCtx, file.ID, deliveredFilePath, observedFailedAt); err != nil {
+		slog.WarnContext(ctx, "clear virtual candidate recovered", "component", "api", "file_id", file.ID, "delivered", deliveredFilePath, "error", err)
+	}
+}
+
+// virtualCandidateDeliveryEvidence reports whether a direct-play transfer
+// actually delivered media: a 200/206 status AND positive body bytes.
+// Header-only responses (204/304/416/zero-length 200) are explicitly forwarded
+// by the relay and are not evidence the media endpoint works.
+func virtualCandidateDeliveryEvidence(statusCode int, bytesWritten int64) bool {
+	if statusCode != http.StatusOK && statusCode != http.StatusPartialContent {
+		return false
+	}
+	return bytesWritten > 0
 }
 
 // streamEmbeddedSubtitle runs a dedicated ffmpeg for a single embedded
@@ -1121,6 +1277,15 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// Virtual relay inputs never enter the payload cache under their rotating
+	// URL; key on the pinned source + effective ordinal instead (the identity
+	// must reflect any drift remap above), and never run a detached warm
+	// against a request-scoped relay registration.
+	if virtualActive {
+		opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
+		opts.DisableBackgroundWarm = true
+	}
+
 	extractErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle)
 	if extractErr != nil {
 		playback.LogSubtitleStreamError(r.Context(), extractErr, file.ID, embeddedIndex)
@@ -1145,6 +1310,12 @@ func (h *StreamHandler) streamEmbeddedSubtitle(w http.ResponseWriter, r *http.Re
 		if !h.verifyVirtualSubtitleLayout(r.Context(), track, session, &opts) {
 			writeSubtitleSourceChanged(w)
 			return
+		}
+		// The retry may have remapped to a different live ordinal; the cache
+		// identity must track the effective map so a remapped extraction lands
+		// under its own key.
+		if virtualActive {
+			opts.CacheIdentity = playback.VirtualSubtitleCacheIdentity(file.ID, session.VirtualSourceURI, opts.TrackIndex)
 		}
 		if retryErr := h.SubtitleCache.ServeExtract(response, r, opts, playback.StreamExtractSubtitle); retryErr != nil {
 			playback.LogSubtitleStreamError(r.Context(), retryErr, file.ID, embeddedIndex)

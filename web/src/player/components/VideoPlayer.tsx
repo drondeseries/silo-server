@@ -15,6 +15,7 @@ import { useIntroSkipPrompt } from "../hooks/useIntroSkipPrompt";
 import { useRemuxSeeking } from "../hooks/useRemuxSeeking";
 import { useSubtitleTracks } from "../hooks/useSubtitleTracks";
 import { useASSSubtitles } from "../hooks/useASSSubtitles";
+import { useSubtitleFontPrefetch } from "../hooks/useSubtitleFontPrefetch";
 import { useSubtitleAppearance } from "../hooks/useSubtitleAppearance";
 import { useSubtitleLayout } from "../hooks/useSubtitleLayout";
 import { useCoarsePointer } from "../hooks/useCoarsePointer";
@@ -70,6 +71,10 @@ import {
   endWatchTogetherRoom,
   setWatchTogetherGuestControl,
 } from "@/lib/watchTogetherActions";
+import {
+  collectLanguageLabels,
+  prettifyReleaseName,
+} from "@/pages/ItemDetail/components/versionFormatUtils";
 import { toast } from "sonner";
 
 let hlsJSModule: Promise<typeof HlsType> | null = null;
@@ -249,6 +254,17 @@ function readNumericPayload(
     }
   }
   return null;
+}
+
+// Autoplay policy blocks play() when the user gesture that caused a transport
+// change has expired (the async replan + buffering can outlive transient
+// activation). No timer can unlock that — only a fresh interaction can.
+function isAutoplayNotAllowedError(error: unknown): boolean {
+  return (
+    typeof DOMException !== "undefined" &&
+    error instanceof DOMException &&
+    error.name === "NotAllowedError"
+  );
 }
 
 function readStringPayload(
@@ -534,6 +550,13 @@ export function VideoPlayer({
   const backendDuration = plan.source.duration_seconds ?? propDuration ?? 0;
   backendDurationRef.current = backendDuration;
   const effectiveInitialPosition = plan.timeline.player_start_seconds;
+  // The transport-init effect reads the start position through a ref. On a
+  // reused transport the server rewrites player_start_seconds to the current
+  // playhead, and keying the effect on that drift would tear down a stream
+  // that must keep playing. The ref is re-read whenever the effect actually
+  // runs, so a genuine transport change still starts at the latest position.
+  const effectiveInitialPositionRef = useRef(effectiveInitialPosition);
+  effectiveInitialPositionRef.current = effectiveInitialPosition;
   const canSeekAnywhere = plan.timeline.can_seek_anywhere;
   // The menu is the plan's; which entry is lit is the session's own preference,
   // since `auto` is a valid preference that names no rung.
@@ -555,14 +578,17 @@ export function VideoPlayer({
     () =>
       versions.map((v) => {
         // Compact audio languages for the version switcher so a
-        // MULTI/French track set is recognizable before playback.
-        const audioLangs = [
-          ...new Set(
-            (v.audio_tracks ?? [])
-              .map((track) => track.language?.trim())
-              .filter((language): language is string => Boolean(language)),
-          ),
-        ].join("/");
+        // MULTI/French track set is recognizable before playback. A MULTi
+        // track advertises its full languages[] list; fall back to the
+        // single language field when the list is absent. Labels resolve
+        // through the same formatter as the item page, so raw ISO codes
+        // render as "English/French" rather than "en/fr".
+        const audioLangs = collectLanguageLabels(
+          (v.audio_tracks ?? []).flatMap((track) => {
+            const languages = track.languages?.filter((l) => l?.trim());
+            return languages && languages.length > 0 ? languages : [track.language?.trim()];
+          }),
+        ).join("/");
         const audioPart = v.codec_audio
           ? ` ${v.codec_audio.toUpperCase()}${audioLangs ? ` ${audioLangs}` : ""}`
           : audioLangs
@@ -571,6 +597,7 @@ export function VideoPlayer({
         return {
           fileId: v.file_id,
           label: `${v.resolution} ${v.codec_video.toUpperCase()}${v.hdr ? " HDR" : ""}${audioPart}`,
+          releaseName: prettifyReleaseName(v.release_name ?? v.file_name),
           isCurrentSource: v.file_id === plan.effective_media_file_id,
           isRequestedSource:
             (v.file_id === pendingSwitchFileId && v.file_id !== plan.effective_media_file_id) ||
@@ -1144,6 +1171,19 @@ export function VideoPlayer({
     );
   }, []);
 
+  // Dedupe signals per plan: a virtual release that rotated under this plan
+  // makes every subtitle URL stale. Refresh the plan's subtitle inventory
+  // exactly like the subtitle menu's "refresh" action — a track_change that
+  // changes nothing re-mints the URLs against the live layout while the A/V
+  // transport stays untouched. Once a plan is signaled, further 409s for it
+  // (windowed VTT and ASS both fire) are ignored until a new plan lands.
+  const subtitleSourceChangedPlanIdRef = useRef<string | null>(null);
+  const handleSubtitleSourceChanged = useCallback(() => {
+    if (subtitleSourceChangedPlanIdRef.current === plan.plan_id) return;
+    subtitleSourceChangedPlanIdRef.current = plan.plan_id;
+    onRefreshSubtitles?.(getSubtitleStartPosition());
+  }, [getSubtitleStartPosition, onRefreshSubtitles, plan.plan_id]);
+
   const resumeFromTranslationPause = useCallback(() => {
     if (translationResumeTimerRef.current !== null) {
       window.clearTimeout(translationResumeTimerRef.current);
@@ -1513,6 +1553,24 @@ export function VideoPlayer({
   const plannedBitrateKbps = plan.effective_recipe.bitrate_kbps ?? 0;
   const plannedDynamicRange = plan.effective_recipe.dynamic_range;
 
+  // Warm the new progressive transport as soon as a transport-changing plan
+  // adopts, before the transport-init effect below tears down the element.
+  // A copy remux's first bytes cost a cold ffmpeg start (1-3s); firing the
+  // request now means the element's own load hits a warm remux.
+  const warmTransportUrlRef = useRef<string | null>(null);
+  const transportRevisionRef = useRef<number | null>(null);
+  useEffect(() => {
+    const url = effectiveStreamUrl;
+    if (!url || !isPlayerReady) return;
+    if (warmTransportUrlRef.current === url) return;
+    if (!transportRevision || effectiveTransportRevision === transportRevisionRef.current) return; // unchanged transport
+    transportRevisionRef.current = effectiveTransportRevision;
+    const controller = new AbortController();
+    warmTransportUrlRef.current = url;
+    void fetch(url, { signal: controller.signal, method: "GET" }).catch(() => {});
+    return () => controller.abort();
+  }, [effectiveStreamUrl, effectiveTransportRevision, isPlayerReady]);
+
   // -- hls.js lifecycle --
   useEffect(() => {
     const video = videoRef.current;
@@ -1537,8 +1595,50 @@ export function VideoPlayer({
       autoplayRetryTimer = null;
     };
 
+    // Autoplay policy: play() needs a fresh user gesture. When it is rejected
+    // with NotAllowedError, timer retries can never unlock it — only a real
+    // interaction can. Arm one-shot document listeners that retry play() on
+    // the next pointer/key/touch, so a transport change that outlived the
+    // original gesture resumes from the user's next interaction instead of
+    // stranding them on a paused player.
+    const gestureResumeEvents = ["pointerdown", "keydown", "touchstart"] as const;
+    let gestureResumeCleanup: (() => void) | null = null;
+
+    const cleanupGestureResume = () => {
+      gestureResumeCleanup?.();
+      gestureResumeCleanup = null;
+    };
+
+    const armGestureResume = () => {
+      if (gestureResumeCleanup) return;
+      const resume = (event: Event) => {
+        const target = event.target instanceof Element ? event.target : null;
+        // The video surface and the transport buttons resume playback within
+        // their own click handlers under a fresh gesture; let them, instead
+        // of resuming here and then toggling straight back to paused.
+        if (
+          target &&
+          (target === video ||
+            target.closest("button, video, [role='button'], [role='slider'], input"))
+        ) {
+          return;
+        }
+        cleanupGestureResume();
+        attemptAutoplayWhenReady();
+      };
+      for (const type of gestureResumeEvents) {
+        document.addEventListener(type, resume, true);
+      }
+      gestureResumeCleanup = () => {
+        for (const type of gestureResumeEvents) {
+          document.removeEventListener(type, resume, true);
+        }
+      };
+    };
+
     const cleanupStartupListeners = () => {
       clearAutoplayRetry();
+      cleanupGestureResume();
       video.removeEventListener("loadeddata", attemptAutoplayWhenReady);
       video.removeEventListener("canplay", attemptAutoplayWhenReady);
       video.removeEventListener("loadedmetadata", attemptAutoplayWhenReady);
@@ -1550,7 +1650,9 @@ export function VideoPlayer({
 
     // Settles the player into a deliberate paused state: the startup guard is
     // told playback is viable so it does not report a bogus startup timeout,
-    // and the first frame is shown with the controls up.
+    // and the first frame is shown with the controls up. The autoplay gate
+    // stays armed (playbackStarted stays false) so a later gesture can still
+    // start playback.
     const settlePaused = () => {
       playbackStarted = true;
       cleanupStartupListeners();
@@ -1587,6 +1689,18 @@ export function VideoPlayer({
           // The element is paused now, whatever happens next, so the transport
           // reflects that immediately.
           setPlaying(false);
+          if (isAutoplayNotAllowedError(error)) {
+            // Autoplay policy: play() needs a fresh user gesture, and the one
+            // that caused this transport change expired during the async
+            // replan + buffering. Timer retries can never unlock it. Mark the
+            // media viable so the startup guard does not report a bogus
+            // timeout while the viewer decides to interact, show the paused
+            // player, and resume on the next real interaction.
+            hlsStartupGuardRef.current?.markPlaybackStarted();
+            setAwaitingFirstFrame(false);
+            armGestureResume();
+            return;
+          }
           if (autoplayAttempts < MAX_AUTOPLAY_ATTEMPTS) {
             // Deliberately keeps the readiness listeners armed: whichever
             // wakes first — a later `canplay` or this timer — retries.
@@ -1611,7 +1725,7 @@ export function VideoPlayer({
     const attachNativeHLS = () => {
       video.src = effectiveStreamUrl;
       nativeHLSMetadataHandler = () => {
-        video.currentTime = effectiveInitialPosition;
+        video.currentTime = effectiveInitialPositionRef.current;
         attemptAutoplayWhenReady();
       };
       video.addEventListener("loadedmetadata", nativeHLSMetadataHandler, { once: true });
@@ -1658,7 +1772,7 @@ export function VideoPlayer({
               backBufferLength: Infinity,
               maxBufferLength,
               maxMaxBufferLength: maxBufferLength,
-              startPosition: effectiveInitialPosition,
+              startPosition: effectiveInitialPositionRef.current,
               startFragPrefetch: true,
               // Segment requests may block while FFmpeg encodes on demand.
               // Remote transcode nodes can also briefly defer the initial
@@ -1787,7 +1901,7 @@ export function VideoPlayer({
         // the load algorithm that is about to seek to the resume position, and
         // the spec has that algorithm reject it.
         video.src = effectiveStreamUrl;
-        video.currentTime = effectiveInitialPosition;
+        video.currentTime = effectiveInitialPositionRef.current;
         attemptAutoplayWhenReady();
       }
     }
@@ -1809,11 +1923,13 @@ export function VideoPlayer({
         video.load();
       }
     };
-    // `planRevision` is the single signal that the transport changed: two plans
-    // can share a stream URL and still differ in protocol, timeline, or recipe.
+    // The effect must re-run only when the transport itself changed: the stream
+    // URL, the A/V transport identity (transportRevision), the delivery class,
+    // or the recipe facts that change the produced bytes. The start position is
+    // read fresh from the ref, so a plan whose only difference is the playhead
+    // (a reused-transport subtitle replan) must not reload the element.
   }, [
     effectiveStreamUrl,
-    effectiveInitialPosition,
     effectiveTransportRevision,
     isHlsStream,
     isPlayerReady,
@@ -2251,6 +2367,7 @@ export function VideoPlayer({
     liveTranslation?.trackKey ?? null,
     subtitleStreamGeneration,
     setTextSubtitleState,
+    handleSubtitleSourceChanged,
   );
 
   // -- ASS/SSA subtitle rendering via JASSUB (client-side libass) --
@@ -2262,7 +2379,14 @@ export function VideoPlayer({
     timelineOffsetSeconds,
     subtitleDelayMs,
     setASSSubtitleState,
+    handleSubtitleSourceChanged,
+    plan.plan_id,
   );
+  // Prefetch ASS font bundles at plan adoption so a later track selection hits
+  // the in-memory font cache instead of a cold server extraction. Purely a
+  // warm-up: errors are swallowed and never affect playback. Mirrors the
+  // useASSSubtitles gating — the hook itself no-ops without font inventory.
+  useSubtitleFontPrefetch(subtitleUrls);
   const subtitleLoadState = isASSActive ? assSubtitleState : textSubtitleState;
 
   // -- Authoritative subtitle track selection --

@@ -16,6 +16,8 @@ function makeVersion(overrides: Partial<FileVersion> = {}): FileVersion {
     file_name: overrides.file_name,
     file_path: overrides.file_path,
     edition_raw: overrides.edition_raw,
+    release_name: overrides.release_name,
+    release_group: overrides.release_group,
     audio_tracks: overrides.audio_tracks,
     video_tracks: overrides.video_tracks,
     subtitle_tracks: overrides.subtitle_tracks,
@@ -176,7 +178,32 @@ describe("buildDetailLine", () => {
       edition_raw: "Movie.2160p.Remux.mkv",
       file_size: 45 * 1024 ** 3,
     });
-    expect(buildDetailLine(version)).toBe("Movie.2160p.Remux.mkv · 45.0 GB · Remux");
+    expect(buildDetailLine(version)).toBe("Movie 2160p Remux mkv · 45.0 GB · Remux");
+  });
+
+  it("prettifies release-style separators in the release name", () => {
+    const version = makeVersion({
+      release_name: "Mission.Impossible.2023.2160p.Multi-AltMount",
+      file_size: 0,
+    });
+    expect(buildDetailLine(version)).toBe("Mission Impossible 2023 2160p Multi-AltMount");
+  });
+
+  it("leads with release_name and prefers it over edition_raw", () => {
+    const version = makeVersion({
+      edition_raw: "Provider.Raw.Label",
+      release_name: "Movie.2023.1080p.WEB-DL.x264-GRP",
+      file_size: 10 * 1024 ** 3,
+    });
+    expect(buildDetailLine(version)).toBe("Movie 2023 1080p WEB-DL x264-GRP · 10.0 GB · WEB-DL");
+  });
+
+  it("falls back to edition_raw when release_name is absent", () => {
+    const version = makeVersion({
+      edition_raw: "Movie.2023.1080p.WEB-DL.x264-GRP",
+      file_size: 0,
+    });
+    expect(buildDetailLine(version)).toBe("Movie 2023 1080p WEB-DL x264-GRP · WEB-DL");
   });
 });
 

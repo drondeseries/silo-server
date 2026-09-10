@@ -16,6 +16,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/pathscope"
 	"github.com/Silo-Server/silo-server/internal/scanbatch"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -65,10 +66,11 @@ const fileColumns = `id, content_id, episode_id, extra_id, season_number, episod
 	recap_markers_source, recap_markers_provider, recap_markers_confidence, recap_markers_algorithm, recap_markers_detected_at,
 	preview_markers_source, preview_markers_provider, preview_markers_confidence, preview_markers_algorithm, preview_markers_detected_at,
 	edition_raw, edition_key, edition_confidence, edition_source,
+	release_name, release_group,
 	presentation_kind, presentation_group_key, presentation_part_index, presentation_part_total,
 	multi_episode_start, multi_episode_end,
 	multiple_pps, multiple_pps_scan_size, multiple_pps_scan_mtime,
-	probe_source, probe_updated_at, match_attempted_at, missing_since, failed_at,
+	probe_source, probe_updated_at, probe_version, match_attempted_at, missing_since, failed_at,
 	first_seen_scan_run_id, created_at, updated_at,
 	virtual_owner_installation_id`
 
@@ -91,10 +93,11 @@ const mfFileColumns = `mf.id, mf.content_id, mf.episode_id, mf.extra_id, mf.seas
 	mf.recap_markers_source, mf.recap_markers_provider, mf.recap_markers_confidence, mf.recap_markers_algorithm, mf.recap_markers_detected_at,
 	mf.preview_markers_source, mf.preview_markers_provider, mf.preview_markers_confidence, mf.preview_markers_algorithm, mf.preview_markers_detected_at,
 	mf.edition_raw, mf.edition_key, mf.edition_confidence, mf.edition_source,
+	mf.release_name, mf.release_group,
 	mf.presentation_kind, mf.presentation_group_key, mf.presentation_part_index, mf.presentation_part_total,
 	mf.multi_episode_start, mf.multi_episode_end,
 	mf.multiple_pps, mf.multiple_pps_scan_size, mf.multiple_pps_scan_mtime,
-	mf.probe_source, mf.probe_updated_at, mf.match_attempted_at, mf.missing_since, mf.failed_at,
+	mf.probe_source, mf.probe_updated_at, mf.probe_version, mf.match_attempted_at, mf.missing_since, mf.failed_at,
 	mf.first_seen_scan_run_id, mf.created_at, mf.updated_at,
 	mf.virtual_owner_installation_id`
 
@@ -112,12 +115,14 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	var fileModifiedAt *time.Time
 	var fileHash *string
 	var codecVideo, codecAudio, resolution, container, probeSource *string
+	var probeVersion int
 	var markersSource, introMarkersSource, introMarkersProvider, introMarkersAlgorithm *string
 	var creditsMarkersSource, creditsMarkersProvider, creditsMarkersAlgorithm *string
 	var recapMarkersSource, recapMarkersProvider, recapMarkersAlgorithm *string
 	var previewMarkersSource, previewMarkersProvider, previewMarkersAlgorithm *string
 	var chapterThumbnailLastError *string
 	var editionRaw, editionKey, editionSource *string
+	var releaseName, releaseGroup *string
 	var audioChannels *int
 	var hdr *bool
 	var duration, bitrate *int
@@ -206,6 +211,8 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 		&editionKey,
 		&editionConfidence,
 		&editionSource,
+		&releaseName,
+		&releaseGroup,
 		&presentationKind,
 		&presentationGroupKey,
 		&presentationPartIndex,
@@ -217,6 +224,7 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 		&f.MultiplePPSScanMtime,
 		&probeSource,
 		&f.ProbeUpdatedAt,
+		&probeVersion,
 		&f.MatchAttemptedAt,
 		&f.MissingSince,
 		&f.FailedAt,
@@ -321,6 +329,7 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	if probeSource != nil {
 		f.ProbeSource = *probeSource
 	}
+	f.ProbeVersion = probeVersion
 	if editionRaw != nil {
 		f.EditionRaw = *editionRaw
 	}
@@ -330,6 +339,12 @@ func scanMediaFile(row pgx.Row) (*models.MediaFile, error) {
 	f.EditionConfidence = editionConfidence
 	if editionSource != nil {
 		f.EditionSource = *editionSource
+	}
+	if releaseName != nil {
+		f.ReleaseName = *releaseName
+	}
+	if releaseGroup != nil {
+		f.ReleaseGroup = *releaseGroup
 	}
 	if presentationKind != nil {
 		f.PresentationKind = *presentationKind
@@ -437,12 +452,14 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		var fileModifiedAt *time.Time
 		var fileHash *string
 		var codecVideo, codecAudio, resolution, container, probeSource *string
+		var probeVersion int
 		var markersSource, introMarkersSource, introMarkersProvider, introMarkersAlgorithm *string
 		var creditsMarkersSource, creditsMarkersProvider, creditsMarkersAlgorithm *string
 		var recapMarkersSource, recapMarkersProvider, recapMarkersAlgorithm *string
 		var previewMarkersSource, previewMarkersProvider, previewMarkersAlgorithm *string
 		var chapterThumbnailLastError *string
 		var editionRaw, editionKey, editionSource *string
+		var releaseName, releaseGroup *string
 		var audioChannels *int
 		var hdr *bool
 		var duration, bitrate *int
@@ -531,6 +548,8 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 			&editionKey,
 			&editionConfidence,
 			&editionSource,
+			&releaseName,
+			&releaseGroup,
 			&presentationKind,
 			&presentationGroupKey,
 			&presentationPartIndex,
@@ -542,6 +561,7 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 			&f.MultiplePPSScanMtime,
 			&probeSource,
 			&f.ProbeUpdatedAt,
+			&probeVersion,
 			&f.MatchAttemptedAt,
 			&f.MissingSince,
 			&f.FailedAt,
@@ -638,6 +658,7 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		if probeSource != nil {
 			f.ProbeSource = *probeSource
 		}
+		f.ProbeVersion = probeVersion
 		if editionRaw != nil {
 			f.EditionRaw = *editionRaw
 		}
@@ -647,6 +668,12 @@ func scanMediaFiles(rows pgx.Rows) ([]*models.MediaFile, error) {
 		f.EditionConfidence = editionConfidence
 		if editionSource != nil {
 			f.EditionSource = *editionSource
+		}
+		if releaseName != nil {
+			f.ReleaseName = *releaseName
+		}
+		if releaseGroup != nil {
+			f.ReleaseGroup = *releaseGroup
 		}
 		if presentationKind != nil {
 			f.PresentationKind = *presentationKind
@@ -929,9 +956,10 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		duration, bitrate, video_tracks, audio_tracks, subtitle_tracks, external_subtitles, chapters,
 		intro_start, intro_end, credits_start, credits_end, markers_source, markers_confidence,
 		edition_raw, edition_key, edition_confidence, edition_source,
+		release_name, release_group,
 		presentation_kind, presentation_group_key, presentation_part_index, presentation_part_total,
 		multi_episode_start, multi_episode_end,
-		probe_source, probe_updated_at, missing_since,
+		probe_source, probe_updated_at, probe_version, missing_since,
 		first_seen_scan_run_id, virtual_owner_installation_id
 	) VALUES (
 		$1, $2, $3, $4, $5,
@@ -941,10 +969,10 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		$20, $21, $22, $23, $24, $25,
 		$26, $27, $28, $29, $30, $31, $32,
 		$33, $34, $35, $36, $37, $38,
-		$39, $40, $41, $42,
-		$43, $44, $45, $46,
-		$47, $48,
-		$49, $50, $51, $52, $53
+		$39, $40, $41, $42, $43, $44,
+		$45, $46, $47, $48,
+		$49, $50, $51,
+		$52, $53, $54, $55, $56
 	)
 	ON CONFLICT (file_path) WHERE virtual_owner_installation_id IS NULL DO UPDATE SET
 		content_id = CASE
@@ -994,6 +1022,8 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		edition_key = EXCLUDED.edition_key,
 		edition_confidence = EXCLUDED.edition_confidence,
 		edition_source = EXCLUDED.edition_source,
+		release_name = EXCLUDED.release_name,
+		release_group = EXCLUDED.release_group,
 		presentation_kind = EXCLUDED.presentation_kind,
 		presentation_group_key = EXCLUDED.presentation_group_key,
 		presentation_part_index = EXCLUDED.presentation_part_index,
@@ -1002,6 +1032,7 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		multi_episode_end = EXCLUDED.multi_episode_end,
 		probe_source = EXCLUDED.probe_source,
 		probe_updated_at = EXCLUDED.probe_updated_at,
+		probe_version = EXCLUDED.probe_version,
 		match_suppressed_at = NULL,
 		missing_since = NULL,
 		updated_at = NOW()
@@ -1050,6 +1081,8 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		mf.EditionKey,
 		mf.EditionConfidence,
 		mf.EditionSource,
+		mf.ReleaseName,
+		mf.ReleaseGroup,
 		mf.PresentationKind,
 		mf.PresentationGroupKey,
 		nilIfZero(mf.PresentationPartIndex),
@@ -1058,6 +1091,7 @@ func (r *FileRepository) Upsert(ctx context.Context, mf models.MediaFile) (*mode
 		nilIfZero(mf.MultiEpisodeEnd),
 		probeSource,
 		mf.ProbeUpdatedAt,
+		mf.ProbeVersion,
 		mf.MissingSince,
 		nilIfEmpty(scanbatch.RunID(ctx)),
 		virtualOwnerInstallationValue(mf),
@@ -1158,15 +1192,21 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 		}
 		var id int
 		err = tx.QueryRow(ctx, `
+			-- The provider display label is display-only metadata: it lives in
+			-- edition_raw (the version flyout's fallback). Virtual files have no
+			-- filename to parse a release name from, so release_name and
+			-- release_group stay empty (the column default) on both insert and
+			-- conflict update, matching upsertVirtualFileVariant and the cleanup
+			-- migration 20260908140000_cleanup_virtual_release_metadata.sql.
 			INSERT INTO media_files (
 				content_id, episode_id, media_folder_id, file_path, file_size,
 				resolution, codec_video, codec_audio, hdr, container, bitrate,
-				edition_raw, audio_tracks, subtitle_tracks, probe_source,
+				edition_raw, release_name, release_group, audio_tracks, subtitle_tracks, probe_source,
 				probe_updated_at, virtual_owner_installation_id
 			) VALUES (
 				$1, NULLIF($2,''), $3, $4, $5,
 				NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), $9, 'virtual',
-				NULLIF($10,0), $11, $12, $13, 'virtual', NOW(), $14
+				NULLIF($10,0), $11, '', '', $12, $13, 'virtual', NOW(), $14
 			)
 			ON CONFLICT (file_path, virtual_owner_installation_id, media_folder_id)
 				WHERE virtual_owner_installation_id IS NOT NULL
@@ -1182,6 +1222,8 @@ func (r *FileRepository) ReplaceVirtualCandidates(ctx context.Context, source *m
 				container='virtual',
 				bitrate=EXCLUDED.bitrate,
 				edition_raw=EXCLUDED.edition_raw,
+				release_name='',
+				release_group='',
 				audio_tracks=EXCLUDED.audio_tracks,
 				subtitle_tracks=EXCLUDED.subtitle_tracks,
 				probe_source='virtual',
@@ -1267,14 +1309,63 @@ func virtualCandidateGroup(raw string) (string, bool) {
 // MarkVirtualCandidateFailed stamps a virtual candidate row as known-bad after
 // a transport produced no bytes (corrupted NZB, dead provider URL). The
 // auto-pick skips failed candidates; a fresh listing clears the flag.
-func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID int) error {
+//
+// The write is fenced on the candidate identity the caller actually inspected:
+// expectedFilePath must still be the row's file_path and observedFailedAt must
+// still be the row's failed_at. A concurrent candidate rotation (the row's
+// file_path now points at a replacement candidate) or a newer failure stamp
+// therefore makes the write a no-op instead of mis-marking the replacement or
+// clearing fresh evidence. This mirrors ReplaceVirtualResultPin's
+// `WHERE id=$1 AND file_path=$2` guard.
+func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
 	if r == nil || r.pool == nil {
 		return errors.New("file repository is not configured")
 	}
 	if fileID <= 0 {
 		return nil
 	}
-	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NOW(), updated_at = NOW() WHERE id = $1`, fileID)
+	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NOW(), updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3`, fileID, expectedFilePath, observedFailedAt)
+	return err
+}
+
+// ClearVirtualCandidateFailed clears the failed_at stamp on a virtual candidate
+// row after a liveness check resolved its pinned result successfully, so the
+// auto-pick considers it again. No-op when the row is not virtual or has
+// vanished.
+//
+// Like MarkVirtualCandidateFailed, the write is fenced on the candidate
+// identity the check inspected: expectedFilePath must still be the row's
+// file_path and observedFailedAt must still be the row's failed_at, so a
+// concurrent rotation or a newer failure stamp is never cleared by a stale
+// success.
+func (r *FileRepository) ClearVirtualCandidateFailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
+	if r == nil || r.pool == nil {
+		return errors.New("file repository is not configured")
+	}
+	if fileID <= 0 {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NULL, updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, expectedFilePath, observedFailedAt)
+	return err
+}
+
+// MarkVirtualCandidateRecovered clears a virtual candidate's failed_at stamp
+// after that candidate actually delivered media bytes to a client. This is the
+// transport-delivery counterpart to ClearVirtualCandidateFailed: the caller
+// passes the candidate identity the transport served (the row's file_path AT
+// DELIVERY TIME, which a session retains even after the row rotates) and the
+// failure timestamp observed when the transport started, so the write only
+// lands when the row still describes the delivered candidate in the observed
+// health state. A rotated row (now describing candidate B) or a newer failure
+// stamp on candidate A is never cleared by a late delivery of A.
+func (r *FileRepository) MarkVirtualCandidateRecovered(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error {
+	if r == nil || r.pool == nil {
+		return errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(deliveredFilePath) == "" {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NULL, updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, deliveredFilePath, observedFailedAt)
 	return err
 }
 
@@ -1373,13 +1464,15 @@ func (r *FileRepository) updateIdentity(ctx context.Context, mf models.MediaFile
 		edition_key = $15,
 		edition_confidence = $16,
 		edition_source = $17,
-		presentation_kind = $18,
-		presentation_group_key = $19,
-		presentation_part_index = $20,
-		presentation_part_total = $21,
-		multi_episode_start = $22,
-		multi_episode_end = $23,
-		external_subtitles = COALESCE($24, external_subtitles),
+		release_name = $18,
+		release_group = $19,
+		presentation_kind = $20,
+		presentation_group_key = $21,
+		presentation_part_index = $22,
+		presentation_part_total = $23,
+		multi_episode_start = $24,
+		multi_episode_end = $25,
+		external_subtitles = COALESCE($26, external_subtitles),
 		match_suppressed_at = NULL,
 		updated_at = NOW()
 	WHERE file_path = $1
@@ -1404,6 +1497,8 @@ func (r *FileRepository) updateIdentity(ctx context.Context, mf models.MediaFile
 		mf.EditionKey,
 		mf.EditionConfidence,
 		mf.EditionSource,
+		mf.ReleaseName,
+		mf.ReleaseGroup,
 		mf.PresentationKind,
 		mf.PresentationGroupKey,
 		nilIfZero(mf.PresentationPartIndex),
@@ -2253,17 +2348,72 @@ func (r *FileRepository) GetByID(ctx context.Context, id int) (*models.MediaFile
 	return scanMediaFile(r.pool.QueryRow(ctx, query, id))
 }
 
+// stripVirtualResultParam returns the virtual URI with the pinned ?result=
+// selection removed, preserving the scheme/host/path and every other query
+// parameter. The result parameter is removed wherever it appears in the query
+// string (leading, trailing, or between other parameters). A URI whose only
+// query parameter was result collapses to the bare path with no trailing '?'.
+// The input is returned unchanged when it carries no result parameter or
+// cannot be parsed.
+func stripVirtualResultParam(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	q := parsed.Query()
+	if strings.TrimSpace(q.Get("result")) == "" {
+		return raw
+	}
+	q.Del("result")
+	parsed.RawQuery = q.Encode()
+	return parsed.String()
+}
+
+// unpinVirtualResult strips the pinned ?result= selection from a virtual
+// file's path inside a transaction, preserving every other query parameter.
+// It is a no-op when the row vanished, no longer matches expectedPath (CAS),
+// or carries no result parameter. expectedPath "" skips the CAS check.
+func (r *FileRepository) unpinVirtualResult(ctx context.Context, fileID int, expectedPath string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var currentPath string
+	err = tx.QueryRow(ctx, `SELECT file_path FROM media_files WHERE id = $1 FOR UPDATE`, fileID).Scan(&currentPath)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read current path: %w", err)
+	}
+	if expectedPath != "" && currentPath != expectedPath {
+		return nil
+	}
+	neutralPath := stripVirtualResultParam(currentPath)
+	if neutralPath == currentPath {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE media_files
+		SET file_path = $1
+		WHERE id = $2 AND file_path = $3`, neutralPath, fileID, currentPath); err != nil {
+		return fmt.Errorf("update path: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
 // ClearVirtualResultPin strips the pinned ?result= selection from a virtual
 // file's path so the next playback re-lists live provider candidates instead
 // of resolving a cached link that just failed (expired or 5xx-ing debrid
 // links otherwise brick the title: the pin survives every failover). No-op
 // when the row has no pin or vanished concurrently.
 func (r *FileRepository) ClearVirtualResultPin(ctx context.Context, fileID int) error {
-	_, err := r.pool.Exec(ctx, `
-		UPDATE media_files
-		SET file_path = regexp_replace(file_path, '\?result=[^&]*$', '')
-		WHERE id = $1 AND file_path LIKE '%?result=%'`, fileID)
-	if err != nil {
+	if err := r.unpinVirtualResult(ctx, fileID, ""); err != nil {
 		return fmt.Errorf("clear virtual result pin for file %d: %w", fileID, err)
 	}
 	return nil
@@ -2272,12 +2422,30 @@ func (r *FileRepository) ClearVirtualResultPin(ctx context.Context, fileID int) 
 // ReplaceVirtualResultPin conditionally updates a virtual file's path if it still
 // matches expectedPath. This prevents concurrent playback sessions or stale attempts
 // from clobbering a newer or already-updated file path.
+//
+// Collision semantics: the unique index media_files_virtual_file_owner_key
+// (file_path, virtual_owner_installation_id, media_folder_id) means a replacement
+// path can only be written to this row if no sibling row already owns that tuple.
+// A unique violation (SQLSTATE 23505) therefore means the winning candidate is a
+// separate live row that a concurrent scan/refresh already re-listed — repointing
+// this row would duplicate it. In that case the dead pin on this row is simply
+// stripped (reverted to the neutral no-pin path so it re-lists next time) and
+// (false, nil) is returned: the pin was not moved, this row was unpinned instead.
 func (r *FileRepository) ReplaceVirtualResultPin(ctx context.Context, fileID int, expectedPath, replacementPath string) (bool, error) {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE media_files
 		SET file_path = $1
 		WHERE id = $2 AND file_path = $3`, replacementPath, fileID, expectedPath)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			// Another row already owns the (replacementPath, owner, folder) tuple.
+			// Strip this row's pin instead of repointing it at the live candidate.
+			if unpinErr := r.unpinVirtualResult(ctx, fileID, expectedPath); unpinErr != nil {
+				return false, fmt.Errorf("replace virtual result pin for file %d: %w", fileID, unpinErr)
+			}
+			return false, nil
+		}
 		return false, fmt.Errorf("replace virtual result pin for file %d: %w", fileID, err)
 	}
 	return tag.RowsAffected() > 0, nil

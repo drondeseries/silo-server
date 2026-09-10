@@ -23,6 +23,7 @@ import {
 import {
   cancelItemDetailQueries,
   invalidateMediaSurfaceQueries,
+  isTerminalItemDetailNotFound,
   scheduleMediaSurfaceInvalidation,
   updateCatalogItemDetail,
 } from "./mediaSurfaceRefresh";
@@ -516,7 +517,10 @@ export function useApplyItemImage() {
           queryKey: ["catalog", "items", item.content_id, "detail"],
         }),
         queryClient.invalidateQueries({ queryKey: ["items", "watchDetail", item.content_id] }),
-        queryClient.invalidateQueries({ queryKey: catalogKeys.all }),
+        queryClient.invalidateQueries({
+          queryKey: catalogKeys.all,
+          predicate: (query) => !isTerminalItemDetailNotFound(query),
+        }),
         queryClient.invalidateQueries({ queryKey: sectionKeys.all }),
       ]);
 
@@ -630,7 +634,10 @@ export function useDeleteMediaItem() {
     onSuccess: (result) => {
       toast.success(result.message || "Item deleted");
       void queryClient.invalidateQueries({ queryKey: sectionKeys.all });
-      void queryClient.invalidateQueries({ queryKey: catalogKeys.all });
+      void queryClient.invalidateQueries({
+        queryKey: catalogKeys.all,
+        predicate: (query) => !isTerminalItemDetailNotFound(query),
+      });
     },
     onError: (error) => {
       toast.error(error instanceof Error ? error.message : "Failed to delete item");

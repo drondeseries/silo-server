@@ -1376,7 +1376,7 @@ func virtualDVLabel(isDV bool, profile int) string {
 // subtitle inventory comes only from the probe; provider subtitle hints stay on
 // the candidate stream for the picker and drive the background subtitle search.
 func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualPlaybackStream) {
-	if probed == nil {
+	if probed == nil || len(probed.AudioTracks) > 0 {
 		return
 	}
 	audioCodec := probed.CodecAudio
@@ -1388,25 +1388,41 @@ func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualP
 	}
 	channels := inferChannelsFromCodec(audioCodec)
 	if len(candidate.AudioLanguages) > 0 {
-		existing := make(map[string]bool, len(probed.AudioTracks))
-		for _, t := range probed.AudioTracks {
-			if lang := strings.TrimSpace(t.Language); lang != "" {
-				existing[strings.ToLower(lang)] = true
-			}
-		}
+		existing := make(map[string]bool, len(candidate.AudioLanguages))
 		for _, lang := range candidate.AudioLanguages {
 			lang = strings.TrimSpace(lang)
-			if lang == "" || !isRealVirtualLanguageTag(lang) || existing[strings.ToLower(lang)] {
+			if lang == "" || !isRealVirtualLanguageTag(lang) {
 				continue
 			}
-			existing[strings.ToLower(lang)] = true
+			canonical := virtualLanguageBaseSubtag(lang)
+			if existing[canonical] {
+				continue
+			}
+			existing[canonical] = true
 			probed.AudioTracks = append(probed.AudioTracks, models.AudioTrack{
+				// Synthesized tracks carry no real container stream index; the
+				// array position is the ordinal (audioStreamOrdinalV3 falls back
+				// to it when Index <= 0).
 				Language: lang,
 				Codec:    audioCodec,
 				Channels: channels,
 			})
 		}
 	}
+}
+
+// virtualLanguageBaseSubtag canonicalizes a language token to its ISO base
+// subtag ("ITA" → "it", "en-US" → "en"), so probe-recorded codes and
+// provider-declared codes dedup against the same key. Unparseable tokens fall
+// back to the lowercased trimmed input.
+func virtualLanguageBaseSubtag(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if tag, err := language.Parse(trimmed); err == nil {
+		if base, conf := tag.Base(); conf != language.No && base.String() != "" {
+			return base.String()
+		}
+	}
+	return strings.ToLower(trimmed)
 }
 
 // isRealVirtualLanguageTag reports whether a provider-declared language token

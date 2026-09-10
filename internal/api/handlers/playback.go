@@ -302,22 +302,27 @@ type PlaybackHandler struct {
 	// CopySafetyRacer resolves an unknown H.264 copy-safety verdict behind an
 	// already-issued stream-copy plan. Optional: nil keeps unknown verdicts
 	// unknown and never withdraws a copy route.
-	CopySafetyRacer              PlaybackCopySafetyRacer
-	ChapterThumbnailQueuer       PlaybackChapterThumbnailQueuer
-	IntroAnalyzer                IntroEpisodeAnalyzer
-	IntroRepository              PlaybackIntroEligibilityChecker
-	MarkerRegistry               *markers.Registry
-	MarkerResolver               markers.ExternalIDResolver
-	MarkerUpserter               PlaybackMarkerUpserter
-	MarkerUpdateNotifier         PlaybackMarkerUpdateNotifier
-	StartTranscodeFunc           func(context.Context, playback.TranscodeOpts) (*playback.TranscodeSession, error)
-	MarkerLazyContext            context.Context
-	MarkerLazyInFlight           sync.Map
-	v3StartEffectsOnce           sync.Once
-	v3StartEffectsQueue          chan playbackStartSideEffectsV3
-	v3StartEffectsMu             sync.Mutex
-	v3StartEffectsPending        map[string]*playbackStartSideEffectsStateV3
-	SubtitleRepo                 subtitles.Repository // optional; enables downloaded subtitles in playback
+	CopySafetyRacer        PlaybackCopySafetyRacer
+	ChapterThumbnailQueuer PlaybackChapterThumbnailQueuer
+	IntroAnalyzer          IntroEpisodeAnalyzer
+	IntroRepository        PlaybackIntroEligibilityChecker
+	MarkerRegistry         *markers.Registry
+	MarkerResolver         markers.ExternalIDResolver
+	MarkerUpserter         PlaybackMarkerUpserter
+	MarkerUpdateNotifier   PlaybackMarkerUpdateNotifier
+	StartTranscodeFunc     func(context.Context, playback.TranscodeOpts) (*playback.TranscodeSession, error)
+	MarkerLazyContext      context.Context
+	MarkerLazyInFlight     sync.Map
+	v3StartEffectsOnce     sync.Once
+	v3StartEffectsQueue    chan playbackStartSideEffectsV3
+	v3StartEffectsMu       sync.Mutex
+	v3StartEffectsPending  map[string]*playbackStartSideEffectsStateV3
+	SubtitleRepo           subtitles.Repository // optional; enables downloaded subtitles in playback
+	// SubtitleCache warms virtual subtitle extracts at plan time so the
+	// first subtitle click is served from cache instead of paying a full
+	// remote demux. Shared with StreamHandler's serve path — wired in the
+	// router from the single NewSubtitleCache instance.
+	SubtitleCache                *playback.SubtitleCache
 	RealtimeHub                  *playback.RealtimeHub
 	CommandTracker               *playback.CommandTracker
 	CommandDispatcher            *playback.CommandDispatcher
@@ -387,6 +392,13 @@ type PlaybackHandler struct {
 	v3ReplanSlots           chan struct{}
 	v3EventRateMu           sync.Mutex
 	v3EventRates            map[string]v3EventRate
+	// v3DVRPUVerds memoizes the Dolby Vision RPU strip verdict per catalog
+	// file-row identity (ID + size + mtime). The shared probe cache keys on
+	// bin|inputPath and the transport URL rotates per relay registration, so
+	// without this memo every sidecar replan would re-run the ~6s probe.
+	// Guarded by v3DVRPUMu.
+	v3DVRPUMu    sync.Mutex
+	v3DVRPUVerds map[dvRPUMemoKeyV3]bool
 }
 
 type PlaybackWatchScrobbler interface {
@@ -1509,7 +1521,11 @@ func (h *PlaybackHandler) HandleUpdateProgress(w http.ResponseWriter, r *http.Re
 	session, err := h.sessionMgr.GetSession(sessionID)
 	if err != nil {
 		if errors.Is(err, playback.ErrSessionNotFound) {
-			writePlaybackSessionNotFound(w)
+			// Progress for a session that is already gone (e.g. a version
+			// switch deleted it while a 10s progress tick was in flight) is a
+			// benign no-op, not an error the client must handle. Answer 204 so
+			// browsers don't log a 404 on every switch.
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load playback session")
@@ -1530,7 +1546,7 @@ func (h *PlaybackHandler) HandleUpdateProgress(w http.ResponseWriter, r *http.Re
 	err = h.sessionMgr.UpdateProgress(sessionID, req.Position, req.IsPaused)
 	if err != nil {
 		if errors.Is(err, playback.ErrSessionNotFound) {
-			writePlaybackSessionNotFound(w)
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update progress")

@@ -121,6 +121,8 @@ export interface ActionBarProps {
   playbackVariants?: PlaybackVariant[];
   selectedVersion?: FileVersion | null;
   onSelectVersion?: (version: FileVersion) => void;
+  /** Fired when a version picker popover opens or closes (open=true on open). */
+  onVersionPickerOpenChange?: (open: boolean) => void;
   onDownload?: () => void;
   onSearchSubtitles?: () => void;
   rating?: number | null;
@@ -128,6 +130,9 @@ export interface ActionBarProps {
   qualityPreference?: string | null;
   audioSelectionMode?: "auto" | "explicit";
   explicitAudioTrackIndex?: number | null;
+  /** True when the play target version was explicitly chosen by the viewer;
+   * the server must not silently substitute another version. */
+  explicitFileSelection?: boolean;
   onSelectAudioTrack?: (trackIndex: number) => void;
   onResetAudioSelection?: () => void;
   prePlaySubtitleMode?: "auto" | "off" | "explicit";
@@ -173,12 +178,14 @@ export default function ActionBar({
   playbackVariants,
   selectedVersion,
   onSelectVersion,
+  onVersionPickerOpenChange,
   onDownload,
   onSearchSubtitles,
   rating,
   onRatingChange,
   audioSelectionMode = "auto",
   explicitAudioTrackIndex = null,
+  explicitFileSelection = false,
   onSelectAudioTrack,
   onResetAudioSelection,
   prePlaySubtitleMode = "auto",
@@ -246,8 +253,15 @@ export default function ActionBar({
       prePlaySubtitleMode,
       prePlaySubtitleSelection:
         prePlaySubtitleMode === "explicit" ? explicitSubtitleSelection : null,
+      explicitFileSelection,
     }),
-    [audioSelectionMode, explicitAudioTrackIndex, explicitSubtitleSelection, prePlaySubtitleMode],
+    [
+      audioSelectionMode,
+      explicitAudioTrackIndex,
+      explicitSubtitleSelection,
+      explicitFileSelection,
+      prePlaySubtitleMode,
+    ],
   );
   const startPlaybackFromHref = useCallback(
     (href: string, restartOverride?: boolean) => {
@@ -785,6 +799,7 @@ export default function ActionBar({
               playbackVariants={playbackVariants}
               selectedVersion={selectedVersion}
               onSelectVersion={onSelectVersion}
+              onOpenChange={onVersionPickerOpenChange}
             />
           )}
           {selectedVersion && (selectedVersion.audio_tracks?.length ?? 0) > 0 && (

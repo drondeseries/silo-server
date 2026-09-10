@@ -404,6 +404,12 @@ func scopedFolderPaths(folder *models.MediaFolder, paths []string) *models.Media
 	return &clone
 }
 
+// probeVersion is the current shape version of probe-derived columns. It is
+// written on every probe; rows probed under an older shape (e.g. audio tracks
+// without a languages array) fail needsCriticalProbeRepairScanState and are
+// re-probed once.
+const probeVersion = 1
+
 // walkMode tells walkLogicalTree which file extensions to surface and
 // which library-specific filename heuristics (sample/extra skipping)
 // to apply.
@@ -3037,7 +3043,8 @@ func populateScanIdentity(
 		mf.EpisodeNumber = filenameHints.EpisodeNum
 	}
 	variantHints := naming.ParseVariantHints(filePath, folderType)
-	if existing != nil && existing.EditionSource == "import" && existing.EditionKey != "" {
+	importVariantOverride := existing != nil && existing.EditionSource == "import" && existing.EditionKey != ""
+	if importVariantOverride {
 		variantHints = &naming.VariantHints{
 			EditionRaw:            existing.EditionRaw,
 			EditionKey:            existing.EditionKey,
@@ -3060,6 +3067,17 @@ func populateScanIdentity(
 		mf.PresentationPartIndex = variantHints.PresentationPartIndex
 		mf.MultiEpisodeStart = variantHints.MultiEpisodeStart
 		mf.MultiEpisodeEnd = variantHints.MultiEpisodeEnd
+	}
+	// Release name/group come from the filename itself. The import override
+	// pins only the edition fields, so re-parse a fresh hints value for the
+	// release fields to keep the override struct untouched.
+	releaseHints := variantHints
+	if importVariantOverride {
+		releaseHints = naming.ParseVariantHints(filePath, folderType)
+	}
+	if releaseHints != nil {
+		mf.ReleaseName = releaseHints.ReleaseName
+		mf.ReleaseGroup = releaseHints.ReleaseGroup
 	}
 }
 
@@ -3310,7 +3328,15 @@ func needsCriticalProbeRepairScanState(file *scanStateFile) bool {
 	if file == nil {
 		return true
 	}
+	// Virtual files are never probed from disk; their track shape is declared
+	// by the provider, not discovered by ffprobe. Mirror isVirtualMediaFile.
+	if strings.HasPrefix(file.FilePath, "virtual://") || strings.EqualFold(file.Container, "virtual") {
+		return false
+	}
 	if file.DVProvenanceCurrent != nil && !*file.DVProvenanceCurrent {
+		return true
+	}
+	if file.ProbeVersion < probeVersion {
 		return true
 	}
 	if strings.TrimSpace(file.ProbeSource) == "" || file.ProbeUpdatedAt == nil {
@@ -3845,6 +3871,7 @@ func applyProbeData(mf *models.MediaFile, probe *ProbeData, probeSource string) 
 		mf.Bitrate = int(impliedBitrateBps(mf.FileSize, float64(mf.Duration)) / 1000)
 	}
 	mf.ProbeSource = probeSource
+	mf.ProbeVersion = probeVersion
 
 	now := time.Now().UTC()
 	mf.ProbeUpdatedAt = &now
@@ -3889,9 +3916,11 @@ func applyProbeData(mf *models.MediaFile, probe *ProbeData, probeSource string) 
 	audioTracks := make([]models.AudioTrack, len(probe.AudioTracks))
 	for i, at := range probe.AudioTracks {
 		audioTracks[i] = models.AudioTrack{
+			Index:         at.Index,
 			Title:         at.Title,
 			EmbeddedTitle: at.EmbeddedTitle,
 			Language:      at.Language,
+			Languages:     append([]string(nil), at.Languages...),
 			Codec:         at.Codec,
 			Profile:       at.Profile,
 			Layout:        at.Layout,

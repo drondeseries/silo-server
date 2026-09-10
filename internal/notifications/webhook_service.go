@@ -48,6 +48,7 @@ type WebhookInput struct {
 	NotifyContinueWatching *bool
 	NotifyNextUp           *bool
 	NotifyRequests         *bool
+	NotifyRatings          *bool
 }
 
 // validateChannelName applies the shared destination-name policy (matching
@@ -165,6 +166,7 @@ func (s *WebhookService) Create(ctx context.Context, userID int, profileID strin
 		NotifyContinueWatching: boolOrDefault(input.NotifyContinueWatching, true),
 		NotifyNextUp:           boolOrDefault(input.NotifyNextUp, true),
 		NotifyRequests:         boolOrDefault(input.NotifyRequests, true),
+		NotifyRatings:          boolOrDefault(input.NotifyRatings, false),
 	}
 	hook.URLCiphertext, err = s.cipher.Encrypt(rawURL, webhookURLAAD(hook.ID))
 	if err != nil {
@@ -252,6 +254,9 @@ func (s *WebhookService) Update(ctx context.Context, profileID, id string, input
 	}
 	if input.NotifyRequests != nil {
 		hook.NotifyRequests = *input.NotifyRequests
+	}
+	if input.NotifyRatings != nil {
+		hook.NotifyRatings = *input.NotifyRatings
 	}
 
 	if err := s.repo.Update(ctx, *hook); err != nil {

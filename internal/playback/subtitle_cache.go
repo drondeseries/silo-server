@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/httpstream"
+	"golang.org/x/sync/singleflight"
 )
 
 // SubtitleCache stores complete SUP, VTT, and ASS subtitle extracts on disk
@@ -50,16 +52,21 @@ type SubtitleCache struct {
 	// non-blocking: warms beyond the budget are dropped, not queued; the
 	// next windowed miss for that track re-attempts the warm.
 	warmSem chan struct{}
+
+	// fontBundleFlight coalesces concurrent font-bundle extractions for the
+	// same source so a font fetch stampede runs ffprobe+ffmpeg exactly once.
+	fontBundleFlight singleflight.Group
 }
 
 const (
-	subtitleFormatSRT    = "srt"
-	subtitleCodecSubRip  = "subrip"
-	subtitleCodecSSA     = "ssa"
-	subtitleFormatSUP    = "sup"
-	subtitleFormatASS    = "ass"
-	subtitleMuxerWebVTT  = "webvtt"
-	subtitleCacheDirName = "subtitle-cache"
+	subtitleFormatSRT        = "srt"
+	subtitleCodecSubRip      = "subrip"
+	subtitleCodecSSA         = "ssa"
+	subtitleFormatSUP        = "sup"
+	subtitleFormatASS        = "ass"
+	subtitleMuxerWebVTT      = "webvtt"
+	subtitleFormatFontBundle = "fontbundle"
+	subtitleCacheDirName     = "subtitle-cache"
 	// defaultSubtitleCacheMaxBytes caps the cache at 2 GiB — PGS tracks run
 	// 15-80 MB, so this holds a few dozen tracks.
 	// TODO: expose as a config knob following the download.artifact_max_bytes
@@ -76,6 +83,15 @@ const (
 	// demux of a large remux on network storage can take minutes; anything
 	// beyond this is stuck and should release its slot.
 	subtitleCacheWarmTimeout = 30 * time.Minute
+	// subtitleCacheGenerationBucket bounds the staleness of identity-keyed
+	// (remote / virtual / generated) cache entries: the key rotates every ten
+	// minutes, so a source that rotated can never be served past the bucket
+	// boundary.
+	subtitleCacheGenerationBucket = 10 * time.Minute
+	// subtitleFontBundleExtractTimeout bounds one shared font-bundle
+	// extraction. The extraction runs detached from the leading request (see
+	// ExtractFontBundle), so a hung upstream cannot pin a flight forever.
+	subtitleFontBundleExtractTimeout = 60 * time.Second
 )
 
 // SUPExtractFunc runs one ffmpeg subtitle extract described by opts, writing
@@ -130,6 +146,26 @@ func (c *SubtitleCache) ServeExtract(w http.ResponseWriter, r *http.Request, opt
 			// A previous owner may have committed between lookup and reservation.
 			fill.Discard()
 			return nil
+		}
+	} else {
+		// Windowed text fetches are position-dependent slices, so they are
+		// never cached themselves — but the cache still speeds them up,
+		// exactly like serveWindowedSUP does for PGS: when a committed
+		// full-track entry exists, the windowed extract's input is rewritten
+		// to that small artifact (the -ss scan reads kilobytes instead of
+		// re-demuxing a multi-GB remote source), and when it doesn't, a
+		// detached warm is kicked off so later windows hit the fast path.
+		// The committed-entry lookup always runs: virtual relay sources
+		// disable only the background warm (a detached fill must not outlive
+		// the request-scoped relay registration) while an already-populated
+		// entry must still be served instead of re-demuxing the source.
+		if cachedPath, _, ok := c.cachedFormatEntryPath(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format); ok {
+			slog.DebugContext(r.Context(), "windowed text subtitle extract using cached full track",
+				"input", opts.InputPath, "track", opts.TrackIndex, "cache_entry", cachedPath)
+			opts.InputPath = cachedPath
+			opts.InputIsExtractedText = format
+		} else if !opts.DisableBackgroundWarm {
+			c.WarmTrackInBackground(opts, extract)
 		}
 	}
 
@@ -305,6 +341,87 @@ func (c *SubtitleCache) WarmInBackground(opts StreamExtractOpts, extract SUPExtr
 			"input", opts.InputPath, "track", opts.TrackIndex,
 			"elapsed_ms", time.Since(start).Milliseconds())
 	}()
+}
+
+// WarmTrackInBackground starts a detached full-track extract for one subtitle
+// track in any output format (text VTT/ASS or bitmap .sup), so the first
+// client fetch — full-track or windowed — hits the cache instead of paying a
+// full remote demux. The returned channel closes exactly once when the warm
+// finished (success or failure) or was skipped (warm slots busy, another fill
+// in flight, cache disabled, already cached); callers use it to release a
+// request-scoped relay registration the warm held open.
+//
+// Staleness for identity-keyed (virtual) sources follows the same 10-minute
+// generation bucket as every other cache lookup: an entry committed under an
+// earlier bucket is not found by later lookups, so a warm that loses its
+// bucket race is simply re-kicked by the next windowed miss.
+func (c *SubtitleCache) WarmTrackInBackground(opts StreamExtractOpts, extract SUPExtractFunc) <-chan struct{} {
+	done := make(chan struct{})
+	_, format := streamExtractOutput(opts.SourceCodec, opts.TargetFormat)
+	if format == subtitleMuxerWebVTT {
+		format = SubtitleFormatVTTV3
+	}
+	if c == nil || extract == nil || c.dir() == "" || format == "" {
+		close(done)
+		return done
+	}
+	// Already committed under the current bucket: nothing to warm.
+	if _, _, ok := c.cachedFormatEntryPath(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format); ok {
+		close(done)
+		return done
+	}
+	select {
+	case c.warmSem <- struct{}{}:
+	default:
+		slog.Debug("subtitle cache warm skipped: all warm slots busy",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		close(done)
+		return done
+	}
+	fill := c.beginFill(opts.InputPath, opts.CacheIdentity, opts.TrackIndex, format)
+	if fill == nil {
+		// Another fill (client-driven or a previous warm) is already in
+		// flight, or the cache is unusable — either way, nothing to do.
+		<-c.warmSem
+		close(done)
+		return done
+	}
+
+	// Full-track options: the warm ignores the triggering request's window
+	// and writes only to the cache temp file (no response writer).
+	opts.SeekSeconds = 0
+	opts.DurationSeconds = 0
+	opts.AllowWindow = false
+	opts.InputIsExtractedSup = false
+	opts.InputIsExtractedText = ""
+	opts.Writer = fill.Tee(io.Discard)
+
+	go func() {
+		defer close(done)
+		defer func() { <-c.warmSem }()
+		ctx, cancel := context.WithTimeout(context.Background(), subtitleCacheWarmTimeout)
+		defer cancel()
+
+		start := time.Now()
+		slog.Info("subtitle cache warm started",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", format)
+		if err := extract(ctx, opts); err != nil {
+			fill.Discard()
+			slog.Warn("subtitle cache warm failed",
+				"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
+				"elapsed_ms", time.Since(start).Milliseconds(), "error", err)
+			return
+		}
+		if err := fill.Commit(); err != nil {
+			slog.Warn("subtitle cache warm commit failed",
+				"input", opts.InputPath, "track", opts.TrackIndex, "error", err)
+			return
+		}
+		slog.Info("subtitle cache warm finished",
+			"input", opts.InputPath, "track", opts.TrackIndex, "format", format,
+			"elapsed_ms", time.Since(start).Milliseconds())
+	}()
+	return done
 }
 
 // dir resolves the cache directory, or "" when caching is disabled.
@@ -517,15 +634,205 @@ func (c *SubtitleCache) beginFill(inputPath, cacheIdentity string, trackIndex in
 
 func subtitleCacheSource(inputPath, cacheIdentity string, now time.Time) (string, time.Time, int64, bool) {
 	if identity := strings.TrimSpace(cacheIdentity); identity != "" {
-		const generation = 10 * time.Minute
-		bucket := now.Unix() / int64(generation/time.Second)
-		return identity, time.Unix(bucket*int64(generation/time.Second), 0), 0, true
+		bucket := now.Unix() / int64(subtitleCacheGenerationBucket/time.Second)
+		return identity, time.Unix(bucket*int64(subtitleCacheGenerationBucket/time.Second), 0), 0, true
 	}
 	src, err := os.Stat(inputPath)
 	if err != nil {
 		return "", time.Time{}, 0, false
 	}
 	return inputPath, src.ModTime(), src.Size(), true
+}
+
+// FontBundleKey is a stable identity for font-bundle caching. Virtual rows
+// key on the pinned result id — resolved relay URLs rotate per registration
+// and would defeat the cache (mirror of the DV RPU memo key). Local rows key
+// on the file row's size and mtime so a re-probed or replaced file reads as a
+// miss.
+type FontBundleKey struct {
+	FileID        int
+	PinnedResult  string // "" for local files
+	Size          int64
+	MtimeUnixNano int64
+	FFmpegPath    string
+}
+
+// source resolves the stable cache identity and invalidation coordinates for
+// the key, mirroring subtitleCacheSource's two modes. Local rows use the file
+// row's mtime/size verbatim (no generation bucket); virtual rows key on the
+// pinned result id plus a 10-minute generation bucket so a rotated source can
+// never be served past the bucket boundary. ok is false for rows that cannot
+// be keyed reliably (a local row without a usable mtime/size), which callers
+// treat as "do not cache" — the same fallback the DV RPU memo uses.
+func (k FontBundleKey) source(now time.Time) (identity string, modTime time.Time, size int64, ok bool) {
+	if k.PinnedResult != "" {
+		bucket := now.Unix() / int64(subtitleCacheGenerationBucket/time.Second)
+		return fontBundleIdentity(k.FileID, k.PinnedResult, k.FFmpegPath, bucket),
+			time.Unix(bucket*int64(subtitleCacheGenerationBucket/time.Second), 0), 0, true
+	}
+	if k.MtimeUnixNano == 0 || k.Size <= 0 {
+		return "", time.Time{}, 0, false
+	}
+	return fontBundleIdentity(k.FileID, "", k.FFmpegPath, 0), time.Unix(0, k.MtimeUnixNano), k.Size, true
+}
+
+// fontBundleIdentity hashes the stable components of a font-bundle cache key.
+// The ffmpeg path is included so a binary relocation (which can change
+// extraction output) starts a fresh cache.
+func fontBundleIdentity(fileID int, pinnedResult, ffmpegPath string, bucket int64) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s|%d", fileID, pinnedResult, ffmpegPath, bucket)))
+	return fmt.Sprintf("%x", sum[:12])
+}
+
+func fontBundleCacheFileName(identity string, modTime time.Time, size int64) string {
+	return fmt.Sprintf("fb-%s-%d-%d.%s", identity, modTime.UnixNano(), size, subtitleFormatFontBundle)
+}
+
+// VirtualSubtitleCacheIdentity is the credential-free, stable cache identity
+// for a virtual subtitle extract. Relay URLs rotate per registration and would
+// defeat the cache, so the identity is built from the pinned provider-neutral
+// URI's "result=" candidate id plus the effective ffmpeg track ordinal (the
+// ordinal the extraction will actually map, after any drift remap). Staleness
+// is bounded by the same 10-minute generation bucket subtitleCacheSource
+// applies to identity-keyed entries.
+func VirtualSubtitleCacheIdentity(fileID int, virtualSourceURI string, trackIndex int) string {
+	pinned := ""
+	if parsed, err := url.Parse(strings.TrimSpace(virtualSourceURI)); err == nil {
+		pinned = strings.TrimSpace(parsed.Query().Get("result"))
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%d", fileID, pinned, trackIndex)))
+	return fmt.Sprintf("%x", sum[:12])
+}
+
+// LookupFontBundle returns the cached encoded font-bundle JSON for the key, or
+// false on a miss. A nil receiver reads as a miss so cache-less handlers keep
+// their uncached path.
+func (c *SubtitleCache) LookupFontBundle(key FontBundleKey) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+	path, ok := c.fontBundleEntryPath(key, time.Now())
+	if !ok {
+		return nil, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+// ExtractFontBundle returns the encoded font-bundle JSON for the key, reusing
+// a committed disk entry when present and otherwise running extract once under
+// single-flight and writing the result through to disk for every waiter. The
+// extraction runs on a context detached from the leading request (bounded to
+// subtitleFontBundleExtractTimeout), so a canceled leader does not fail the
+// shared work other callers are waiting on.
+func (c *SubtitleCache) ExtractFontBundle(ctx context.Context, key FontBundleKey, extract func(context.Context) ([]byte, error)) ([]byte, error) {
+	if c == nil {
+		return extract(ctx)
+	}
+	if data, ok := c.LookupFontBundle(key); ok {
+		return data, nil
+	}
+	identity, modTime, size, ok := key.source(time.Now())
+	if !ok {
+		// Not reliably keyable (e.g. a local row without mtime/size): extract
+		// uncached, matching the DV RPU memo's fallback.
+		return extract(ctx)
+	}
+	// The flight key carries the invalidation coordinates too, so concurrent
+	// requests for a changed source version (different mtime/size) do not
+	// coalesce onto the stale version's extraction.
+	flightKey := fmt.Sprintf("fontbundle:%s-%d-%d", identity, modTime.UnixNano(), size)
+	v, err, _ := c.fontBundleFlight.Do(flightKey, func() (any, error) {
+		// Another caller may have committed the entry while we waited to lead.
+		if data, ok := c.LookupFontBundle(key); ok {
+			return data, nil
+		}
+		extractCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), subtitleFontBundleExtractTimeout)
+		defer cancel()
+		data, extractErr := extract(extractCtx)
+		if extractErr != nil {
+			return nil, extractErr
+		}
+		if storeErr := c.storeFontBundle(key, data); storeErr != nil {
+			slog.WarnContext(ctx, "subtitle font bundle cache store failed", "error", storeErr)
+		}
+		return data, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	data, _ := v.([]byte)
+	return data, nil
+}
+
+// fontBundleEntryPath resolves the committed cache-entry path for the key and
+// stats it, bumping its mtime for LRU eviction. ok is false when the cache is
+// disabled, the key is not reliably keyable, or no entry exists.
+func (c *SubtitleCache) fontBundleEntryPath(key FontBundleKey, now time.Time) (string, bool) {
+	dir := c.dir()
+	if dir == "" {
+		return "", false
+	}
+	identity, modTime, size, ok := key.source(now)
+	if !ok {
+		return "", false
+	}
+	path := filepath.Join(dir, fontBundleCacheFileName(identity, modTime, size))
+	if _, err := os.Stat(path); err != nil {
+		return "", false
+	}
+	// Recency bump for LRU eviction.
+	now = time.Now()
+	if err := os.Chtimes(path, now, now); err != nil {
+		slog.Debug("subtitle cache recency bump failed", "path", path, "error", err)
+	}
+	return path, true
+}
+
+// storeFontBundle publishes the encoded font-bundle bytes with an atomic
+// temp-file + rename commit, following the payload cache's Commit pattern. The
+// temp file carries the ".part-" marker so the stale-sibling sweep reclaims it
+// after a crash.
+func (c *SubtitleCache) storeFontBundle(key FontBundleKey, data []byte) error {
+	dir := c.dir()
+	if dir == "" {
+		return nil
+	}
+	identity, modTime, size, ok := key.source(time.Now())
+	if !ok {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	final := filepath.Join(dir, fontBundleCacheFileName(identity, modTime, size))
+	tmp, err := os.CreateTemp(dir, filepath.Base(final)+".part-*")
+	if err != nil {
+		return fmt.Errorf("subtitle font bundle temp create: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, final); err != nil {
+		return fmt.Errorf("subtitle font bundle publish: %w", err)
+	}
+	// Evict stale font-bundle entries so they don't accumulate past the budget.
+	// The recognizer in evict already handles .fontbundle files.
+	c.evict(dir)
+	return nil
 }
 
 func (c *SubtitleCache) release(key string) {
@@ -671,7 +978,7 @@ func (c *SubtitleCache) evict(dir string) {
 			}
 			continue
 		}
-		if !slices.Contains([]string{SubtitleExtPGSV3, SubtitleExtVTTV3, SubtitleExtASSV3, ".srt"}, filepath.Ext(e.Name())) {
+		if !slices.Contains([]string{SubtitleExtPGSV3, SubtitleExtVTTV3, SubtitleExtASSV3, ".srt", "." + subtitleFormatFontBundle}, filepath.Ext(e.Name())) {
 			continue
 		}
 		ents = append(ents, cacheEnt{path: path, size: info.Size(), mtime: info.ModTime()})

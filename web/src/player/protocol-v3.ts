@@ -303,6 +303,16 @@ export interface StartRequestV3 {
   progress_persistence?: ProgressPersistenceV3;
   audio_track_id?: string;
   audio_track_index?: number;
+  /** Audio track identity carried from the current plan into a replacement
+   * start (a version switch); remapped by family onto the new file server-side. */
+  carried_audio_track_id?: string;
+  /**
+   * How the requested file was chosen. `explicit` means the viewer picked a
+   * specific version; the server must not silently substitute another one.
+   * `auto` (or omitted) lets the server adapt the file when the plan is
+   * terminal for a capability reason.
+   */
+  file_selection?: "auto" | "explicit";
   subtitle_track_id?: string;
   subtitle_track_index?: number;
   metered: boolean;
@@ -510,6 +520,30 @@ export interface SubtitleDecisionV3 {
   inventory: SubtitleInventoryItemV3[];
 }
 
+/**
+ * One probed audio stream of the effective source, mirroring the catalog's
+ * file-version `audio_tracks` shape so a client renders the same menu from
+ * either source. `index` is the ABSOLUTE container stream index as probed by
+ * ffprobe (video 0, first audio 1, subtitles interleaved) — NOT the
+ * audio-only FFmpeg ordinal `0:a:N` expects, and NOT the track's array
+ * position. Clients must not send it as an ffmpeg map value directly.
+ */
+export interface AudioTrackV3 {
+  index?: number;
+  title?: string;
+  embedded_title?: string;
+  language?: string;
+  languages?: string[];
+  codec?: string;
+  profile?: string;
+  layout?: string;
+  channels?: number;
+  bitrate?: number;
+  sample_rate?: number;
+  bit_depth?: number;
+  default: boolean;
+}
+
 export interface AppliedQuirkV3 {
   id: string;
   registry_revision: string;
@@ -558,6 +592,14 @@ export interface PlanV3 {
   effective_media_file_id: number;
   source: SourceDescriptorV3;
   subtitle_fidelity_policy: string;
+  /**
+   * Authoritative per-track audio inventory of the effective source, mirroring
+   * the subtitle inventory. Clients should prefer it over item metadata: after
+   * a version fallback the effective file can differ from the requested
+   * catalog row, and only this list reflects the tracks the plan actually
+   * plays. Shape matches the catalog's file-version `audio_tracks`.
+   */
+  audio_tracks?: AudioTrackV3[];
 }
 
 export interface TerminalV3 {

@@ -217,6 +217,11 @@ export function PluginConfigForm({
             onClick={() => {
               const raw = values.quality_profiles;
               try {
+                // Empty input: JSON.parse("") throws the raw browser
+                // "Unexpected end of JSON input" — say what it means instead.
+                if (typeof raw === "string" && raw.trim() === "") {
+                  throw new Error("No profiles entered. Paste a JSON array of profiles first.");
+                }
                 const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
                 if (!Array.isArray(parsed)) throw new Error("Profiles must be a JSON array.");
                 const seen = new Set<string>();

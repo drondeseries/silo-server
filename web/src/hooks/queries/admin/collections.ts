@@ -25,6 +25,7 @@ import type {
 } from "@/lib/collectionTemplates";
 import { adminKeys, catalogKeys, sectionKeys } from "../keys";
 import { invalidateAdminCollectionQueries } from "../collectionSurfaceRefresh";
+import { isTerminalItemDetailNotFound } from "../mediaSurfaceRefresh";
 import { runBulkDelete, type BulkDeleteProgress } from "../bulkDelete";
 
 const ADMIN_STALE_TIME = 30_000;
@@ -667,7 +668,10 @@ export function usePurgeVirtualPlaybackItems() {
       toast.success(result.message);
       void invalidateAdminCollectionQueries(queryClient);
       void queryClient.invalidateQueries({ queryKey: sectionKeys.all });
-      void queryClient.invalidateQueries({ queryKey: catalogKeys.all });
+      void queryClient.invalidateQueries({
+        queryKey: catalogKeys.all,
+        predicate: (query) => !isTerminalItemDetailNotFound(query),
+      });
     },
     onError: (error) => {
       toast.error(error instanceof Error ? error.message : "Virtual library purge failed");

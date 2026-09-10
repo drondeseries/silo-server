@@ -983,6 +983,11 @@ func NewRouter(deps Dependencies) chi.Router {
 	var recsRepoForStale *recommendations.Repo
 	if ratingsRepo != nil && itemRepo != nil {
 		ratingsHandler = handlers.NewRatingsHandler(ratingsRepo, itemRepo)
+		// Fire rating.set outbound deliveries (webhooks with notify_ratings)
+		// when notifications are wired. Best-effort and non-blocking.
+		if deps.Notifications != nil && episodeRepo != nil {
+			ratingsHandler.SetRatingNotifier(notifications.NewRatingNotifier(deps.Notifications, itemRepo, episodeRepo, seasonRepo))
+		}
 		if deps.DB != nil {
 			recsRepoForStale = recommendations.NewRepo(deps.DB)
 			ratingsHandler.SetProfileStaler(recsRepoForStale)
@@ -1192,6 +1197,13 @@ func NewRouter(deps Dependencies) chi.Router {
 				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET failed_at = NOW(), updated_at = NOW() WHERE id = $1`, fileID)
 				return err
 			}
+			// The recovered marker clears a known-bad stamp after the candidate
+			// actually delivered media bytes. Fenced on the delivered candidate
+			// identity AND the failure state observed at transport start: a row
+			// rotated to a different candidate while the stream was being
+			// delivered, or a newer failure on the delivered candidate, is
+			// never cleared by a late delivery signal.
+			streamHandler.VirtualCandidateRecoveredMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateRecovered
 			playbackHandler.VirtualFileUpdater = func(ctx context.Context, fileID int, newFilePath string) error {
 				_, _ = deps.DB.Exec(ctx, `DELETE FROM media_files WHERE file_path=$1 AND id != $2 AND virtual_owner_installation_id IS NOT NULL`, newFilePath, fileID)
 				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET file_path=$1, updated_at=now() WHERE id=$2`, newFilePath, fileID)
@@ -1500,6 +1512,33 @@ func NewRouter(deps Dependencies) chi.Router {
 		}
 	}
 
+	// Wire the batched version liveness check onto the catalog resource
+	// handler. The file repository provides row lookup and the failed_at
+	// stamping; the playback handler's detailed resolver (when playback is
+	// wired) resolves pinned virtual candidates through the provider. The
+	// item/episode/extra repositories authorize each file for the requesting
+	// profile before anything is resolved or stamped — the same access
+	// checker instance the playback handler uses.
+	if catalogResourceHandler != nil {
+		if deps.FileRepo != nil {
+			catalogResourceHandler.FileResolver = deps.FileRepo
+			catalogResourceHandler.MarkVirtualFailed = deps.FileRepo.MarkVirtualCandidateFailed
+			catalogResourceHandler.ClearVirtualFailed = deps.FileRepo.ClearVirtualCandidateFailed
+		}
+		if itemRepo != nil {
+			catalogResourceHandler.ItemAccess = itemRepo
+		}
+		if episodeRepo != nil {
+			catalogResourceHandler.EpisodeLookup = episodeRepo
+		}
+		if extraRepo != nil {
+			catalogResourceHandler.ExtraLookup = extraRepo
+		}
+		if playbackHandler != nil {
+			catalogResourceHandler.VirtualResolver = playbackHandler.VirtualMediaDetailedResolver
+		}
+	}
+
 	// Wire subtitle repo and S3 client onto streamHandler for S3-stored subtitle serving.
 	if streamHandler != nil && subtitleRepo != nil && deps.S3Public != nil {
 		streamHandler.SubtitleRepo = subtitleRepo
@@ -1510,9 +1549,15 @@ func NewRouter(deps Dependencies) chi.Router {
 		streamHandler.PlaybackConfig = func() config.PlaybackConfig {
 			return deps.CurrentConfig().Playback
 		}
-		streamHandler.SubtitleCache = playback.NewSubtitleCache(func() string {
+		subtitleCache := playback.NewSubtitleCache(func() string {
 			return deps.CurrentConfig().Playback.TranscodeDir
 		})
+		streamHandler.SubtitleCache = subtitleCache
+		// Share the serve-path cache with the playback handler so a plan
+		// can pre-warm virtual subtitle extracts before the first fetch.
+		if playbackHandler != nil {
+			playbackHandler.SubtitleCache = subtitleCache
+		}
 	}
 
 	restartStatus := deps.ServerRestartStatus
@@ -2669,6 +2714,7 @@ func NewRouter(deps Dependencies) chi.Router {
 						r.Get("/catalog/series/{id}/seasons", catalogResourceHandler.HandleGetSeasons)
 						r.Get("/catalog/series/{id}/seasons/{num}", catalogResourceHandler.HandleGetSeason)
 						r.Get("/catalog/series/{id}/seasons/{num}/episodes", catalogResourceHandler.HandleGetEpisodes)
+						r.Post("/catalog/versions/check", catalogResourceHandler.HandleCheckVersions)
 					}
 					r.Get("/watch/{id}", itemsHandler.HandleGetWatchDetail)
 				}

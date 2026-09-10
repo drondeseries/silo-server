@@ -110,12 +110,18 @@ type MediaFile struct {
 	EditionKey                   string
 	EditionConfidence            *float64
 	EditionSource                string
-	PresentationKind             string
-	PresentationGroupKey         string
-	PresentationPartIndex        int
-	PresentationPartTotal        int
-	MultiEpisodeStart            int
-	MultiEpisodeEnd              int
+	// ReleaseName is the file stem (basename without extension), the closest
+	// the server gets to the release's advertised name.
+	ReleaseName string
+	// ReleaseGroup is the trailing group tag on release-style names
+	// ("Movie.2023.2160p.AltMount" → "AltMount"), "" when none is present.
+	ReleaseGroup          string
+	PresentationKind      string
+	PresentationGroupKey  string
+	PresentationPartIndex int
+	PresentationPartTotal int
+	MultiEpisodeStart     int
+	MultiEpisodeEnd       int
 	// MultiplePPS is the persisted H.264 multi-PPS copy-safety verdict; nil
 	// means the file has never been successfully analyzed. It is trusted only
 	// when MultiplePPSScanSize and MultiplePPSScanMtime still match the file's
@@ -129,8 +135,13 @@ type MediaFile struct {
 	MultiplePPSScanMtime *time.Time `json:"-"`
 	ProbeSource          string     // arrs, local
 	ProbeUpdatedAt       *time.Time
-	MatchAttemptedAt     *time.Time
-	MissingSince         *time.Time
+	// ProbeVersion is the schema version of the probe-derived columns
+	// (audio/subtitle track shape, track languages). Scans bump it so rows
+	// probed before a probe-shape change are re-probed once instead of being
+	// served forever with the legacy shape.
+	ProbeVersion     int
+	MatchAttemptedAt *time.Time
+	MissingSince     *time.Time
 	// FailedAt marks a virtual candidate that produced no bytes at
 	// stream-open (corrupted NZB, dead provider URL). A fresh listing clears
 	// it; the auto-pick skips failed candidates while the dropdown still
@@ -383,17 +394,26 @@ func (v *VideoTrack) UnmarshalJSON(data []byte) error {
 
 // AudioTrack represents a probed audio stream stored as JSONB.
 type AudioTrack struct {
+	// Index is the container stream ordinal (ffmpeg's `0:a:N`). Preserved so
+	// the selected track maps to the real stream even when the track list
+	// order differs from the container order (MULTi releases, virtual
+	// sources). -1/0 when unknown (synthesized tracks).
+	Index         int    `json:"index,omitempty"`
 	Title         string `json:"title,omitempty"`
 	EmbeddedTitle string `json:"embedded_title,omitempty"`
 	Language      string `json:"language,omitempty"`
-	Codec         string `json:"codec,omitempty"`
-	Profile       string `json:"profile,omitempty"`
-	Layout        string `json:"layout,omitempty"`
-	Channels      int    `json:"channels,omitempty"`
-	Bitrate       int    `json:"bitrate,omitempty"`
-	SampleRate    int    `json:"sample_rate,omitempty"`
-	BitDepth      int    `json:"bit_depth,omitempty"`
-	Default       bool   `json:"default"`
+	// Languages is the full advertised language list for MULTI/DUAL tracks,
+	// parsed from the track title when the container language tag is absent,
+	// undetermined, or multiple.
+	Languages  []string `json:"languages,omitempty"`
+	Codec      string   `json:"codec,omitempty"`
+	Profile    string   `json:"profile,omitempty"`
+	Layout     string   `json:"layout,omitempty"`
+	Channels   int      `json:"channels,omitempty"`
+	Bitrate    int      `json:"bitrate,omitempty"`
+	SampleRate int      `json:"sample_rate,omitempty"`
+	BitDepth   int      `json:"bit_depth,omitempty"`
+	Default    bool     `json:"default"`
 }
 
 // SubtitleTrack represents an embedded subtitle track stored as JSONB.

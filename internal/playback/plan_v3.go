@@ -331,6 +331,10 @@ func PlanPlaybackV3(input PlannerInputV3) PlannerResultV3 {
 	}
 	base.AvailableQualities = availableQualitiesV3(input, source)
 	base.Subtitle.Inventory = BuildSubtitleInventoryV3(file, input.AdditionalSubtitles)
+	// Authoritative per-track audio inventory of the effective source; clients
+	// should prefer it over item metadata, which can be stale after a version
+	// fallback rehydrates a different candidate under the same catalog row.
+	base.AudioTracks = file.AudioTracks
 	base.Claims.Audio.Passthrough = passthrough
 	if mkvQuirkFired {
 		appendAppliedQuirkV3(&base, *mkvQuirk, "")
@@ -780,7 +784,11 @@ func planAudioOnlyV3(input PlannerInputV3, file *models.MediaFile, source Source
 		Claims:          ValidationClaimsV3{Audio: audioClaims},
 		// Audio-only routes bypass every subtitle gate, so the inventory is
 		// empty rather than a list of tracks no route on this plan can deliver.
-		Subtitle:               SubtitleDecisionV3{Mode: SubtitleOffV3, Inventory: []SubtitleInventoryItemV3{}},
+		Subtitle: SubtitleDecisionV3{Mode: SubtitleOffV3, Inventory: []SubtitleInventoryItemV3{}},
+		// The audio inventory is the effective source's probed tracks, exactly
+		// as on video plans: clients render the audio menu from it rather than
+		// from item metadata that can be stale after a version fallback.
+		AudioTracks:            file.AudioTracks,
 		Transformations:        []TransformationV3{},
 		AppliedQuirks:          []AppliedQuirkV3{},
 		RuntimeCorrections:     []string{},
