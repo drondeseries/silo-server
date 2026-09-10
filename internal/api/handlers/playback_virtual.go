@@ -1388,14 +1388,23 @@ func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualP
 	}
 	channels := inferChannelsFromCodec(audioCodec)
 	if len(candidate.AudioLanguages) > 0 {
-		// Dedup must be language-normalized: the probe records ISO 639-1 codes
-		// ("it") while providers declare 639-2/3 codes ("ITA"), so exact-string
-		// matching would append a duplicate track for every language the probe
-		// already found — and a synthesized duplicate maps to the same (or an
-		// out-of-range) ffmpeg ordinal, producing the phantom second audio
-		// menu. Canonicalize both sides to the ISO base subtag.
+		// Provider-declared languages are HINTS, not streams. When the probe
+		// produced a real inventory, appending provider-only languages as new
+		// selectable tracks fabricates streams that do not exist: a zero-index
+		// track in an otherwise probed inventory maps to the wrong (or an
+		// out-of-range) ffmpeg ordinal, so selecting it plays the wrong audio
+		// or nothing. In that case the hints become language metadata of the
+		// existing real tracks (attached to the first real track's Languages
+		// list), and only genuinely new languages annotate that track.
+		// Per-language synthesized tracks are created ONLY when the probe left
+		// the inventory empty — there, the declared list is the only inventory
+		// source and each entry maps to the single stream by ordinal 0.
 		existing := make(map[string]bool, len(probed.AudioTracks))
+		anyProbed := false
 		for _, t := range probed.AudioTracks {
+			if t.Index > 0 {
+				anyProbed = true
+			}
 			if lang := strings.TrimSpace(t.Language); lang != "" {
 				existing[virtualLanguageBaseSubtag(lang)] = true
 			}
@@ -1410,6 +1419,12 @@ func mergeVirtualCandidateLanguages(probed *models.MediaFile, candidate VirtualP
 				continue
 			}
 			existing[canonical] = true
+			if anyProbed {
+				// Probed inventory exists: keep the hint as metadata of the
+				// first real track instead of fabricating a selectable stream.
+				probed.AudioTracks[0].Languages = append(probed.AudioTracks[0].Languages, lang)
+				continue
+			}
 			probed.AudioTracks = append(probed.AudioTracks, models.AudioTrack{
 				// Synthesized tracks carry no real container stream index; the
 				// array position is the ordinal (audioStreamOrdinalV3 falls back
