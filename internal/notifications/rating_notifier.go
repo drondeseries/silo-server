@@ -143,10 +143,23 @@ func (n *RatingNotifier) hasRatingSubscribers(ctx context.Context, profileID str
 			return true
 		}
 	}
-	// Apple/Android push: ListEnabledPushByProfiles requires a tx, which is
-	// heavyweight for a pre-check. Skip it here — the delivery row is still
-	// written if webhooks or web push match, and the push fan-out is a
-	// post-commit no-op when no devices exist.
+	// Apple/Android push: a profile whose only rating consumers are native
+	// devices must still produce a delivery, so the gate has to count them.
+	// ListEnabledPushByProfiles needs a tx; run a short read-only one so this
+	// check reuses the exact query DispatchOperational's post-commit enqueuer
+	// runs (platform, provider, push_mode, enabled) instead of drifting from it.
+	if n.system.pushDeviceRepo != nil && n.system.pool != nil {
+		if platforms := n.system.Settings.EnabledPushPlatforms(ctx); len(platforms) > 0 {
+			tx, err := n.system.pool.Begin(ctx)
+			if err == nil {
+				devices, listErr := n.system.pushDeviceRepo.ListEnabledPushByProfiles(ctx, tx, []string{profileID}, platforms)
+				_ = tx.Rollback(ctx)
+				if listErr == nil && len(devices[profileID]) > 0 {
+					return true
+				}
+			}
+		}
+	}
 	return false
 }
 
