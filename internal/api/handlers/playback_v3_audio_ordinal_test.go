@@ -31,6 +31,46 @@ func audioOrdinalFixtureFileV3(t *testing.T) *models.MediaFile {
 	return file
 }
 
+// audioOrdinalAudioFirstFixtureFileV3 builds a probed file whose audio track
+// sits at absolute stream 0 (audio muxed before video, or an audio-only
+// container): stream index 0 is a real container position, not a missing
+// index.
+func audioOrdinalAudioFirstFixtureFileV3(t *testing.T) *models.MediaFile {
+	t.Helper()
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = []models.AudioTrack{
+		{Index: 0, Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+	}
+	return file
+}
+
+// audioOrdinalAudioOnlyZeroBasedFixtureFileV3 builds a probed audio-only file
+// whose two audio tracks carry indexes [0, 1] — the shape the old `Index > 0`
+// ranking mis-ranked: selecting the second track (Index 1) must yield the
+// audio-only ordinal 1, not the array-position fallback.
+func audioOrdinalAudioOnlyZeroBasedFixtureFileV3(t *testing.T) *models.MediaFile {
+	t.Helper()
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = []models.AudioTrack{
+		{Index: 0, Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+		{Index: 1, Language: "fra", Codec: "aac", Channels: 2, Layout: "stereo"},
+	}
+	return file
+}
+
+// audioOrdinalSynthesizedZeroIndexFixtureFileV3 builds the synthesized
+// virtual-source shape: every track carries Index 0 (the zero value of an
+// unset field), so the array position is the ordinal for all tracks.
+func audioOrdinalSynthesizedZeroIndexFixtureFileV3(t *testing.T) *models.MediaFile {
+	t.Helper()
+	file := v3HandlerFixtureFile(t)
+	file.AudioTracks = []models.AudioTrack{
+		{Index: 0, Language: "eng", Codec: "aac", Channels: 2, Layout: "stereo", Default: true},
+		{Index: 0, Language: "fra", Codec: "aac", Channels: 2, Layout: "stereo"},
+	}
+	return file
+}
+
 // audioOrdinalPlanV3 is a transcode plan whose SelectedTracks.Audio.Index is
 // the array position of the selected audio track (the protocol domain).
 func audioOrdinalPlanV3(selectedAudioIndex int) *playback.PlanV3 {
@@ -72,6 +112,58 @@ func TestAudioStreamOrdinalV3MapsAbsoluteIndexToAudioOnlyOrdinal(t *testing.T) {
 				t.Fatalf("audioStreamOrdinalV3(file, %d) = %d, want %d", tt.selectedIndex, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestAudioStreamOrdinalV3AudioFirstAtStreamZero verifies a real probed audio
+// track at absolute stream 0 (audio muxed before video, or an audio-only
+// container) maps to ordinal 0: stream index 0 is a real container position.
+func TestAudioStreamOrdinalV3AudioFirstAtStreamZero(t *testing.T) {
+	file := audioOrdinalAudioFirstFixtureFileV3(t)
+	if got := audioStreamOrdinalV3(file, 0); got != 0 {
+		t.Fatalf("audioStreamOrdinalV3(file, 0) = %d, want 0", got)
+	}
+}
+
+// TestAudioStreamOrdinalV3MultiTrackAudioOnlyZeroBasedIndexes verifies a
+// probed audio-only inventory with indexes [0, 1] ranks by absolute stream
+// index: selecting the second track (Index 1) yields ordinal 1, not the
+// array-position fallback.
+func TestAudioStreamOrdinalV3MultiTrackAudioOnlyZeroBasedIndexes(t *testing.T) {
+	file := audioOrdinalAudioOnlyZeroBasedFixtureFileV3(t)
+	tests := []struct {
+		name          string
+		selectedIndex int
+		want          int
+	}{
+		{name: "first audio at stream 0 maps to ordinal 0", selectedIndex: 0, want: 0},
+		{name: "second audio at stream 1 maps to ordinal 1", selectedIndex: 1, want: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := audioStreamOrdinalV3(file, tt.selectedIndex); got != tt.want {
+				t.Fatalf("audioStreamOrdinalV3(file, %d) = %d, want %d", tt.selectedIndex, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAudioStreamOrdinalV3SynthesizedZeroIndexInventoryFallsBack verifies the
+// synthesized virtual-source shape (every track Index 0) keeps the array
+// position as the ordinal for all tracks, even though Index 0 alone would be
+// a valid rankable position in a probed inventory.
+func TestAudioStreamOrdinalV3SynthesizedZeroIndexInventoryFallsBack(t *testing.T) {
+	file := audioOrdinalSynthesizedZeroIndexFixtureFileV3(t)
+	for _, tt := range []struct {
+		selectedIndex int
+		want          int
+	}{
+		{selectedIndex: 0, want: 0},
+		{selectedIndex: 1, want: 1},
+	} {
+		if got := audioStreamOrdinalV3(file, tt.selectedIndex); got != tt.want {
+			t.Fatalf("audioStreamOrdinalV3(file, %d) = %d, want %d", tt.selectedIndex, got, tt.want)
+		}
 	}
 }
 
@@ -139,6 +231,112 @@ func TestPrepareLocalTransportV3AudioTrackIndexIsAudioOnlyOrdinal(t *testing.T) 
 				t.Fatalf("local FFmpeg args missing -map %s: %s", tt.wantMap, string(args))
 			}
 		})
+	}
+}
+
+// TestPrepareLocalTransportV3AudioFirstAtStreamZeroEmitsOrdinalZero drives the
+// local start path with a real probed audio track at absolute stream 0 (audio
+// muxed before video, or an audio-only container) and asserts the emitted map
+// is `0:a:0?` — stream index 0 is a real container position, not a missing
+// index.
+func TestPrepareLocalTransportV3AudioFirstAtStreamZeroEmitsOrdinalZero(t *testing.T) {
+	file := audioOrdinalAudioFirstFixtureFileV3(t)
+	transcodeDir := t.TempDir()
+	argsPath := filepath.Join(t.TempDir(), "audio-first-args.txt")
+	ffmpegPath := writePlaybackArgsRecordingFFmpegV3(t, argsPath)
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{FFmpegPath: ffmpegPath, TranscodeDir: transcodeDir, TranscodeEnabled: true, HWAccel: playback.HWAccelNone}
+	}
+	transport, transportErr := handler.prepareLocalTransportV3(
+		httptest.NewRequest(http.MethodPost, "/", nil),
+		&playback.Session{ID: "session-audio-ordinal-audio-first", UserID: 7, ProfileID: "profile-1"},
+		file, audioOrdinalResultV3(0), preparedTimelineV3{}, mediaAuthModeV3{},
+	)
+	if transportErr != nil {
+		t.Fatalf("prepare local transport: %v (cause: %v)", transportErr, transportErr.cause)
+	}
+	transport.rollback()
+	args, readErr := os.ReadFile(argsPath)
+	if readErr != nil {
+		t.Fatalf("read local FFmpeg args: %v", readErr)
+	}
+	if !strings.Contains(string(args), "-map\n0:a:0?\n") {
+		t.Fatalf("local FFmpeg args missing -map 0:a:0? for the stream-0 audio track: %s", string(args))
+	}
+}
+
+// TestPrepareLocalTransportV3AudioOnlyZeroBasedIndexesEmitsOrdinals drives the
+// local start path with a probed audio-only inventory [0, 1] and asserts the
+// emitted maps: selecting the second track (Index 1) must emit `0:a:1?`, not
+// the array-position fallback.
+func TestPrepareLocalTransportV3AudioOnlyZeroBasedIndexesEmitsOrdinals(t *testing.T) {
+	tests := []struct {
+		name          string
+		selectedIndex int
+		wantMap       string
+	}{
+		{name: "first audio at stream 0", selectedIndex: 0, wantMap: "0:a:0?"},
+		{name: "second audio at stream 1", selectedIndex: 1, wantMap: "0:a:1?"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			file := audioOrdinalAudioOnlyZeroBasedFixtureFileV3(t)
+			transcodeDir := t.TempDir()
+			argsPath := filepath.Join(t.TempDir(), tt.name+"-args.txt")
+			ffmpegPath := writePlaybackArgsRecordingFFmpegV3(t, argsPath)
+			handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+			handler.PlaybackConfig = func() config.PlaybackConfig {
+				return config.PlaybackConfig{FFmpegPath: ffmpegPath, TranscodeDir: transcodeDir, TranscodeEnabled: true, HWAccel: playback.HWAccelNone}
+			}
+			transport, transportErr := handler.prepareLocalTransportV3(
+				httptest.NewRequest(http.MethodPost, "/", nil),
+				&playback.Session{ID: "session-audio-ordinal-audio-only", UserID: 7, ProfileID: "profile-1"},
+				file, audioOrdinalResultV3(tt.selectedIndex), preparedTimelineV3{}, mediaAuthModeV3{},
+			)
+			if transportErr != nil {
+				t.Fatalf("prepare local transport: %v (cause: %v)", transportErr, transportErr.cause)
+			}
+			transport.rollback()
+			args, readErr := os.ReadFile(argsPath)
+			if readErr != nil {
+				t.Fatalf("read local FFmpeg args: %v", readErr)
+			}
+			if !strings.Contains(string(args), "-map\n"+tt.wantMap+"\n") {
+				t.Fatalf("local FFmpeg args missing -map %s: %s", tt.wantMap, string(args))
+			}
+		})
+	}
+}
+
+// TestPrepareLocalTransportV3SynthesizedZeroIndexInventoryKeepsArrayPosition
+// drives the local start path with the synthesized virtual-source shape (every
+// track Index 0) and asserts the array-position fallback is preserved: the
+// second track still emits `0:a:1?`.
+func TestPrepareLocalTransportV3SynthesizedZeroIndexInventoryKeepsArrayPosition(t *testing.T) {
+	file := audioOrdinalSynthesizedZeroIndexFixtureFileV3(t)
+	transcodeDir := t.TempDir()
+	argsPath := filepath.Join(t.TempDir(), "synthesized-args.txt")
+	ffmpegPath := writePlaybackArgsRecordingFFmpegV3(t, argsPath)
+	handler := NewPlaybackHandler(playback.NewSessionManager(0, 0))
+	handler.PlaybackConfig = func() config.PlaybackConfig {
+		return config.PlaybackConfig{FFmpegPath: ffmpegPath, TranscodeDir: transcodeDir, TranscodeEnabled: true, HWAccel: playback.HWAccelNone}
+	}
+	transport, transportErr := handler.prepareLocalTransportV3(
+		httptest.NewRequest(http.MethodPost, "/", nil),
+		&playback.Session{ID: "session-audio-ordinal-synthesized", UserID: 7, ProfileID: "profile-1"},
+		file, audioOrdinalResultV3(1), preparedTimelineV3{}, mediaAuthModeV3{},
+	)
+	if transportErr != nil {
+		t.Fatalf("prepare local transport: %v (cause: %v)", transportErr, transportErr.cause)
+	}
+	transport.rollback()
+	args, readErr := os.ReadFile(argsPath)
+	if readErr != nil {
+		t.Fatalf("read local FFmpeg args: %v", readErr)
+	}
+	if !strings.Contains(string(args), "-map\n0:a:1?\n") {
+		t.Fatalf("local FFmpeg args missing -map 0:a:1? for the synthesized second track: %s", string(args))
 	}
 }
 
