@@ -34,3 +34,33 @@ func TestMergeCompatCandidateTracksFiltersReleaseMarkersAndOrdersDeclaration(t *
 		}
 	}
 }
+
+// Mirror of the native surface's hint-becomes-metadata fixture: once a real
+// probed inventory exists, provider-only language hints must not become
+// fabricated selectable audio tracks on the Jellyfin surface either.
+func TestMergeCompatCandidateTracksHintBecomesMetadataNotSelectableStream(t *testing.T) {
+	probed := &models.MediaFile{
+		AudioTracks: []models.AudioTrack{
+			{Index: 1, Language: "en", Codec: "aac", Channels: 2, Default: true},
+		},
+	}
+	candidate := VirtualPlaybackStream{
+		CodecAudio:     "aac",
+		AudioLanguages: []string{"ENG", "FRA"},
+	}
+
+	mergeCompatCandidateTracks(probed, candidate)
+
+	if len(probed.AudioTracks) != 1 {
+		t.Fatalf("audio tracks = %#v, want exactly the probed English track (FRA is metadata, not a stream)", probed.AudioTracks)
+	}
+	foundFRA := false
+	for _, lang := range probed.AudioTracks[0].Languages {
+		if lang == "FRA" {
+			foundFRA = true
+		}
+	}
+	if !foundFRA {
+		t.Fatalf("FRA hint missing from the probed track's Languages metadata: %#v", probed.AudioTracks[0].Languages)
+	}
+}

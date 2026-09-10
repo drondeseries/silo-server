@@ -816,6 +816,8 @@ func TestMergeVirtualCandidateLanguagesDedupsByNormalizedLanguage(t *testing.T) 
 
 // Mixed-script dedup: a provider language that resolves to a base subtag the
 // probe already covers in a different code form ("en-US" vs "en") also dedups.
+// Once a probed inventory exists, a genuinely NEW provider language (FRA) is
+// kept as metadata of the real track (Languages list), not a new track.
 func TestMergeVirtualCandidateLanguagesDedupsRegionalVariants(t *testing.T) {
 	probed := &models.MediaFile{
 		AudioTracks: []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2, Default: true}},
@@ -827,10 +829,53 @@ func TestMergeVirtualCandidateLanguagesDedupsRegionalVariants(t *testing.T) {
 
 	mergeVirtualCandidateTracks(probed, candidate)
 
-	if len(probed.AudioTracks) != 2 {
-		t.Fatalf("audio tracks = %#v, want [en probed, fra synthesized] — EN and en-US dedup to the same base subtag", probed.AudioTracks)
+	if len(probed.AudioTracks) != 1 {
+		t.Fatalf("audio tracks = %#v, want the single probed track — EN and en-US dedup to the same base subtag and FRA is metadata, not a fabricated stream", probed.AudioTracks)
 	}
-	if probed.AudioTracks[1].Language != "FRA" {
-		t.Fatalf("audio[1].language = %q, want FRA (the only genuinely new language)", probed.AudioTracks[1].Language)
+	track := probed.AudioTracks[0]
+	if track.Language != "en" {
+		t.Fatalf("audio[0].language = %q, want the probed en untouched", track.Language)
+	}
+	foundFRA := false
+	for _, lang := range track.Languages {
+		if lang == "FRA" {
+			foundFRA = true
+		}
+	}
+	if !foundFRA {
+		t.Fatalf("FRA hint missing from the probed track's Languages metadata: %#v", track.Languages)
+	}
+}
+
+// The reviewer's exact fixture, followed through to playback semantics: the
+// probe observed ONE real audio stream (English, absolute index 1) while the
+// provider hints at English + French. After the merge, English must keep its
+// real ordinal (0 → 0:a:0?) and the French hint must not exist as a
+// selectable track — it is metadata on the English track. Ranking the merged
+// inventory must never produce an out-of-range ordinal or a fabricated
+// French stream.
+func TestMergeVirtualCandidateLanguagesHintBecomesMetadataNotSelectableStream(t *testing.T) {
+	probed := &models.MediaFile{
+		AudioTracks: []models.AudioTrack{
+			{Index: 1, Language: "en", Codec: "aac", Channels: 2, Default: true},
+		},
+	}
+	candidate := VirtualPlaybackStream{
+		CodecAudio:     "aac",
+		AudioLanguages: []string{"ENG", "FRA"},
+	}
+
+	mergeVirtualCandidateTracks(probed, candidate)
+
+	if len(probed.AudioTracks) != 1 {
+		t.Fatalf("audio tracks = %#v, want exactly the probed English track (FRA is metadata, not a stream)", probed.AudioTracks)
+	}
+	// The merged inventory ranks through the real ordinal math: English keeps
+	// its audio ordinal 0 (emitted as 0:a:0?), and there is no ordinal 1.
+	if ordinal := playback.AudioStreamOrdinal(probed.AudioTracks, 0); ordinal != 0 {
+		t.Fatalf("English ordinal = %d, want 0", ordinal)
+	}
+	if len(probed.AudioTracks) > 1 {
+		t.Fatal("a French ordinal would exist — the hint became a stream")
 	}
 }

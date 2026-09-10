@@ -1349,6 +1349,26 @@ func (r *FileRepository) ClearVirtualCandidateFailed(ctx context.Context, fileID
 	return err
 }
 
+// MarkVirtualCandidateRecovered clears a virtual candidate's failed_at stamp
+// after that candidate actually delivered media bytes to a client. This is the
+// transport-delivery counterpart to ClearVirtualCandidateFailed: the caller
+// passes the candidate identity the transport served (the row's file_path AT
+// DELIVERY TIME, which a session retains even after the row rotates) and the
+// failure timestamp observed when the transport started, so the write only
+// lands when the row still describes the delivered candidate in the observed
+// health state. A rotated row (now describing candidate B) or a newer failure
+// stamp on candidate A is never cleared by a late delivery of A.
+func (r *FileRepository) MarkVirtualCandidateRecovered(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error {
+	if r == nil || r.pool == nil {
+		return errors.New("file repository is not configured")
+	}
+	if fileID <= 0 || strings.TrimSpace(deliveredFilePath) == "" {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NULL, updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, deliveredFilePath, observedFailedAt)
+	return err
+}
+
 func virtualCandidateSelection(raw string) bool {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {

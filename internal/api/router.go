@@ -1198,11 +1198,13 @@ func NewRouter(deps Dependencies) chi.Router {
 				return err
 			}
 			// The recovered marker clears a known-bad stamp after the candidate
-			// actually delivered bytes. Fenced on the candidate identity the
-			// transport just served: a row rotated to a different candidate
-			// while the stream was being delivered is never cleared.
-			streamHandler.VirtualCandidateRecoveredMarker = func(ctx context.Context, fileID int) error {
-				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET failed_at = NULL, updated_at = NOW() WHERE id = $1 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID)
+			// actually delivered media bytes. Fenced on the delivered candidate
+			// identity AND the failure state observed at transport start: a row
+			// rotated to a different candidate while the stream was being
+			// delivered, or a newer failure on the delivered candidate, is
+			// never cleared by a late delivery signal.
+			streamHandler.VirtualCandidateRecoveredMarker = func(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error {
+				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET failed_at = NULL, updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, deliveredFilePath, observedFailedAt)
 				return err
 			}
 			playbackHandler.VirtualFileUpdater = func(ctx context.Context, fileID int, newFilePath string) error {

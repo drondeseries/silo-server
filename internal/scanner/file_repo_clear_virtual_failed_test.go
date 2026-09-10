@@ -262,3 +262,114 @@ func TestVirtualCandidateFailedFencing(t *testing.T) {
 		}
 	})
 }
+
+// The transport-delivery recovery path: a session retains the candidate it is
+// serving even after the catalog row rotates. A late delivery signal must be
+// fenced on the DELIVERED identity and the health state observed at transport
+// start — a rotation to B or a newer failure on A is never cleared by a late
+// delivery of A.
+func TestMarkVirtualCandidateRecoveredFencing(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	pool, err := pgxpool.New(t.Context(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(t.Context(), query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefix := fmt.Sprintf("recovered-fencing-%d-", time.Now().UnixNano())
+	var library int
+	if err := pool.QueryRow(t.Context(), `INSERT INTO media_folders (type,name) VALUES ('movies',$1) RETURNING id`, prefix).Scan(&library); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx := context.Background()
+		if _, err := pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, library); err != nil {
+			t.Error(err)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM media_items WHERE content_id LIKE $1`, prefix+"%"); err != nil {
+			t.Error(err)
+		}
+	})
+	exec(`INSERT INTO media_items (content_id,type,title,genres,default_metadata_language) VALUES ($1,'movie','Recovered Fencing','{}','en')`, prefix+"movie")
+	exec(`INSERT INTO media_item_libraries (content_id,media_folder_id) VALUES ($1,$2)`, prefix+"movie", library)
+
+	originalPath := fmt.Sprintf("virtual://movie/tt%d?result=original", time.Now().UnixNano())
+	replacementPath := fmt.Sprintf("virtual://movie/tt%d?result=replacement", time.Now().UnixNano())
+	var fileID int
+	if err := pool.QueryRow(t.Context(), `
+		INSERT INTO media_files (content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id,failed_at)
+		VALUES ($1,$2,$3,1000,'virtual',7,NOW()) RETURNING id`,
+		prefix+"movie", library, originalPath).Scan(&fileID); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := NewFileRepository(pool)
+	readRow := func() (path string, failedAt *time.Time) {
+		t.Helper()
+		if err := pool.QueryRow(t.Context(), `SELECT file_path, failed_at FROM media_files WHERE id=$1`, fileID).Scan(&path, &failedAt); err != nil {
+			t.Fatal(err)
+		}
+		return path, failedAt
+	}
+
+	t.Run("late delivery of A does not clear a rotation to B", func(t *testing.T) {
+		exec(`UPDATE media_files SET file_path=$1, failed_at=NOW() WHERE id=$2`, originalPath, fileID)
+		path, _ := readRow()
+		if path != originalPath {
+			t.Fatalf("precondition: path = %q", path)
+		}
+		// The session delivers A; the row then rotates to B (a newer failure
+		// stamp is also set on the rotated row by another session). The late
+		// delivery signal for A must not clear B's failure.
+		exec(`UPDATE media_files SET file_path=$1, failed_at=NOW() WHERE id=$2`, replacementPath, fileID)
+		deliveredObserved := time.Now().Add(-time.Minute) // the health state at transport start (A, stamped)
+		if err := repo.MarkVirtualCandidateRecovered(t.Context(), fileID, originalPath, &deliveredObserved); err != nil {
+			t.Fatal(err)
+		}
+		path, failedAt := readRow()
+		if path != replacementPath {
+			t.Fatalf("recovery modified file_path: %q, want %q", path, replacementPath)
+		}
+		if failedAt == nil {
+			t.Fatal("late delivery of A cleared the rotation to B (and its failure)")
+		}
+	})
+
+	t.Run("late delivery of A does not clear a newer failure on A", func(t *testing.T) {
+		exec(`UPDATE media_files SET file_path=$1, failed_at=NOW() WHERE id=$2`, originalPath, fileID)
+		// The delivery started with A unstamped; a newer failure lands on A
+		// before the delivery completes. The late signal must not clear it.
+		firstObserved := (*time.Time)(nil)
+		exec(`UPDATE media_files SET failed_at=NOW() WHERE id=$1`, fileID)
+		if err := repo.MarkVirtualCandidateRecovered(t.Context(), fileID, originalPath, firstObserved); err != nil {
+			t.Fatal(err)
+		}
+		_, failedAt := readRow()
+		if failedAt == nil {
+			t.Fatal("late delivery erased a newer failure on the same candidate")
+		}
+	})
+
+	t.Run("matching identity and health state recovers", func(t *testing.T) {
+		exec(`UPDATE media_files SET file_path=$1, failed_at=NOW() WHERE id=$2`, originalPath, fileID)
+		path, failedAt := readRow()
+		if failedAt == nil {
+			t.Fatal("precondition: candidate must start stamped failed")
+		}
+		if err := repo.MarkVirtualCandidateRecovered(t.Context(), fileID, path, failedAt); err != nil {
+			t.Fatal(err)
+		}
+		path, failedAt = readRow()
+		if failedAt != nil {
+			t.Fatalf("matching recovery did not clear failed_at: path=%q failed_at=%v", path, failedAt)
+		}
+	})
+}

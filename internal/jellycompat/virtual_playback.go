@@ -436,14 +436,20 @@ func mergeCompatCandidateTracks(probed *models.MediaFile, candidate VirtualPlayb
 	}
 
 	if len(candidate.AudioLanguages) > 0 {
-		// Dedup must be language-normalized (mirror of the native surface's
-		// mergeVirtualCandidateLanguages): the probe records ISO 639-1 codes
-		// ("it") while providers declare 639-2/3 codes ("ITA"), so
-		// exact-string matching would append a duplicate track for every
-		// language the probe already found. Canonicalize both sides to the
-		// ISO base subtag.
+		// Provider-declared languages are HINTS, not streams (mirror of the
+		// native surface's mergeVirtualCandidateLanguages). When the probe
+		// produced a real inventory, appending provider-only languages as new
+		// selectable tracks fabricates streams that do not exist — a
+		// zero-index track in an otherwise probed inventory maps to the wrong
+		// or an out-of-range ffmpeg ordinal. Hints then become language
+		// metadata of the existing real tracks; per-language synthesized
+		// tracks are created ONLY when the probe left the inventory empty.
 		existing := make(map[string]bool, len(probed.AudioTracks))
+		anyProbed := false
 		for _, track := range probed.AudioTracks {
+			if track.Index > 0 {
+				anyProbed = true
+			}
 			if language := strings.TrimSpace(track.Language); language != "" {
 				existing[compatLanguageBaseSubtag(language)] = true
 			}
@@ -462,6 +468,12 @@ func mergeCompatCandidateTracks(probed *models.MediaFile, candidate VirtualPlayb
 				continue
 			}
 			existing[canonical] = true
+			if anyProbed {
+				// Probed inventory exists: keep the hint as metadata of the
+				// first real track instead of fabricating a selectable stream.
+				probed.AudioTracks[0].Languages = append(probed.AudioTracks[0].Languages, language)
+				continue
+			}
 			assigned := false
 			for i := range probed.AudioTracks {
 				if strings.TrimSpace(probed.AudioTracks[i].Language) == "" {

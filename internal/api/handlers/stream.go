@@ -88,10 +88,13 @@ type StreamHandler struct {
 	// next play while the dropdown still shows it for a manual retry.
 	VirtualCandidateFailMarker func(ctx context.Context, fileID int) error
 	// VirtualCandidateRecoveredMarker clears a known-bad stamp after the
-	// candidate actually delivered bytes to a client — the only evidence that
-	// forgives a transport failure. Metadata-only liveness checks resolve
-	// URLs without opening media and must never clear it.
-	VirtualCandidateRecoveredMarker func(ctx context.Context, fileID int) error
+	// candidate actually delivered media bytes to a client — the only evidence
+	// that forgives a transport failure. The callback is fenced on the
+	// delivered candidate identity and the failure state observed when the
+	// transport started, so a rotation or a newer failure is never cleared.
+	// Metadata-only liveness checks resolve URLs without opening media and
+	// must never clear it.
+	VirtualCandidateRecoveredMarker func(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error
 }
 
 // ffmpegPath returns the currently configured ffmpeg binary path.
@@ -345,6 +348,19 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	// the exact URI that was resolved and probed during planning.
 	file = bindSessionVirtualSource(file, session)
 
+	// Capture the delivered identity and observed health state at transport
+	// start: the delivered candidate is the path the transport will serve
+	// (retained by the session even if the row rotates mid-stream), and the
+	// failure stamp seen now is the only health state a successful delivery
+	// may clear. A rotation to B or a newer failure on A that lands while the
+	// stream is being served is preserved.
+	virtualObservedFailedAt := (*time.Time)(nil)
+	if file != nil && isVirtualPlaybackFile(file) {
+		if current, err := h.fileResolver.GetByID(r.Context(), file.ID); err == nil && current != nil {
+			virtualObservedFailedAt = current.FailedAt
+		}
+	}
+
 	inputPath := file.FilePath
 	releaseInput := func() {}
 	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
@@ -407,12 +423,16 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				},
 			}
 			proxy.ServeHTTP(streamWriter, r)
-			if lastProxyErr == nil && streamWriter.StatusCode() != 0 && isVirtualPlaybackFile(file) {
-				// Bytes actually flowed to the client for this candidate —
-				// the only evidence that forgives a transport failure.
-				if failedID := virtualResultCandidateID(file.FilePath); failedID != "" {
-					h.clearVirtualCandidateRecovered(r.Context(), file, failedID)
-				}
+			if lastProxyErr == nil && isVirtualPlaybackFile(file) &&
+				virtualCandidateDeliveryEvidence(streamWriter.StatusCode(), streamWriter.BytesWritten()) {
+				// Media bytes actually flowed to the client for the candidate
+				// the session planned — the only evidence that forgives a
+				// transport failure. The delivered identity is the path the
+				// transport served (retained by the session even if the
+				// catalog row rotated mid-stream); the health state is the one
+				// observed at transport start, so a rotation to B or a newer
+				// failure on A is never cleared by a late delivery of A.
+				h.clearVirtualCandidateRecovered(r.Context(), file, file.FilePath, virtualObservedFailedAt)
 			}
 			if lastProxyErr != nil {
 				if streamWriter.StatusCode() == 0 && (h.VirtualMediaDetailedResolver != nil || h.VirtualMediaRefreshResolver != nil) {
@@ -489,22 +509,31 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		if dvProfile == 0 {
 			dvProfile = file.PrimaryDVProfile()
 		}
-		remuxErr := playback.ServeRemuxWithOptions(w, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, audioStreamOrdinalV3(file, session.AudioTrackIndex), dvProfile, playback.RemuxServeOptions{
-			DVMode:                 session.RemuxDVMode,
-			FFmpegPath:             h.ffmpegPath(),
-			ContentType:            playback.RemuxContentType(file.IsAudioOnly()),
-			AudioOnly:              file.IsAudioOnly(),
-			SourceAudioChannels:    session.SourceAudioChannels,
-			TargetAudioChannels:    session.TargetAudioChannels,
-			TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
-		})
-		if remuxErr == nil && isVirtualPlaybackFile(file) {
-			// The remux committed media bytes from this candidate — the only
-			// evidence that forgives a transport failure.
-			if deliveredID := virtualResultCandidateID(file.FilePath); deliveredID != "" {
-				h.clearVirtualCandidateRecovered(r.Context(), file, deliveredID)
+		remuxErr := func() error {
+			// The remux writes through the raw writer; wrap it to observe how
+			// many bytes actually reached the client. nil return is NOT
+			// delivery evidence (remux.go can return nil when the first
+			// client write fails) — recovery is gated on positive bytes.
+			remuxWriter := httpstream.NewRollingDeadlineWriter(w)
+			err := playback.ServeRemuxWithOptions(remuxWriter, r, inputPath, "mp4", seekSeconds, session.TranscodeAudio, audioStreamOrdinalV3(file, session.AudioTrackIndex), dvProfile, playback.RemuxServeOptions{
+				DVMode:                 session.RemuxDVMode,
+				FFmpegPath:             h.ffmpegPath(),
+				ContentType:            playback.RemuxContentType(file.IsAudioOnly()),
+				AudioOnly:              file.IsAudioOnly(),
+				SourceAudioChannels:    session.SourceAudioChannels,
+				TargetAudioChannels:    session.TargetAudioChannels,
+				TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
+			})
+			if err == nil && isVirtualPlaybackFile(file) &&
+				virtualCandidateDeliveryEvidence(http.StatusOK, remuxWriter.BytesWritten()) {
+				// Media bytes actually flowed to the client for the candidate
+				// the session planned — the only evidence that forgives a
+				// transport failure. Fenced on the delivered identity and the
+				// health state observed at transport start.
+				h.clearVirtualCandidateRecovered(r.Context(), file, file.FilePath, virtualObservedFailedAt)
 			}
-		}
+			return err
+		}()
 		if remuxErr != nil {
 			// The remux only commits 200 after FFmpeg produces media bytes, so
 			// a failure here means the provider release served no output
@@ -1117,15 +1146,18 @@ func (h *StreamHandler) markVirtualCandidateFailed(ctx context.Context, file *mo
 }
 
 // clearVirtualCandidateRecovered clears a virtual candidate's known-bad stamp
-// after the candidate actually delivered bytes to a client. This is the only
-// evidence that forgives a transport failure: a resolved URL (liveness check)
-// is not, because resolution never opens the media. The clear must reference
-// the row's CURRENT state, so it passes the candidate identity the transport
-// just delivered — the fenced clear in the file repository no-ops if the row
-// rotated to a different candidate while the stream was being served.
+// after the candidate actually delivered media bytes to a client. This is the
+// only evidence that forgives a transport failure: a resolved URL (liveness
+// check) is not, because resolution never opens the media, and written
+// response headers alone are not either (the relay forwards header-only 204,
+// 304, 416, and zero-length 200 responses). The clear is fenced on the
+// DELIVERED candidate identity (the file path the transport served, which the
+// session retains even after the catalog row rotates) and the failure state
+// observed when the transport started, so a late delivery of candidate A never
+// clears a rotation to B or a newer failure on A.
 // Best-effort: a persistence failure must not fail a delivering stream.
-func (h *StreamHandler) clearVirtualCandidateRecovered(ctx context.Context, file *models.MediaFile, candidateID string) {
-	if h == nil || file == nil || candidateID == "" {
+func (h *StreamHandler) clearVirtualCandidateRecovered(ctx context.Context, file *models.MediaFile, deliveredFilePath string, observedFailedAt *time.Time) {
+	if h == nil || file == nil || strings.TrimSpace(deliveredFilePath) == "" {
 		return
 	}
 	if h.VirtualCandidateRecoveredMarker == nil {
@@ -1133,9 +1165,20 @@ func (h *StreamHandler) clearVirtualCandidateRecovered(ctx context.Context, file
 	}
 	clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
-	if err := h.VirtualCandidateRecoveredMarker(clearCtx, file.ID); err != nil {
-		slog.WarnContext(ctx, "clear virtual candidate recovered", "component", "api", "file_id", file.ID, "candidate", candidateID, "error", err)
+	if err := h.VirtualCandidateRecoveredMarker(clearCtx, file.ID, deliveredFilePath, observedFailedAt); err != nil {
+		slog.WarnContext(ctx, "clear virtual candidate recovered", "component", "api", "file_id", file.ID, "delivered", deliveredFilePath, "error", err)
 	}
+}
+
+// virtualCandidateDeliveryEvidence reports whether a direct-play transfer
+// actually delivered media: a 200/206 status AND positive body bytes.
+// Header-only responses (204/304/416/zero-length 200) are explicitly forwarded
+// by the relay and are not evidence the media endpoint works.
+func virtualCandidateDeliveryEvidence(statusCode int, bytesWritten int64) bool {
+	if statusCode != http.StatusOK && statusCode != http.StatusPartialContent {
+		return false
+	}
+	return bytesWritten > 0
 }
 
 // streamEmbeddedSubtitle runs a dedicated ffmpeg for a single embedded

@@ -406,3 +406,32 @@ func TestAudioStreamOrdinalV3PlanRoundTripKeepsProtocolDomain(t *testing.T) {
 		t.Fatalf("plan audio identity malformed: %q", result.Plan.SelectedTracks.Audio.ID)
 	}
 }
+
+// Recovery evidence discipline (round-5 review finding 2): written response
+// headers are not media delivery. The relay explicitly forwards header-only
+// 204/304/416/zero-length 200 responses, so direct-play recovery must require
+// a 200/206 status AND positive body bytes.
+func TestVirtualCandidateDeliveryEvidence(t *testing.T) {
+	cases := []struct {
+		name       string
+		statusCode int
+		bytes      int64
+		want       bool
+	}{
+		{"200 with media bytes", http.StatusOK, 1500, true},
+		{"206 with media bytes", http.StatusPartialContent, 1500, true},
+		{"empty 200 (zero-length body)", http.StatusOK, 0, false},
+		{"204 no content", http.StatusNoContent, 0, false},
+		{"304 not modified", http.StatusNotModified, 0, false},
+		{"416 range not satisfiable", http.StatusRequestedRangeNotSatisfiable, 0, false},
+		{"error status with bytes", http.StatusInternalServerError, 1500, false},
+		{"bytes without committed status", 0, 1500, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := virtualCandidateDeliveryEvidence(tc.statusCode, tc.bytes); got != tc.want {
+				t.Fatalf("deliveryEvidence(%d, %d) = %v, want %v", tc.statusCode, tc.bytes, got, tc.want)
+			}
+		})
+	}
+}

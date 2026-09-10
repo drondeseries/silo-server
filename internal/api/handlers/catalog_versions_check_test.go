@@ -703,7 +703,11 @@ func TestCatalogVersionsCheckStrictCandidate(t *testing.T) {
 		// substitutes candidate B. The strict check must not treat B as
 		// evidence A recovered: no clear, stamp survives, verdict unavailable.
 		exec(`UPDATE media_files SET file_path=$1, failed_at=NOW() WHERE id=$2`, pinnedPath, fileID)
-		_, router := newHandler(VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+		var sawForceRefresh atomic.Bool
+		_, router := newHandler(VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, forceRefresh bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			// Strict check semantics require a forced refresh: the ordinary
+			// candidates[0] substitution branch requires !forceRefresh.
+			sawForceRefresh.Store(forceRefresh)
 			// Ordinary fallback semantics: requested A absent → substitute B.
 			return ResolvedVirtualMedia{URL: "http://provider.test/b.mp4", URI: "virtual://movie/substituted?result=B", CandidateID: "B"}, nil
 		}))
@@ -711,8 +715,29 @@ func TestCatalogVersionsCheckStrictCandidate(t *testing.T) {
 		if len(resp.Results) != 1 || resp.Results[0].FileID != fileID || resp.Results[0].Available {
 			t.Fatalf("substituted candidate must not report the pinned A as available: %#v", resp.Results)
 		}
+		if !sawForceRefresh.Load() {
+			t.Fatal("strict check resolved without forceRefresh=true; the candidates[0] substitution branch was not disabled")
+		}
 		path, failedAt := readRow()
 		if path != pinnedPath || failedAt == nil {
+			t.Fatalf("substituted resolution must not clear the transport failure: path=%q failed_at=%v", path, failedAt)
+		}
+	})
+
+	// Unqualified pin form: ?result=A without a profile parameter — the
+	// identity verification must hold for both URI shapes.
+	t.Run("unqualified pinned form also requires returned identity", func(t *testing.T) {
+		unqualifiedPath := fmt.Sprintf("virtual://movie/tt%d?result=A", time.Now().UnixNano())
+		exec(`UPDATE media_files SET file_path=$1, failed_at=NOW() WHERE id=$2`, unqualifiedPath, fileID)
+		_, router := newHandler(VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URL: "http://provider.test/b.mp4", URI: "virtual://movie/substituted?result=B", CandidateID: "B"}, nil
+		}))
+		resp := post(router)
+		if len(resp.Results) != 1 || resp.Results[0].FileID != fileID || resp.Results[0].Available {
+			t.Fatalf("substituted candidate must not report the unqualified pinned A as available: %#v", resp.Results)
+		}
+		path, failedAt := readRow()
+		if path != unqualifiedPath || failedAt == nil {
 			t.Fatalf("substituted resolution must not clear the transport failure: path=%q failed_at=%v", path, failedAt)
 		}
 	})
