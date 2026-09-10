@@ -709,3 +709,66 @@ func (a *atomicInt) get() int {
 	defer a.mu.Unlock()
 	return a.v
 }
+
+// The user-reported scenario: probe fails (background probe deadline), the
+// candidate is the only one ("show one stream with failover"), and the plugin
+// declares languages with a leading release marker. The merged inventory must
+// end up with one track per real language — no anonymous generic track, the
+// marker filtered — so the player's audio menu shows labeled choices.
+func TestMergeVirtualCandidateTracksProbeFailureYieldsLabeledPerLanguageTracks(t *testing.T) {
+	probed := &models.MediaFile{Resolution: "2160p", CodecVideo: "hevc"}
+	candidate := VirtualPlaybackStream{
+		CodecAudio:     "eac3",
+		AudioLanguages: []string{"MULTI", "eng", "fre"},
+	}
+
+	mergeVirtualCandidateTracks(probed, candidate)
+
+	got := make([]string, 0, len(probed.AudioTracks))
+	for _, track := range probed.AudioTracks {
+		got = append(got, track.Language)
+		if track.Language == "" {
+			t.Fatalf("anonymous audio track leaked into the inventory: %#v", probed.AudioTracks)
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("audio tracks = %v, want exactly [eng fre]", got)
+	}
+	if got[0] != "eng" || got[1] != "fre" {
+		t.Fatalf("audio tracks = %v, want declaration order [eng fre]", got)
+	}
+	if !probed.AudioTracks[0].Default || probed.AudioTracks[1].Default {
+		t.Fatalf("default must mark only the first declared language: %#v", probed.AudioTracks)
+	}
+	for i := range probed.AudioTracks {
+		if probed.AudioTracks[i].Codec != "eac3" {
+			t.Errorf("audio[%d].codec = %q, want eac3", i, probed.AudioTracks[i].Codec)
+		}
+		if probed.AudioTracks[i].Channels <= 0 {
+			t.Errorf("audio[%d].channels = %d, want > 0", i, probed.AudioTracks[i].Channels)
+		}
+	}
+}
+
+// No declared languages (all filtered): the single anonymous generic track is
+// the preserved fallback so a release without usable language metadata still
+// has a playable default.
+func TestMergeVirtualCandidateTracksProbeFailureWithoutLanguagesKeepsGenericTrack(t *testing.T) {
+	probed := &models.MediaFile{Resolution: "2160p", CodecVideo: "hevc"}
+	candidate := VirtualPlaybackStream{
+		CodecAudio:     "aac",
+		AudioLanguages: []string{"MULTI", "DUAL"},
+	}
+
+	mergeVirtualCandidateTracks(probed, candidate)
+
+	if len(probed.AudioTracks) != 1 {
+		t.Fatalf("audio tracks = %#v, want exactly the one generic fallback", probed.AudioTracks)
+	}
+	if probed.AudioTracks[0].Language != "" {
+		t.Fatalf("generic track language = %q, want empty", probed.AudioTracks[0].Language)
+	}
+	if !probed.AudioTracks[0].Default {
+		t.Fatal("generic track should be marked default")
+	}
+}

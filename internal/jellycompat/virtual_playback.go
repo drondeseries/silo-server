@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/text/language"
+
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -442,7 +444,11 @@ func mergeCompatCandidateTracks(probed *models.MediaFile, candidate VirtualPlayb
 		}
 		for _, language := range candidate.AudioLanguages {
 			language = strings.TrimSpace(language)
-			if language == "" || existing[strings.ToLower(language)] {
+			// Release markers like MULTI/DUAL are not language tags; filter
+			// them here exactly like the native surface's
+			// isRealVirtualLanguageTag, so a Jellyfin-protocol client gets the
+			// same labeled per-language inventory as the native one.
+			if language == "" || !isRealCompatLanguageTag(language) || existing[strings.ToLower(language)] {
 				continue
 			}
 			existing[strings.ToLower(language)] = true
@@ -542,6 +548,19 @@ func mediaFileHDRString(file *models.MediaFile) string {
 		return "true"
 	}
 	return ""
+}
+
+// isRealCompatLanguageTag reports whether a provider-declared language token
+// parses as a real ISO language subtag. It mirrors the native surface's
+// isRealVirtualLanguageTag so release markers like MULTI/DUAL are filtered
+// from the synthesized audio inventory on both protocol surfaces.
+func isRealCompatLanguageTag(value string) bool {
+	tag, err := language.Parse(value)
+	if err != nil {
+		return false
+	}
+	base, conf := tag.Base()
+	return conf != language.No && base.String() != ""
 }
 
 func compatVirtualDVProfileMarker(raw string) bool {
