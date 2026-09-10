@@ -1320,6 +1320,21 @@ func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID 
 	return err
 }
 
+// ClearVirtualCandidateFailed clears the failed_at stamp on a virtual candidate
+// row after a liveness check resolved its pinned result successfully, so the
+// auto-pick considers it again. No-op when the row is not virtual or has
+// vanished.
+func (r *FileRepository) ClearVirtualCandidateFailed(ctx context.Context, fileID int) error {
+	if r == nil || r.pool == nil {
+		return errors.New("file repository is not configured")
+	}
+	if fileID <= 0 {
+		return nil
+	}
+	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NULL, updated_at = NOW() WHERE id = $1 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID)
+	return err
+}
+
 func virtualCandidateSelection(raw string) bool {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
@@ -2299,17 +2314,72 @@ func (r *FileRepository) GetByID(ctx context.Context, id int) (*models.MediaFile
 	return scanMediaFile(r.pool.QueryRow(ctx, query, id))
 }
 
+// stripVirtualResultParam returns the virtual URI with the pinned ?result=
+// selection removed, preserving the scheme/host/path and every other query
+// parameter. The result parameter is removed wherever it appears in the query
+// string (leading, trailing, or between other parameters). A URI whose only
+// query parameter was result collapses to the bare path with no trailing '?'.
+// The input is returned unchanged when it carries no result parameter or
+// cannot be parsed.
+func stripVirtualResultParam(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	q := parsed.Query()
+	if strings.TrimSpace(q.Get("result")) == "" {
+		return raw
+	}
+	q.Del("result")
+	parsed.RawQuery = q.Encode()
+	return parsed.String()
+}
+
+// unpinVirtualResult strips the pinned ?result= selection from a virtual
+// file's path inside a transaction, preserving every other query parameter.
+// It is a no-op when the row vanished, no longer matches expectedPath (CAS),
+// or carries no result parameter. expectedPath "" skips the CAS check.
+func (r *FileRepository) unpinVirtualResult(ctx context.Context, fileID int, expectedPath string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var currentPath string
+	err = tx.QueryRow(ctx, `SELECT file_path FROM media_files WHERE id = $1 FOR UPDATE`, fileID).Scan(&currentPath)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read current path: %w", err)
+	}
+	if expectedPath != "" && currentPath != expectedPath {
+		return nil
+	}
+	neutralPath := stripVirtualResultParam(currentPath)
+	if neutralPath == currentPath {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE media_files
+		SET file_path = $1
+		WHERE id = $2 AND file_path = $3`, neutralPath, fileID, currentPath); err != nil {
+		return fmt.Errorf("update path: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
 // ClearVirtualResultPin strips the pinned ?result= selection from a virtual
 // file's path so the next playback re-lists live provider candidates instead
 // of resolving a cached link that just failed (expired or 5xx-ing debrid
 // links otherwise brick the title: the pin survives every failover). No-op
 // when the row has no pin or vanished concurrently.
 func (r *FileRepository) ClearVirtualResultPin(ctx context.Context, fileID int) error {
-	_, err := r.pool.Exec(ctx, `
-		UPDATE media_files
-		SET file_path = regexp_replace(file_path, '\?result=[^&]*$', '')
-		WHERE id = $1 AND file_path LIKE '%?result=%'`, fileID)
-	if err != nil {
+	if err := r.unpinVirtualResult(ctx, fileID, ""); err != nil {
 		return fmt.Errorf("clear virtual result pin for file %d: %w", fileID, err)
 	}
 	return nil
@@ -2337,10 +2407,7 @@ func (r *FileRepository) ReplaceVirtualResultPin(ctx context.Context, fileID int
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			// Another row already owns the (replacementPath, owner, folder) tuple.
 			// Strip this row's pin instead of repointing it at the live candidate.
-			if _, unpinErr := r.pool.Exec(ctx, `
-				UPDATE media_files
-				SET file_path = regexp_replace(file_path, '\?result=[^&]*$', '')
-				WHERE id = $1 AND file_path = $2`, fileID, expectedPath); unpinErr != nil {
+			if unpinErr := r.unpinVirtualResult(ctx, fileID, expectedPath); unpinErr != nil {
 				return false, fmt.Errorf("replace virtual result pin for file %d: %w", fileID, unpinErr)
 			}
 			return false, nil
