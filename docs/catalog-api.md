@@ -53,10 +53,16 @@ carry real language identity instead of being collapsed to a single code.
   keeps the primary code (the first concrete one when the tag was
   undetermined). Rows probed before this support are backfilled at read time
   from the embedded title until the probe-version re-probe catches up.
-- **`FileVersion.audio_tracks[].index`** — the container stream ordinal
-  (ffmpeg's `0:a:N`). Track list order can differ from container order on
-  MULTi releases, so this is the identity a client should use when it needs
-  the real stream position.
+- **`FileVersion.audio_tracks[].index`** — the **absolute container stream
+  index** as ffprobe reported it (video is typically stream 0, the first
+  audio stream 1, subtitles interleaved between them). It is NOT the
+  audio-only FFmpeg ordinal used by `0:a:N` map specifiers, and NOT the
+  track's position in the `audio_tracks` array. Track list order can differ
+  from container order on MULTi releases; clients that need to select a
+  track for ffmpeg must convert this index to the audio-only ordinal
+  (the rank of the selected track among tracks ordered by absolute index —
+  see `playback.AudioStreamOrdinal` server-side) rather than sending this
+  value directly.
 - **`FileVersion.release_name`** / **`FileVersion.release_group`** — the file
   stem (basename without extension) and the trailing group tag on
   release-style names (`Movie.2023.2160p.AltMount` → group `AltMount`), so

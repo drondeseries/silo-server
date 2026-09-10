@@ -523,7 +523,10 @@ export interface SubtitleDecisionV3 {
 /**
  * One probed audio stream of the effective source, mirroring the catalog's
  * file-version `audio_tracks` shape so a client renders the same menu from
- * either source. `index` is the container stream ordinal (ffmpeg's `0:a:N`).
+ * either source. `index` is the ABSOLUTE container stream index as probed by
+ * ffprobe (video 0, first audio 1, subtitles interleaved) — NOT the
+ * audio-only FFmpeg ordinal `0:a:N` expects, and NOT the track's array
+ * position. Clients must not send it as an ffmpeg map value directly.
  */
 export interface AudioTrackV3 {
   index?: number;
