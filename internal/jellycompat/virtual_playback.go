@@ -419,7 +419,8 @@ func mergeCompatCandidateTracks(probed *models.MediaFile, candidate VirtualPlayb
 	if probed.CodecAudio == "" {
 		probed.CodecAudio = audioCodec
 	}
-	if len(probed.AudioTracks) == 0 {
+	synthesizeAudio := len(probed.AudioTracks) == 0
+	if synthesizeAudio {
 		probed.AudioTracks = append(probed.AudioTracks, models.AudioTrack{
 			Codec:    audioCodec,
 			Channels: channels,
@@ -435,25 +436,8 @@ func mergeCompatCandidateTracks(probed *models.MediaFile, candidate VirtualPlayb
 		}
 	}
 
-	if len(candidate.AudioLanguages) > 0 {
-		// Provider-declared languages are HINTS, not streams (mirror of the
-		// native surface's mergeVirtualCandidateLanguages). When the probe
-		// produced a real inventory, appending provider-only languages as new
-		// selectable tracks fabricates streams that do not exist — a
-		// zero-index track in an otherwise probed inventory maps to the wrong
-		// or an out-of-range ffmpeg ordinal. Hints then become language
-		// metadata of the existing real tracks; per-language synthesized
-		// tracks are created ONLY when the probe left the inventory empty.
-		existing := make(map[string]bool, len(probed.AudioTracks))
-		anyProbed := false
-		for _, track := range probed.AudioTracks {
-			if track.Index > 0 {
-				anyProbed = true
-			}
-			if language := strings.TrimSpace(track.Language); language != "" {
-				existing[compatLanguageBaseSubtag(language)] = true
-			}
-		}
+	if synthesizeAudio && len(candidate.AudioLanguages) > 0 {
+		existing := make(map[string]bool, len(candidate.AudioLanguages))
 		for _, language := range candidate.AudioLanguages {
 			language = strings.TrimSpace(language)
 			// Release markers like MULTI/DUAL are not language tags; filter
@@ -468,12 +452,6 @@ func mergeCompatCandidateTracks(probed *models.MediaFile, candidate VirtualPlayb
 				continue
 			}
 			existing[canonical] = true
-			if anyProbed {
-				// Probed inventory exists: keep the hint as metadata of the
-				// first real track instead of fabricating a selectable stream.
-				probed.AudioTracks[0].Languages = append(probed.AudioTracks[0].Languages, language)
-				continue
-			}
 			assigned := false
 			for i := range probed.AudioTracks {
 				if strings.TrimSpace(probed.AudioTracks[i].Language) == "" {
