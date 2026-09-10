@@ -219,6 +219,7 @@ POST /api/v1/catalog/query	non-media
 GET /api/v1/catalog/series/{id}/seasons	non-media
 GET /api/v1/catalog/series/{id}/seasons/{num}	non-media
 GET /api/v1/catalog/series/{id}/seasons/{num}/episodes	non-media
+POST /api/v1/catalog/versions/check	non-media
 GET /api/v1/compat/connect-info	non-media
 POST /api/v1/diagnostics/reports	non-media
 POST /api/v1/diagnostics/reports/uploads/	non-media
