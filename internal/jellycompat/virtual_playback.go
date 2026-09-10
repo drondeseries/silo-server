@@ -436,10 +436,16 @@ func mergeCompatCandidateTracks(probed *models.MediaFile, candidate VirtualPlayb
 	}
 
 	if len(candidate.AudioLanguages) > 0 {
+		// Dedup must be language-normalized (mirror of the native surface's
+		// mergeVirtualCandidateLanguages): the probe records ISO 639-1 codes
+		// ("it") while providers declare 639-2/3 codes ("ITA"), so
+		// exact-string matching would append a duplicate track for every
+		// language the probe already found. Canonicalize both sides to the
+		// ISO base subtag.
 		existing := make(map[string]bool, len(probed.AudioTracks))
 		for _, track := range probed.AudioTracks {
 			if language := strings.TrimSpace(track.Language); language != "" {
-				existing[strings.ToLower(language)] = true
+				existing[compatLanguageBaseSubtag(language)] = true
 			}
 		}
 		for _, language := range candidate.AudioLanguages {
@@ -448,10 +454,14 @@ func mergeCompatCandidateTracks(probed *models.MediaFile, candidate VirtualPlayb
 			// them here exactly like the native surface's
 			// isRealVirtualLanguageTag, so a Jellyfin-protocol client gets the
 			// same labeled per-language inventory as the native one.
-			if language == "" || !isRealCompatLanguageTag(language) || existing[strings.ToLower(language)] {
+			if language == "" || !isRealCompatLanguageTag(language) {
 				continue
 			}
-			existing[strings.ToLower(language)] = true
+			canonical := compatLanguageBaseSubtag(language)
+			if existing[canonical] {
+				continue
+			}
+			existing[canonical] = true
 			assigned := false
 			for i := range probed.AudioTracks {
 				if strings.TrimSpace(probed.AudioTracks[i].Language) == "" {
@@ -561,6 +571,20 @@ func isRealCompatLanguageTag(value string) bool {
 	}
 	base, conf := tag.Base()
 	return conf != language.No && base.String() != ""
+}
+
+// compatLanguageBaseSubtag canonicalizes a language token to its ISO base
+// subtag ("ITA" → "it"), mirroring the native surface's
+// virtualLanguageBaseSubtag so probe-recorded codes and provider-declared
+// codes dedup against the same key on both protocol surfaces.
+func compatLanguageBaseSubtag(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if tag, err := language.Parse(trimmed); err == nil {
+		if base, conf := tag.Base(); conf != language.No && base.String() != "" {
+			return base.String()
+		}
+	}
+	return strings.ToLower(trimmed)
 }
 
 func compatVirtualDVProfileMarker(raw string) bool {

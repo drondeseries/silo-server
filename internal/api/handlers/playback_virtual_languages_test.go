@@ -772,3 +772,65 @@ func TestMergeVirtualCandidateTracksProbeFailureWithoutLanguagesKeepsGenericTrac
 		t.Fatal("generic track should be marked default")
 	}
 }
+
+// The user-reported scenario (file 887387): the probe found real tracks with
+// ISO 639-1 codes (it/ko/en), while the provider declares the same languages
+// as 639-2/3 codes (ITA/KOR/ENG). Exact-string dedup appended all three again,
+// producing a 6-row audio menu where the synthesized rows mapped to the same
+// or out-of-range ffmpeg ordinals (same-ita-sound / silent rows). Dedup must
+// be language-normalized: the declared list adds nothing the probe already has.
+func TestMergeVirtualCandidateLanguagesDedupsByNormalizedLanguage(t *testing.T) {
+	probed := &models.MediaFile{
+		Resolution: "1080p",
+		CodecVideo: "hevc",
+		AudioTracks: []models.AudioTrack{
+			{Index: 1, Language: "it", Codec: "aac", Channels: 2, Default: true},
+			{Index: 2, Language: "ko", Codec: "aac", Channels: 2},
+			{Index: 3, Language: "en", Codec: "aac", Channels: 2},
+		},
+	}
+	candidate := VirtualPlaybackStream{
+		CodecAudio:     "aac",
+		AudioLanguages: []string{"ITA", "KOR", "ENG"},
+	}
+
+	mergeVirtualCandidateTracks(probed, candidate)
+
+	if len(probed.AudioTracks) != 3 {
+		t.Fatalf("audio tracks = %#v, want the 3 probed tracks with no synthesized duplicates", probed.AudioTracks)
+	}
+	got := make([]string, 0, len(probed.AudioTracks))
+	for _, track := range probed.AudioTracks {
+		got = append(got, track.Language)
+		if track.Index <= 0 {
+			t.Errorf("synthesized duplicate leaked into the inventory: %#v", probed.AudioTracks)
+		}
+	}
+	want := []string{"it", "ko", "en"}
+	for i, want := range want {
+		if got[i] != want {
+			t.Fatalf("audio[%d].language = %q, want %q (probed tracks untouched)", i, got[i], want)
+		}
+	}
+}
+
+// Mixed-script dedup: a provider language that resolves to a base subtag the
+// probe already covers in a different code form ("en-US" vs "en") also dedups.
+func TestMergeVirtualCandidateLanguagesDedupsRegionalVariants(t *testing.T) {
+	probed := &models.MediaFile{
+		AudioTracks: []models.AudioTrack{{Index: 1, Language: "en", Codec: "aac", Channels: 2, Default: true}},
+	}
+	candidate := VirtualPlaybackStream{
+		CodecAudio:     "aac",
+		AudioLanguages: []string{"EN", "en-US", "FRA"},
+	}
+
+	mergeVirtualCandidateTracks(probed, candidate)
+
+	if len(probed.AudioTracks) != 2 {
+		t.Fatalf("audio tracks = %#v, want [en probed, fra synthesized] — EN and en-US dedup to the same base subtag", probed.AudioTracks)
+	}
+	if probed.AudioTracks[1].Language != "FRA" {
+		t.Fatalf("audio[1].language = %q, want FRA (the only genuinely new language)", probed.AudioTracks[1].Language)
+	}
+}
