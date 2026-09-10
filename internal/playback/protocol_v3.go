@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 const (
@@ -907,6 +909,12 @@ type PlanV3 struct {
 	EffectiveMediaFileID   int                    `json:"effective_media_file_id"`
 	Source                 SourceDescriptorV3     `json:"source"`
 	SubtitleFidelityPolicy string                 `json:"subtitle_fidelity_policy"`
+	// AudioTracks is the authoritative per-track audio inventory of the
+	// effective source, mirroring the subtitle inventory. Clients should
+	// prefer it over item metadata: after a version fallback the effective
+	// file can differ from the requested catalog row, and only this list
+	// reflects the tracks the plan actually plays.
+	AudioTracks []models.AudioTrack `json:"audio_tracks,omitempty"`
 }
 
 type TerminalV3 struct {

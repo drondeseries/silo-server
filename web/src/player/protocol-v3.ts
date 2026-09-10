@@ -520,6 +520,27 @@ export interface SubtitleDecisionV3 {
   inventory: SubtitleInventoryItemV3[];
 }
 
+/**
+ * One probed audio stream of the effective source, mirroring the catalog's
+ * file-version `audio_tracks` shape so a client renders the same menu from
+ * either source. `index` is the container stream ordinal (ffmpeg's `0:a:N`).
+ */
+export interface AudioTrackV3 {
+  index?: number;
+  title?: string;
+  embedded_title?: string;
+  language?: string;
+  languages?: string[];
+  codec?: string;
+  profile?: string;
+  layout?: string;
+  channels?: number;
+  bitrate?: number;
+  sample_rate?: number;
+  bit_depth?: number;
+  default: boolean;
+}
+
 export interface AppliedQuirkV3 {
   id: string;
   registry_revision: string;
@@ -568,6 +589,14 @@ export interface PlanV3 {
   effective_media_file_id: number;
   source: SourceDescriptorV3;
   subtitle_fidelity_policy: string;
+  /**
+   * Authoritative per-track audio inventory of the effective source, mirroring
+   * the subtitle inventory. Clients should prefer it over item metadata: after
+   * a version fallback the effective file can differ from the requested
+   * catalog row, and only this list reflects the tracks the plan actually
+   * plays. Shape matches the catalog's file-version `audio_tracks`.
+   */
+  audio_tracks?: AudioTrackV3[];
 }
 
 export interface TerminalV3 {

@@ -32,6 +32,7 @@ import {
   type ReplanOptions,
 } from "../playback-session-wire-v3";
 import type {
+  PlayerAudioTrack,
   PlayerFileVersion,
   PlayerPlaybackVariant,
   PlayerSubtitleInfo,
@@ -59,6 +60,12 @@ interface PlaybackSessionState {
   audioTrackIndex: number;
   durationSeconds: number | null;
   subtitleUrls: PlayerSubtitleInfo[];
+  /**
+   * The plan's authoritative audio inventory for the effective source, when
+   * the server publishes one. Consumers render the audio menu from this in
+   * preference to item metadata, which can be stale after a version fallback.
+   */
+  planAudioTracks: PlayerAudioTrack[];
   qualityPreference: string;
   shouldAutoPlay: boolean;
   loading: boolean;
@@ -222,6 +229,7 @@ function planToSessionState(
     initialPosition: plan.timeline.player_start_seconds,
     audioTrackIndex: plan.selected_tracks.audio?.index ?? 0,
     durationSeconds: plan.source.duration_seconds ?? null,
+    planAudioTracks: plan.audio_tracks ?? [],
     subtitleUrls: mapSubtitleInventory(
       plan.subtitle.inventory,
       plan.effective_media_file_id,
@@ -329,6 +337,7 @@ export function usePlaybackSession(
     audioTrackIndex: 0,
     durationSeconds: null,
     subtitleUrls: [],
+    planAudioTracks: [],
     qualityPreference: qualityPreference?.trim() || "auto",
     shouldAutoPlay: true,
     loading: true,
@@ -635,6 +644,7 @@ export function usePlaybackSession(
           audioTrackIndex: 0,
           durationSeconds: null,
           subtitleUrls: [],
+          planAudioTracks: [],
           loading: false,
           replacing: false,
           replanning: false,
@@ -745,6 +755,7 @@ export function usePlaybackSession(
           audioTrackIndex: 0,
           durationSeconds: null,
           subtitleUrls: [],
+          planAudioTracks: [],
           loading: false,
           replacing: false,
           replanning: false,

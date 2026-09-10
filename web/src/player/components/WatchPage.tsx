@@ -149,9 +149,15 @@ export function WatchPage({
     });
   }, [session.initialSubtitleError, session.initialSubtitleErrorTitle, session.playbackAttemptId]);
 
+  // The plan's audio inventory is authoritative for the effective source after
+  // a version fallback; item metadata can be stale. Fall back to the version's
+  // probed tracks only when the plan publishes none (old plans, audiobooks).
   const audioTracks = useMemo(
-    () => playbackVersions.find((v) => v.file_id === session.mediaFileId)?.audio_tracks ?? [],
-    [playbackVersions, session.mediaFileId],
+    () =>
+      session.planAudioTracks.length > 0
+        ? session.planAudioTracks
+        : (playbackVersions.find((v) => v.file_id === session.mediaFileId)?.audio_tracks ?? []),
+    [playbackVersions, session.mediaFileId, session.planAudioTracks],
   );
   const playableSubtitles = useMemo(
     () => resolvePlayableSubtitles(session.subtitleUrls, subtitles),

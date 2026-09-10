@@ -80,6 +80,7 @@ function playbackSession(
     audioTrackIndex: 0,
     durationSeconds: 3600,
     subtitleUrls: [],
+    planAudioTracks: [],
     qualityPreference: "original",
     shouldAutoPlay: true,
     loading: false,
@@ -203,6 +204,39 @@ describe("WatchPage playback state", () => {
 
     expect(updatePlaybackState).toHaveBeenCalledWith(321, true);
     expect(onPlaybackStateChange).toHaveBeenCalledWith(state);
+  });
+});
+
+describe("WatchPage audio menu", () => {
+  it("prefers the plan's audio inventory over item metadata", () => {
+    const planAudioTracks = [
+      { language: "eng", codec: "aac", channels: 2, default: true },
+      { language: "spa", codec: "ac3", channels: 6, default: false },
+    ];
+    playbackSessionMock.mockReturnValue(playbackSession({ planAudioTracks }));
+
+    render(createElement(WatchPage, watchPageProps));
+
+    const props = videoPlayerMock.mock.calls[0]?.[0] as { audioTracks?: unknown[] };
+    expect(props.audioTracks).toEqual(planAudioTracks);
+  });
+
+  it("falls back to the version's item metadata when the plan publishes no inventory", () => {
+    const versionWithTracks: PlayerFileVersion = {
+      ...version,
+      audio_tracks: [{ language: "eng", codec: "aac", channels: 2, default: true }],
+    };
+    playbackSessionMock.mockReturnValue(playbackSession({ planAudioTracks: [] }));
+
+    render(
+      createElement(WatchPage, {
+        ...watchPageProps,
+        versions: [versionWithTracks],
+      }),
+    );
+
+    const props = videoPlayerMock.mock.calls[0]?.[0] as { audioTracks?: unknown[] };
+    expect(props.audioTracks).toEqual(versionWithTracks.audio_tracks);
   });
 });
 

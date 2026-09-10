@@ -1151,6 +1151,19 @@ address the wrong track. (That was a real bug; this rule is the fix.)
 track by echoing an entry's `track_id` or `combined_index`. It must never derive
 an ordinal by counting tracks, summing array lengths, or taking `max(index)+1`.
 
+`playback_plan.audio_tracks` is the authoritative per-track audio inventory of
+the effective source, mirroring the subtitle inventory. It is the probed
+`AudioTrack` list of the file the plan actually plays, in container order, with
+the same shape as the catalog's file-version `audio_tracks` (`index`, `title`,
+`embedded_title`, `language`, `languages`, `codec`, `profile`, `layout`,
+`channels`, `bitrate`, `sample_rate`, `bit_depth`, `default`). A client renders
+its audio menu from this list in preference to item metadata: after a version
+fallback the effective file can differ from the requested catalog row, and only
+the plan's list reflects the tracks the plan actually plays. The field is
+optional — a plan may omit it when the source has no probed audio inventory —
+and it is not part of the plan's identity (§9), exactly like the subtitle
+inventory.
+
 Each entry carries `source` (`external` | `embedded` | `downloaded`), `delivery`
 (`sidecar` | `burn_in_only`), the `forced` / `default` / `hearing_impaired`
 flags, a `url` when deliverable, and a `font_bundle_url` for embedded ASS tracks
