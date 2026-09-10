@@ -350,6 +350,9 @@ func (h *AdminHandler) effectiveSettingsForConnectionCheck(
 			return nil, err
 		}
 	}
+	// Capture the persisted RemuxDB authority before the draft's dirty keys
+	// overwrite it so a changed endpoint cannot receive the stored token.
+	storedRemuxBaseURL := merged[remuxdb.SettingBaseURL]
 	for _, key := range req.DirtyKeys {
 		merged[key] = req.Values[key]
 	}
@@ -360,8 +363,27 @@ func (h *AdminHandler) effectiveSettingsForConnectionCheck(
 		}
 		protectAIConnectionCheckSecrets(kind, req, storedAIConfig, draftAIConfig, merged)
 	}
+	if kind == "remuxdb" {
+		protectRemuxDBConnectionCheckSecrets(storedRemuxBaseURL, req, merged)
+	}
 
 	return merged, nil
+}
+
+// protectRemuxDBConnectionCheckSecrets withholds the stored RemuxDB token when
+// the draft points the connection check at a different authority and the
+// request did not explicitly supply a replacement token.
+func protectRemuxDBConnectionCheckSecrets(
+	storedBaseURL string,
+	req adminSettingsConnectionCheckRequest,
+	settings map[string]string,
+) {
+	if endpointAuthority(storedBaseURL) == endpointAuthority(settings[remuxdb.SettingBaseURL]) {
+		return
+	}
+	if !hasExplicitDraftSecret(req, remuxdb.SettingToken) {
+		settings[remuxdb.SettingToken] = ""
+	}
 }
 
 func protectAIConnectionCheckSecrets(

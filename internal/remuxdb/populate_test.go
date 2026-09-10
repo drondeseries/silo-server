@@ -73,3 +73,46 @@ func TestApplyEvidenceRequiresVideo(t *testing.T) {
 		t.Fatal("nil file applied")
 	}
 }
+
+func TestApplyEvidenceDetectsUppercaseHDR(t *testing.T) {
+	ev := Evidence{
+		VideoTracks: []TrackDetail{
+			{Kind: "video", Codec: "hevc", Width: 3840, Height: 2160, ColorTransfer: " SMPTE2084 "},
+		},
+	}
+	file := &models.MediaFile{}
+	ApplyEvidence(ev, file)
+	if !file.HDR {
+		t.Fatalf("file.HDR = false, want true for SMPTE2084 transfer")
+	}
+	if len(file.VideoTracks) != 1 || file.VideoTracks[0].VideoRange != "HDR" {
+		t.Fatalf("video tracks = %+v, want HDR range", file.VideoTracks)
+	}
+}
+
+func TestApplyEvidenceRoutesExternalSubtitles(t *testing.T) {
+	ev := Evidence{
+		VideoTracks: []TrackDetail{{Kind: "video", Codec: "h264", Width: 1920, Height: 1080}},
+		SubtitleTracks: []TrackDetail{
+			{Kind: "subtitle", Index: 2, Codec: "subrip", Language: "eng"},
+			{Kind: "subtitle", Index: 3, Codec: "srt", Language: "fra", Title: "French", IsExternal: true},
+		},
+	}
+	file := &models.MediaFile{}
+	if !ApplyEvidence(ev, file) {
+		t.Fatal("evidence not applied")
+	}
+	if len(file.SubtitleTracks) != 1 {
+		t.Fatalf("embedded subtitle tracks = %d, want 1: %+v", len(file.SubtitleTracks), file.SubtitleTracks)
+	}
+	if file.SubtitleTracks[0].Codec != "subrip" || file.SubtitleTracks[0].External {
+		t.Fatalf("embedded track = %+v, want non-external subrip", file.SubtitleTracks[0])
+	}
+	if len(file.ExternalSubtitles) != 1 {
+		t.Fatalf("external subtitles = %d, want 1: %+v", len(file.ExternalSubtitles), file.ExternalSubtitles)
+	}
+	ext := file.ExternalSubtitles[0]
+	if ext.Format != "srt" || ext.Language != "fra" || ext.Title != "French" {
+		t.Fatalf("external subtitle = %+v, want srt/fra/French", ext)
+	}
+}

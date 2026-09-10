@@ -162,10 +162,29 @@ func (s *Store) Get(ctx context.Context, contentID, episodeID string, folderID i
 		return Evidence{}, false, fmt.Errorf("get remuxdb match evidence: %w", err)
 	}
 	ev.MatchMethod = MatchMethod(method)
-	_ = json.Unmarshal(videoJSON, &ev.VideoTracks)
-	_ = json.Unmarshal(audioJSON, &ev.AudioTracks)
-	_ = json.Unmarshal(subtitleJSON, &ev.SubtitleTracks)
+	if err := decodeTrackList(videoJSON, &ev.VideoTracks, "video tracks"); err != nil {
+		return Evidence{}, false, err
+	}
+	if err := decodeTrackList(audioJSON, &ev.AudioTracks, "audio tracks"); err != nil {
+		return Evidence{}, false, err
+	}
+	if err := decodeTrackList(subtitleJSON, &ev.SubtitleTracks, "subtitle tracks"); err != nil {
+		return Evidence{}, false, err
+	}
 	return ev, true, nil
+}
+
+// decodeTrackList unmarshals one stored track inventory, surfacing corrupt
+// JSON as an error instead of leaving a silently empty inventory. A nil/empty
+// payload is treated as "not yet probed" and yields no tracks.
+func decodeTrackList(data []byte, dst any, label string) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(data, dst); err != nil {
+		return fmt.Errorf("decode remuxdb %s: %w", label, err)
+	}
+	return nil
 }
 
 // Record upserts the matched evidence for a release identity.

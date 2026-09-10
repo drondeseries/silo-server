@@ -64,19 +64,17 @@ func BuildSubmission(file *models.MediaFile, filename, infoHash string, nzb *Nzb
 	}
 
 	tracks := make([]TrackDetail, 0, len(file.VideoTracks)+len(file.AudioTracks)+len(file.SubtitleTracks))
-	idx := 0
-	for _, vt := range file.VideoTracks {
-		var fps float64
-		if vt.FrameRate != "" {
-			fps, _ = strconv.ParseFloat(vt.FrameRate, 64)
-		}
+	// VideoTrack carries no container index, so the array position is the
+	// video ordinal. Audio and subtitle indices are absolute container stream
+	// indices and are preserved verbatim rather than renumbered.
+	for i, vt := range file.VideoTracks {
 		tracks = append(tracks, TrackDetail{
 			Kind:             "video",
-			Index:            idx,
+			Index:            i,
 			Codec:            vt.Codec,
 			Width:            vt.Width,
 			Height:           vt.Height,
-			FPS:              fps,
+			FPS:              parseFrameRateFloat(vt.FrameRate),
 			BitRate:          int64(vt.Bitrate) * 1000,
 			BitDepth:         vt.BitDepth,
 			Profile:          vt.Profile,
@@ -90,12 +88,11 @@ func BuildSubmission(file *models.MediaFile, filename, infoHash string, nzb *Nzb
 			DVProfile:        vt.DVProfile,
 			Level:            vt.Level,
 		})
-		idx++
 	}
 	for _, at := range file.AudioTracks {
 		tracks = append(tracks, TrackDetail{
 			Kind:          "audio",
-			Index:         idx,
+			Index:         at.Index,
 			Codec:         at.Codec,
 			Channels:      at.Channels,
 			SampleRate:    at.SampleRate,
@@ -106,26 +103,26 @@ func BuildSubmission(file *models.MediaFile, filename, infoHash string, nzb *Nzb
 			Language:      at.Language,
 			IsDefault:     at.Default,
 		})
-		idx++
 	}
 	for _, st := range file.SubtitleTracks {
 		tracks = append(tracks, TrackDetail{
 			Kind:      "subtitle",
-			Index:     idx,
+			Index:     st.Index,
 			Codec:     st.Codec,
 			Title:     st.Title,
 			Language:  st.Language,
 			IsDefault: st.Default,
 			IsForced:  st.Forced,
 		})
-		idx++
 	}
 
 	size := file.FileSize
 	bitrate := int64(file.Bitrate) * 1000
-	container := file.Container
-	if container == "" || container == "virtual" {
-		container = "mkv"
+	// Leave the container empty when unknown; "virtual" is a sentinel for an
+	// unprobed source, not a real container. Never fabricate MKV.
+	container := strings.TrimSpace(file.Container)
+	if strings.EqualFold(container, "virtual") {
+		container = ""
 	}
 
 	return SubmissionPayload{
@@ -149,9 +146,39 @@ func isSafeIndexerGUID(guid string) bool {
 		return false
 	}
 	for _, c := range guid {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-' || c == '_') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && c != '-' && c != '_' {
 			return false
 		}
 	}
 	return true
+}
+
+// parseFrameRateFloat converts a probe frame-rate string to a float, accepting
+// both rational ("30000/1001") and decimal ("23.976") forms, with an optional
+// trailing "fps" label. Unparseable input returns 0.
+func parseFrameRateFloat(raw string) float64 {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0
+	}
+	if lower := strings.ToLower(s); strings.HasSuffix(lower, "fps") {
+		s = strings.TrimSpace(s[:len(s)-len("fps")])
+		if s == "" {
+			return 0
+		}
+	}
+	if !strings.Contains(s, "/") {
+		value, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return 0
+		}
+		return value
+	}
+	parts := strings.SplitN(s, "/", 2)
+	numerator, errNumerator := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	denominator, errDenominator := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if errNumerator != nil || errDenominator != nil || denominator == 0 {
+		return 0
+	}
+	return numerator / denominator
 }

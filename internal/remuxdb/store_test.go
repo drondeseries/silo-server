@@ -3,6 +3,7 @@ package remuxdb
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -81,5 +82,25 @@ func TestStoreNilPoolIsNoop(t *testing.T) {
 	}
 	if err := NewStore(nil).Record(context.Background(), Evidence{}); err != nil {
 		t.Fatalf("nil pool record: %v", err)
+	}
+}
+
+func TestDecodeTrackListPropagatesCorruptJSON(t *testing.T) {
+	var tracks []TrackDetail
+	err := decodeTrackList([]byte(`{"not":"an array"}`), &tracks, "video tracks")
+	if err == nil {
+		t.Fatal("corrupt track JSON should return an error")
+	}
+	if !strings.Contains(err.Error(), "video tracks") {
+		t.Fatalf("error = %v, want label video tracks", err)
+	}
+	if err := decodeTrackList(nil, &tracks, "video tracks"); err != nil {
+		t.Fatalf("empty payload should be tolerated: %v", err)
+	}
+	if err := decodeTrackList([]byte(`[{"kind":"audio","idx":1}]`), &tracks, "audio tracks"); err != nil {
+		t.Fatalf("valid payload: %v", err)
+	}
+	if len(tracks) != 1 || tracks[0].Index != 1 {
+		t.Fatalf("tracks = %+v, want one index 1", tracks)
 	}
 }
