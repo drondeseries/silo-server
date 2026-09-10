@@ -358,6 +358,31 @@ func TestMarkVirtualCandidateRecoveredFencing(t *testing.T) {
 		}
 	})
 
+	t.Run("resolved B cannot recover requested A", func(t *testing.T) {
+		exec(`UPDATE media_files SET file_path=$1, failed_at=NOW() WHERE id=$2`, originalPath, fileID)
+		_, observed := readRow()
+		if err := repo.MarkVirtualCandidateRecovered(t.Context(), fileID, replacementPath, observed); err != nil {
+			t.Fatal(err)
+		}
+		path, failedAt := readRow()
+		if path != originalPath || failedAt == nil || !failedAt.Equal(*observed) {
+			t.Fatalf("B changed A: %s %v", path, failedAt)
+		}
+	})
+
+	t.Run("newer stamped failure survives", func(t *testing.T) {
+		exec(`UPDATE media_files SET file_path=$1, failed_at=NOW() WHERE id=$2`, originalPath, fileID)
+		_, observed := readRow()
+		exec(`UPDATE media_files SET failed_at=failed_at + INTERVAL '1 second' WHERE id=$1`, fileID)
+		if err := repo.MarkVirtualCandidateRecovered(t.Context(), fileID, originalPath, observed); err != nil {
+			t.Fatal(err)
+		}
+		_, failedAt := readRow()
+		if failedAt == nil || !failedAt.After(*observed) {
+			t.Fatalf("newer failure erased: %v", failedAt)
+		}
+	})
+
 	t.Run("matching identity and health state recovers", func(t *testing.T) {
 		exec(`UPDATE media_files SET file_path=$1, failed_at=NOW() WHERE id=$2`, originalPath, fileID)
 		path, failedAt := readRow()

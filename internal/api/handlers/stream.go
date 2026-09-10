@@ -183,6 +183,15 @@ func hasUsableSubtitleTracks(file *models.MediaFile) bool {
 	return false
 }
 
+func resolvedVirtualCandidatePath(resolved ResolvedVirtualMedia) string {
+	uri := strings.TrimSpace(resolved.URI)
+	id := virtualResultCandidateID(uri)
+	if !strings.HasPrefix(uri, "virtual://") || id == "" || resolved.CandidateID == "" || resolved.CandidateID != id {
+		return ""
+	}
+	return uri
+}
+
 func hasVirtualMediaResolver(h *StreamHandler) bool {
 	return h != nil && (h.VirtualMediaResolver != nil || h.VirtualMediaDetailedResolver != nil || h.VirtualMediaRefreshResolver != nil)
 }
@@ -209,7 +218,7 @@ func (h *StreamHandler) resolveVirtualInputURIExcluding(
 	forceRefresh bool,
 	excludedCandidateIDs []string,
 ) (ResolvedVirtualMedia, func(), error) {
-	resolved := ResolvedVirtualMedia{URI: file.FilePath}
+	resolved := ResolvedVirtualMedia{}
 	var err error
 	if h.VirtualMediaDetailedResolver != nil {
 		resolved, err = h.VirtualMediaDetailedResolver.ResolveVirtualMediaDetailed(
@@ -362,6 +371,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	inputPath := file.FilePath
+	deliveredPath := ""
 	releaseInput := func() {}
 	if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
 		resolved, cleanup, resolveErr := h.resolveVirtualInputURI(r.Context(), file, session.UserID, session.ProfileID, false)
@@ -370,6 +380,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		inputPath = resolved.URL
+		deliveredPath = resolvedVirtualCandidatePath(resolved)
 		releaseInput = cleanup
 	}
 	defer func() {
@@ -423,17 +434,6 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				},
 			}
 			proxy.ServeHTTP(streamWriter, r)
-			if lastProxyErr == nil && isVirtualPlaybackFile(file) &&
-				virtualCandidateDeliveryEvidence(streamWriter.StatusCode(), streamWriter.BytesWritten()) {
-				// Media bytes actually flowed to the client for the candidate
-				// the session planned — the only evidence that forgives a
-				// transport failure. The delivered identity is the path the
-				// transport served (retained by the session even if the
-				// catalog row rotated mid-stream); the health state is the one
-				// observed at transport start, so a rotation to B or a newer
-				// failure on A is never cleared by a late delivery of A.
-				h.clearVirtualCandidateRecovered(r.Context(), file, file.FilePath, virtualObservedFailedAt)
-			}
 			if lastProxyErr != nil {
 				if streamWriter.StatusCode() == 0 && (h.VirtualMediaDetailedResolver != nil || h.VirtualMediaRefreshResolver != nil) {
 					if releaseInput != nil {
@@ -443,7 +443,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					// The pinned candidate served no bytes (corrupted NZB, dead
 					// provider URL). Mark it failed and re-resolve with it
 					// excluded so the next-ranked release is tried.
-					failedID := virtualResultCandidateID(file.FilePath)
+					failedID := virtualResultCandidateID(deliveredPath)
 					if failedID != "" {
 						h.markVirtualCandidateFailed(r.Context(), file, failedID)
 					}
@@ -469,6 +469,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 								refreshedHost := refreshedURL.Hostname()
 								if refreshedHost == "127.0.0.1" || refreshedHost == "::1" || refreshedHost == "[::1]" {
 									targetURL = refreshedURL
+									deliveredPath = resolvedVirtualCandidatePath(refreshedMedia)
 									lastProxyErr = nil
 									proxy.ServeHTTP(streamWriter, r)
 								}
@@ -482,6 +483,9 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 						writeError(streamWriter, http.StatusBadGateway, "virtual_stream_unavailable", "Failed to stream virtual media source")
 					}
 				}
+			}
+			if lastProxyErr == nil && virtualCandidateDeliveryEvidence(streamWriter.StatusCode(), streamWriter.BytesWritten()) {
+				h.clearVirtualCandidateRecovered(r.Context(), file, deliveredPath, virtualObservedFailedAt)
 			}
 			return
 		}
@@ -509,7 +513,7 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 		if dvProfile == 0 {
 			dvProfile = file.PrimaryDVProfile()
 		}
-		remuxErr := func() error {
+		serveRemux := func() error {
 			// The remux writes through the raw writer; wrap it to observe how
 			// many bytes actually reached the client. nil return is NOT
 			// delivery evidence (remux.go can return nil when the first
@@ -530,17 +534,18 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				// the session planned — the only evidence that forgives a
 				// transport failure. Fenced on the delivered identity and the
 				// health state observed at transport start.
-				h.clearVirtualCandidateRecovered(r.Context(), file, file.FilePath, virtualObservedFailedAt)
+				h.clearVirtualCandidateRecovered(r.Context(), file, deliveredPath, virtualObservedFailedAt)
 			}
 			return err
-		}()
+		}
+		remuxErr := serveRemux()
 		if remuxErr != nil {
 			// The remux only commits 200 after FFmpeg produces media bytes, so
 			// a failure here means the provider release served no output
 			// (corrupted NZB, dead URL). Mark the candidate failed and retry
 			// once with it excluded so the next-ranked release is tried.
 			if isVirtualPlaybackFile(file) && hasVirtualMediaResolver(h) {
-				failedID := virtualResultCandidateID(file.FilePath)
+				failedID := virtualResultCandidateID(deliveredPath)
 				if failedID != "" {
 					h.markVirtualCandidateFailed(r.Context(), file, failedID)
 				}
@@ -559,15 +564,9 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 					if parseErr == nil && retryURL.Scheme == "http" {
 						retryHost := retryURL.Hostname()
 						if retryHost == "127.0.0.1" || retryHost == "::1" || retryHost == "[::1]" {
-							remuxErr = playback.ServeRemuxWithOptions(w, r, retried.URL, "mp4", seekSeconds, session.TranscodeAudio, audioStreamOrdinalV3(file, session.AudioTrackIndex), dvProfile, playback.RemuxServeOptions{
-								DVMode:                 session.RemuxDVMode,
-								FFmpegPath:             h.ffmpegPath(),
-								ContentType:            playback.RemuxContentType(file.IsAudioOnly()),
-								AudioOnly:              file.IsAudioOnly(),
-								SourceAudioChannels:    session.SourceAudioChannels,
-								TargetAudioChannels:    session.TargetAudioChannels,
-								TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
-							})
+							inputPath = retried.URL
+							deliveredPath = resolvedVirtualCandidatePath(retried)
+							remuxErr = serveRemux()
 						}
 					}
 				}
@@ -1132,7 +1131,7 @@ func (h *StreamHandler) handleTransportStartFailure(ctx context.Context, session
 // on the next play while the dropdown still shows it (clickable) for a manual
 // retry. Best-effort: a persistence failure must not turn a 502 into a 500.
 func (h *StreamHandler) markVirtualCandidateFailed(ctx context.Context, file *models.MediaFile, candidateID string) {
-	if h == nil || file == nil || candidateID == "" {
+	if h == nil || file == nil || candidateID == "" || candidateID != virtualResultCandidateID(file.FilePath) {
 		return
 	}
 	if h.VirtualCandidateFailMarker == nil {

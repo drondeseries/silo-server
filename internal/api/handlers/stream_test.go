@@ -55,6 +55,91 @@ func (m *hookedSessionManager) BeginTransport(sessionID string) error {
 	return m.SessionManager.BeginTransport(sessionID)
 }
 
+type recoveryFailedWriter struct{ *httptest.ResponseRecorder }
+
+func (w recoveryFailedWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestHandleStreamRecoveryResolvedIdentity(t *testing.T) {
+	for _, method := range []playback.PlayMethod{playback.PlayDirect, playback.PlayRemux} {
+		for _, tc := range []struct {
+			name, result, identity string
+		}{
+			{"matching", "A", "A"},
+			{"substituted", "B", "B"},
+			{"unknown", "", ""},
+			{"retained requested URI without identity", "A", ""},
+			{"mismatched identity", "A", "B"},
+		} {
+			t.Run(string(method)+"/"+tc.name, func(t *testing.T) {
+				identity := tc.identity
+				known := identity != "" && identity == tc.result
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("media")) }))
+				defer upstream.Close()
+				stamp := time.Now().Add(-time.Hour)
+				file := &models.MediaFile{ID: 42, FilePath: "virtual://movie/test?result=A", FailedAt: &stamp, VirtualOwnerInstallationID: 7}
+				manager := playback.NewSessionManager(0, 0)
+				session, err := manager.StartSession(1, "profile-1", file.ID, method, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				h := NewStreamHandler(manager, testPlaybackFileResolver{file: file})
+				ffmpeg := filepath.Join(t.TempDir(), "ffmpeg")
+				if err := os.WriteFile(ffmpeg, []byte("#!/bin/sh\nprintf media\n"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				h.PlaybackConfig = func() config.PlaybackConfig { return config.PlaybackConfig{FFmpegPath: ffmpeg} }
+				h.VirtualMediaDetailedResolver = VirtualMediaDetailedResolverFunc(func(context.Context, string, int, int, string, bool, []string, string) (ResolvedVirtualMedia, error) {
+					uri := ""
+					if tc.result != "" {
+						uri = "virtual://movie/test?result=" + tc.result
+					}
+					return ResolvedVirtualMedia{URL: upstream.URL, URI: uri, CandidateID: identity}, nil
+				})
+				calls := 0
+				h.VirtualCandidateRecoveredMarker = func(_ context.Context, id int, path string, observed *time.Time) error {
+					calls++
+					if path != "virtual://movie/test?result="+identity || observed == nil || !observed.Equal(stamp) {
+						t.Fatalf("incorrect recovery: %s %v", path, observed)
+					}
+					if path == file.FilePath {
+						file.FailedAt = nil
+					}
+					return nil
+				}
+				req := httptest.NewRequest(http.MethodGet, "/api/v1/stream/"+session.ID, nil).WithContext(newAuthorizedPlaybackContext())
+				req = withPlaybackRouteParam(req, "session_id", session.ID)
+				rec := httptest.NewRecorder()
+				h.HandleStream(rec, req)
+				if rec.Code != http.StatusOK || rec.Body.Len() == 0 {
+					t.Fatalf("delivery: %d %s", rec.Code, rec.Body.String())
+				}
+				if (file.FailedAt == nil) != (known && identity == "A") {
+					t.Fatalf("wrong recovery for %q", identity)
+				}
+				if (calls > 0) != known {
+					t.Fatalf("marker calls: %d", calls)
+				}
+				file.FailedAt = &stamp
+				calls = 0
+				func() {
+					defer func() {
+						if caught := recover(); caught != nil {
+							err, ok := caught.(error)
+							if !ok || !errors.Is(err, http.ErrAbortHandler) {
+								panic(caught)
+							}
+						}
+					}()
+					h.HandleStream(recoveryFailedWriter{httptest.NewRecorder()}, req)
+				}()
+				if calls != 0 || file.FailedAt == nil {
+					t.Fatal("failed initial write cleared failure")
+				}
+			})
+		}
+	}
+}
+
 func TestHandleStream_VirtualDirectPlayUsesPinnedRelayPathAndHeaders(t *testing.T) {
 	var gotPath, gotRange, gotReferer string
 	var gotQuery url.Values

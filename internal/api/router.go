@@ -1203,10 +1203,7 @@ func NewRouter(deps Dependencies) chi.Router {
 			// rotated to a different candidate while the stream was being
 			// delivered, or a newer failure on the delivered candidate, is
 			// never cleared by a late delivery signal.
-			streamHandler.VirtualCandidateRecoveredMarker = func(ctx context.Context, fileID int, deliveredFilePath string, observedFailedAt *time.Time) error {
-				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET failed_at = NULL, updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, deliveredFilePath, observedFailedAt)
-				return err
-			}
+			streamHandler.VirtualCandidateRecoveredMarker = scanner.NewFileRepository(deps.DB).MarkVirtualCandidateRecovered
 			playbackHandler.VirtualFileUpdater = func(ctx context.Context, fileID int, newFilePath string) error {
 				_, _ = deps.DB.Exec(ctx, `DELETE FROM media_files WHERE file_path=$1 AND id != $2 AND virtual_owner_installation_id IS NOT NULL`, newFilePath, fileID)
 				_, err := deps.DB.Exec(ctx, `UPDATE media_files SET file_path=$1, updated_at=now() WHERE id=$2`, newFilePath, fileID)
