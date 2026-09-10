@@ -10,7 +10,10 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Silo-Server/silo-server/internal/access"
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
+	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/models"
 )
 
 const (
@@ -84,18 +87,26 @@ func (h *CatalogResourceHandler) HandleCheckVersions(w http.ResponseWriter, r *h
 }
 
 // checkVersion tests one media file's liveness and returns whether it is
-// available. Virtual rows resolve the pinned candidate through the provider
-// and stamp failed_at on a confirmed dead pin; local rows are read from
-// missing_since with no probe. Ambiguous provider errors (timeout, network,
-// resolver not configured) leave the stamp unchanged and report the row's
-// current computed availability, so a provider outage cannot mass-tag
-// versions as dead.
+// available. The file is authorized for the requesting profile BEFORE any
+// resolution: inaccessible IDs are indistinguishable from unknown IDs
+// (available=false, no distinguishing error), so a restricted profile cannot
+// probe arbitrary files or trigger provider work for them. Virtual rows
+// resolve the pinned candidate through the provider and stamp failed_at on a
+// confirmed dead pin; local rows are read from missing_since with no probe.
+// Ambiguous provider errors (timeout, network, resolver not configured) leave
+// the stamp unchanged and report the row's current computed availability, so
+// a provider outage cannot mass-tag versions as dead.
 func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) bool {
 	if h == nil || h.FileResolver == nil {
 		return false
 	}
 	file, err := h.FileResolver.GetByID(ctx, fileID)
 	if err != nil || file == nil {
+		return false
+	}
+	if !h.fileAccessible(ctx, file) {
+		// Denied by the profile's catalog/library access policy: report the
+		// same shape as an unknown ID and never resolve or stamp.
 		return false
 	}
 	if !isVirtualPlaybackFile(file) {
@@ -115,23 +126,79 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) b
 	)
 	if err == nil {
 		// The pinned candidate resolved: it is live. Clear any stale failed
-		// stamp so the auto-pick considers it again.
+		// stamp so the auto-pick considers it again. The clear is fenced on
+		// the candidate identity and failed_at observed above, so a stale
+		// success can never clear a newer failure or a rotated candidate.
 		if h.ClearVirtualFailed != nil {
-			_ = h.ClearVirtualFailed(context.WithoutCancel(ctx), fileID)
+			_ = h.ClearVirtualFailed(context.WithoutCancel(ctx), fileID, file.FilePath, file.FailedAt)
 		}
 		return true
 	}
 	if isVirtualCandidateDeadError(err) {
 		// Confirmed dead pin: the provider listed but the pinned candidate is
-		// gone or unusable. Stamp it so the auto-pick skips it.
+		// gone or unusable. Stamp it so the auto-pick skips it. The stamp is
+		// fenced the same way: a candidate rotated while resolution was in
+		// flight is never mis-marked.
 		if h.MarkVirtualFailed != nil {
-			_ = h.MarkVirtualFailed(context.WithoutCancel(ctx), fileID)
+			_ = h.MarkVirtualFailed(context.WithoutCancel(ctx), fileID, file.FilePath, file.FailedAt)
 		}
 		return false
 	}
 	// Ambiguous (provider down, timeout): do not stamp. Report the current
 	// durable signal so an outage does not mass-tag versions.
 	return file.FailedAt == nil
+}
+
+// fileAccessible applies the requesting profile's catalog/library access
+// policy to a media file, mirroring the playback handler's loadAuthorizedFile
+// authorization: episodes authorize through their parent series, extras
+// through their parent item, and plain files through their own content ID,
+// followed by the file-level library/quality predicate. Any failure — missing
+// lookup dependencies, an inaccessible parent, or a file outside the allowed
+// libraries — denies the file exactly like an unknown ID.
+func (h *CatalogResourceHandler) fileAccessible(ctx context.Context, file *models.MediaFile) bool {
+	if h == nil || h.ItemAccess == nil {
+		return false
+	}
+	filter := catalog.AccessFilter{
+		AllowedLibraryIDs:  accessScopeAllowedLibraryIDs(ctx),
+		DisabledLibraryIDs: accessScopeDisabledLibraryIDs(ctx),
+		MaxContentRating:   accessScopeMaxContentRating(ctx),
+		MaxPlaybackQuality: accessScopeMaxPlaybackQuality(ctx),
+		UserID:             apimw.GetUserID(ctx),
+		ProfileID:          apimw.GetProfileID(ctx),
+	}
+	switch {
+	case file.EpisodeID != "":
+		if h.EpisodeLookup == nil {
+			return false
+		}
+		episode, err := h.EpisodeLookup.GetByID(ctx, file.EpisodeID)
+		if err != nil || episode == nil {
+			return false
+		}
+		if err := h.ItemAccess.EnsureAccessible(ctx, episode.SeriesID, filter); err != nil {
+			return false
+		}
+	case file.ContentID != "":
+		if err := h.ItemAccess.EnsureAccessible(ctx, file.ContentID, filter); err != nil {
+			return false
+		}
+	case file.ExtraID != "":
+		if h.ExtraLookup == nil {
+			return false
+		}
+		extra, err := h.ExtraLookup.GetByID(ctx, file.ExtraID)
+		if err != nil || extra == nil {
+			return false
+		}
+		if err := h.ItemAccess.EnsureAccessible(ctx, extra.ParentID, filter); err != nil {
+			return false
+		}
+	default:
+		return false
+	}
+	return catalog.FileAllowedByAccess(file, filter)
 }
 
 // isVirtualCandidateDeadError classifies a resolution failure as a confirmed
@@ -155,4 +222,38 @@ func isVirtualCandidateDeadError(err error) bool {
 	return strings.Contains(msg, "no matching candidate") ||
 		strings.Contains(msg, "no streams available") ||
 		strings.Contains(msg, "no usable stream")
+}
+
+// The access-scope extractors below mirror requestAccessFilter's mapping of
+// the resolved access scope onto a catalog.AccessFilter, but take a context
+// instead of an *http.Request because the liveness check fans out per file
+// through an errgroup. A missing scope yields the unrestricted zero values,
+// exactly like requestAccessFilter.
+
+func accessScopeAllowedLibraryIDs(ctx context.Context) []int {
+	if scope, ok := access.GetScope(ctx); ok {
+		return scope.AllowedLibraryIDs
+	}
+	return nil
+}
+
+func accessScopeDisabledLibraryIDs(ctx context.Context) []int {
+	if scope, ok := access.GetScope(ctx); ok {
+		return scope.DisabledLibraryIDs
+	}
+	return nil
+}
+
+func accessScopeMaxContentRating(ctx context.Context) string {
+	if scope, ok := access.GetScope(ctx); ok {
+		return scope.MaxContentRating
+	}
+	return ""
+}
+
+func accessScopeMaxPlaybackQuality(ctx context.Context) string {
+	if scope, ok := access.GetScope(ctx); ok {
+		return scope.MaxPlaybackQuality
+	}
+	return ""
 }

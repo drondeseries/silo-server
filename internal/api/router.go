@@ -1508,12 +1508,24 @@ func NewRouter(deps Dependencies) chi.Router {
 	// Wire the batched version liveness check onto the catalog resource
 	// handler. The file repository provides row lookup and the failed_at
 	// stamping; the playback handler's detailed resolver (when playback is
-	// wired) resolves pinned virtual candidates through the provider.
+	// wired) resolves pinned virtual candidates through the provider. The
+	// item/episode/extra repositories authorize each file for the requesting
+	// profile before anything is resolved or stamped — the same access
+	// checker instance the playback handler uses.
 	if catalogResourceHandler != nil {
 		if deps.FileRepo != nil {
 			catalogResourceHandler.FileResolver = deps.FileRepo
 			catalogResourceHandler.MarkVirtualFailed = deps.FileRepo.MarkVirtualCandidateFailed
 			catalogResourceHandler.ClearVirtualFailed = deps.FileRepo.ClearVirtualCandidateFailed
+		}
+		if itemRepo != nil {
+			catalogResourceHandler.ItemAccess = itemRepo
+		}
+		if episodeRepo != nil {
+			catalogResourceHandler.EpisodeLookup = episodeRepo
+		}
+		if extraRepo != nil {
+			catalogResourceHandler.ExtraLookup = extraRepo
 		}
 		if playbackHandler != nil {
 			catalogResourceHandler.VirtualResolver = playbackHandler.VirtualMediaDetailedResolver

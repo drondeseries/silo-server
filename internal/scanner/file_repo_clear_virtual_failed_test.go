@@ -55,21 +55,31 @@ func TestClearVirtualCandidateFailed(t *testing.T) {
 	repo := NewFileRepository(pool)
 
 	// Virtual candidate row (container='virtual', virtual:// path).
+	virtualPath := fmt.Sprintf("virtual://movie/tt%d?result=dead", suffix)
 	var virtualID int
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id,failed_at)
 		VALUES($1,$2,$3,1000,'virtual',7,NOW()) RETURNING id`,
-		contentID, folderID, fmt.Sprintf("virtual://movie/tt%d?result=dead", suffix)).Scan(&virtualID); err != nil {
+		contentID, folderID, virtualPath).Scan(&virtualID); err != nil {
 		t.Fatalf("seed virtual file: %v", err)
+	}
+	var failedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT failed_at FROM media_files WHERE id=$1`, virtualID).Scan(&failedAt); err != nil {
+		t.Fatalf("read virtual failed_at: %v", err)
 	}
 
 	// Local row with a failed_at stamp (should never be touched by the clear).
+	localPath := fmt.Sprintf("/media/clear-virtual-failed-%d.mkv", suffix)
 	var localID int
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,failed_at)
 		VALUES($1,$2,$3,1000,NOW()) RETURNING id`,
-		contentID, folderID, fmt.Sprintf("/media/clear-virtual-failed-%d.mkv", suffix)).Scan(&localID); err != nil {
+		contentID, folderID, localPath).Scan(&localID); err != nil {
 		t.Fatalf("seed local file: %v", err)
+	}
+	var localFailedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT failed_at FROM media_files WHERE id=$1`, localID).Scan(&localFailedAt); err != nil {
+		t.Fatalf("read local failed_at: %v", err)
 	}
 
 	assertFailedAt := func(fileID int, want bool) {
@@ -84,24 +94,24 @@ func TestClearVirtualCandidateFailed(t *testing.T) {
 	}
 
 	// Clear on the virtual row removes the stamp.
-	if err := repo.ClearVirtualCandidateFailed(ctx, virtualID); err != nil {
+	if err := repo.ClearVirtualCandidateFailed(ctx, virtualID, virtualPath, failedAt); err != nil {
 		t.Fatalf("clear virtual candidate failed: %v", err)
 	}
 	assertFailedAt(virtualID, false)
 
 	// Clear on a local row is a no-op: the stamp survives.
-	if err := repo.ClearVirtualCandidateFailed(ctx, localID); err != nil {
+	if err := repo.ClearVirtualCandidateFailed(ctx, localID, localPath, localFailedAt); err != nil {
 		t.Fatalf("clear local candidate failed: %v", err)
 	}
 	assertFailedAt(localID, true)
 
 	// Clear on a vanished row is a no-op (no error).
-	if err := repo.ClearVirtualCandidateFailed(ctx, 999999999); err != nil {
+	if err := repo.ClearVirtualCandidateFailed(ctx, 999999999, "virtual://gone?result=x", nil); err != nil {
 		t.Fatalf("clear vanished candidate failed: %v", err)
 	}
 
 	// MarkVirtualCandidateFailed still stamps the virtual row (round-trip).
-	if err := repo.MarkVirtualCandidateFailed(ctx, virtualID); err != nil {
+	if err := repo.MarkVirtualCandidateFailed(ctx, virtualID, virtualPath, nil); err != nil {
 		t.Fatalf("mark virtual candidate failed: %v", err)
 	}
 	assertFailedAt(virtualID, true)
@@ -117,4 +127,138 @@ func TestClearVirtualCandidateFailed(t *testing.T) {
 	if file.MissingSince != nil {
 		t.Fatalf("virtual file must never carry missing_since: %#v", file)
 	}
+}
+
+// TestVirtualCandidateFailedFencing verifies the failed_at stamp/clear writes
+// are fenced on the candidate identity the liveness check inspected: when the
+// row's file_path rotates (candidate replaced) or failed_at changes while a
+// resolution is in flight, the stale write is a no-op. The happy paths still
+// write.
+func TestVirtualCandidateFailedFencing(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	suffix := time.Now().UnixNano()
+	contentID := fmt.Sprintf("virtual-failed-fencing-%d", suffix)
+	originalPath := fmt.Sprintf("virtual://movie/tt%d?result=original", suffix)
+	replacementPath := fmt.Sprintf("virtual://movie/tt%d?result=replacement", suffix)
+
+	var folderID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_folders(type,name,enabled)
+		VALUES('movies',$1,true) RETURNING id`, fmt.Sprintf("Failed Fencing %d", suffix)).Scan(&folderID); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM media_files WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_item_libraries WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_items WHERE content_id=$1`, contentID)
+		_, _ = pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, folderID)
+	})
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_items(content_id,type,title,status,genres)
+		VALUES($1,'movie','Failed Fencing Item','matched','{}'::text[])`, contentID); err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO media_item_libraries(content_id,media_folder_id)
+		VALUES($1,$2)`, contentID, folderID); err != nil {
+		t.Fatalf("seed item library: %v", err)
+	}
+
+	var fileID int
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO media_files(content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id)
+		VALUES($1,$2,$3,1000,'virtual',7) RETURNING id`,
+		contentID, folderID, originalPath).Scan(&fileID); err != nil {
+		t.Fatalf("seed virtual file: %v", err)
+	}
+
+	repo := NewFileRepository(pool)
+	readFailedAt := func() *time.Time {
+		t.Helper()
+		var failedAt *time.Time
+		if err := pool.QueryRow(ctx, `SELECT failed_at FROM media_files WHERE id=$1`, fileID).Scan(&failedAt); err != nil {
+			t.Fatalf("read failed_at: %v", err)
+		}
+		return failedAt
+	}
+	readPath := func() string {
+		t.Helper()
+		var path string
+		if err := pool.QueryRow(ctx, `SELECT file_path FROM media_files WHERE id=$1`, fileID).Scan(&path); err != nil {
+			t.Fatalf("read file_path: %v", err)
+		}
+		return path
+	}
+
+	t.Run("stale mark after candidate rotation is a no-op", func(t *testing.T) {
+		// The check inspected originalPath with failed_at nil; while its
+		// resolution was in flight the provider rotated the candidate.
+		if _, err := pool.Exec(ctx, `UPDATE media_files SET file_path=$1 WHERE id=$2`, replacementPath, fileID); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.MarkVirtualCandidateFailed(ctx, fileID, originalPath, nil); err != nil {
+			t.Fatalf("stale mark: %v", err)
+		}
+		if readFailedAt() != nil {
+			t.Fatal("stale mark stamped the rotated replacement candidate")
+		}
+		if readPath() != replacementPath {
+			t.Fatalf("stale mark modified file_path: %q", readPath())
+		}
+	})
+
+	t.Run("stale clear after newer failure is a no-op", func(t *testing.T) {
+		// The check inspected replacementPath with failed_at nil; while its
+		// resolution was in flight another session stamped the candidate dead.
+		if _, err := pool.Exec(ctx, `UPDATE media_files SET failed_at=NOW() WHERE id=$1`, fileID); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.ClearVirtualCandidateFailed(ctx, fileID, replacementPath, nil); err != nil {
+			t.Fatalf("stale clear: %v", err)
+		}
+		if readFailedAt() == nil {
+			t.Fatal("stale clear erased a newer failure stamp")
+		}
+	})
+
+	t.Run("stale mark after newer failure is a no-op", func(t *testing.T) {
+		// The check inspected replacementPath with failed_at nil; a newer
+		// failure arrived before the stale dead-pin verdict landed.
+		if err := repo.MarkVirtualCandidateFailed(ctx, fileID, replacementPath, nil); err != nil {
+			t.Fatalf("stale mark: %v", err)
+		}
+		if readFailedAt() == nil {
+			t.Fatal("stale mark cleared a newer failure stamp")
+		}
+	})
+
+	t.Run("matching mark writes", func(t *testing.T) {
+		observed := readFailedAt()
+		if err := repo.MarkVirtualCandidateFailed(ctx, fileID, replacementPath, observed); err != nil {
+			t.Fatalf("matching mark: %v", err)
+		}
+		if readFailedAt() == nil {
+			t.Fatal("matching mark did not stamp failed_at")
+		}
+	})
+
+	t.Run("matching clear writes", func(t *testing.T) {
+		observed := readFailedAt()
+		if err := repo.ClearVirtualCandidateFailed(ctx, fileID, replacementPath, observed); err != nil {
+			t.Fatalf("matching clear: %v", err)
+		}
+		if readFailedAt() != nil {
+			t.Fatal("matching clear did not remove failed_at")
+		}
+	})
 }

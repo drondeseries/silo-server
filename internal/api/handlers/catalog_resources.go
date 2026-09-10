@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -28,10 +29,20 @@ type CatalogResourceHandler struct {
 	VirtualResolver VirtualMediaDetailedResolver
 	// MarkVirtualFailed stamps a virtual candidate row as known-bad after a
 	// confirmed dead pin. Optional: without it the check never stamps.
-	MarkVirtualFailed func(ctx context.Context, fileID int) error
+	MarkVirtualFailed func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
 	// ClearVirtualFailed clears a virtual candidate's failed stamp after a
 	// successful resolution. Optional: without it the check never clears.
-	ClearVirtualFailed func(ctx context.Context, fileID int) error
+	ClearVirtualFailed func(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error
+	// ItemAccess authorizes a file's parent item for the requesting profile
+	// before the liveness check resolves or stamps anything. Optional: without
+	// it every file is reported unavailable, indistinguishable from unknown.
+	ItemAccess PlaybackItemAccessChecker
+	// EpisodeLookup and ExtraLookup resolve the parent of episode and extra
+	// files so they authorize through their series/item, mirroring the
+	// playback handler's loadAuthorizedFile. Optional: without them episode
+	// and extra files are denied.
+	EpisodeLookup PlaybackEpisodeLookup
+	ExtraLookup   PlaybackExtraLookup
 }
 
 // NewCatalogResourceHandler creates a new canonical catalog resource handler.

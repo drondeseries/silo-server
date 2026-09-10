@@ -1309,14 +1309,22 @@ func virtualCandidateGroup(raw string) (string, bool) {
 // MarkVirtualCandidateFailed stamps a virtual candidate row as known-bad after
 // a transport produced no bytes (corrupted NZB, dead provider URL). The
 // auto-pick skips failed candidates; a fresh listing clears the flag.
-func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID int) error {
+//
+// The write is fenced on the candidate identity the caller actually inspected:
+// expectedFilePath must still be the row's file_path and observedFailedAt must
+// still be the row's failed_at. A concurrent candidate rotation (the row's
+// file_path now points at a replacement candidate) or a newer failure stamp
+// therefore makes the write a no-op instead of mis-marking the replacement or
+// clearing fresh evidence. This mirrors ReplaceVirtualResultPin's
+// `WHERE id=$1 AND file_path=$2` guard.
+func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
 	if r == nil || r.pool == nil {
 		return errors.New("file repository is not configured")
 	}
 	if fileID <= 0 {
 		return nil
 	}
-	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NOW(), updated_at = NOW() WHERE id = $1`, fileID)
+	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NOW(), updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3`, fileID, expectedFilePath, observedFailedAt)
 	return err
 }
 
@@ -1324,14 +1332,20 @@ func (r *FileRepository) MarkVirtualCandidateFailed(ctx context.Context, fileID 
 // row after a liveness check resolved its pinned result successfully, so the
 // auto-pick considers it again. No-op when the row is not virtual or has
 // vanished.
-func (r *FileRepository) ClearVirtualCandidateFailed(ctx context.Context, fileID int) error {
+//
+// Like MarkVirtualCandidateFailed, the write is fenced on the candidate
+// identity the check inspected: expectedFilePath must still be the row's
+// file_path and observedFailedAt must still be the row's failed_at, so a
+// concurrent rotation or a newer failure stamp is never cleared by a stale
+// success.
+func (r *FileRepository) ClearVirtualCandidateFailed(ctx context.Context, fileID int, expectedFilePath string, observedFailedAt *time.Time) error {
 	if r == nil || r.pool == nil {
 		return errors.New("file repository is not configured")
 	}
 	if fileID <= 0 {
 		return nil
 	}
-	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NULL, updated_at = NOW() WHERE id = $1 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID)
+	_, err := r.pool.Exec(ctx, `UPDATE media_files SET failed_at = NULL, updated_at = NOW() WHERE id = $1 AND file_path = $2 AND failed_at IS NOT DISTINCT FROM $3 AND (container = 'virtual' OR file_path LIKE 'virtual://%')`, fileID, expectedFilePath, observedFailedAt)
 	return err
 }
 
