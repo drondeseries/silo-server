@@ -174,7 +174,29 @@ func TestDeliveryDemotionSurvivesDisabledAndOmittedEntriesAcrossReplans(t *testi
 	// Intermediate replan 1: the payload re-sends original_http DISABLED
 	// (SupportedOnDevice=false, Enabled=false, no marker). The re-application
 	// must still re-stamp the marker so the commit keeps the server evidence.
-	disabledContext := start.ClientPlaybackContext
+	// Deliveries maps are aliased by Go struct copies, so every round clones
+	// the map — otherwise disabling/deleting an entry here would corrupt the
+	// base context later rounds build from.
+	cloneContext := func(base playback.ClientPlaybackContextV3) playback.ClientPlaybackContextV3 {
+		cloned := base
+		cloned.Deliveries = make(map[string]playback.DeliveryCapabilityV3, len(base.Deliveries))
+		for class, capability := range base.Deliveries {
+			cloned.Deliveries[class] = capability
+		}
+		return cloned
+	}
+	assertDeliveryEntry := func(t *testing.T, ctx playback.ClientPlaybackContextV3, class string, wantEnabled bool) {
+		t.Helper()
+		capability, ok := ctx.Deliveries[class]
+		if !ok {
+			t.Fatalf("outgoing payload dropped %s entirely", class)
+		}
+		if capability.Enabled != wantEnabled {
+			t.Fatalf("outgoing payload %s Enabled = %v, want %v", class, capability.Enabled, wantEnabled)
+		}
+	}
+
+	disabledContext := cloneContext(start.ClientPlaybackContext)
 	disabledOriginal := disabledContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
 	disabledOriginal.Enabled = false
 	disabledOriginal.SupportedOnDevice = false
@@ -191,6 +213,9 @@ func TestDeliveryDemotionSurvivesDisabledAndOmittedEntriesAcrossReplans(t *testi
 	disabledReq.PlanAttemptKey = recoveredPlan.PlanAttemptKey
 	disabledReq.AttemptedPlanKeys = nil
 	disabledReq.ClientPlaybackContext = disabledContext
+	// Assert the outgoing payload actually carries the disabled entry — the
+	// map-aliasing regression this guard exists for.
+	assertDeliveryEntry(t, disabledReq.ClientPlaybackContext, playback.DeliveryClassOriginalHTTPV3, false)
 	intermediate := postPlaybackReplanV3(t, handler, started.SessionID, disabledReq)
 	if intermediate.Terminal != nil {
 		t.Fatalf("intermediate replan with the delivery disabled returned a terminal: %#v", intermediate.Terminal)
@@ -200,11 +225,13 @@ func TestDeliveryDemotionSurvivesDisabledAndOmittedEntriesAcrossReplans(t *testi
 	} else if caps := persisted.NormalizedRequest.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]; caps.Enabled || caps.FailureReason != demoteDeliveryReasonV3 {
 		t.Fatalf("disabled-entry round erased the demotion marker: %+v", caps)
 	}
+	// The base context must be uncorrupted by the disabled round.
+	assertDeliveryEntry(t, start.ClientPlaybackContext, playback.DeliveryClassOriginalHTTPV3, true)
 
 	// Intermediate replan 2: the payload OMITS the demoted class entirely.
 	// The re-application must synthesize the disabled entry so the marker
 	// survives the commit.
-	omittedContext := disabledContext
+	omittedContext := cloneContext(disabledContext)
 	delete(omittedContext.Deliveries, playback.DeliveryClassOriginalHTTPV3)
 	omittedReq := disabledReq
 	omittedReq.QualityPreference = "medium"
@@ -214,6 +241,9 @@ func TestDeliveryDemotionSurvivesDisabledAndOmittedEntriesAcrossReplans(t *testi
 	omittedReq.PlanAttemptKey = intermediate.PlaybackPlan.PlanAttemptKey
 	omittedReq.AttemptedPlanKeys = nil
 	omittedReq.ClientPlaybackContext = omittedContext
+	if _, exists := omittedReq.ClientPlaybackContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]; exists {
+		t.Fatal("omitted round payload still carries original_http; the fixture is not omitting it")
+	}
 	omitted := postPlaybackReplanV3(t, handler, started.SessionID, omittedReq)
 	if omitted.Terminal != nil {
 		t.Fatalf("intermediate replan with the delivery omitted returned a terminal: %#v", omitted.Terminal)
@@ -226,9 +256,16 @@ func TestDeliveryDemotionSurvivesDisabledAndOmittedEntriesAcrossReplans(t *testi
 		t.Fatalf("omitted-entry round erased the demotion marker: %+v", caps)
 	}
 
-	// Final replan: the client re-enables the delivery at full strength. The
+	// Final replan: the client re-enables the delivery at full strength
+	// (explicitly enabled and supported in the outgoing payload). The
 	// server-side demotion must still win — the route must not come back.
-	reenabledContext := start.ClientPlaybackContext
+	reenabledContext := cloneContext(start.ClientPlaybackContext)
+	reenabledOriginal := reenabledContext.Deliveries[playback.DeliveryClassOriginalHTTPV3]
+	reenabledOriginal.Enabled = true
+	reenabledOriginal.SupportedOnDevice = true
+	reenabledOriginal.FailureReason = ""
+	reenabledOriginal.ValidatedClaims = nil
+	reenabledContext.Deliveries[playback.DeliveryClassOriginalHTTPV3] = reenabledOriginal
 	reenabledReq := disabledReq
 	reenabledReq.QualityPreference = "auto"
 	reenabledReq.ReplanRequestID = "demote-omit-0003-re"
@@ -237,12 +274,16 @@ func TestDeliveryDemotionSurvivesDisabledAndOmittedEntriesAcrossReplans(t *testi
 	reenabledReq.PlanAttemptKey = omitted.PlaybackPlan.PlanAttemptKey
 	reenabledReq.AttemptedPlanKeys = nil
 	reenabledReq.ClientPlaybackContext = reenabledContext
+	// The transition under test: the outgoing payload really does re-enable.
+	assertDeliveryEntry(t, reenabledReq.ClientPlaybackContext, playback.DeliveryClassOriginalHTTPV3, true)
 	final := postPlaybackReplanV3(t, handler, started.SessionID, reenabledReq)
 	if final.Terminal != nil {
 		t.Fatalf("final replan returned a terminal: %#v", final.Terminal)
 	}
-	if finalPlan := final.PlaybackPlan; finalPlan != nil &&
-		playback.DeliveryClassV3(finalPlan.Delivery) == playback.DeliveryClassOriginalHTTPV3 {
-		t.Fatalf("final replan re-enabled the demoted delivery: %s (%s)", finalPlan.Delivery, finalPlan.DecisionReason)
+	if final.PlaybackPlan == nil {
+		t.Fatal("final replan returned no plan")
+	}
+	if playback.DeliveryClassV3(final.PlaybackPlan.Delivery) == playback.DeliveryClassOriginalHTTPV3 {
+		t.Fatalf("final replan re-enabled the demoted delivery: %s (%s)", final.PlaybackPlan.Delivery, final.PlaybackPlan.DecisionReason)
 	}
 }
