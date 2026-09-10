@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -155,7 +156,7 @@ func TestCatalogVersionsCheckHTTP(t *testing.T) {
 		}
 	})
 
-	t.Run("live candidate cleared and reported available", func(t *testing.T) {
+	t.Run("live candidate reported available without clearing transport evidence", func(t *testing.T) {
 		if !readFailedAt(livePinID) {
 			t.Fatal("precondition: live candidate must start stamped failed")
 		}
@@ -167,11 +168,14 @@ func TestCatalogVersionsCheckHTTP(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 			t.Fatal(err)
 		}
+		// Listing availability is true (the pinned candidate resolved), but a
+		// metadata-only check never opens media, so the transport-failure
+		// stamp survives — only a real delivery clears it.
 		if len(resp.Results) != 1 || resp.Results[0].FileID != livePinID || !resp.Results[0].Available {
 			t.Fatalf("unexpected results: %#v", resp.Results)
 		}
-		if readFailedAt(livePinID) {
-			t.Fatal("live candidate failed_at was not cleared")
+		if !readFailedAt(livePinID) {
+			t.Fatal("metadata-only check erased transport-failure evidence")
 		}
 	})
 
@@ -389,8 +393,345 @@ func TestCatalogVersionsCheckAccess(t *testing.T) {
 		if resolveCalls.Load() != 1 {
 			t.Fatalf("resolver calls = %d, want 1", resolveCalls.Load())
 		}
-		if clearCalls.Load() != 1 {
-			t.Fatalf("clear calls = %d, want 1", clearCalls.Load())
+		// A metadata-only check resolves a URL but never opens media, so it
+		// must NOT clear a transport-failure stamp — only a real delivery does.
+		if clearCalls.Load() != 0 {
+			t.Fatalf("clear calls = %d, want 0 (listing availability is not transport evidence)", clearCalls.Load())
+		}
+	})
+}
+
+// TestCatalogVersionsCheckInFlightFencing exercises the version-check handler
+// while the DB row changes concurrently with an in-flight resolution: the
+// fake resolver signals `started` once the handler has read the row and is
+// blocked inside the provider call, the test then rotates the candidate
+// (file_path) or stamps a newer failure directly through the repository, and
+// only then releases the resolver. The handler's fenced conditional write
+// (expectedFilePath + observedFailedAt) must be a no-op against the mutated
+// row, so the row reflects ONLY the concurrent mutation — never the stale
+// verdict the check computed from the pre-mutation identity. This is the
+// handler-level counterpart to the repository-level CAS tests in
+// internal/scanner/file_repo_clear_virtual_failed_test.go, which mutate and
+// call sequentially and therefore never have a resolution in flight.
+func TestCatalogVersionsCheckInFlightFencing(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	pool, err := pgxpool.New(t.Context(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(t.Context(), query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefix := fmt.Sprintf("versions-check-fencing-%d-", time.Now().UnixNano())
+	var library int
+	if err := pool.QueryRow(t.Context(), `INSERT INTO media_folders (type,name) VALUES ('movies',$1) RETURNING id`, prefix).Scan(&library); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx := context.Background()
+		if _, err := pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, library); err != nil {
+			t.Error(err)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM media_items WHERE content_id LIKE $1`, prefix+"%"); err != nil {
+			t.Error(err)
+		}
+	})
+	exec(`INSERT INTO media_items (content_id,type,title,genres,default_metadata_language) VALUES ($1,'movie','Versions Check Fencing','{}','en')`, prefix+"movie")
+	exec(`INSERT INTO media_item_libraries (content_id,media_folder_id) VALUES ($1,$2)`, prefix+"movie", library)
+
+	originalPath := fmt.Sprintf("virtual://movie/tt%d?result=original", time.Now().UnixNano())
+	replacementPath := fmt.Sprintf("virtual://movie/tt%d?result=replacement", time.Now().UnixNano())
+	var fileID int
+	if err := pool.QueryRow(t.Context(), `
+		INSERT INTO media_files (content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id)
+		VALUES ($1,$2,$3,1000,'virtual',7) RETURNING id`,
+		prefix+"movie", library, originalPath).Scan(&fileID); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := scanner.NewFileRepository(pool)
+	itemRepo := catalog.NewItemRepository(pool)
+
+	readRow := func() (path string, failedAt *time.Time) {
+		t.Helper()
+		if err := pool.QueryRow(t.Context(), `SELECT file_path, failed_at FROM media_files WHERE id=$1`, fileID).Scan(&path, &failedAt); err != nil {
+			t.Fatal(err)
+		}
+		return path, failedAt
+	}
+
+	// newBlockingResolver returns a resolver that signals `started` once the
+	// handler is inside the provider call (the row has been read and the
+	// fenced identity captured) and then blocks until `release` is closed.
+	newBlockingResolver := func(verdict error) (VirtualMediaDetailedResolver, *sync.WaitGroup, chan struct{}, chan struct{}) {
+		var wg sync.WaitGroup
+		started := make(chan struct{})
+		release := make(chan struct{})
+		wg.Add(1)
+		resolver := VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			defer wg.Done()
+			close(started)
+			<-release
+			if verdict != nil {
+				return ResolvedVirtualMedia{}, verdict
+			}
+			return ResolvedVirtualMedia{URL: "http://provider.test/live.mp4", URI: uri, CandidateID: "live"}, nil
+		})
+		return resolver, &wg, started, release
+	}
+
+	post := func(router *chi.Mux) *httptest.ResponseRecorder {
+		t.Helper()
+		body, err := json.Marshal(map[string][]int{"file_ids": {fileID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodPost, "/catalog/versions/check", strings.NewReader(string(body)))
+		r.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, r)
+		return rec
+	}
+
+	// Subtest 1: the check resolves the ORIGINAL path as a confirmed dead pin
+	// while the provider rotates the candidate to replacementPath. The stale
+	// mark must be a no-op: failed_at stays NULL and file_path stays the
+	// replacement, and the response verdict (computed from the stale identity)
+	// is available=false.
+	t.Run("stale dead-pin mark is a no-op while candidate rotates", func(t *testing.T) {
+		exec(`UPDATE media_files SET file_path=$1, failed_at=NULL WHERE id=$2`, originalPath, fileID)
+		resolver, wg, started, release := newBlockingResolver(errors.New("virtual stream provider returned no matching candidate"))
+		h := &CatalogResourceHandler{
+			FileResolver:       repo,
+			VirtualResolver:    resolver,
+			MarkVirtualFailed:  repo.MarkVirtualCandidateFailed,
+			ClearVirtualFailed: repo.ClearVirtualCandidateFailed,
+			ItemAccess:         itemRepo,
+			EpisodeLookup:      catalog.NewEpisodeRepository(pool),
+			ExtraLookup:        catalog.NewExtraRepository(pool),
+		}
+		router := chi.NewRouter()
+		router.Post("/catalog/versions/check", h.HandleCheckVersions)
+
+		recCh := make(chan *httptest.ResponseRecorder, 1)
+		go func() { recCh <- post(router) }()
+		select {
+		case <-started:
+		case <-time.After(10 * time.Second):
+			t.Fatal("resolver never started")
+		}
+		// The handler is now blocked inside the provider call with the stale
+		// identity (originalPath, failed_at nil) captured. Rotate the row.
+		exec(`UPDATE media_files SET file_path=$1 WHERE id=$2`, replacementPath, fileID)
+		close(release)
+		rec := <-recCh
+		wg.Wait()
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp versionCheckResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Results) != 1 || resp.Results[0].FileID != fileID || resp.Results[0].Available {
+			t.Fatalf("stale dead-pin verdict must report unavailable: %#v", resp.Results)
+		}
+		path, failedAt := readRow()
+		if path != replacementPath {
+			t.Fatalf("stale mark modified file_path: %q, want %q", path, replacementPath)
+		}
+		if failedAt != nil {
+			t.Fatal("stale dead-pin mark stamped the rotated replacement candidate")
+		}
+	})
+
+	// Subtest 2: the check resolves the ORIGINAL path as live while another
+	// session stamps the candidate dead. The stale clear must be a no-op:
+	// failed_at stays set and file_path stays the original, and the response
+	// verdict (computed from the stale identity) is available=true.
+	t.Run("stale live clear is a no-op while a newer failure lands", func(t *testing.T) {
+		exec(`UPDATE media_files SET file_path=$1, failed_at=NULL WHERE id=$2`, originalPath, fileID)
+		resolver, wg, started, release := newBlockingResolver(nil)
+		h := &CatalogResourceHandler{
+			FileResolver:       repo,
+			VirtualResolver:    resolver,
+			MarkVirtualFailed:  repo.MarkVirtualCandidateFailed,
+			ClearVirtualFailed: repo.ClearVirtualCandidateFailed,
+			ItemAccess:         itemRepo,
+			EpisodeLookup:      catalog.NewEpisodeRepository(pool),
+			ExtraLookup:        catalog.NewExtraRepository(pool),
+		}
+		router := chi.NewRouter()
+		router.Post("/catalog/versions/check", h.HandleCheckVersions)
+
+		recCh := make(chan *httptest.ResponseRecorder, 1)
+		go func() { recCh <- post(router) }()
+		select {
+		case <-started:
+		case <-time.After(10 * time.Second):
+			t.Fatal("resolver never started")
+		}
+		// The handler is blocked inside the provider call with the stale
+		// identity (originalPath, failed_at nil) captured. Stamp the row dead.
+		exec(`UPDATE media_files SET failed_at=NOW() WHERE id=$1`, fileID)
+		close(release)
+		rec := <-recCh
+		wg.Wait()
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp versionCheckResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if len(resp.Results) != 1 || resp.Results[0].FileID != fileID || !resp.Results[0].Available {
+			t.Fatalf("stale live verdict must report available: %#v", resp.Results)
+		}
+		path, failedAt := readRow()
+		if path != originalPath {
+			t.Fatalf("stale clear modified file_path: %q, want %q", path, originalPath)
+		}
+		if failedAt == nil {
+			t.Fatal("stale live clear erased a newer failure stamp")
+		}
+	})
+}
+
+// TestCatalogVersionsCheckStrictCandidateIdentity pins the strict check
+// semantics: a metadata-only check must verify that the resolver's answer
+// names the REQUESTED candidate. Ordinary playback may substitute candidates[0]
+// for an absent pin, but a substituted answer is evidence the pin is gone, not
+// that it recovered — and a metadata-only check must never clear a
+// transport-failure stamp regardless of the verdict.
+func TestCatalogVersionsCheckStrictCandidate(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	pool, err := pgxpool.New(t.Context(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(t.Context(), query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefix := fmt.Sprintf("versions-check-strict-%d-", time.Now().UnixNano())
+	var library int
+	if err := pool.QueryRow(t.Context(), `INSERT INTO media_folders (type,name) VALUES ('movies',$1) RETURNING id`, prefix).Scan(&library); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx := context.Background()
+		if _, err := pool.Exec(ctx, `DELETE FROM media_folders WHERE id=$1`, library); err != nil {
+			t.Error(err)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM media_items WHERE content_id LIKE $1`, prefix+"%"); err != nil {
+			t.Error(err)
+		}
+	})
+	exec(`INSERT INTO media_items (content_id,type,title,genres,default_metadata_language) VALUES ($1,'movie','Versions Check Strict','{}','en')`, prefix+"movie")
+	exec(`INSERT INTO media_item_libraries (content_id,media_folder_id) VALUES ($1,$2)`, prefix+"movie", library)
+
+	// A transport-failed candidate: failed_at is set (no bytes at stream open).
+	pinnedPath := fmt.Sprintf("virtual://movie/tt%d?profile=1080p&result=A", time.Now().UnixNano())
+	var fileID int
+	if err := pool.QueryRow(t.Context(), `
+		INSERT INTO media_files (content_id,media_folder_id,file_path,file_size,container,virtual_owner_installation_id,failed_at)
+		VALUES ($1,$2,$3,1000,'virtual',7,NOW()) RETURNING id`,
+		prefix+"movie", library, pinnedPath).Scan(&fileID); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := scanner.NewFileRepository(pool)
+	itemRepo := catalog.NewItemRepository(pool)
+
+	readRow := func() (path string, failedAt *time.Time) {
+		t.Helper()
+		if err := pool.QueryRow(t.Context(), `SELECT file_path, failed_at FROM media_files WHERE id=$1`, fileID).Scan(&path, &failedAt); err != nil {
+			t.Fatal(err)
+		}
+		return path, failedAt
+	}
+
+	newHandler := func(resolver VirtualMediaDetailedResolver) (*CatalogResourceHandler, *chi.Mux) {
+		h := &CatalogResourceHandler{
+			FileResolver:       repo,
+			VirtualResolver:    resolver,
+			MarkVirtualFailed:  repo.MarkVirtualCandidateFailed,
+			ClearVirtualFailed: repo.ClearVirtualCandidateFailed,
+			ItemAccess:         itemRepo,
+			EpisodeLookup:      catalog.NewEpisodeRepository(pool),
+			ExtraLookup:        catalog.NewExtraRepository(pool),
+		}
+		router := chi.NewRouter()
+		router.Post("/catalog/versions/check", h.HandleCheckVersions)
+		return h, router
+	}
+	post := func(router *chi.Mux) versionCheckResponse {
+		t.Helper()
+		body, err := json.Marshal(map[string][]int{"file_ids": {fileID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodPost, "/catalog/versions/check", strings.NewReader(string(body)))
+		r.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, r)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp versionCheckResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	t.Run("substituted candidate is not recovery for the requested pin", func(t *testing.T) {
+		// Request pinned A; the provider (playing ordinary playback semantics)
+		// substitutes candidate B. The strict check must not treat B as
+		// evidence A recovered: no clear, stamp survives, verdict unavailable.
+		exec(`UPDATE media_files SET file_path=$1, failed_at=NOW() WHERE id=$2`, pinnedPath, fileID)
+		_, router := newHandler(VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			// Ordinary fallback semantics: requested A absent → substitute B.
+			return ResolvedVirtualMedia{URL: "http://provider.test/b.mp4", URI: "virtual://movie/substituted?result=B", CandidateID: "B"}, nil
+		}))
+		resp := post(router)
+		if len(resp.Results) != 1 || resp.Results[0].FileID != fileID || resp.Results[0].Available {
+			t.Fatalf("substituted candidate must not report the pinned A as available: %#v", resp.Results)
+		}
+		path, failedAt := readRow()
+		if path != pinnedPath || failedAt == nil {
+			t.Fatalf("substituted resolution must not clear the transport failure: path=%q failed_at=%v", path, failedAt)
+		}
+	})
+
+	t.Run("identity-verified success reports available without clearing", func(t *testing.T) {
+		// The resolver genuinely names the requested candidate A. The check
+		// reports listing-availability (true) but a metadata-only resolution
+		// still never clears the transport-failure stamp.
+		exec(`UPDATE media_files SET file_path=$1, failed_at=NOW() WHERE id=$2`, pinnedPath, fileID)
+		_, router := newHandler(VirtualMediaDetailedResolverFunc(func(_ context.Context, uri string, _ int, _ int, _ string, _ bool, _ []string, _ string) (ResolvedVirtualMedia, error) {
+			return ResolvedVirtualMedia{URL: "http://provider.test/a.mp4", URI: pinnedPath, CandidateID: "A"}, nil
+		}))
+		resp := post(router)
+		if len(resp.Results) != 1 || !resp.Results[0].Available {
+			t.Fatalf("identity-verified resolution must report available: %#v", resp.Results)
+		}
+		path, failedAt := readRow()
+		if path != pinnedPath || failedAt == nil {
+			t.Fatalf("listing availability must not clear transport evidence: path=%q failed_at=%v", path, failedAt)
 		}
 	})
 }

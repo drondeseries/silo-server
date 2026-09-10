@@ -87,6 +87,11 @@ type StreamHandler struct {
 	// after a transport produced no bytes, so the auto-pick skips it on the
 	// next play while the dropdown still shows it for a manual retry.
 	VirtualCandidateFailMarker func(ctx context.Context, fileID int) error
+	// VirtualCandidateRecoveredMarker clears a known-bad stamp after the
+	// candidate actually delivered bytes to a client — the only evidence that
+	// forgives a transport failure. Metadata-only liveness checks resolve
+	// URLs without opening media and must never clear it.
+	VirtualCandidateRecoveredMarker func(ctx context.Context, fileID int) error
 }
 
 // ffmpegPath returns the currently configured ffmpeg binary path.
@@ -402,6 +407,13 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 				},
 			}
 			proxy.ServeHTTP(streamWriter, r)
+			if lastProxyErr == nil && streamWriter.StatusCode() != 0 && isVirtualPlaybackFile(file) {
+				// Bytes actually flowed to the client for this candidate —
+				// the only evidence that forgives a transport failure.
+				if failedID := virtualResultCandidateID(file.FilePath); failedID != "" {
+					h.clearVirtualCandidateRecovered(r.Context(), file, failedID)
+				}
+			}
 			if lastProxyErr != nil {
 				if streamWriter.StatusCode() == 0 && (h.VirtualMediaDetailedResolver != nil || h.VirtualMediaRefreshResolver != nil) {
 					if releaseInput != nil {
@@ -486,6 +498,13 @@ func (h *StreamHandler) HandleStream(w http.ResponseWriter, r *http.Request) {
 			TargetAudioChannels:    session.TargetAudioChannels,
 			TargetAudioBitrateKbps: session.TargetAudioBitrateKbps,
 		})
+		if remuxErr == nil && isVirtualPlaybackFile(file) {
+			// The remux committed media bytes from this candidate — the only
+			// evidence that forgives a transport failure.
+			if deliveredID := virtualResultCandidateID(file.FilePath); deliveredID != "" {
+				h.clearVirtualCandidateRecovered(r.Context(), file, deliveredID)
+			}
+		}
 		if remuxErr != nil {
 			// The remux only commits 200 after FFmpeg produces media bytes, so
 			// a failure here means the provider release served no output
@@ -1094,6 +1113,28 @@ func (h *StreamHandler) markVirtualCandidateFailed(ctx context.Context, file *mo
 	defer cancel()
 	if err := h.VirtualCandidateFailMarker(markCtx, file.ID); err != nil {
 		slog.WarnContext(ctx, "mark virtual candidate failed", "component", "api", "file_id", file.ID, "candidate", candidateID, "error", err)
+	}
+}
+
+// clearVirtualCandidateRecovered clears a virtual candidate's known-bad stamp
+// after the candidate actually delivered bytes to a client. This is the only
+// evidence that forgives a transport failure: a resolved URL (liveness check)
+// is not, because resolution never opens the media. The clear must reference
+// the row's CURRENT state, so it passes the candidate identity the transport
+// just delivered — the fenced clear in the file repository no-ops if the row
+// rotated to a different candidate while the stream was being served.
+// Best-effort: a persistence failure must not fail a delivering stream.
+func (h *StreamHandler) clearVirtualCandidateRecovered(ctx context.Context, file *models.MediaFile, candidateID string) {
+	if h == nil || file == nil || candidateID == "" {
+		return
+	}
+	if h.VirtualCandidateRecoveredMarker == nil {
+		return
+	}
+	clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := h.VirtualCandidateRecoveredMarker(clearCtx, file.ID); err != nil {
+		slog.WarnContext(ctx, "clear virtual candidate recovered", "component", "api", "file_id", file.ID, "candidate", candidateID, "error", err)
 	}
 }
 

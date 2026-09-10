@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -120,19 +121,38 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) b
 
 	perFileCtx, cancel := context.WithTimeout(ctx, versionCheckPerFileBudget)
 	defer cancel()
-	_, err = h.VirtualResolver.ResolveVirtualMediaDetailed(
+	requestedCandidateID := virtualResultCandidateID(file.FilePath)
+	resolved, err := h.VirtualResolver.ResolveVirtualMediaDetailed(
 		perFileCtx, file.FilePath, file.VirtualOwnerInstallationID,
-		apimw.GetUserID(ctx), apimw.GetProfileID(ctx), false, nil, "",
+		apimw.GetUserID(ctx), apimw.GetProfileID(ctx), true, nil, requestedCandidateID,
 	)
 	if err == nil {
-		// The pinned candidate resolved: it is live. Clear any stale failed
-		// stamp so the auto-pick considers it again. The clear is fenced on
-		// the candidate identity and failed_at observed above, so a stale
-		// success can never clear a newer failure or a rotated candidate.
-		if h.ClearVirtualFailed != nil {
-			_ = h.ClearVirtualFailed(context.WithoutCancel(ctx), fileID, file.FilePath, file.FailedAt)
+		// Strict check semantics, not playback fallback semantics: with
+		// forceRefresh=true the selection code does not substitute candidates[0]
+		// for an absent pin, and the identity verification below is the
+		// belt-and-braces guarantee. A successful resolution only counts when it
+		// actually named the requested candidate — a substituted candidate is
+		// evidence the pin is gone, not that it recovered. And listing
+		// availability is deliberately kept separate from transport health: a
+		// metadata-only check never clears an existing transport-failure stamp
+		// (failed_at), because a resolved URL is not evidence the media
+		// endpoint delivers bytes; only a real delivery does (see
+		// StreamHandler.clearVirtualCandidateRecovered).
+		if requestedCandidateID != "" && resolvedIdentityMatches(resolved, requestedCandidateID) {
+			return true
 		}
-		return true
+		if requestedCandidateID == "" {
+			// The row carries no concrete pin (profile-neutral row): any
+			// resolution of its identity is listing evidence, still not
+			// transport evidence — report live, never clear.
+			return true
+		}
+		// The provider answered with a different candidate: the requested pin
+		// is gone. Stamp it (fenced) so the auto-pick skips it.
+		if h.MarkVirtualFailed != nil {
+			_ = h.MarkVirtualFailed(context.WithoutCancel(ctx), fileID, file.FilePath, file.FailedAt)
+		}
+		return false
 	}
 	if isVirtualCandidateDeadError(err) {
 		// Confirmed dead pin: the provider listed but the pinned candidate is
@@ -147,6 +167,28 @@ func (h *CatalogResourceHandler) checkVersion(ctx context.Context, fileID int) b
 	// Ambiguous (provider down, timeout): do not stamp. Report the current
 	// durable signal so an outage does not mass-tag versions.
 	return file.FailedAt == nil
+}
+
+// resolvedIdentityMatches reports whether the resolver's answer named the
+// requested candidate: either the returned CandidateID is the requested
+// result= value, or the returned URI carries it. Substituted candidates are
+// never treated as recovery evidence for the requested pin.
+func resolvedIdentityMatches(resolved struct {
+	URL            string
+	URI            string
+	CandidateID    string
+	RequestHeaders map[string]string
+	ExpiresAt      time.Time
+}, requestedCandidateID string) bool {
+	if resolved.CandidateID == requestedCandidateID {
+		return true
+	}
+	if parsed, err := url.Parse(resolved.URI); err == nil {
+		if strings.TrimSpace(parsed.Query().Get("result")) == requestedCandidateID {
+			return true
+		}
+	}
+	return false
 }
 
 // fileAccessible applies the requesting profile's catalog/library access
