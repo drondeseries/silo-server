@@ -211,4 +211,43 @@ describe("PluginConfigForm quality profiles", () => {
     expect(screen.getByText(/Valid JSON structure: 4K HDR/)).toBeInTheDocument();
     expect(screen.queryByText(/Invalid include_regex/)).not.toBeInTheDocument();
   });
+
+  it("says what an empty input means instead of leaking a JSON parse exception", async () => {
+    const qualitySchema: PluginConfigSchema = {
+      key: "streaming",
+      title: "Streaming",
+      json_schema: JSON.stringify({
+        type: "object",
+        properties: {
+          quality_profiles: {
+            type: "array",
+            items: { type: "object" },
+          },
+        },
+      }),
+      required: true,
+      admin_form: {
+        fields: [
+          {
+            key: "quality_profiles",
+            label: "Quality Profiles",
+            control: "TEXTAREA",
+            required: false,
+            secret: false,
+            multiline: true,
+          },
+        ],
+      },
+    };
+    renderWithClient(<PluginConfigForm schema={qualitySchema} value={{}} onSave={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Validate profiles" }));
+
+    // JSON.parse("") throws "Unexpected end of JSON input"; the guard must
+    // surface an actionable message instead.
+    expect(
+      screen.getByText(/No profiles entered\. Paste a JSON array of profiles first\./),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Unexpected end of JSON/)).not.toBeInTheDocument();
+  });
 });
