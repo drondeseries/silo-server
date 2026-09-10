@@ -106,11 +106,14 @@ describe("buildPrePlaySubtitleCandidates track_index", () => {
   const downloaded: DownloadedSubtitle[] = [
     {
       id: 77,
+      media_file_id: 42,
       language: "fr",
       format: "srt",
       provider: "open",
       release_name: "Movie.French",
       score: 9,
+      hearing_impaired: false,
+      created_at: "2026-01-01T00:00:00Z",
     },
   ];
 
@@ -142,7 +145,7 @@ describe("buildPrePlaySubtitleCandidates track_index", () => {
   it("numbers a downloaded-only item starting at zero", () => {
     const { all } = buildPrePlaySubtitleCandidates(undefined, downloaded);
     expect(all).toHaveLength(1);
-    expect(all[0].selection.track_index).toBe(0);
+    expect(all[0]?.selection.track_index).toBe(0);
   });
 
   it("falls back to the catalog enumeration index when tracks carry no explicit index", () => {
