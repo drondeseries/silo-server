@@ -1972,3 +1972,68 @@ func TestHandleCheckSettingsConnectionRemuxDB(t *testing.T) {
 		t.Fatal("unreachable URL reported success")
 	}
 }
+
+func TestHandleCheckSettingsConnectionRemuxDBDoesNotSendStoredTokenToDraftEndpoint(t *testing.T) {
+	storedHits := 0
+	storedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		storedHits++
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_mediainfo": 1})
+	}))
+	defer storedServer.Close()
+
+	var draftAuth string
+	draftHits := 0
+	draftServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		draftHits++
+		draftAuth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_mediainfo": 1})
+	}))
+	defer draftServer.Close()
+
+	handler := &AdminHandler{SettingsRepo: &fakeServerSettingsStore{values: map[string]string{
+		"remuxdb.base_url": storedServer.URL,
+		"remuxdb.token":    "persisted-secret",
+	}}}
+
+	rec := performSettingsCheckRequest(t, handler, "/admin/settings/check/remuxdb", map[string]any{
+		"values":     map[string]string{"remuxdb.base_url": draftServer.URL},
+		"dirty_keys": []string{"remuxdb.base_url"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if draftHits != 1 {
+		t.Fatalf("draft endpoint hits = %d, want 1", draftHits)
+	}
+	if draftAuth != "" {
+		t.Fatalf("draft endpoint received stored token %q, want no Authorization header", draftAuth)
+	}
+	if storedHits != 0 {
+		t.Fatalf("stored endpoint hits = %d, want none", storedHits)
+	}
+}
+
+func TestHandleCheckSettingsConnectionRemuxDBReusesStoredTokenForSameEndpoint(t *testing.T) {
+	var auth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_mediainfo": 1})
+	}))
+	defer server.Close()
+
+	handler := &AdminHandler{SettingsRepo: &fakeServerSettingsStore{values: map[string]string{
+		"remuxdb.base_url": server.URL,
+		"remuxdb.token":    "persisted-secret",
+	}}}
+
+	rec := performSettingsCheckRequest(t, handler, "/admin/settings/check/remuxdb", map[string]any{
+		"values":     map[string]string{"remuxdb.base_url": server.URL + "/mirror"},
+		"dirty_keys": []string{"remuxdb.base_url"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if auth != "Bearer persisted-secret" {
+		t.Fatalf("Authorization = %q, want stored token for unchanged authority", auth)
+	}
+}

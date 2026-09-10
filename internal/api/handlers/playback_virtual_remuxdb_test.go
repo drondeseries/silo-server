@@ -57,7 +57,10 @@ func TestMatchRemuxDBCandidatesRecordsSizeMatch(t *testing.T) {
 		{URI: "virtual://movie/tt0000001?result=a", FileSize: 28980000000, Resolution: "1080p", CodecVideo: "h264"},
 		{URI: "virtual://movie/tt0000001?result=b", FileSize: 2670000000, Resolution: "1080p", CodecVideo: "av1"},
 	}
-	matched := h.matchRemuxDBCandidates(context.Background(), file, candidates)
+	matched, enabled := h.matchRemuxDBCandidates(context.Background(), file, candidates)
+	if !enabled {
+		t.Fatal("enabled = false, want true for enabled config")
+	}
 	if calls != 1 {
 		t.Fatalf("fetches = %d, want 1 shared fetch", calls)
 	}
@@ -89,11 +92,11 @@ func TestMatchRemuxDBCandidatesDisabled(t *testing.T) {
 		},
 	}
 	file := &models.MediaFile{ContentID: "movie-tmdb-1", FilePath: "virtual://movie/tt0000001"}
-	matched := h.matchRemuxDBCandidates(context.Background(), file, []VirtualPlaybackStream{
+	matched, enabled := h.matchRemuxDBCandidates(context.Background(), file, []VirtualPlaybackStream{
 		{URI: "virtual://movie/tt0000001?result=a", FileSize: 1},
 	})
-	if len(matched) != 0 || calls != 0 {
-		t.Fatalf("disabled matched=%d calls=%d, want 0/0", len(matched), calls)
+	if len(matched) != 0 || calls != 0 || enabled {
+		t.Fatalf("disabled matched=%d calls=%d enabled=%v, want 0/0/false", len(matched), calls, enabled)
 	}
 }
 
@@ -108,7 +111,7 @@ func TestMatchRemuxDBCandidatesAbstainsWithoutIdentity(t *testing.T) {
 		},
 	}
 	file := &models.MediaFile{ContentID: "movie-tmdb-1", FilePath: "virtual://movie/tt0000001"}
-	matched := h.matchRemuxDBCandidates(context.Background(), file, []VirtualPlaybackStream{
+	matched, _ := h.matchRemuxDBCandidates(context.Background(), file, []VirtualPlaybackStream{
 		{URI: "virtual://movie/tt0000001?result=a"},
 	})
 	if len(matched) != 0 {
@@ -146,7 +149,7 @@ func TestMatchRemuxDBCandidatesMatchesFilenameFromLabelWhenSizeZero(t *testing.T
 	candidates := []VirtualPlaybackStream{
 		{URI: "virtual://movie/tt0000001?result=named", Label: "named.movie.2024.1080p.mkv", FileSize: 0},
 	}
-	matched := h.matchRemuxDBCandidates(context.Background(), file, candidates)
+	matched, _ := h.matchRemuxDBCandidates(context.Background(), file, candidates)
 	if len(matched) != 1 {
 		t.Fatalf("matched = %d releases, want 1", len(matched))
 	}
@@ -205,5 +208,58 @@ func TestRemuxHintDoesNotBorrowDifferentReleaseIdentity(t *testing.T) {
 	hintA := remuxHintForCandidate(file, candA)
 	if hintA.Size != 5000000000 || hintA.Filename != "Pinned.Movie.2024.2160p.mkv" || hintA.Resolution != "2160p" || hintA.CodecVideo != "hevc" {
 		t.Fatalf("candidate A failed to borrow its own file identity: %+v", hintA)
+	}
+}
+
+func TestRemuxEvidenceKeyNormalizesProfileAndParamOrdering(t *testing.T) {
+	want := "virtual://movie/tt0000001?result=candA"
+	for _, uri := range []string{
+		"virtual://movie/tt0000001?profile=1080p&result=candA",
+		"virtual://movie/tt0000001?result=candA&profile=1080p",
+		"virtual://movie/tt0000001?result=candA",
+	} {
+		if got := remuxEvidenceKey(uri); got != want {
+			t.Fatalf("remuxEvidenceKey(%q) = %q, want %q", uri, got, want)
+		}
+	}
+}
+
+func TestApplyRemuxDBEvidenceUsesPrecomputedKey(t *testing.T) {
+	key := remuxEvidenceKey("virtual://movie/tt0000001?profile=1080p&result=candA")
+	matched := map[string]remuxdb.Evidence{
+		key: {
+			CodecVideo:  "hevc",
+			VideoTracks: []remuxdb.TrackDetail{{Kind: "video", Codec: "hevc", Width: 3840, Height: 2160}},
+		},
+	}
+	file := &models.MediaFile{ContentID: "movie-tmdb-1", FilePath: "virtual://movie/tt0000001"}
+	backfilled := applyRemuxDBEvidence(file, matched, key)
+	if backfilled == file || backfilled.CodecVideo != "hevc" {
+		t.Fatalf("backfilled = %+v, same=%v", backfilled, backfilled == file)
+	}
+}
+
+func TestAllowDeferredProbeMatchesMainBehaviorWhenRemuxDBDisabled(t *testing.T) {
+	// RemuxDB disabled: the gate is main's plain deferProbe flag, so an
+	// evidence-poor candidate still defers and never blocks start.
+	if !allowDeferredProbe(true, false, "", "", "", "") {
+		t.Fatal("disabled RemuxDB should defer without metadata evidence")
+	}
+	if allowDeferredProbe(false, false, "1080p", "1080p", "h264", "h264") {
+		t.Fatal("deferProbe=false must never allow deferral")
+	}
+
+	// RemuxDB enabled: keep the metadata-confidence gate.
+	if allowDeferredProbe(true, true, "", "", "", "") {
+		t.Fatal("enabled RemuxDB should not defer without resolution/codec evidence")
+	}
+	if !allowDeferredProbe(true, true, "1080p", "", "h264", "") {
+		t.Fatal("enabled RemuxDB should defer with transient evidence")
+	}
+	if !allowDeferredProbe(true, true, "", "1080p", "", "h264") {
+		t.Fatal("enabled RemuxDB should defer with candidate evidence")
+	}
+	if allowDeferredProbe(true, true, "1080p", "", "", "") {
+		t.Fatal("enabled RemuxDB needs both resolution and codec evidence")
 	}
 }

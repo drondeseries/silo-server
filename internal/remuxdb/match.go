@@ -47,7 +47,7 @@ func MatchVariant(versions []MediaInfo, hint MatchHint) (*MediaInfo, MatchMethod
 	if v := matchByIndexerGUID(versions, hint); v != nil {
 		return v, MatchIndexerGUID
 	}
-	if v := matchBySize(versions, hint, true); v != nil {
+	if v := matchBySize(versions, hint); v != nil {
 		return v, MatchSize
 	}
 	if v := matchBySizeTags(versions, hint); v != nil {
@@ -120,7 +120,7 @@ func matchByIndexerGUID(versions []MediaInfo, hint MatchHint) *MediaInfo {
 }
 
 // matchBySize requires byte-exact equality.
-func matchBySize(versions []MediaInfo, hint MatchHint, _ bool) *MediaInfo {
+func matchBySize(versions []MediaInfo, hint MatchHint) *MediaInfo {
 	if hint.Size <= 0 {
 		return nil
 	}

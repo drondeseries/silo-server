@@ -28,11 +28,12 @@ func ApplyEvidence(ev Evidence, file *models.MediaFile) bool {
 	videoTracks := make([]models.VideoTrack, 0, len(ev.VideoTracks))
 	audioTracks := make([]models.AudioTrack, 0, len(ev.AudioTracks))
 	subTracks := make([]models.SubtitleTrack, 0, len(ev.SubtitleTracks))
+	externalSubs := make([]models.ExternalSubtitle, 0, len(ev.SubtitleTracks))
 
 	for _, t := range ev.VideoTracks {
 		videoRange := "SDR"
 		videoRangeType := "SDR"
-		if t.ColorTransfer == "smpte2084" || t.DVProfile > 0 || t.HDR10PlusPresent {
+		if strings.EqualFold(strings.TrimSpace(t.ColorTransfer), "smpte2084") || t.DVProfile > 0 || t.HDR10PlusPresent {
 			videoRange = "HDR"
 			if t.DVProfile > 0 {
 				videoRangeType = "DOVI"
@@ -104,6 +105,17 @@ func ApplyEvidence(ev Evidence, file *models.MediaFile) bool {
 	}
 
 	for _, t := range ev.SubtitleTracks {
+		if t.IsExternal {
+			externalSubs = append(externalSubs, models.ExternalSubtitle{
+				Language:        t.Language,
+				Format:          t.Codec,
+				Title:           t.Title,
+				Forced:          t.IsForced,
+				Default:         t.IsDefault,
+				HearingImpaired: t.IsHearingImpaired,
+			})
+			continue
+		}
 		st := models.SubtitleTrack{
 			Index:           t.Index,
 			Title:           t.Title,
@@ -112,7 +124,6 @@ func ApplyEvidence(ev Evidence, file *models.MediaFile) bool {
 			Default:         t.IsDefault,
 			Forced:          t.IsForced,
 			HearingImpaired: t.IsHearingImpaired,
-			External:        t.IsExternal,
 		}
 		subTracks = append(subTracks, st)
 	}
@@ -125,6 +136,9 @@ func ApplyEvidence(ev Evidence, file *models.MediaFile) bool {
 	}
 	if len(subTracks) > 0 && len(file.SubtitleTracks) == 0 {
 		file.SubtitleTracks = subTracks
+	}
+	if len(externalSubs) > 0 && len(file.ExternalSubtitles) == 0 {
+		file.ExternalSubtitles = externalSubs
 	}
 	return len(videoTracks) > 0
 }

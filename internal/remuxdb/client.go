@@ -188,7 +188,7 @@ type SubmissionPayload struct {
 	TorrentInfoHash string         `json:"torrent_info_hash,omitempty"`
 	TorrentFileIdx  *int           `json:"torrent_file_idx,omitempty"`
 	NZB             *NzbSubmission `json:"nzb,omitempty"`
-	Container       string         `json:"container"`
+	Container       string         `json:"container,omitempty"`
 	Size            int64          `json:"size"`
 	Duration        float64        `json:"duration"`
 	Bitrate         int64          `json:"bitrate,omitempty"`
