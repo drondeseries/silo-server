@@ -22,6 +22,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/plugins"
+	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"golang.org/x/text/language"
 )
 
@@ -431,6 +432,10 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 	if noResult {
 		candidates = h.applyVirtualStickyPin(stickyKey, pinnedURI, candidates, deviceCaps)
 	}
+	remuxMatches := map[string]remuxdb.Evidence{}
+	if needsCandidateMetadata && len(candidates) > 0 {
+		remuxMatches = h.matchRemuxDBCandidates(r.Context(), file, candidates)
+	}
 	if len(candidates) > maxAttempts {
 		candidates = candidates[:maxAttempts]
 	}
@@ -510,6 +515,9 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				}
 			}
 		}
+		if backfilled := applyRemuxDBEvidence(&transient, remuxMatches, cand.URI); backfilled != &transient {
+			transient = *backfilled
+		}
 		hasCompleteVideoEvidence := completeVirtualVideoEvidenceV3(&transient)
 		hasCompleteAudioEvidence := completeVirtualAudioEvidenceV3(&transient)
 		hasCompleteContainerEvidence := completeVirtualContainerEvidenceV3(&transient)
@@ -535,7 +543,8 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 				URL: streamURL, URI: cand.URI, OwnerID: oid, File: &transient, ProbeSucceeded: true, Provenance: ProbeProvenanceVerified,
 			}, nil
 		}
-		if deferProbe {
+		allowDefer := deferProbe && (transient.Resolution != "" || cand.Resolution != "") && (transient.CodecVideo != "" || cand.CodecVideo != "")
+		if allowDefer {
 			h.pinVirtualSticky(stickyKey, cand.URI)
 			mergeVirtualCandidateTracks(&transient, cand)
 			if !transient.HDR && cand.HDR != "" {
@@ -602,6 +611,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 					if probeTransient.Duration > 0 && probed.Duration <= 0 {
 						probed.Duration = probeTransient.Duration
 					}
+					h.maybeSubmitRemuxDBEvidence(bgCtx, probed, probeCand)
 					mergeVirtualCandidateTracks(probed, probeCand)
 					h.persistVirtualMetadataBounded(bgCtx, targetID, probeCand.URI, probed)
 				}()
@@ -641,6 +651,7 @@ func (h *PlaybackHandler) resolveVirtualPlaybackSource(r *http.Request, file *mo
 		if transient.Duration > 0 && probed.Duration <= 0 {
 			probed.Duration = transient.Duration
 		}
+		h.maybeSubmitRemuxDBEvidence(attemptCtx, probed, cand)
 		mergeVirtualCandidateTracks(probed, cand)
 		h.maybeTriggerSubtitleSearch(probeCtx, probed, cand)
 		return &resolvedVirtualPlaybackSource{
@@ -1061,6 +1072,222 @@ func (h *PlaybackHandler) maybeTriggerSubtitleSearch(
 			cand.SubtitleLanguages,
 		)
 	}()
+}
+
+const remuxDBFetchBudget = 3 * time.Second
+
+func remuxEvidenceKey(candidateURI string) string {
+	neutral := virtualPlaybackNeutralKey(candidateURI)
+	if parsed, err := url.Parse(candidateURI); err == nil {
+		if result := strings.TrimSpace(parsed.Query().Get("result")); result != "" {
+			return neutral + "?result=" + result
+		}
+	}
+	return neutral
+}
+
+func remuxHintForCandidate(file *models.MediaFile, cand VirtualPlaybackStream) remuxdb.MatchHint {
+	size := cand.FileSize
+	resolution := cand.Resolution
+	codecVideo := cand.CodecVideo
+	hdrKnown := false
+	hdr := false
+	sameRelease := file != nil && (file.FilePath == cand.URI || (cand.ID != "" && virtualResultCandidateID(file.FilePath) == cand.ID))
+	if file != nil && sameRelease {
+		if size <= 0 {
+			size = file.FileSize
+		}
+		if resolution == "" {
+			resolution = file.Resolution
+		}
+		if codecVideo == "" {
+			codecVideo = file.CodecVideo
+		}
+		if len(file.VideoTracks) > 0 {
+			hdrKnown = true
+			hdr = file.HDR
+		}
+	}
+	if cand.HDR != "" {
+		hdrKnown = true
+		hdr = true
+	}
+	filename := strings.TrimSpace(cand.Label)
+	if filename == "" && sameRelease {
+		filename = strings.TrimSpace(file.ReleaseName)
+	}
+	infoHash := ""
+	indexerGUID := ""
+	indexer := ""
+	if cand.URI != "" {
+		if parsed, err := url.Parse(cand.URI); err == nil {
+			if h := strings.TrimSpace(parsed.Query().Get("hash")); len(h) == 40 && isHexString(h) {
+				infoHash = h
+			} else if h := strings.TrimSpace(parsed.Query().Get("info_hash")); len(h) == 40 && isHexString(h) {
+				infoHash = h
+			}
+			if g := strings.TrimSpace(parsed.Query().Get("guid")); g != "" {
+				indexerGUID = g
+			} else if g := strings.TrimSpace(parsed.Query().Get("indexer_guid")); g != "" {
+				indexerGUID = g
+			}
+			if idx := strings.TrimSpace(parsed.Query().Get("indexer")); idx != "" {
+				indexer = idx
+			}
+		}
+	}
+	hint := remuxdb.HintFromCandidate(infoHash, nil, size, filename, resolution, codecVideo, hdrKnown, hdr)
+	hint.IndexerGUID = indexerGUID
+	hint.Indexer = indexer
+	return hint
+}
+
+func isHexString(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *PlaybackHandler) matchRemuxDBCandidates(ctx context.Context, file *models.MediaFile, candidates []VirtualPlaybackStream) map[string]remuxdb.Evidence {
+	matched := map[string]remuxdb.Evidence{}
+	if h == nil || file == nil || len(candidates) == 0 {
+		return matched
+	}
+	cfg := remuxdb.DefaultConfig()
+	if h.RemuxDBConfig != nil {
+		cfg = h.RemuxDBConfig(ctx)
+	}
+	if !cfg.Enabled {
+		return matched
+	}
+	imdbID := remuxdb.ExtractIMDbID(file.ContentID)
+	if imdbID == "" {
+		imdbID = remuxdb.ExtractIMDbID(file.FilePath)
+	}
+	if imdbID == "" {
+		return matched
+	}
+	var seasonPtr, episodePtr *int
+	if file.SeasonNumber > 0 {
+		seasonPtr = &file.SeasonNumber
+	}
+	if file.EpisodeNumber > 0 {
+		episodePtr = &file.EpisodeNumber
+	}
+	type pendingCandidate struct {
+		key   string
+		hint  remuxdb.MatchHint
+		owner int
+	}
+	remuxCtx, cancel := context.WithTimeout(ctx, remuxDBFetchBudget)
+	defer cancel()
+
+	pending := make([]pendingCandidate, 0, len(candidates))
+	for _, cand := range candidates {
+		key := remuxEvidenceKey(cand.URI)
+		if key == "" {
+			continue
+		}
+		if _, dup := matched[key]; dup {
+			continue
+		}
+		if h.RemuxDBStore != nil {
+			if ev, ok, err := h.RemuxDBStore.Get(remuxCtx, file.ContentID, file.EpisodeID, file.MediaFolderID, key); err == nil && ok && len(ev.VideoTracks) > 0 {
+				matched[key] = ev
+				continue
+			}
+		}
+		owner := cand.OwnerInstallationID
+		if owner <= 0 {
+			owner = file.VirtualOwnerInstallationID
+		}
+		pending = append(pending, pendingCandidate{key: key, hint: remuxHintForCandidate(file, cand), owner: owner})
+	}
+	if len(pending) == 0 {
+		return matched
+	}
+	client := remuxdb.NewClient(cfg.BaseURL, cfg.Token)
+	versions, err := client.FetchProbe(remuxCtx, imdbID, seasonPtr, episodePtr)
+	slog.InfoContext(remuxCtx, "remuxdb match candidates", "component", "api", "imdb_id", imdbID, "pending", len(pending), "versions", len(versions), "error", err)
+	if err != nil || len(versions) == 0 {
+		return matched
+	}
+	for _, p := range pending {
+		variant, method := remuxdb.MatchVariant(versions, p.hint)
+		if variant == nil {
+			continue
+		}
+		slog.InfoContext(remuxCtx, "remuxdb candidate matched", "component", "api", "key", p.key, "method", method)
+		ev := remuxdb.EvidenceFromVariant(file.ContentID, file.EpisodeID, file.MediaFolderID, p.key, method, variant)
+		matched[p.key] = ev
+		if h.RemuxDBStore != nil {
+			if recErr := h.RemuxDBStore.Record(remuxCtx, ev); recErr != nil {
+				slog.WarnContext(remuxCtx, "remuxdb store record failed", "component", "api", "key", p.key, "error", recErr)
+			}
+		}
+	}
+	slog.InfoContext(remuxCtx, "remuxdb match complete", "component", "api", "imdb_id", imdbID, "matched", len(matched))
+	return matched
+}
+
+func (h *PlaybackHandler) maybeSubmitRemuxDBEvidence(ctx context.Context, probed *models.MediaFile, cand VirtualPlaybackStream) {
+	if h == nil || probed == nil {
+		return
+	}
+	cfg := remuxdb.DefaultConfig()
+	if h.RemuxDBConfig != nil {
+		cfg = h.RemuxDBConfig(ctx)
+	}
+	if !cfg.Enabled || !cfg.SubmitEnabled || strings.TrimSpace(cfg.Token) == "" {
+		return
+	}
+	hint := remuxHintForCandidate(probed, cand)
+	if hint.InfoHash == "" && hint.IndexerGUID == "" {
+		return
+	}
+	var nzb *remuxdb.NzbSubmission
+	if hint.IndexerGUID != "" {
+		nzb = &remuxdb.NzbSubmission{
+			Indexer:     hint.Indexer,
+			IndexerGUID: hint.IndexerGUID,
+			Title:       hint.Filename,
+		}
+	}
+	payload, ok := remuxdb.BuildSubmission(probed, hint.Filename, hint.InfoHash, nzb)
+	if !ok {
+		return
+	}
+	go func() {
+		submitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		client := remuxdb.NewClient(cfg.BaseURL, cfg.Token)
+		if err := client.SubmitProbe(submitCtx, payload); err != nil {
+			slog.DebugContext(submitCtx, "remuxdb probe submission failed", "component", "api", "filename", payload.Filename, "error", err)
+		} else {
+			slog.InfoContext(submitCtx, "remuxdb probe submitted", "component", "api", "filename", payload.Filename, "kind", payload.Kind)
+		}
+	}()
+}
+
+func applyRemuxDBEvidence(file *models.MediaFile, matched map[string]remuxdb.Evidence, candidateURI string) *models.MediaFile {
+	if file == nil || len(matched) == 0 {
+		return file
+	}
+	ev, ok := matched[remuxEvidenceKey(candidateURI)]
+	if !ok || len(ev.VideoTracks) == 0 {
+		return file
+	}
+	out := *file
+	if remuxdb.ApplyEvidence(ev, &out) {
+		return &out
+	}
+	return file
 }
 
 // mergeVirtualCandidateTracks supplements probed virtual file tracks with

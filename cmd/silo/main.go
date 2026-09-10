@@ -95,6 +95,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/ratelimit"
 	"github.com/Silo-Server/silo-server/internal/recommendations"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
+	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	mediarequests "github.com/Silo-Server/silo-server/internal/requests"
 	"github.com/Silo-Server/silo-server/internal/s3client"
 	"github.com/Silo-Server/silo-server/internal/scanner"
@@ -457,6 +458,9 @@ func configureOperationalLogging(
 	}
 	if err := diagnostics.SeedDefaults(ctx, settingsRepo); err != nil {
 		log.Fatalf("seed diagnostics defaults: %v", err)
+	}
+	if err := remuxdb.SeedDefaults(ctx, settingsRepo); err != nil {
+		log.Fatalf("seed remuxdb defaults: %v", err)
 	}
 	opsPM := partman.NewManager(pool, "operational_logs", partman.Daily, 3)
 	if err := opsPM.EnsureFuturePartitions(ctx); err != nil {

@@ -21,6 +21,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/mdblist"
 	"github.com/Silo-Server/silo-server/internal/recommendations/embeddings"
+	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"github.com/Silo-Server/silo-server/internal/s3client"
 )
 
@@ -151,6 +152,8 @@ func (h *AdminHandler) HandleCheckSettingsConnection(w http.ResponseWriter, r *h
 		response = checkMeilisearchConnection(r.Context(), effectiveSettings)
 	case "mdblist":
 		response = checkMDBListConnection(r.Context(), cfg)
+	case "remuxdb":
+		response = checkRemuxDBConnection(r.Context(), effectiveSettings)
 	default:
 		writeError(w, http.StatusBadRequest, "bad_request", "Unsupported connection check kind")
 		return
@@ -169,6 +172,39 @@ func checkMDBListConnection(ctx context.Context, cfg *config.Config) connectionC
 		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("MDBList connection check failed: %v", err)}
 	}
 	return connectionCheckResponse{Success: true, Message: "MDBList API key verified."}
+}
+
+func checkRemuxDBConnection(ctx context.Context, settings map[string]string) connectionCheckResponse {
+	baseURL := strings.TrimSpace(settings[remuxdb.SettingBaseURL])
+	if baseURL == "" {
+		baseURL = remuxdb.DefaultBaseURL
+	}
+	token := strings.TrimSpace(settings[remuxdb.SettingToken])
+	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/api/public/stats", nil)
+	if err != nil {
+		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB URL is invalid: %v", err)}
+	}
+	req.Header.Set("x-client-id", "silo-server")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB connection check failed: %v", err)}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB returned status %d.", resp.StatusCode)}
+	}
+	var stats struct {
+		TotalMediainfo int64 `json:"total_mediainfo"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		return connectionCheckResponse{Success: false, Message: fmt.Sprintf("RemuxDB returned an unexpected response: %v", err)}
+	}
+	return connectionCheckResponse{Success: true, Message: fmt.Sprintf("RemuxDB verified (%d mediainfo records).", stats.TotalMediainfo)}
 }
 
 func aiClientConfig(cfg *config.Config) llm.Config {

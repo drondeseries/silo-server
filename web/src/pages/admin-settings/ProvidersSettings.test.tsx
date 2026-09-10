@@ -500,3 +500,66 @@ describe("ProvidersSettings", () => {
     );
   });
 });
+
+describe("RemuxDB tile", () => {
+  beforeEach(() => {
+    settingsValues = { "remuxdb.enabled": "true", "remuxdb.base_url": "" };
+  });
+
+  it("renders beside MDBList and shows the default URL hint", async () => {
+    const user = userEvent.setup();
+    render(<ProvidersSettings />);
+
+    const tile = screen.getByRole("group", { name: "RemuxDB" });
+    expect(tile).toBeInTheDocument();
+
+    await user.click(within(tile).getByRole("button", { name: "Manage" }));
+    expect(within(tile).getByPlaceholderText("https://remuxdb.1632022.xyz")).toBeInTheDocument();
+  });
+
+  it("saves enabled, URL, and a drafted token", async () => {
+    const user = userEvent.setup();
+    mocks.updateSettings.mockResolvedValue({});
+    render(<ProvidersSettings />);
+
+    const tile = screen.getByRole("group", { name: "RemuxDB" });
+    await user.click(within(tile).getByRole("button", { name: "Manage" }));
+    await user.type(
+      within(tile).getByPlaceholderText("https://remuxdb.1632022.xyz"),
+      "https://mirror.example.com",
+    );
+    await user.type(within(tile).getByLabelText("API token"), "tok-123");
+    await user.click(within(tile).getByRole("button", { name: "Save" }));
+
+    expect(mocks.updateSettings).toHaveBeenCalledWith({
+      "remuxdb.enabled": "true",
+      "remuxdb.base_url": "https://mirror.example.com",
+      "remuxdb.token": "tok-123",
+    });
+  });
+
+  it("tests the typed URL through the remuxdb check kind", async () => {
+    const user = userEvent.setup();
+    mocks.checkConnection.mockResolvedValue({
+      success: true,
+      message: "RemuxDB verified (42 mediainfo records).",
+    });
+    render(<ProvidersSettings />);
+
+    const tile = screen.getByRole("group", { name: "RemuxDB" });
+    await user.click(within(tile).getByRole("button", { name: "Manage" }));
+    await user.type(
+      within(tile).getByPlaceholderText("https://remuxdb.1632022.xyz"),
+      "https://mirror.example.com",
+    );
+    await user.click(within(tile).getByRole("button", { name: "Test connection" }));
+
+    expect(mocks.checkConnection).toHaveBeenCalledWith({
+      kind: "remuxdb",
+      body: {
+        values: { "remuxdb.base_url": "https://mirror.example.com" },
+        dirty_keys: ["remuxdb.base_url"],
+      },
+    });
+  });
+});

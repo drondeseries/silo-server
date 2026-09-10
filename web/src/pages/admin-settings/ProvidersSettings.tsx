@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router";
 import { toast } from "sonner";
 
@@ -44,11 +44,11 @@ import { MarkerProviderTiles } from "./MarkerProviderTiles";
 import { SettingField } from "./SettingField";
 
 /**
- * MDBList is the only provider on this page whose credential is a server
- * setting; the subtitle providers have their own endpoints. The form is still
- * mounted so the page reads one sensitive-status list for every tile.
+ * MDBList's credential and RemuxDB's URL, token, and kill-switch are server
+ * settings; the subtitle providers have their own endpoints. The form is
+ * still mounted so the page reads one sensitive-status list for every tile.
  */
-const KEYS = ["mdblist.api_key"];
+const KEYS = ["mdblist.api_key", "remuxdb.enabled", "remuxdb.base_url", "remuxdb.token"];
 
 // ---------------------------------------------------------------------------
 // Shared tile plumbing
@@ -300,9 +300,7 @@ function SubtitleProviderTile({
             value={username}
             onChange={handleUsernameChange}
             description={
-              config.has_credentials
-                ? "OpenSubtitles signs you in with your username, not your email. Leave blank to keep the saved one."
-                : "OpenSubtitles signs you in with your username, not your email."
+              config.has_credentials ? "Leave blank to keep the saved username." : undefined
             }
           />
           <SecretField
@@ -511,6 +509,189 @@ function MDBListTile({
 }
 
 // ---------------------------------------------------------------------------
+// RemuxDB
+// ---------------------------------------------------------------------------
+
+const REMUXDB_DEFAULT_URL = "https://remuxdb.1632022.xyz";
+
+function RemuxDBTile({
+  savedEnabled,
+  savedUrl,
+  sensitiveConfigured,
+  restartKeys,
+  expanded,
+  onExpand,
+  onCollapse,
+  test,
+  onTested,
+}: {
+  savedEnabled: string;
+  savedUrl: string;
+  sensitiveConfigured: string[];
+  restartKeys: RestartKeyMatcher;
+  expanded: boolean;
+  onExpand: () => void;
+  onCollapse: () => void;
+  test: ProviderTestState | undefined;
+  onTested: (test: ProviderTestState | undefined) => void;
+}) {
+  const updateSettings = useUpdateServerSettings();
+  const checkConnection = useCheckAdminSettingsConnection();
+  const savedOn = savedEnabled === "true";
+  const [enabled, setEnabled] = useState(savedOn);
+  const [url, setUrl] = useState(savedUrl);
+  const [token, setToken] = useState("");
+  const [testing, setTesting] = useState(false);
+
+  useEffect(() => {
+    if (expanded) {
+      setEnabled(savedOn);
+      setUrl(savedUrl);
+      setToken("");
+    }
+  }, [expanded, savedOn, savedUrl]);
+
+  const tokenConfigured = sensitiveConfigured.includes("remuxdb.token");
+  const effectiveUrl = url.trim() || savedUrl.trim() || REMUXDB_DEFAULT_URL;
+  const hasDraft = enabled !== savedOn || url !== savedUrl || token.trim() !== "";
+  useReportUnsavedChanges(hasDraft);
+
+  async function save() {
+    if (!hasDraft) {
+      toast.info("Nothing to save for RemuxDB.");
+      return;
+    }
+    try {
+      await updateSettings.mutateAsync({
+        "remuxdb.enabled": enabled ? "true" : "false",
+        "remuxdb.base_url": url.trim() || savedUrl.trim() || REMUXDB_DEFAULT_URL,
+        ...(token.trim() !== "" ? { "remuxdb.token": token.trim() } : {}),
+      });
+      setToken("");
+      onTested(undefined);
+      toast.success("RemuxDB settings saved");
+    } catch {
+      // The mutation surfaces the API error.
+    }
+  }
+
+  async function runTest() {
+    setTesting(true);
+    try {
+      const { result, durationMs } = await timed(() =>
+        checkConnection.mutateAsync({
+          kind: "remuxdb",
+          body: {
+            values: {
+              "remuxdb.base_url": effectiveUrl,
+              ...(token.trim() !== "" ? { "remuxdb.token": token.trim() } : {}),
+            },
+            dirty_keys: ["remuxdb.base_url", ...(token.trim() !== "" ? ["remuxdb.token"] : [])],
+          },
+        }),
+      );
+      onTested({ ok: result.success, message: result.message, at: Date.now(), durationMs });
+    } catch (error) {
+      onTested({
+        ok: false,
+        message: error instanceof Error ? error.message : "Connection check failed.",
+        at: Date.now(),
+        durationMs: 0,
+      });
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  const state = resolveProviderTileState({ expanded, test, connected: enabled });
+  const meta = !expanded && test && !test.ok ? test.message : undefined;
+
+  return (
+    <ProviderTile
+      name="RemuxDB"
+      tagline="Crowdsourced stream metadata"
+      monogram="RX"
+      monogramClass="bg-sky-500/20 text-sky-700 dark:text-sky-300"
+      state={state}
+      meta={meta}
+      busy={updateSettings.isPending || testing}
+      expanded={expanded}
+      badge={restartKeys.has("remuxdb.base_url") ? <RestartBadge /> : undefined}
+      primaryAction={{
+        label: test && !test.ok ? "Fix" : enabled ? "Manage" : "Enable",
+        onClick: onExpand,
+      }}
+    >
+      <p className="text-muted-foreground mb-1 text-xs">
+        Fills in codec, HDR, and audio evidence for virtual files that were never probed, so
+        playback starts without waiting on the provider. Reads work without a token.
+      </p>
+      <SettingField
+        label="Enabled"
+        settingKey="remuxdb.enabled"
+        type="toggle"
+        description="Look up crowdsourced stream metadata for cold virtual files."
+        dirty={enabled !== savedOn}
+        value={enabled ? "true" : "false"}
+        onChange={(v) => {
+          if (test) onTested(undefined);
+          setEnabled(v === "true");
+        }}
+      />
+      <SettingField
+        label="Base URL"
+        settingKey="remuxdb.base_url"
+        type="text"
+        hint={REMUXDB_DEFAULT_URL}
+        description="RemuxDB endpoint. Change it if the service moves to a new address."
+        dirty={url !== savedUrl}
+        value={url}
+        onChange={(v) => {
+          if (test) onTested(undefined);
+          setUrl(v);
+        }}
+        restartRequired={restartKeys.has("remuxdb.base_url")}
+      />
+      <SecretField
+        label="API token"
+        value={token}
+        configured={tokenConfigured}
+        onChange={(next) => {
+          if (test) onTested(undefined);
+          setToken(next);
+        }}
+        onKeep={() => setToken("")}
+      />
+      <ProviderPanelActions test={test}>
+        <Button
+          type="button"
+          size="sm"
+          onClick={() => void save()}
+          disabled={updateSettings.isPending || !hasDraft}
+        >
+          {updateSettings.isPending ? "Saving..." : "Save"}
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          onClick={() => void runTest()}
+          disabled={testing}
+        >
+          {testing ? "Testing..." : "Test connection"}
+        </Button>
+        <Button type="button" size="sm" variant="outline" onClick={onCollapse}>
+          Close
+        </Button>
+      </ProviderPanelActions>
+      <p className="text-muted-foreground mt-2 text-xs">
+        Test uses the URL typed here, or the saved one.
+      </p>
+    </ProviderTile>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -592,6 +773,17 @@ export default function ProvidersSettings() {
               onCollapse={() => setExpandedTile(null)}
               test={tests.mdblist}
               onTested={(test) => recordTest("mdblist", test)}
+            />
+            <RemuxDBTile
+              savedEnabled={form.getValue("remuxdb.enabled")}
+              savedUrl={form.getValue("remuxdb.base_url")}
+              sensitiveConfigured={form.sensitiveConfigured}
+              restartKeys={restartKeys}
+              expanded={expandedTile === "remuxdb"}
+              onExpand={() => setExpandedTile("remuxdb")}
+              onCollapse={() => setExpandedTile(null)}
+              test={tests.remuxdb}
+              onTested={(test) => recordTest("remuxdb", test)}
             />
           </ProviderTileGrid>
           <p className="text-muted-foreground text-xs">

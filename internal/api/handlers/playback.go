@@ -30,6 +30,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/noderouting"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/remotestream"
+	"github.com/Silo-Server/silo-server/internal/remuxdb"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
 	"github.com/Silo-Server/silo-server/internal/settingskeys"
 	"github.com/Silo-Server/silo-server/internal/settingsresolve"
@@ -341,6 +342,8 @@ type PlaybackHandler struct {
 	VirtualSubtitleSearcher                SubtitleSearchTrigger
 	SubtitleSearchInFlight                 *sync.Map
 	DeviceCapabilitySource                 *providerDeviceCapabilitySource
+	RemuxDBConfig                          func(ctx context.Context) remuxdb.Config
+	RemuxDBStore                           *remuxdb.Store
 	// PlaybackConfig returns the current playback config (ffmpeg path,
 	// hwaccel, transcode dir). Wired to the live config in integrated mode
 	// so admin changes apply to newly started transcodes. Read it through

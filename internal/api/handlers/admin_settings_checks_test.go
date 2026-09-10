@@ -1927,3 +1927,48 @@ func TestAdminGetSettingReportsRestartRequired(t *testing.T) {
 		})
 	}
 }
+
+func TestHandleCheckSettingsConnectionRemuxDB(t *testing.T) {
+	stats := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/public/stats" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		if got := r.Header.Get("x-client-id"); got != "silo-server" {
+			t.Errorf("client id = %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"total_mediainfo": 42})
+	}))
+	defer stats.Close()
+
+	handler := &AdminHandler{SettingsRepo: &fakeServerSettingsStore{values: map[string]string{}}}
+
+	rec := performSettingsCheckRequest(t, handler, "/admin/settings/check/remuxdb", map[string]any{
+		"values":     map[string]string{"remuxdb.base_url": stats.URL},
+		"dirty_keys": []string{"remuxdb.base_url"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var response connectionCheckResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Success {
+		t.Fatalf("connection check failed: %s", response.Message)
+	}
+
+	rec = performSettingsCheckRequest(t, handler, "/admin/settings/check/remuxdb", map[string]any{
+		"values":     map[string]string{"remuxdb.base_url": "http://127.0.0.1:1"},
+		"dirty_keys": []string{"remuxdb.base_url"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	response = connectionCheckResponse{}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Success {
+		t.Fatal("unreachable URL reported success")
+	}
+}

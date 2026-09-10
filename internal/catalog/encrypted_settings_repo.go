@@ -68,6 +68,7 @@ var SensitiveSettingKeys = map[string]bool{
 	"tmdb.api_key":    true,
 	"mdblist.api_key": true,
 	"introdb.api_key": true,
+	"remuxdb.token":   true,
 
 	// Shared AI endpoint API keys (+ legacy subtitle_ai alias the loader still
 	// falls back to; the legacy row is never renamed because ciphertext is
