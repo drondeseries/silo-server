@@ -1,5 +1,46 @@
 # Catalog API
 
+## Version liveness
+
+`FileVersion.available` reports the durable per-version health signal on the
+item detail and item-versions responses: a virtual candidate is available when
+it has not been stamped failed (`failed_at` is NULL), a local file when it is
+not marked missing (`missing_since` is NULL). The field is omitted when the
+version is available, so an absent `available` means available/unknown; `false`
+means the version is currently unavailable. `FileVersion.failed` remains the
+virtual-only "produced no bytes at stream-open" flag.
+
+`POST /api/v1/catalog/versions/check` batch-tests a set of media file IDs and
+stamps the durable signal. The request is:
+
+```json
+{
+  "file_ids": [123, 456]
+}
+```
+
+At most 40 IDs are accepted per request (413 `too_large` beyond that; 400
+`bad_request` when the body is missing or the list is empty). Each file is
+tested cheaply — virtual rows resolve their pinned `?result=` candidate through
+the provider (no media transfer), local rows are read from `missing_since` with
+no probe — with bounded concurrency and a per-file timeout. A confirmed dead
+pin stamps `failed_at`; a successful resolution clears it. Ambiguous provider
+errors (provider down, timeout) leave the stamp unchanged and report the row's
+current computed availability, so a provider outage cannot mass-tag versions.
+
+**Response** (200 OK):
+
+```json
+{
+  "results": [
+    { "file_id": 123, "available": true },
+    { "file_id": 456, "available": false }
+  ]
+}
+```
+
+Unknown or deleted file IDs are reported as `available: false`.
+
 ## Multi-audio language support and release metadata
 
 MULTi/DUAL releases — a single audio stream tagged `und`/`mul`/empty whose

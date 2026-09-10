@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,6 +18,20 @@ import (
 // CatalogResourceHandler serves canonical catalog resource read routes.
 type CatalogResourceHandler struct {
 	items *ItemsHandler
+	// FileResolver looks up a media file row by ID for the batched version
+	// liveness check. Optional: without it the check reports every file as
+	// unavailable.
+	FileResolver FilePathResolver
+	// VirtualResolver resolves a virtual candidate's pinned result through the
+	// provider for the liveness check. Optional: without it virtual rows are
+	// reported from their durable failed_at stamp only and never re-stamped.
+	VirtualResolver VirtualMediaDetailedResolver
+	// MarkVirtualFailed stamps a virtual candidate row as known-bad after a
+	// confirmed dead pin. Optional: without it the check never stamps.
+	MarkVirtualFailed func(ctx context.Context, fileID int) error
+	// ClearVirtualFailed clears a virtual candidate's failed stamp after a
+	// successful resolution. Optional: without it the check never clears.
+	ClearVirtualFailed func(ctx context.Context, fileID int) error
 }
 
 // NewCatalogResourceHandler creates a new canonical catalog resource handler.

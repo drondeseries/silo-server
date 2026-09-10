@@ -428,39 +428,45 @@ type PersonCredit struct {
 
 // FileVersion represents a single file version available for playback.
 type FileVersion struct {
-	FileID                   int                    `json:"file_id"`
-	FileName                 string                 `json:"file_name,omitempty"`
-	FilePath                 string                 `json:"file_path,omitempty"`
-	Resolution               string                 `json:"resolution"`
-	CodecVideo               string                 `json:"codec_video"`
-	CodecAudio               string                 `json:"codec_audio"`
-	HDR                      bool                   `json:"hdr"`
-	Container                string                 `json:"container"`
-	FileSize                 int64                  `json:"file_size"`
-	Duration                 int                    `json:"duration"`
-	Bitrate                  int                    `json:"bitrate"`
-	AddedAt                  time.Time              `json:"added_at"`
-	EditionRaw               string                 `json:"edition_raw,omitempty"`
-	EditionKey               string                 `json:"edition_key,omitempty"`
-	ReleaseName              string                 `json:"release_name,omitempty"`
-	ReleaseGroup             string                 `json:"release_group,omitempty"`
-	PresentationKind         string                 `json:"presentation_kind,omitempty"`
-	PresentationGroupKey     string                 `json:"presentation_group_key,omitempty"`
-	PresentationPartIndex    int                    `json:"presentation_part_index,omitempty"`
-	PresentationPartTotal    int                    `json:"presentation_part_total,omitempty"`
-	MultiEpisodeStart        int                    `json:"multi_episode_start,omitempty"`
-	MultiEpisodeEnd          int                    `json:"multi_episode_end,omitempty"`
-	EffectiveAudioTrackIndex *int                   `json:"effective_audio_track_index,omitempty"`
-	EffectiveAudioLanguage   string                 `json:"effective_audio_language,omitempty"`
-	Failed                   bool                   `json:"failed,omitempty"`
-	VideoTracks              []models.VideoTrack    `json:"video_tracks,omitempty"`
-	AudioTracks              []models.AudioTrack    `json:"audio_tracks,omitempty"`
-	SubtitleTracks           []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
-	Chapters                 []VersionChapter       `json:"chapters,omitempty"`
-	Intro                    *Marker                `json:"intro,omitempty"`
-	Credits                  *Marker                `json:"credits,omitempty"`
-	Recap                    *Marker                `json:"recap,omitempty"`
-	Preview                  *Marker                `json:"preview,omitempty"`
+	FileID                   int       `json:"file_id"`
+	FileName                 string    `json:"file_name,omitempty"`
+	FilePath                 string    `json:"file_path,omitempty"`
+	Resolution               string    `json:"resolution"`
+	CodecVideo               string    `json:"codec_video"`
+	CodecAudio               string    `json:"codec_audio"`
+	HDR                      bool      `json:"hdr"`
+	Container                string    `json:"container"`
+	FileSize                 int64     `json:"file_size"`
+	Duration                 int       `json:"duration"`
+	Bitrate                  int       `json:"bitrate"`
+	AddedAt                  time.Time `json:"added_at"`
+	EditionRaw               string    `json:"edition_raw,omitempty"`
+	EditionKey               string    `json:"edition_key,omitempty"`
+	ReleaseName              string    `json:"release_name,omitempty"`
+	ReleaseGroup             string    `json:"release_group,omitempty"`
+	PresentationKind         string    `json:"presentation_kind,omitempty"`
+	PresentationGroupKey     string    `json:"presentation_group_key,omitempty"`
+	PresentationPartIndex    int       `json:"presentation_part_index,omitempty"`
+	PresentationPartTotal    int       `json:"presentation_part_total,omitempty"`
+	MultiEpisodeStart        int       `json:"multi_episode_start,omitempty"`
+	MultiEpisodeEnd          int       `json:"multi_episode_end,omitempty"`
+	EffectiveAudioTrackIndex *int      `json:"effective_audio_track_index,omitempty"`
+	EffectiveAudioLanguage   string    `json:"effective_audio_language,omitempty"`
+	Failed                   bool      `json:"failed,omitempty"`
+	// Available reports the durable per-version health signal: a virtual
+	// candidate is available when it has not been stamped failed (failed_at is
+	// NULL), a local file when it is not marked missing (missing_since is
+	// NULL). Omitted when the version is available, so an absent field means
+	// available/unknown; false means the version is currently unavailable.
+	Available      *bool                  `json:"available,omitempty"`
+	VideoTracks    []models.VideoTrack    `json:"video_tracks,omitempty"`
+	AudioTracks    []models.AudioTrack    `json:"audio_tracks,omitempty"`
+	SubtitleTracks []VersionSubtitleTrack `json:"subtitle_tracks,omitempty"`
+	Chapters       []VersionChapter       `json:"chapters,omitempty"`
+	Intro          *Marker                `json:"intro,omitempty"`
+	Credits        *Marker                `json:"credits,omitempty"`
+	Recap          *Marker                `json:"recap,omitempty"`
+	Preview        *Marker                `json:"preview,omitempty"`
 }
 
 // PlaybackVariant is one logical watch choice, optionally spanning multiple ordered parts.
@@ -3563,6 +3569,30 @@ func ensureTrackLanguages(tracks []models.AudioTrack) []models.AudioTrack {
 	return tracks
 }
 
+// isVirtualMediaFile reports whether a media file row is a zero-storage
+// virtual candidate (provider-backed) rather than a local file. Virtual rows
+// carry a virtual:// path; local liveness (missing_since) never applies to
+// them, and their health signal is the failed_at stamp instead.
+func isVirtualMediaFile(f *models.MediaFile) bool {
+	return f != nil && strings.HasPrefix(f.FilePath, "virtual://")
+}
+
+// versionAvailability returns the durable per-version health signal as a
+// pointer so the JSON field is omitted when the version is available (absent
+// means available/unknown) and false when it is not: a virtual candidate is
+// unavailable when stamped failed (failed_at set), a local file when marked
+// missing (missing_since set).
+func versionAvailability(f *models.MediaFile) *bool {
+	if f == nil {
+		return nil
+	}
+	available := isVirtualMediaFile(f) && f.FailedAt == nil || !isVirtualMediaFile(f) && f.MissingSince == nil
+	if available {
+		return nil
+	}
+	return boolPtr(false)
+}
+
 func (s *DetailService) buildPlaybackInfo(
 	ctx context.Context,
 	files []*models.MediaFile,
@@ -3641,14 +3671,20 @@ func (s *DetailService) buildPlaybackInfo(
 			EffectiveAudioTrackIndex: intPtr(effectiveAudioSelection.Index),
 			EffectiveAudioLanguage:   effectiveAudioSelection.Language,
 			Failed:                   f.FailedAt != nil,
-			VideoTracks:              append([]models.VideoTrack(nil), f.VideoTracks...),
-			AudioTracks:              audioTracks,
-			SubtitleTracks:           buildVersionSubtitleTracks(f),
-			Chapters:                 s.buildVersionChapters(ctx, f),
-			Intro:                    versionIntro,
-			Credits:                  versionCredits,
-			Recap:                    versionRecap,
-			Preview:                  versionPreview,
+			// Available is the durable per-version health signal: a virtual
+			// candidate is available when it has not been stamped failed
+			// (failed_at IS NULL), a local file when it is not marked missing
+			// (missing_since IS NULL). Omitted when available, so an absent
+			// field means available/unknown; false means unavailable.
+			Available:      versionAvailability(f),
+			VideoTracks:    append([]models.VideoTrack(nil), f.VideoTracks...),
+			AudioTracks:    audioTracks,
+			SubtitleTracks: buildVersionSubtitleTracks(f),
+			Chapters:       s.buildVersionChapters(ctx, f),
+			Intro:          versionIntro,
+			Credits:        versionCredits,
+			Recap:          versionRecap,
+			Preview:        versionPreview,
 		})
 
 		for _, sub := range f.SubtitleTracks {

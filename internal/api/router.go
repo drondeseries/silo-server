@@ -1505,6 +1505,21 @@ func NewRouter(deps Dependencies) chi.Router {
 		}
 	}
 
+	// Wire the batched version liveness check onto the catalog resource
+	// handler. The file repository provides row lookup and the failed_at
+	// stamping; the playback handler's detailed resolver (when playback is
+	// wired) resolves pinned virtual candidates through the provider.
+	if catalogResourceHandler != nil {
+		if deps.FileRepo != nil {
+			catalogResourceHandler.FileResolver = deps.FileRepo
+			catalogResourceHandler.MarkVirtualFailed = deps.FileRepo.MarkVirtualCandidateFailed
+			catalogResourceHandler.ClearVirtualFailed = deps.FileRepo.ClearVirtualCandidateFailed
+		}
+		if playbackHandler != nil {
+			catalogResourceHandler.VirtualResolver = playbackHandler.VirtualMediaDetailedResolver
+		}
+	}
+
 	// Wire subtitle repo and S3 client onto streamHandler for S3-stored subtitle serving.
 	if streamHandler != nil && subtitleRepo != nil && deps.S3Public != nil {
 		streamHandler.SubtitleRepo = subtitleRepo
@@ -2680,6 +2695,7 @@ func NewRouter(deps Dependencies) chi.Router {
 						r.Get("/catalog/series/{id}/seasons", catalogResourceHandler.HandleGetSeasons)
 						r.Get("/catalog/series/{id}/seasons/{num}", catalogResourceHandler.HandleGetSeason)
 						r.Get("/catalog/series/{id}/seasons/{num}/episodes", catalogResourceHandler.HandleGetEpisodes)
+						r.Post("/catalog/versions/check", catalogResourceHandler.HandleCheckVersions)
 					}
 					r.Get("/watch/{id}", itemsHandler.HandleGetWatchDetail)
 				}
