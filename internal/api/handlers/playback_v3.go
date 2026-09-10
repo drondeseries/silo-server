@@ -6882,18 +6882,32 @@ func demotedDeliveryClassesV3(durable playback.StartRequestV3) []string {
 // map, and without the stamp the commit would persist an Enabled=false entry
 // the next replan can no longer distinguish from a client-advertised
 // unsupported delivery — the stickiness would die after one hop.
+//
+// The re-application is independent of what the client sent this round: an
+// incoming entry that exists but is disabled still gets the marker (so the
+// commit keeps the server-owned evidence), and a class the client omitted
+// entirely gets a synthesized disabled entry — otherwise a successful
+// intermediate replan that carried the class absent would erase the marker
+// and let a later replan re-enable the delivery that failed.
 func reapplyDeliveryDemotionsV3(start *playback.StartRequestV3, durable playback.StartRequestV3) {
 	if start == nil {
 		return
 	}
+	if start.ClientPlaybackContext.Deliveries == nil {
+		start.ClientPlaybackContext.Deliveries = make(map[string]playback.DeliveryCapabilityV3)
+	}
 	for _, class := range demotedDeliveryClassesV3(durable) {
-		if capability, ok := start.ClientPlaybackContext.Deliveries[class]; ok && capability.Enabled {
-			capability.Enabled = false
-			capability.SupportedOnDevice = false
-			capability.ValidatedClaims = nil
-			capability.FailureReason = demoteDeliveryReasonV3
-			start.ClientPlaybackContext.Deliveries[class] = capability
+		capability, ok := start.ClientPlaybackContext.Deliveries[class]
+		if !ok {
+			// Omitted this round: synthesize the disabled entry so the
+			// demotion marker survives into the commit.
+			capability = playback.DeliveryCapabilityV3{}
 		}
+		capability.Enabled = false
+		capability.SupportedOnDevice = false
+		capability.ValidatedClaims = nil
+		capability.FailureReason = demoteDeliveryReasonV3
+		start.ClientPlaybackContext.Deliveries[class] = capability
 	}
 }
 
