@@ -119,6 +119,30 @@ describe("mergeVersionLiveness", () => {
     expect(merged.get(1)).toBe(true);
   });
 
+  it("recovers a version the metadata marked unavailable when the check reports it available", () => {
+    const versions = [makeVersion({ file_id: 1, available: false })];
+    const merged = mergeVersionLiveness(versions, {
+      results: [{ file_id: 1, available: true }],
+    });
+    expect(merged.get(1)).toBe(true);
+  });
+
+  it("keeps a version unavailable when the check confirms the metadata", () => {
+    const versions = [makeVersion({ file_id: 1, available: false })];
+    const merged = mergeVersionLiveness(versions, {
+      results: [{ file_id: 1, available: false }],
+    });
+    expect(merged.get(1)).toBe(false);
+  });
+
+  it("marks a version unavailable when the check reports it so despite metadata saying available", () => {
+    const versions = [makeVersion({ file_id: 1, available: true })];
+    const merged = mergeVersionLiveness(versions, {
+      results: [{ file_id: 1, available: false }],
+    });
+    expect(merged.get(1)).toBe(false);
+  });
+
   it("leaves virtual versions without a result unknown (absent from the map)", () => {
     const versions = [makeVersion({ file_id: 1, container: "virtual" })];
     expect(mergeVersionLiveness(versions, undefined).has(1)).toBe(false);
@@ -173,7 +197,7 @@ describe("useVersionLiveness", () => {
     expect(result.current.has(3)).toBe(false);
   });
 
-  it("merges item metadata with check results (metadata unavailable wins)", async () => {
+  it("merges item metadata with check results (check result wins as fresher)", async () => {
     const versions = [
       makeVersion({ file_id: 1, container: "virtual", available: false }),
       makeVersion({ file_id: 2, container: "virtual" }),
@@ -191,9 +215,9 @@ describe("useVersionLiveness", () => {
 
     await waitFor(() => expect(result.current.get(2)).toBe(false));
 
-    // The item metadata already said unavailable; the check result must not
-    // flip it back to available.
-    expect(result.current.get(1)).toBe(false);
+    // The check ran after the item snapshot, so its result wins: the version
+    // the metadata marked unavailable is recovered.
+    expect(result.current.get(1)).toBe(true);
   });
 
   it("caches results across re-enables (no second request while fresh)", async () => {

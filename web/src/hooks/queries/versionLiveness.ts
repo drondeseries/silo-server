@@ -42,10 +42,16 @@ export function chunkVirtualFileIds(versions: FileVersion[]): number[][] {
 }
 
 /**
- * Merges the batched liveness results over the item's own metadata. A version
- * is unavailable when the item metadata says so (`available === false`) or a
- * check result reports it unavailable. Virtual versions with no result yet are
- * unknown (absent from the map). Non-virtual versions are always available.
+ * Merges the batched liveness results over the item's own metadata. A check
+ * result is fresher than the item snapshot (the snapshot was fetched before
+ * the check ran), so for any file_id the check reports, the result is
+ * authoritative: true recovers a version the metadata marked unavailable (the
+ * server clears `failed_at` on a successful check), false marks it
+ * unavailable. Item metadata `available === false` only stays authoritative
+ * while the check has not yet reported for that file_id. Virtual versions
+ * with no result yet are unknown (absent from the map) and remain visible;
+ * non-virtual versions are not part of the check batch, so their metadata
+ * flag stays authoritative unless the backend reports them too.
  */
 export function mergeVersionLiveness(
   versions: FileVersion[],
@@ -58,9 +64,9 @@ export function mergeVersionLiveness(
     }
   }
   for (const result of results?.results ?? []) {
-    // Item metadata `available: false` is authoritative; a check result only
-    // fills in or refines versions the metadata did not already mark.
-    if (availability.get(result.file_id) === false) continue;
+    // The check ran after the item snapshot was fetched, so its result wins
+    // for the file_ids it reports — including recovering a version the
+    // metadata marked unavailable.
     availability.set(result.file_id, result.available);
   }
   return availability;

@@ -92,6 +92,29 @@ describe("VersionDropdown unavailable versions", () => {
     expect(dialog.queryByRole("button", { name: /Show .* unavailable/ })).not.toBeInTheDocument();
   });
 
+  it("shows a recovered version without an unavailable toggle after a successful check", () => {
+    // The item metadata marked the version unavailable, but the liveness check
+    // reported it available again; the merged version (available: true) must
+    // render normally with no "Show N unavailable" toggle.
+    const versions = [
+      makeVersion({ file_id: 1, resolution: "2160p" }),
+      makeVersion({ file_id: 2, resolution: "1080p", available: true }),
+    ];
+    render(
+      <VersionDropdown
+        versions={versions}
+        selectedVersion={versions[0]!}
+        onSelectVersion={vi.fn()}
+      />,
+    );
+
+    const dialog = openVersionDropdown();
+
+    expect(dialog.getByRole("button", { name: /1080p/ })).toBeInTheDocument();
+    expect(dialog.queryByText("Unavailable")).not.toBeInTheDocument();
+    expect(dialog.queryByRole("button", { name: /Show .* unavailable/ })).not.toBeInTheDocument();
+  });
+
   it("does not filter when every version is unavailable", () => {
     const versions = [
       makeVersion({ file_id: 1, resolution: "2160p", available: false }),
