@@ -9,12 +9,15 @@ import DetailPopover from "./DetailPopover";
 import { sortPlaybackVariantsByEditionPreference } from "./versionRankingUtils";
 import { collectLanguageLabels } from "./versionFormatUtils";
 import { buildDetailLine, buildQualitySummary, sortByResolution } from "./VersionFlyout";
+import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
 
 interface VersionDropdownProps {
   versions: FileVersion[];
   playbackVariants?: PlaybackVariant[];
   selectedVersion: FileVersion | null;
   onSelectVersion: (version: FileVersion) => void;
+  /** Fired whenever a picker popover opens or closes (open=true on open). */
+  onOpenChange?: (open: boolean) => void;
 }
 
 interface EditionOption {
@@ -30,9 +33,19 @@ function VersionDropdown({
   playbackVariants,
   selectedVersion,
   onSelectVersion,
+  onOpenChange,
 }: VersionDropdownProps) {
   const [editionOpen, setEditionOpen] = useState(false);
   const [versionOpen, setVersionOpen] = useState(false);
+
+  const handleEditionOpenChange = (open: boolean) => {
+    setEditionOpen(open);
+    onOpenChange?.(open);
+  };
+  const handleVersionOpenChange = (open: boolean) => {
+    setVersionOpen(open);
+    onOpenChange?.(open);
+  };
 
   const sorted = useMemo(() => sortByResolution(versions), [versions]);
   const editionOptions = useMemo(
@@ -54,6 +67,11 @@ function VersionDropdown({
     selectedVersion ?? selectedEdition?.defaultVersion ?? activeVersions[0] ?? null;
   const showVersionDropdown = activeVersions.length > 1;
 
+  const { visibleVersions, hiddenUnavailableCount, setShowUnavailable } = useVersionVisibility(
+    activeVersions,
+    activeVersion?.file_id,
+  );
+
   if (!showEditionDropdown && !showVersionDropdown) {
     return null;
   }
@@ -63,7 +81,7 @@ function VersionDropdown({
       {showEditionDropdown && selectedEdition ? (
         <DetailPopover
           open={editionOpen}
-          onOpenChange={setEditionOpen}
+          onOpenChange={handleEditionOpenChange}
           contentClassName="w-[30rem] p-1.5"
           trigger={
             <Button
@@ -112,7 +130,7 @@ function VersionDropdown({
       {showVersionDropdown ? (
         <DetailPopover
           open={versionOpen}
-          onOpenChange={setVersionOpen}
+          onOpenChange={handleVersionOpenChange}
           contentClassName="w-[30rem] p-1.5"
           trigger={
             <Button
@@ -129,11 +147,12 @@ function VersionDropdown({
           }
         >
           <div className="space-y-0.5">
-            {activeVersions.map((version) => {
+            {visibleVersions.map((version) => {
               const isSelected = version.file_id === activeVersion?.file_id;
               const summary = buildQualitySummary(version);
               const detail = buildDetailLine(version);
               const rangeLabel = videoRangeLabel(version);
+              const unavailable = isVersionUnavailable(version);
 
               return (
                 <button
@@ -145,7 +164,7 @@ function VersionDropdown({
                   }}
                   className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors ${
                     isSelected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50"
-                  }`}
+                  } ${unavailable ? "opacity-60" : ""}`}
                 >
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -156,6 +175,14 @@ function VersionDropdown({
                         {rangeLabel ? (
                           <Badge variant="secondary" className="px-1.5 py-0 text-[10px] uppercase">
                             {rangeLabel}
+                          </Badge>
+                        ) : null}
+                        {unavailable ? (
+                          <Badge
+                            variant="destructive"
+                            className="px-1.5 py-0 text-[10px] font-medium uppercase"
+                          >
+                            Unavailable
                           </Badge>
                         ) : null}
                       </div>
@@ -198,6 +225,16 @@ function VersionDropdown({
                 </button>
               );
             })}
+            {hiddenUnavailableCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowUnavailable(true)}
+                className="text-muted-foreground hover:bg-accent/50 hover:text-foreground w-full rounded-lg px-3 py-2 text-left text-xs font-medium transition-colors"
+              >
+                Show {hiddenUnavailableCount} unavailable{" "}
+                {hiddenUnavailableCount === 1 ? "version" : "versions"}
+              </button>
+            )}
           </div>
         </DetailPopover>
       ) : null}

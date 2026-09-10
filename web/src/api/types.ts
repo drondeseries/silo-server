@@ -935,6 +935,10 @@ export interface FileVersion {
   file_size: number;
   duration: number;
   bitrate: number;
+  /** Liveness for virtual versions. Absent means available/unknown; false
+   *  means the version is currently unavailable (e.g. the provider no longer
+   *  serves it). Populated by the catalog versions/check endpoint. */
+  available?: boolean;
   added_at?: string;
   edition_raw?: string;
   edition_key?: string;
@@ -956,6 +960,16 @@ export interface FileVersion {
   credits?: TimeRange | null;
   recap?: TimeRange | null;
   preview?: TimeRange | null;
+}
+
+// Batched liveness check for virtual versions (POST /catalog/versions/check).
+export interface VersionLivenessResult {
+  file_id: number;
+  available: boolean;
+}
+
+export interface VersionLivenessResponse {
+  results: VersionLivenessResult[];
 }
 
 export interface PlaybackVariantPart {

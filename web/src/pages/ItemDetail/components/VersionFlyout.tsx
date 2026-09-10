@@ -14,6 +14,7 @@ import {
   prettifyReleaseName,
 } from "./versionFormatUtils";
 import { audioScore, resolutionScore } from "./versionRankingUtils";
+import { isVersionUnavailable, useVersionVisibility } from "./versionAvailability";
 
 // ---------------------------------------------------------------------------
 // Exported helper functions (also used by tests)
@@ -94,24 +95,29 @@ interface VersionFlyoutItemsProps {
 
 export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionFlyoutItemsProps) {
   const sorted = sortByResolution(versions);
+  const { visibleVersions, hiddenUnavailableCount, setShowUnavailable } = useVersionVisibility(
+    sorted,
+    null,
+  );
 
   return (
     <>
       <DropdownMenuLabel>Play Version</DropdownMenuLabel>
       <DropdownMenuSeparator />
 
-      {sorted.map((version) => {
+      {visibleVersions.map((version) => {
         const qualitySummary = buildQualitySummary(version);
         const detailLine = buildDetailLine(version);
         const isMoreAction = qualitySummary === "More results…";
         const isVirtual =
           version.container === "virtual" ||
           Boolean(version.file_path?.toLowerCase().startsWith("virtual://"));
+        const unavailable = isVersionUnavailable(version);
 
         return (
           <DropdownMenuItem
             key={version.file_id}
-            className="flex items-center gap-3 rounded-lg py-2.5"
+            className={`flex items-center gap-3 rounded-lg py-2.5 ${unavailable ? "opacity-60" : ""}`}
             onSelect={() => onPlayVersion(version.file_id)}
           >
             <span className="bg-accent/70 flex size-7 shrink-0 items-center justify-center rounded-full">
@@ -132,6 +138,14 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
                       className="shrink-0 px-1.5 py-0 text-[10px] font-medium"
                     >
                       Virtual
+                    </Badge>
+                  )}
+                  {unavailable && (
+                    <Badge
+                      variant="destructive"
+                      className="shrink-0 px-1.5 py-0 text-[10px] font-medium uppercase"
+                    >
+                      Unavailable
                     </Badge>
                   )}
                 </span>
@@ -173,6 +187,15 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
           </DropdownMenuItem>
         );
       })}
+      {hiddenUnavailableCount > 0 && (
+        <DropdownMenuItem
+          className="text-muted-foreground justify-center text-xs font-medium"
+          onSelect={() => setShowUnavailable(true)}
+        >
+          Show {hiddenUnavailableCount} unavailable{" "}
+          {hiddenUnavailableCount === 1 ? "version" : "versions"}
+        </DropdownMenuItem>
+      )}
     </>
   );
 }

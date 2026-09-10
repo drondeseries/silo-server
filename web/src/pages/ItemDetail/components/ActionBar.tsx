@@ -121,6 +121,8 @@ export interface ActionBarProps {
   playbackVariants?: PlaybackVariant[];
   selectedVersion?: FileVersion | null;
   onSelectVersion?: (version: FileVersion) => void;
+  /** Fired when a version picker popover opens or closes (open=true on open). */
+  onVersionPickerOpenChange?: (open: boolean) => void;
   onDownload?: () => void;
   onSearchSubtitles?: () => void;
   rating?: number | null;
@@ -176,6 +178,7 @@ export default function ActionBar({
   playbackVariants,
   selectedVersion,
   onSelectVersion,
+  onVersionPickerOpenChange,
   onDownload,
   onSearchSubtitles,
   rating,
@@ -796,6 +799,7 @@ export default function ActionBar({
               playbackVariants={playbackVariants}
               selectedVersion={selectedVersion}
               onSelectVersion={onSelectVersion}
+              onOpenChange={onVersionPickerOpenChange}
             />
           )}
           {selectedVersion && (selectedVersion.audio_tracks?.length ?? 0) > 0 && (

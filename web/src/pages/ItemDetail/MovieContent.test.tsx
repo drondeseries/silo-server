@@ -97,6 +97,12 @@ vi.mock("@/hooks/queries/qualityPreference", () => ({
   useQualityPreference: (fallback?: string | null) => fallback ?? null,
 }));
 
+vi.mock("@/hooks/queries/versionLiveness", () => ({
+  // These tests render without a QueryClient; the liveness check is a no-op
+  // that leaves item metadata untouched.
+  useVersionLiveness: () => new Map<number, boolean>(),
+}));
+
 vi.mock("@/hooks/useCurrentProfile", () => ({
   useCurrentProfile: mocks.useCurrentProfile,
 }));
