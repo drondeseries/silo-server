@@ -136,6 +136,7 @@ export function WatchPage({
     initialSubtitleTrackIndexByFileId,
     initialBitmapSubtitleTrackIndexByFileId,
     explicitFileSelection,
+    forceRelink,
   );
 
   const initialSubtitleErrorKeyRef = useRef<string | null>(null);
