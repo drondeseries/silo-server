@@ -922,6 +922,9 @@ func TestResolveVirtualPlaybackSourceForceRelistListsAndKeepsPin(t *testing.T) {
 	var resolvedPaths []string
 	var forceRefreshArgs []bool
 	h := &PlaybackHandler{
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+			return path, nil
+		}),
 		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
 			listCalls++
 			return []VirtualPlaybackStream{pinned, alternate}, nil
@@ -961,6 +964,9 @@ func TestResolveVirtualPlaybackSourceCompleteEvidenceSkipsListerWithoutForceReli
 
 	listCalls := 0
 	h := &PlaybackHandler{
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+			return path, nil
+		}),
 		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
 			listCalls++
 			return []VirtualPlaybackStream{pinned}, nil
@@ -993,6 +999,9 @@ func TestResolveVirtualPlaybackSourceForceRelistDropsGonePin(t *testing.T) {
 
 	var resolvedPaths []string
 	h := &PlaybackHandler{
+		VirtualPlaybackResolver: VirtualPlaybackResolverFunc(func(_ context.Context, path string, _ int, _ string, _ int) (string, error) {
+			return path, nil
+		}),
 		VirtualPlaybackStreamLister: VirtualPlaybackStreamListerFunc(func(_ context.Context, _ string, _ int, _ string, _ int) ([]VirtualPlaybackStream, error) {
 			return []VirtualPlaybackStream{fresh}, nil
 		}),

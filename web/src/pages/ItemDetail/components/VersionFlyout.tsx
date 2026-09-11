@@ -143,7 +143,7 @@ export default function VersionFlyoutItems({ versions, onPlayVersion }: VersionF
                   {unavailable && (
                     <Badge
                       variant="outline"
-                      className="border-amber-500/30 bg-amber-500/15 shrink-0 px-1.5 py-0 text-[10px] font-medium text-amber-600 dark:text-amber-300"
+                      className="shrink-0 border-amber-500/30 bg-amber-500/15 px-1.5 py-0 text-[10px] font-medium text-amber-600 dark:text-amber-300"
                     >
                       Will retry on play
                     </Badge>
