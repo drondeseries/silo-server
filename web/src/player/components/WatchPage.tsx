@@ -77,6 +77,7 @@ export function WatchPage({
   initialSubtitleTrackIndexByFileId,
   initialBitmapSubtitleTrackIndexByFileId,
   explicitFileSelection = false,
+  forceRelink = false,
   preferredSubtitleLanguage,
   preferredSubtitleTrackSignature,
   subtitleMode,
